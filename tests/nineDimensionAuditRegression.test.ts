@@ -946,7 +946,8 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
       }
     });
 
-    it('does NOT clear storefrontReviewHarvester cache when hiding/unhiding a game, but DOES clear it on an actual score/metadata override', () => {
+    it('does NOT evict storefrontReviewHarvester cache when hiding/unhiding a game, and performs targeted eviction (without nuclear clearCache) on an actual score/metadata override', () => {
+      const evictHarvesterSpy = vi.spyOn(storefrontReviewHarvester, 'evictForGame');
       const clearHarvesterSpy = vi.spyOn(storefrontReviewHarvester, 'clearCache');
       try {
         // 1. Hiding a game (no `override` property in detail)
@@ -955,6 +956,7 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
             detail: { gameId: 'steam_10', isHidden: true, hiddenGameId: 'steam_10' },
           })
         );
+        expect(evictHarvesterSpy).toHaveBeenCalledTimes(0);
         expect(clearHarvesterSpy).toHaveBeenCalledTimes(0);
 
         // 2. Actual override object in detail
@@ -971,8 +973,10 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
             },
           })
         );
-        expect(clearHarvesterSpy).toHaveBeenCalledTimes(1);
+        expect(evictHarvesterSpy).toHaveBeenCalled();
+        expect(clearHarvesterSpy).toHaveBeenCalledTimes(0);
       } finally {
+        evictHarvesterSpy.mockRestore();
         clearHarvesterSpy.mockRestore();
       }
     });

@@ -12,12 +12,15 @@ const {
   shell,
   dialog,
   protocol,
+  powerMonitor,
 } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
 const storeSync = require('./storeSync.cjs');
 const launcherEngine = require('./launcherEngine.cjs');
+const { isNetworkOnlineForLaunch } = require('./launcher/engineStateRegistry.cjs');
+const { replayPendingCloudUploads } = require('./launcher/sessionAndProcessSupervisor.cjs');
 const { createStorefrontLocalCacheFederator } = require('./launcher/storefrontLocalCacheFederator.cjs');
 const { createOfflineVaultService } = require('./launcher/offlineVaultService.cjs');
 const { createMediaHydrationEngine } = require('./launcher/mediaHydrationEngine.cjs');
@@ -707,6 +710,9 @@ function createMainWindow() {
         } else if (ctrlOrCmd && key === '0') {
           event.preventDefault();
           mainWindow.webContents.setZoomLevel(0);
+        } else if (ctrlOrCmd && !input.shift && key === ',') {
+          event.preventDefault();
+          sendOrBufferRendererEvent('app:open-settings', undefined);
         }
       }
     );
@@ -1106,6 +1112,60 @@ if (!gotTheLock) {
 
     if (
       process.platform === 'darwin' &&
+      Menu &&
+      typeof Menu.buildFromTemplate === 'function' &&
+      typeof Menu.setApplicationMenu === 'function'
+    ) {
+      try {
+        const allowDevToolsMenu = !app?.isPackaged || process.env.ONE_LAUNCHER_DEBUG === '1';
+        /** @type {any[]} */
+        const macAppMenuTemplate = [
+          {
+            label: app?.name || 'One Launcher',
+            submenu: [
+              { role: 'about' },
+              { type: 'separator' },
+              {
+                label: 'Settings…',
+                accelerator: 'CmdOrCtrl+,',
+                click: () => {
+                  restoreOrCreateMainWindow();
+                  sendOrBufferRendererEvent('app:open-settings', undefined);
+                },
+              },
+              { type: 'separator' },
+              { role: 'services' },
+              { type: 'separator' },
+              { role: 'hide' },
+              { role: 'hideOthers' },
+              { role: 'unhide' },
+              { type: 'separator' },
+              { role: 'quit' },
+            ],
+          },
+          { role: 'editMenu' },
+          {
+            label: 'View',
+            submenu: [
+              { role: 'reload' },
+              { role: 'forceReload' },
+              ...(allowDevToolsMenu ? [{ role: 'toggleDevTools' }] : []),
+              { type: 'separator' },
+              { role: 'resetZoom' },
+              { role: 'zoomIn' },
+              { role: 'zoomOut' },
+              { type: 'separator' },
+              { role: 'togglefullscreen' },
+            ],
+          },
+          { role: 'windowMenu' },
+        ];
+        Menu.setApplicationMenu(Menu.buildFromTemplate(macAppMenuTemplate));
+      } catch {}
+    }
+
+    if (
+      process.platform === 'darwin' &&
       process.arch === 'arm64' &&
       typeof launcherEngine.ensureRosetta2InBackground === 'function'
     ) {
@@ -1114,6 +1174,38 @@ if (!gotTheLock) {
       }, 1500);
       if (typeof bgRosettaTimer.unref === 'function') {
         bgRosettaTimer.unref();
+      }
+    }
+
+    // L-10: Replay any interrupted/offline post-exit cloud uploads on startup and system wake (conflict-safe bidirectional mode)
+    if (
+      typeof replayPendingCloudUploads === 'function' &&
+      !(typeof launcherEngine.isTestEnvironment === 'function' && launcherEngine.isTestEnvironment())
+    ) {
+      const triggerPendingCloudReplay = () => {
+        try {
+          if (
+            typeof isNetworkOnlineForLaunch === 'function' &&
+            !isNetworkOnlineForLaunch()
+          ) {
+            return;
+          }
+          void Promise.resolve(replayPendingCloudUploads()).catch(() => {});
+        } catch {}
+      };
+      const startupReplayTimer = setTimeout(triggerPendingCloudReplay, 3000);
+      if (typeof startupReplayTimer.unref === 'function') {
+        startupReplayTimer.unref();
+      }
+      if (powerMonitor && typeof powerMonitor.on === 'function') {
+        try {
+          powerMonitor.on('resume', () => {
+            const resumeReplayTimer = setTimeout(triggerPendingCloudReplay, 2000);
+            if (typeof resumeReplayTimer.unref === 'function') {
+              resumeReplayTimer.unref();
+            }
+          });
+        } catch {}
       }
     }
 
@@ -1166,7 +1258,7 @@ app.on('before-quit', (/** @type {any} */ event) => {
     isQuittingAfterSync = true;
     const waitPromise =
       hasPostWork && typeof launcherEngine.waitForActivePostSessionWork === 'function'
-        ? launcherEngine.waitForActivePostSessionWork(10000)
+        ? launcherEngine.waitForActivePostSessionWork(20000)
         : Promise.resolve();
     const downloadPromise =
       hasActiveDownloads && typeof launcherEngine.gracefulShutdownDownloads === 'function'

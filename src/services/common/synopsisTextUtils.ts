@@ -23,6 +23,19 @@ function lruSet<K, V>(cache: Map<K, V>, key: K, value: V): V {
   return value;
 }
 
+const EMPTY_MARKDOWN_LINK_ONLY_RE = /^(?:\s*!?\[\s*\]\([^)]*\)\s*)+$/;
+
+/**
+ * Returns true when raw text consists solely of empty-label Markdown link/image artifacts
+ * such as `[](/discover/v-bucks)` or `![]()`.
+ */
+export function isEmptyMarkdownLinkArtifact(rawText?: string): boolean {
+  if (!rawText || typeof rawText !== 'string') return false;
+  const trimmed = rawText.trim();
+  if (!trimmed) return false;
+  return EMPTY_MARKDOWN_LINK_ONLY_RE.test(trimmed);
+}
+
 /**
  * Strips raw HTML tags, comments, BBCode, Markdown links/images, and HTML entities
  * from storefront descriptions, returning a clean plain-text synopsis suitable for
@@ -32,6 +45,7 @@ function lruSet<K, V>(cache: Map<K, V>, key: K, value: V): V {
  */
 export function stripHtmlToPlainSynopsis(rawText?: string, maxLength = 320): string {
   if (!rawText || typeof rawText !== 'string') return '';
+  if (isEmptyMarkdownLinkArtifact(rawText)) return '';
   const canMemo = rawText.length <= MAX_SYNOPSIS_MEMO_INPUT_LEN;
   const memoKey = canMemo ? `${maxLength}\u0000${rawText}` : '';
   if (canMemo) {
@@ -51,7 +65,7 @@ export function stripHtmlToPlainSynopsis(rawText?: string, maxLength = 320): str
     .replace(/<[^>]+>/g, '')
     .replace(/\[\/?(?:b|i|u|url|quote|img|h[1-6]|list|code|spoiler|\*)[^\]]*\]/gi, '')
     .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/&quot;/gi, '"')
     .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')

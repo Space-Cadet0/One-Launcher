@@ -37,10 +37,41 @@ const {
   setBoundedMapEntry,
   toLocalFsPath,
   resolveHostLocaleInfo,
+  isNetworkOnlineForLaunch,
   loadManagedInstalledGames,
   findLegendaryBinary,
   resolveWindowsNodeShebangSpawn,
 } = require('./engineStateRegistry.cjs');
+
+/** @type {Map<string, Promise<any>>} */
+const inFlightEpicRefreshByToken = new Map();
+
+/**
+ * Single-flight mutex for Epic OAuth refresh token rotation so concurrent callers
+ * (startup sync, pre-launch cloud sync, launch auth, post-exit playtime) never race
+ * on the same rotated refresh token.
+ *
+ * @param {string} refreshToken
+ * @param {(token: string) => Promise<any>} renewFn
+ * @returns {Promise<any>}
+ */
+async function renewEpicTokensSingleFlight(refreshToken, renewFn) {
+  const tokenKey = String(refreshToken || '').trim();
+  if (!tokenKey || typeof renewFn !== 'function') return null;
+  const existing = inFlightEpicRefreshByToken.get(tokenKey);
+  if (existing) {
+    return existing;
+  }
+  const flight = Promise.resolve()
+    .then(() => renewFn(tokenKey))
+    .finally(() => {
+      if (inFlightEpicRefreshByToken.get(tokenKey) === flight) {
+        inFlightEpicRefreshByToken.delete(tokenKey);
+      }
+    });
+  inFlightEpicRefreshByToken.set(tokenKey, flight);
+  return flight;
+}
 const {
   findPrimaryExecutable,
   listAllInitializedBottlePaths,
@@ -1297,6 +1328,9 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
   let recoveredSession = false;
   const triedRefreshTokens = new Set();
 
+  const effectiveSkipNetwork =
+    Boolean(options.skipNetwork) || !isNetworkOnlineForLaunch(options);
+
   for (const { data: cand, isExternal } of candidateRecords) {
     const expiresAtMs = cand.expires_at ? new Date(cand.expires_at).getTime() : 0;
     const isExpiringSoon =
@@ -1312,7 +1346,7 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
       break;
     }
 
-    if (options.skipNetwork) {
+    if (effectiveSkipNetwork) {
       if (cand.access_token && !options.forceTokenRefresh) {
         epicTokenData = { ...cand };
         epicTokenFromExternal = Boolean(isExternal);
@@ -1330,7 +1364,9 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
     ) {
       triedRefreshTokens.add(cand.refresh_token);
       try {
-        const renewed = await activeStoreSync.renewEpicTokens(cand.refresh_token);
+        const renewed = await renewEpicTokensSingleFlight(cand.refresh_token, (tok) =>
+          activeStoreSync.renewEpicTokens(tok)
+        );
         if (
           renewed &&
           renewed.access_token &&
@@ -1365,7 +1401,7 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
     }
   }
 
-  if ((!epicTokenData || !epicTokenData.access_token) && !options.skipNetwork) {
+  if ((!epicTokenData || !epicTokenData.access_token) && !effectiveSkipNetwork) {
     const recoveryFn =
       typeof options.recoverEpicAuthFn === 'function'
         ? options.recoverEpicAuthFn
@@ -1409,15 +1445,34 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
         ? epicTokenData.account_id
         : epicTokenData.in_app_id || epicTokenData.account_id || '';
 
+    let existingDiskRaw = null;
+    /** @type {any} */
+    let existingDiskParsed = null;
+    try {
+      if (fs.existsSync(userFilePath)) {
+        existingDiskRaw = fs.readFileSync(userFilePath, 'utf8');
+        existingDiskParsed = JSON.parse(existingDiskRaw);
+      }
+    } catch {}
+
     const userJsonPayload = {
       access_token: epicTokenData.access_token,
       expires_in: epicTokenData.expires_in || 7200,
-      expires_at: epicTokenData.expires_at || new Date(Date.now() + 7200 * 1000).toISOString(),
+      expires_at:
+        epicTokenData.expires_at ||
+        (existingDiskParsed?.access_token === epicTokenData.access_token &&
+        existingDiskParsed?.expires_at
+          ? existingDiskParsed.expires_at
+          : new Date(Date.now() + 7200 * 1000).toISOString()),
       token_type: epicTokenData.token_type || 'bearer',
       refresh_token: epicTokenData.refresh_token || '',
       refresh_expires: epicTokenData.refresh_expires || 28800,
       refresh_expires_at:
-        epicTokenData.refresh_expires_at || new Date(Date.now() + 28800 * 1000).toISOString(),
+        epicTokenData.refresh_expires_at ||
+        (existingDiskParsed?.refresh_token === (epicTokenData.refresh_token || '') &&
+        existingDiskParsed?.refresh_expires_at
+          ? existingDiskParsed.refresh_expires_at
+          : new Date(Date.now() + 28800 * 1000).toISOString()),
       account_id: resolvedAccountId,
       client_id:
         epicTokenData.client_id ||
@@ -1431,7 +1486,10 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
     };
 
     try {
-      atomicWriteSecureFileSync(userFilePath, JSON.stringify(userJsonPayload, null, 2), options);
+      const nextSerialized = JSON.stringify(userJsonPayload, null, 2);
+      if (existingDiskRaw !== nextSerialized) {
+        atomicWriteSecureFileSync(userFilePath, nextSerialized, options);
+      }
     } catch (writeErr) {
       diagLog.warn('ensureLegendaryConfigAndAuth.writeSecureUserJson', writeErr, { userFilePath });
     }
@@ -2416,7 +2474,14 @@ async function resolveEpicLaunchAuthArguments(
       ? activeStoreSync.loadSavedTokens()
       : {});
 
-  const legAuth = await ensureLegendaryConfigAndAuth(options).catch(() => null);
+  const effectiveOffline = Boolean(options.skipNetwork) || !isNetworkOnlineForLaunch(options);
+
+  const legAuth =
+    options.prefetchedLegAuth && typeof options.prefetchedLegAuth === 'object'
+      ? options.prefetchedLegAuth
+      : await ensureLegendaryConfigAndAuth(
+          effectiveOffline ? { ...options, skipNetwork: true } : options
+        ).catch(() => null);
 
   let accessToken =
     legAuth?.accessToken ||
@@ -2462,7 +2527,7 @@ async function resolveEpicLaunchAuthArguments(
   let exchangeCode = null;
   if (options.mockEpicExchangeCode) {
     exchangeCode = String(options.mockEpicExchangeCode).trim();
-  } else if (accessToken && !options.skipNetwork) {
+  } else if (accessToken && !effectiveOffline) {
     const requestExchange = (/** @type {string} */ token) =>
       performJsonHttpRequest(
         'https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange',
@@ -2490,7 +2555,7 @@ async function resolveEpicLaunchAuthArguments(
         let refreshedToken = null;
         if (refreshToken && typeof renewFn === 'function') {
           try {
-            const renewed = await renewFn(refreshToken);
+            const renewed = await renewEpicTokensSingleFlight(refreshToken, (tok) => renewFn(tok));
             if (renewed?.access_token) {
               refreshedToken = renewed.access_token;
               if (activeStoreSync && typeof activeStoreSync.saveTokens === 'function') {
@@ -2566,6 +2631,7 @@ async function resolveEpicLaunchAuthArguments(
   return {
     args: epicArgs,
     authenticated,
+    ...(effectiveOffline && !authenticated ? { offlineSkipped: true, reason: 'offline_skipped' } : {}),
     appName: appName || '',
     namespace: namespace || '',
     catalogItemId: catalogItemId || '',
@@ -2763,6 +2829,7 @@ module.exports = {
   isPoisonedStorefrontToken,
   getLegendaryConfigDir,
   sanitizeEpicCandidateRecord,
+  renewEpicTokensSingleFlight,
   ensureLegendaryConfigAndAuth,
   extractEpicThirdPartyPartnerMetadata,
   refreshLocalLegendaryMetadata,

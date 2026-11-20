@@ -1,6 +1,9 @@
 import {
   DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
+  LAUNCH_PROFILE_KEYS,
+  migrateLegacyHudConfig,
   sanitizeLaunchMethod,
+  sanitizePerformanceHudMode,
   type BottleDisplayScalingMode,
   type CompatibilityLayerType,
   type DisplayAspectRatioMode,
@@ -118,7 +121,7 @@ export function sanitizeVirtualDesktopResolution(
 export function sanitizeGameLaunchConfig(cfg: GameLaunchConfig): GameLaunchConfig {
   if (!cfg || typeof cfg !== 'object') return cfg;
   const cleanVdRes = sanitizeVirtualDesktopResolution(cfg.virtualDesktopResolution);
-  const nextCfg: GameLaunchConfig = {
+  const nextCfg: GameLaunchConfig = migrateLegacyHudConfig({
     ...cfg,
     launchMethod: sanitizeLaunchMethod(cfg.launchMethod),
     ...(cfg.compatibilityLayer
@@ -143,13 +146,13 @@ export function sanitizeGameLaunchConfig(cfg: GameLaunchConfig): GameLaunchConfi
     ...(cfg.virtualDesktopResolution !== undefined
       ? { virtualDesktopResolution: cleanVdRes }
       : {}),
-  };
+  });
   if (cfg.platformConfigs && typeof cfg.platformConfigs === 'object') {
     const nextPlatCfgs: Partial<Record<StorefrontId, StorefrontLaunchProfile>> = {};
     for (const [platId, p] of Object.entries(cfg.platformConfigs)) {
       if (p) {
         const cleanPlatVdRes = sanitizeVirtualDesktopResolution(p.virtualDesktopResolution);
-        nextPlatCfgs[platId as StorefrontId] = {
+        nextPlatCfgs[platId as StorefrontId] = migrateLegacyHudConfig({
           ...p,
           ...(p.launchMethod !== undefined
             ? { launchMethod: sanitizeLaunchMethod(p.launchMethod) }
@@ -176,7 +179,7 @@ export function sanitizeGameLaunchConfig(cfg: GameLaunchConfig): GameLaunchConfi
           ...(p.virtualDesktopResolution !== undefined
             ? { virtualDesktopResolution: cleanPlatVdRes }
             : {}),
-        };
+        });
       }
     }
     nextCfg.platformConfigs = nextPlatCfgs;
@@ -189,6 +192,8 @@ export function sanitizePerformanceSettings(
 ): LauncherPerformanceSettings {
   const base = { ...DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS };
   if (!raw || typeof raw !== 'object') return base;
+  const rawRecord = raw as Record<string, unknown>;
+  const legacyHudDefault = rawRecord.enableMetalHud === true || rawRecord.enableMangoHud === true;
   return {
     inGameLauncherBehavior:
       raw.inGameLauncherBehavior === 'keep_open' ||
@@ -234,6 +239,12 @@ export function sanitizePerformanceSettings(
       typeof raw.enableFullscreenHotkey === 'boolean'
         ? raw.enableFullscreenHotkey
         : (base.enableFullscreenHotkey ?? true),
+    defaultPerformanceHud:
+      typeof raw.defaultPerformanceHud === 'boolean'
+        ? raw.defaultPerformanceHud
+        : legacyHudDefault
+          ? true
+          : (base.defaultPerformanceHud ?? false),
   };
 }
 
@@ -241,41 +252,8 @@ export function extractStorefrontProfile(
   config: Partial<GameLaunchConfig | StorefrontLaunchProfile>,
   _platformId?: StorefrontId
 ): StorefrontLaunchProfile {
-  const profileKeys: (keyof StorefrontLaunchProfile)[] = [
-    'launchMethod',
-    'customExecutablePath',
-    'workingDirectory',
-    'launchArguments',
-    'environmentVariables',
-    'compatibilityLayer',
-    'wineBottleName',
-    'winePrefixPath',
-    'crossoverGraphicsBackend',
-    'crossoverD3DMetalVersion',
-    'crossoverHighResolutionMode',
-    'crossoverDlss',
-    'preferredMaxFrameRate',
-    'metalfxSpatialUpscaleFactor',
-    'virtualDesktop',
-    'virtualDesktopResolution',
-    'displayScalingMode',
-    'displayAspectRatio',
-    'emulateModeset',
-    'forceLargeAddressAware',
-    'audioBufferClamp',
-    'advertiseAvx',
-    'wineMsync',
-    'wineEsync',
-    'wineDebug',
-    'metalHud',
-    'dxvkHud',
-    'preLaunchCommand',
-    'postExitCommand',
-    'inGameLauncherBehavior',
-    'storefrontClientLifecycle',
-  ];
   const profile: StorefrontLaunchProfile = {};
-  for (const key of profileKeys) {
+  for (const key of LAUNCH_PROFILE_KEYS) {
     const val = config[key];
     if (val !== undefined) {
       if (key === 'launchMethod') {
@@ -284,6 +262,11 @@ export function extractStorefrontProfile(
         profile.compatibilityLayer = sanitizeLegacyCompatLayer(val);
       } else if (key === 'storefrontClientLifecycle') {
         profile.storefrontClientLifecycle = sanitizeStorefrontLifecycleOverride(val);
+      } else if (key === 'performanceHud') {
+        const cleanHud = sanitizePerformanceHudMode(val);
+        if (cleanHud !== undefined) {
+          profile.performanceHud = cleanHud;
+        }
       } else if (key === 'wineDebug') {
         const cleanDebug = sanitizeWineDebugMode(val);
         if (cleanDebug !== undefined) {

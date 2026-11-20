@@ -16,6 +16,13 @@ import {
   hasSameStorefrontConflict,
 } from '../services/integrations/catalogSanitizer';
 import { steamMatcher } from '../services/steam/steamMatcher';
+import { steamApi } from '../services/steam/steamApi';
+import { isKnownDeadSteamCover } from '../services/igdb/igdbCoverService';
+import {
+  reconcileCapsuleImage,
+  reconcileHeaderImage,
+  type ArtworkRecoveryContext,
+} from '../services/storage/metadataReconciliation';
 import { launcherService } from '../services/launcher/launcherService';
 
 export type PartialAchievementRecord = Partial<StoreAchievementSummary> & {
@@ -204,12 +211,38 @@ export function runIntelligentNonSteamMatchPass(currentCatalog: CanonicalGame[])
       if (conflictingOwner) {
         return g;
       }
+      const gogPlat = g.platforms?.find((p) => p.platformId === 'gog');
+      const browseAssets = steamApi.peekCachedBrowseAssets(matched);
+      const candidateHeader =
+        browseAssets?.headerImage ||
+        `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matched}/header.jpg`;
+      const candidateCapsule =
+        browseAssets?.capsuleImage ||
+        (!isKnownDeadSteamCover(matched)
+          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matched}/library_600x900.jpg`
+          : undefined);
+
+      const artworkCtx: ArtworkRecoveryContext = {
+        gameId: g.id,
+        title: g.title,
+        steamAppId: matched,
+        gogId: gogPlat?.platformGameId,
+      };
+      const nextHeader =
+        reconcileHeaderImage(g.headerImage, candidateHeader, artworkCtx) ||
+        g.headerImage ||
+        candidateHeader;
+      const nextCapsule = reconcileCapsuleImage(g.capsuleImage, candidateCapsule, {
+        ...artworkCtx,
+        headerUrl: nextHeader,
+      });
+
       const enriched: CanonicalGame = {
         ...g,
         steamAppId: matched,
         id: `steam-${matched}`,
-        headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matched}/header.jpg`,
-        capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matched}/library_600x900.jpg`,
+        headerImage: nextHeader,
+        capsuleImage: nextCapsule,
       };
       assignedSteamIds.set(matched, enriched);
       return enriched;

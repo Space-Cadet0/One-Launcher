@@ -13,7 +13,11 @@ import {
   decodeTitleHtmlEntities,
   EDITION_TOKENS,
 } from '../common/titleUtils';
-import { computeAdaptive404RetryDelayMs, isWafOrChallengeResponse } from '../../contracts/network';
+import {
+  computeAdaptive404RetryDelayMs,
+  isWafOrChallengeResponse,
+  unwrapOlMediaUrl,
+} from '../../contracts/network';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 import { syncJobManager } from '../network/syncJobManager';
@@ -26,26 +30,71 @@ const STORAGE_KEY_COVER_SCHEMA_MIGRATION = 'antigravity_igdb_covers_schema_v3';
 const STORAGE_KEY_GOG_BOXART = 'antigravity_gog_boxart_v1';
 const STORAGE_KEY_DEAD_STEAM_COVERS = 'antigravity_dead_steam_covers_v1';
 const STORAGE_KEY_DEAD_STEAM_COVER_COUNTS = 'antigravity_dead_steam_cover_counts_v1';
+const STORAGE_KEY_DEAD_STEAM_HASHED_V2 = 'antigravity_dead_steam_hashed_v2';
+const STORAGE_KEY_DEAD_STEAM_SCHEMA_V2 = 'antigravity_dead_steam_schema_v2';
 const NEGATIVE_COVER_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const DEAD_STEAM_COVER_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const MAX_DEAD_STEAM_FAILURE_COUNT = 4; // 6h -> 24h -> 7d -> 30d
+const DEAD_STEAM_BURST_WINDOW_MS = 15_000;
+const DEAD_STEAM_BURST_THRESHOLD = 8;
+const DEAD_STEAM_BURST_COOLDOWN_MS = 60_000;
+
+const STEAM_LIBRARY_COVER_URL_RE =
+  /\/apps\/(\d+)\/(?:([a-f0-9]{40})\/)?library_(?:600x900|capsule)/i;
 
 // Steam App IDs verified to not host standard unhashed library_600x900 assets on Steam CDN
 export const KNOWN_DEAD_STEAM_COVER_APP_IDS = new Set<number>();
 
+// Active non-expired SHA1-hashed Steam library cover keys (`${appId}:${sha1}`) — strictly isolated from KNOWN_DEAD_STEAM_COVER_APP_IDS
+const KNOWN_DEAD_STEAM_HASHED_KEYS = new Set<string>();
+
 export function isKnownDeadSteamCover(appId?: number | null): boolean {
-  if (!appId) return false;
+  if (!appId || appId <= 0) return false;
   igdbCoverService.ensureInitialized();
-  return KNOWN_DEAD_STEAM_COVER_APP_IDS.has(appId);
+  return igdbCoverService.isKnownDeadUnhashedSteamCover(appId);
+}
+
+/**
+ * Checks whether an unhashed Steam cover AppID has an expired dead record eligible for
+ * stale-while-revalidate (SWR) background re-probing.
+ */
+export function isExpiredDeadSteamUnhashed(appId?: number | null): boolean {
+  if (!appId || appId <= 0) return false;
+  igdbCoverService.ensureInitialized();
+  return igdbCoverService.isExpiredDeadSteamUnhashed(appId);
+}
+
+/**
+ * Schedules a deduplicated idle background HEAD/status re-probe for an expired dead unhashed Steam cover.
+ */
+export function scheduleExpiredDeadSteamReprobe(appId: number): void {
+  igdbCoverService.scheduleExpiredDeadSteamReprobe(appId);
+}
+
+/**
+ * O(1) URL-kind-aware dead Steam cover check.
+ * - Unhashed `/apps/<id>/library_600x900*.jpg` (or `library_capsule*.jpg`) checks `KNOWN_DEAD_STEAM_COVER_APP_IDS`.
+ * - 40-char SHA1-hashed `/apps/<id>/<40-hex>/library_*` checks `KNOWN_DEAD_STEAM_HASHED_KEYS` (`${appId}:${sha1}`),
+ *   so an unhashed 404 NEVER poisons a SHA1-hashed cover and vice versa.
+ */
+export function isDeadSteamCoverUrl(url?: string | null): boolean {
+  if (!url) return false;
+  igdbCoverService.ensureInitialized();
+  const raw = url.startsWith('ol-media://') ? unwrapOlMediaUrl(url) : url;
+  const match = STEAM_LIBRARY_COVER_URL_RE.exec(raw);
+  if (!match) return false;
+  const appId = Number(match[1]);
+  if (!Number.isFinite(appId) || appId <= 0) return false;
+  const sha1 = match[2]?.toLowerCase();
+  if (sha1) {
+    return igdbCoverService.isKnownDeadHashedSteamCover(appId, sha1);
+  }
+  return igdbCoverService.isKnownDeadUnhashedSteamCover(appId);
 }
 
 export const KNOWN_IGDB_COVERS: Record<string, string> = {};
 
 export const NORMALIZED_KNOWN_IGDB_COVERS = new Map<string, string>();
-
-for (const [k, v] of Object.entries(KNOWN_IGDB_COVERS)) {
-  NORMALIZED_KNOWN_IGDB_COVERS.set(k.toLowerCase().trim(), v);
-  NORMALIZED_KNOWN_IGDB_COVERS.set(normalizeKey(k), v);
-}
 
 /**
  * Extracts the 64-character hex asset hash from a GOG CDN URL.
@@ -121,9 +170,9 @@ export function isUnsuitableCoverUrl(url?: string | null): boolean {
     return true;
   }
 
-  // 2. Dead Steam App IDs returning 404
-  for (const deadId of KNOWN_DEAD_STEAM_COVER_APP_IDS) {
-    if (lower.includes(`apps/${deadId}/library_600x900`)) return true;
+  // 2. O(1) URL-kind-aware dead Steam cover check (isolates SHA1-hashed vs unhashed paths)
+  if (isDeadSteamCoverUrl(url)) {
+    return true;
   }
 
   return false;
@@ -308,6 +357,11 @@ interface PersistedNegativeCoverRecord {
   cachedAt: number;
 }
 
+interface PersistedHashedDeadSteamRecord {
+  cachedAt: number;
+  failureCount: number;
+}
+
 interface LutrisSearchItem {
   name?: string;
   year?: number | string | null;
@@ -321,12 +375,26 @@ export class IgdbCoverService {
   private gogNegativeTimestamps = new Map<string, number>();
   private deadSteamTimestamps = new Map<number, number>();
   private deadSteamFailureCounts = new Map<number, number>();
+  private expiredDeadSteamUnhashedAppIds = new Set<number>();
+  private deadSteamHashedEntries = new Map<string, PersistedHashedDeadSteamRecord>();
   private pendingFetches = new Map<string, Promise<string | null>>();
+  private pendingDeadProbes = new Map<string, Promise<boolean>>();
+  private scheduledExpiredReprobes = new Set<number>();
+  private recentDeadFailureEvents: Array<{ appId: number; ts: number }> = [];
+  private burstCircuitBreakerTrippedUntil = 0;
   private initialized = false;
   private cacheGeneration = 0;
 
   constructor() {
     // Lazily hydrated on first lookup via ensureInitialized() to avoid synchronous constructor localStorage scans
+    try {
+      onlineLifecycleManager.onOnline(() => {
+        this.burstCircuitBreakerTrippedUntil = 0;
+        this.recentDeadFailureEvents = [];
+      });
+    } catch {
+      // Ignore partial environments in unit tests
+    }
   }
 
   public ensureInitialized(): void {
@@ -362,6 +430,171 @@ export class IgdbCoverService {
     }
   }
 
+  public isKnownDeadUnhashedSteamCover(appId: number): boolean {
+    if (!appId || appId <= 0) return false;
+    this.ensureInitialized();
+    if (!KNOWN_DEAD_STEAM_COVER_APP_IDS.has(appId)) return false;
+    const ts = this.deadSteamTimestamps.get(appId);
+    if (ts !== undefined) {
+      const count = this.deadSteamFailureCounts.get(appId);
+      const ttlMs =
+        count !== undefined ? computeAdaptive404RetryDelayMs(count) : DEAD_STEAM_COVER_TTL_MS;
+      if (Date.now() - ts >= ttlMs) {
+        KNOWN_DEAD_STEAM_COVER_APP_IDS.delete(appId);
+        this.expiredDeadSteamUnhashedAppIds.add(appId);
+        if (count === undefined) {
+          this.deadSteamFailureCounts.set(appId, 1);
+        }
+        return false;
+      }
+    }
+    return true;
+  }
+
+  public isExpiredDeadSteamUnhashed(appId: number): boolean {
+    if (!appId || appId <= 0) return false;
+    this.ensureInitialized();
+    if (KNOWN_DEAD_STEAM_COVER_APP_IDS.has(appId)) {
+      this.isKnownDeadUnhashedSteamCover(appId);
+    }
+    return this.expiredDeadSteamUnhashedAppIds.has(appId);
+  }
+
+  public isKnownDeadHashedSteamCover(appId: number, sha1: string): boolean {
+    if (!appId || appId <= 0 || !sha1) return false;
+    this.ensureInitialized();
+    const key = `${appId}:${sha1.toLowerCase()}`;
+    if (!KNOWN_DEAD_STEAM_HASHED_KEYS.has(key)) return false;
+    const entry = this.deadSteamHashedEntries.get(key);
+    if (entry) {
+      const ttlMs = computeAdaptive404RetryDelayMs(entry.failureCount);
+      if (Date.now() - entry.cachedAt >= ttlMs) {
+        KNOWN_DEAD_STEAM_HASHED_KEYS.delete(key);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  public getDeadSteamFailureCount(appId: number): number {
+    this.ensureInitialized();
+    return this.deadSteamFailureCounts.get(appId) || 0;
+  }
+
+  public isDeadSteamBurstCircuitOpen(): boolean {
+    return Date.now() < this.burstCircuitBreakerTrippedUntil;
+  }
+
+  private checkAndUpdateBurstCircuitBreaker(appId: number, now: number): boolean {
+    const cutoff = now - DEAD_STEAM_BURST_WINDOW_MS;
+    this.recentDeadFailureEvents = this.recentDeadFailureEvents.filter((ev) => ev.ts >= cutoff);
+
+    if (now < this.burstCircuitBreakerTrippedUntil) {
+      return true;
+    }
+
+    const distinctAppIds = new Set<number>();
+    for (const ev of this.recentDeadFailureEvents) {
+      distinctAppIds.add(ev.appId);
+    }
+    distinctAppIds.add(appId);
+    this.recentDeadFailureEvents.push({ appId, ts: now });
+
+    if (distinctAppIds.size >= DEAD_STEAM_BURST_THRESHOLD) {
+      this.burstCircuitBreakerTrippedUntil = now + DEAD_STEAM_BURST_COOLDOWN_MS;
+      return true;
+    }
+    return false;
+  }
+
+  private persistDeadSteamUnhashedState(): void {
+    const deadObj: Record<string, number> = {};
+    const countsObj: Record<string, number> = {};
+    for (const [id, ts] of this.deadSteamTimestamps.entries()) {
+      deadObj[String(id)] = ts;
+    }
+    for (const [id, count] of this.deadSteamFailureCounts.entries()) {
+      if (count > 0) {
+        countsObj[String(id)] = Math.min(MAX_DEAD_STEAM_FAILURE_COUNT, Math.floor(count));
+      }
+    }
+    void vaultSet(STORAGE_KEY_DEAD_STEAM_COVERS, deadObj);
+    void vaultSet(STORAGE_KEY_DEAD_STEAM_COVER_COUNTS, countsObj);
+    if (typeof localStorage !== 'undefined') {
+      try {
+        localStorage.setItem(STORAGE_KEY_DEAD_STEAM_COVERS, JSON.stringify(deadObj));
+        localStorage.setItem(STORAGE_KEY_DEAD_STEAM_COVER_COUNTS, JSON.stringify(countsObj));
+      } catch {
+        // Ignore storage write error; IndexedDB vault retains state
+      }
+    }
+  }
+
+  private persistDeadSteamHashedState(): void {
+    const hashedObj: Record<string, PersistedHashedDeadSteamRecord> = {};
+    for (const [key, rec] of this.deadSteamHashedEntries.entries()) {
+      hashedObj[key] = {
+        cachedAt: rec.cachedAt,
+        failureCount: Math.min(MAX_DEAD_STEAM_FAILURE_COUNT, Math.max(1, Math.floor(rec.failureCount))),
+      };
+    }
+    void vaultSet(STORAGE_KEY_DEAD_STEAM_HASHED_V2, hashedObj);
+    if (typeof localStorage !== 'undefined') {
+      try {
+        if (Object.keys(hashedObj).length > 0) {
+          localStorage.setItem(STORAGE_KEY_DEAD_STEAM_HASHED_V2, JSON.stringify(hashedObj));
+        } else {
+          localStorage.removeItem(STORAGE_KEY_DEAD_STEAM_HASHED_V2);
+        }
+      } catch {
+        // Ignore storage write error
+      }
+    }
+  }
+
+  private clearDeadUnhashedSteamCover(appId: number): boolean {
+    const hadRecord =
+      KNOWN_DEAD_STEAM_COVER_APP_IDS.has(appId) ||
+      this.deadSteamTimestamps.has(appId) ||
+      this.deadSteamFailureCounts.has(appId) ||
+      this.expiredDeadSteamUnhashedAppIds.has(appId);
+    KNOWN_DEAD_STEAM_COVER_APP_IDS.delete(appId);
+    this.deadSteamTimestamps.delete(appId);
+    this.deadSteamFailureCounts.delete(appId);
+    this.expiredDeadSteamUnhashedAppIds.delete(appId);
+    if (hadRecord) {
+      this.persistDeadSteamUnhashedState();
+    }
+    return hadRecord;
+  }
+
+  private recordDeadHashedSteamCover(appId: number, sha1: string): boolean {
+    if (!appId || appId <= 0 || !sha1) return false;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+    this.ensureInitialized();
+    const now = Date.now();
+    if (this.checkAndUpdateBurstCircuitBreaker(appId, now)) {
+      return false;
+    }
+    const key = `${appId}:${sha1.toLowerCase()}`;
+    const existing = this.deadSteamHashedEntries.get(key);
+    if (existing && KNOWN_DEAD_STEAM_HASHED_KEYS.has(key)) {
+      const activeTtl = computeAdaptive404RetryDelayMs(existing.failureCount);
+      if (now - existing.cachedAt < activeTtl) {
+        return true;
+      }
+    }
+    const nextCount = Math.min(
+      MAX_DEAD_STEAM_FAILURE_COUNT,
+      (existing?.failureCount || 0) + 1
+    );
+    this.deadSteamHashedEntries.set(key, { cachedAt: now, failureCount: nextCount });
+    KNOWN_DEAD_STEAM_HASHED_KEYS.add(key);
+    // CRITICAL: NEVER touch KNOWN_DEAD_STEAM_COVER_APP_IDS for SHA1-hashed failures!
+    this.persistDeadSteamHashedState();
+    return true;
+  }
+
   public clearCache(): void {
     this.cacheGeneration += 1;
     this.initialized = true;
@@ -371,16 +604,28 @@ export class IgdbCoverService {
     this.gogNegativeTimestamps.clear();
     this.deadSteamTimestamps.clear();
     this.deadSteamFailureCounts.clear();
+    this.expiredDeadSteamUnhashedAppIds.clear();
+    this.deadSteamHashedEntries.clear();
     this.pendingFetches.clear();
+    this.pendingDeadProbes.clear();
+    this.scheduledExpiredReprobes.clear();
+    this.recentDeadFailureEvents = [];
+    this.burstCircuitBreakerTrippedUntil = 0;
     KNOWN_DEAD_STEAM_COVER_APP_IDS.clear();
+    KNOWN_DEAD_STEAM_HASHED_KEYS.clear();
     void vaultDelete(STORAGE_KEY_IGDB_COVERS);
     void vaultDelete(STORAGE_KEY_GOG_BOXART);
+    void vaultDelete(STORAGE_KEY_DEAD_STEAM_COVERS);
+    void vaultDelete(STORAGE_KEY_DEAD_STEAM_COVER_COUNTS);
+    void vaultDelete(STORAGE_KEY_DEAD_STEAM_HASHED_V2);
     if (typeof localStorage !== 'undefined') {
       try {
         localStorage.removeItem(STORAGE_KEY_IGDB_COVERS);
         localStorage.removeItem(STORAGE_KEY_GOG_BOXART);
         localStorage.removeItem(STORAGE_KEY_DEAD_STEAM_COVERS);
         localStorage.removeItem(STORAGE_KEY_DEAD_STEAM_COVER_COUNTS);
+        localStorage.removeItem(STORAGE_KEY_DEAD_STEAM_HASHED_V2);
+        localStorage.removeItem(STORAGE_KEY_DEAD_STEAM_SCHEMA_V2);
       } catch {
         // Ignore storage errors
       }
@@ -397,20 +642,26 @@ export class IgdbCoverService {
       KNOWN_DEAD_STEAM_COVER_APP_IDS.delete(steamAppId);
       this.deadSteamTimestamps.delete(steamAppId);
       this.deadSteamFailureCounts.delete(steamAppId);
-      if (typeof localStorage !== 'undefined') {
-        try {
-          const deadObj: Record<string, number> = {};
-          const countsObj: Record<string, number> = {};
-          for (const [id, ts] of this.deadSteamTimestamps.entries()) {
-            deadObj[String(id)] = ts;
-            const c = this.deadSteamFailureCounts.get(id);
-            if (c && c > 0) countsObj[String(id)] = c;
-          }
-          localStorage.setItem(STORAGE_KEY_DEAD_STEAM_COVERS, JSON.stringify(deadObj));
-          localStorage.setItem(STORAGE_KEY_DEAD_STEAM_COVER_COUNTS, JSON.stringify(countsObj));
-        } catch {
-          // Ignore storage error
+      this.expiredDeadSteamUnhashedAppIds.delete(steamAppId);
+      this.persistDeadSteamUnhashedState();
+
+      const hashedPrefix = `${steamAppId}:`;
+      let removedAnyHashed = false;
+      for (const k of Array.from(this.deadSteamHashedEntries.keys())) {
+        if (k.startsWith(hashedPrefix)) {
+          this.deadSteamHashedEntries.delete(k);
+          KNOWN_DEAD_STEAM_HASHED_KEYS.delete(k);
+          removedAnyHashed = true;
         }
+      }
+      for (const k of Array.from(KNOWN_DEAD_STEAM_HASHED_KEYS)) {
+        if (k.startsWith(hashedPrefix)) {
+          KNOWN_DEAD_STEAM_HASHED_KEYS.delete(k);
+          removedAnyHashed = true;
+        }
+      }
+      if (removedAnyHashed) {
+        this.persistDeadSteamHashedState();
       }
     }
 
@@ -442,52 +693,80 @@ export class IgdbCoverService {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
     this.ensureInitialized();
     const now = Date.now();
-    const nextCount = (this.deadSteamFailureCounts.get(appId) || 0) + 1;
+    if (this.checkAndUpdateBurstCircuitBreaker(appId, now)) {
+      return;
+    }
+
+    // Deduplicate repeated recordings within an already-active TTL window so failureCount never storms to 19
+    const existingTs = this.deadSteamTimestamps.get(appId);
+    const existingCount = this.deadSteamFailureCounts.get(appId);
+    if (
+      existingTs !== undefined &&
+      KNOWN_DEAD_STEAM_COVER_APP_IDS.has(appId) &&
+      !this.expiredDeadSteamUnhashedAppIds.has(appId)
+    ) {
+      const activeTtl =
+        existingCount !== undefined
+          ? computeAdaptive404RetryDelayMs(existingCount)
+          : DEAD_STEAM_COVER_TTL_MS;
+      if (now - existingTs < activeTtl) {
+        return;
+      }
+    }
+
+    const nextCount = Math.min(MAX_DEAD_STEAM_FAILURE_COUNT, (existingCount || 0) + 1);
+    this.expiredDeadSteamUnhashedAppIds.delete(appId);
     KNOWN_DEAD_STEAM_COVER_APP_IDS.add(appId);
     this.deadSteamTimestamps.set(appId, now);
     this.deadSteamFailureCounts.set(appId, nextCount);
-    if (typeof localStorage !== 'undefined') {
-      try {
-        const deadObj: Record<string, number> = {};
-        const countsObj: Record<string, number> = {};
-        for (const [id, ts] of this.deadSteamTimestamps.entries()) {
-          deadObj[String(id)] = ts;
-          const count = this.deadSteamFailureCounts.get(id);
-          if (count && count > 0) {
-            countsObj[String(id)] = count;
-          }
-        }
-        localStorage.setItem(STORAGE_KEY_DEAD_STEAM_COVERS, JSON.stringify(deadObj));
-        localStorage.setItem(STORAGE_KEY_DEAD_STEAM_COVER_COUNTS, JSON.stringify(countsObj));
-      } catch {
-        // Ignore storage write error
-      }
+    this.persistDeadSteamUnhashedState();
+  }
+
+  public scheduleExpiredDeadSteamReprobe(appId: number): void {
+    if (!appId || appId <= 0 || !onlineLifecycleManager.isOnline()) return;
+    this.ensureInitialized();
+    if (!this.isExpiredDeadSteamUnhashed(appId)) return;
+    if (this.scheduledExpiredReprobes.has(appId)) return;
+    this.scheduledExpiredReprobes.add(appId);
+
+    const run = () => {
+      void this.verifyAndRecordDeadSteamCover(appId).finally(() => {
+        this.scheduledExpiredReprobes.delete(appId);
+      });
+    };
+
+    const g = globalThis as typeof globalThis & {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout?: number }) => number;
+    };
+    if (typeof g.requestIdleCallback === 'function') {
+      g.requestIdleCallback(run, { timeout: 4000 });
+    } else {
+      setTimeout(run, 150);
     }
   }
 
-  public async verifyAndRecordDeadSteamCover(
-    appId: number,
-    _failedUrl?: string
-  ): Promise<boolean> {
-    if (!onlineLifecycleManager.isOnline() || !Number.isFinite(appId) || appId <= 0) {
-      return false;
-    }
-
-    const probeUrl = `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/library_600x900.jpg`;
-
+  private async probeUrlStatus(
+    probeUrl: string
+  ): Promise<{ outcome: 'ok' | 'definitive_404' | 'transient' }> {
     if (typeof window !== 'undefined' && window.electronAPI?.offlineVault?.checkUrlStatus) {
       try {
         const statusRes = await window.electronAPI.offlineVault.checkUrlStatus(probeUrl);
         if (!statusRes || statusRes.online === false || statusRes.isWafOrRateLimited) {
-          return false;
+          return { outcome: 'transient' };
         }
         if (statusRes.isDefinitive404 === true || statusRes.status === 404) {
-          this.recordDeadSteamCover(appId, { verified404: true });
-          return true;
+          return { outcome: 'definitive_404' };
         }
-        return false;
+        if (
+          typeof statusRes.status === 'number' &&
+          statusRes.status >= 200 &&
+          statusRes.status < 300
+        ) {
+          return { outcome: 'ok' };
+        }
+        return { outcome: 'transient' };
       } catch {
-        return false;
+        return { outcome: 'transient' };
       }
     }
 
@@ -499,16 +778,135 @@ export class IgdbCoverService {
             ? AbortSignal.timeout(4500)
             : undefined,
       });
-      if (!onlineLifecycleManager.isOnline()) return false;
-      if (isWafOrChallengeResponse(res.status, '')) return false;
-      if (res.status === 404) {
-        this.recordDeadSteamCover(appId, { verified404: true });
-        return true;
-      }
-      return false;
+      if (!onlineLifecycleManager.isOnline()) return { outcome: 'transient' };
+      if (isWafOrChallengeResponse(res.status, '')) return { outcome: 'transient' };
+      if (res.status === 404) return { outcome: 'definitive_404' };
+      if (res.ok || (res.status >= 200 && res.status < 300)) return { outcome: 'ok' };
+      return { outcome: 'transient' };
     } catch {
+      return { outcome: 'transient' };
+    }
+  }
+
+  public async verifyAndRecordDeadSteamCover(
+    appId: number,
+    failedUrl?: string
+  ): Promise<boolean> {
+    if (!onlineLifecycleManager.isOnline() || !Number.isFinite(appId) || appId <= 0) {
       return false;
     }
+    this.ensureInitialized();
+
+    const unwrappedFailed = failedUrl ? unwrapOlMediaUrl(failedUrl).trim() : '';
+    const normalizedFailed = unwrappedFailed.startsWith('//')
+      ? `https:${unwrappedFailed}`
+      : unwrappedFailed;
+    const urlMatch = normalizedFailed ? STEAM_LIBRARY_COVER_URL_RE.exec(normalizedFailed) : null;
+    const sha1 = urlMatch?.[2]?.toLowerCase() || null;
+
+    // Branch A: 40-char SHA1-hashed Steam URL — probe ONLY that exact URL and NEVER poison the AppID!
+    if (sha1 && normalizedFailed) {
+      if (this.isKnownDeadHashedSteamCover(appId, sha1)) {
+        return true;
+      }
+      const probeKey = `hashed:${appId}:${sha1}`;
+      const existingProbe = this.pendingDeadProbes.get(probeKey);
+      if (existingProbe) return existingProbe;
+
+      const probePromise = (async (): Promise<boolean> => {
+        const { outcome } = await this.probeUrlStatus(normalizedFailed);
+        if (outcome === 'definitive_404') {
+          return this.recordDeadHashedSteamCover(appId, sha1);
+        }
+        if (outcome === 'ok') {
+          const hashedKey = `${appId}:${sha1}`;
+          if (this.deadSteamHashedEntries.delete(hashedKey)) {
+            KNOWN_DEAD_STEAM_HASHED_KEYS.delete(hashedKey);
+            this.persistDeadSteamHashedState();
+          }
+        }
+        return false;
+      })();
+
+      this.pendingDeadProbes.set(probeKey, probePromise);
+      try {
+        return await probePromise;
+      } finally {
+        this.pendingDeadProbes.delete(probeKey);
+      }
+    }
+
+    // Branch B: Legacy unhashed Steam cover URL
+    if (this.isKnownDeadUnhashedSteamCover(appId)) {
+      return true;
+    }
+
+    const probeKey = `unhashed:${appId}`;
+    const existingProbe = this.pendingDeadProbes.get(probeKey);
+    if (existingProbe) return existingProbe;
+
+    const probeUrl = `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/library_600x900.jpg`;
+
+    const probePromise = (async (): Promise<boolean> => {
+      const { outcome } = await this.probeUrlStatus(probeUrl);
+      if (outcome === 'definitive_404') {
+        const beforeActive = KNOWN_DEAD_STEAM_COVER_APP_IDS.has(appId);
+        this.recordDeadSteamCover(appId, { verified404: true });
+        return KNOWN_DEAD_STEAM_COVER_APP_IDS.has(appId) || beforeActive;
+      }
+      if (outcome === 'ok') {
+        const wasDeadOrExpired = this.clearDeadUnhashedSteamCover(appId);
+        if (
+          wasDeadOrExpired &&
+          typeof window !== 'undefined' &&
+          typeof window.dispatchEvent === 'function'
+        ) {
+          try {
+            window.dispatchEvent(
+              new CustomEvent('antigravity:steam-assets-resolved', {
+                detail: { appId, capsuleImage: probeUrl, ts: Date.now() },
+              })
+            );
+          } catch {
+            // Ignore event dispatch errors
+          }
+        }
+      }
+      return false;
+    })();
+
+    this.pendingDeadProbes.set(probeKey, probePromise);
+    try {
+      return await probePromise;
+    } finally {
+      this.pendingDeadProbes.delete(probeKey);
+    }
+  }
+
+  private detectBurstClusterAppIds(
+    entries: Array<{ appId: number; tsNum: number; countNum: number | undefined }>
+  ): Set<number> {
+    const uncounted = entries
+      .filter((e) => e.countNum === undefined && e.appId > 0 && e.tsNum > 0)
+      .sort((a, b) => a.tsNum - b.tsNum);
+
+    const burstPurged = new Set<number>();
+    if (uncounted.length < DEAD_STEAM_BURST_THRESHOLD) {
+      return burstPurged;
+    }
+
+    let left = 0;
+    for (let right = 0; right < uncounted.length; right++) {
+      while (uncounted[right].tsNum - uncounted[left].tsNum > DEAD_STEAM_BURST_WINDOW_MS) {
+        left++;
+      }
+      if (right - left + 1 >= DEAD_STEAM_BURST_THRESHOLD) {
+        for (let k = left; k <= right; k++) {
+          burstPurged.add(uncounted[k].appId);
+        }
+      }
+    }
+    return burstPurged;
   }
 
   private loadPersistentCache() {
@@ -591,6 +989,8 @@ export class IgdbCoverService {
         }
       }
 
+      // 4. Load dead unhashed Steam cover counts & timestamps (with one-time v2 burst-cluster poison purge
+      //    and strict preservation of deadSteamFailureCounts across TTL expiry!)
       const rawDeadCounts = localStorage.getItem(STORAGE_KEY_DEAD_STEAM_COVER_COUNTS);
       let parsedCounts: Record<string, number> = {};
       if (rawDeadCounts) {
@@ -602,38 +1002,126 @@ export class IgdbCoverService {
         } catch {}
       }
 
+      for (const [idStr, rawCount] of Object.entries(parsedCounts)) {
+        const appId = Number(idStr);
+        if (Number.isFinite(appId) && appId > 0 && typeof rawCount === 'number' && rawCount > 0) {
+          this.deadSteamFailureCounts.set(
+            appId,
+            Math.min(MAX_DEAD_STEAM_FAILURE_COUNT, Math.floor(rawCount))
+          );
+        }
+      }
+
+      const hasDeadSteamSchemaV2 =
+        localStorage.getItem(STORAGE_KEY_DEAD_STEAM_SCHEMA_V2) === '1';
       const rawDeadSteam = localStorage.getItem(STORAGE_KEY_DEAD_STEAM_COVERS);
       if (rawDeadSteam) {
         const parsedDead: unknown = JSON.parse(rawDeadSteam);
         if (parsedDead && typeof parsedDead === 'object' && !Array.isArray(parsedDead)) {
+          const parsedEntries: Array<{
+            appId: number;
+            tsNum: number;
+            countNum: number | undefined;
+          }> = [];
           for (const [idStr, ts] of Object.entries(parsedDead as Record<string, unknown>)) {
             const appId = Number(idStr);
+            if (!Number.isFinite(appId) || appId <= 0) continue;
             let tsNum = 0;
             let countNum: number | undefined = undefined;
             if (typeof ts === 'number') {
               tsNum = ts;
               if (typeof parsedCounts[idStr] === 'number' && parsedCounts[idStr] > 0) {
-                countNum = parsedCounts[idStr];
+                countNum = Math.min(MAX_DEAD_STEAM_FAILURE_COUNT, Math.floor(parsedCounts[idStr]));
               }
             } else if (ts && typeof ts === 'object') {
               const deadObj = ts as { cachedAt?: unknown; failureCount?: unknown };
               tsNum = Number(deadObj.cachedAt || 0);
               if (typeof deadObj.failureCount === 'number' && deadObj.failureCount > 0) {
-                countNum = deadObj.failureCount;
+                countNum = Math.min(
+                  MAX_DEAD_STEAM_FAILURE_COUNT,
+                  Math.floor(deadObj.failureCount)
+                );
               }
             }
+            if (tsNum > 0) {
+              parsedEntries.push({ appId, tsNum, countNum });
+            }
+          }
+
+          // One-time v2 poison purge: remove any scroll-burst cluster (>= 8 uncounted entries within 15s)
+          // while preserving single genuine 404s and unit-test-seeded entries!
+          const burstPurgedIds = !hasDeadSteamSchemaV2
+            ? this.detectBurstClusterAppIds(parsedEntries)
+            : new Set<number>();
+
+          const now = Date.now();
+          for (const entry of parsedEntries) {
+            if (burstPurgedIds.has(entry.appId)) {
+              KNOWN_DEAD_STEAM_COVER_APP_IDS.delete(entry.appId);
+              this.deadSteamTimestamps.delete(entry.appId);
+              this.deadSteamFailureCounts.delete(entry.appId);
+              this.expiredDeadSteamUnhashedAppIds.delete(entry.appId);
+              continue;
+            }
+
             const ttlMs =
-              countNum !== undefined
-                ? computeAdaptive404RetryDelayMs(countNum)
+              entry.countNum !== undefined
+                ? computeAdaptive404RetryDelayMs(entry.countNum)
                 : DEAD_STEAM_COVER_TTL_MS;
-            if (appId > 0 && tsNum > 0 && Date.now() - tsNum < ttlMs) {
-              KNOWN_DEAD_STEAM_COVER_APP_IDS.add(appId);
-              this.deadSteamTimestamps.set(appId, tsNum);
-              if (countNum !== undefined) {
-                this.deadSteamFailureCounts.set(appId, countNum);
+            this.deadSteamTimestamps.set(entry.appId, entry.tsNum);
+            if (entry.countNum !== undefined) {
+              this.deadSteamFailureCounts.set(entry.appId, entry.countNum);
+            }
+
+            if (now - entry.tsNum < ttlMs) {
+              KNOWN_DEAD_STEAM_COVER_APP_IDS.add(entry.appId);
+              this.expiredDeadSteamUnhashedAppIds.delete(entry.appId);
+            } else {
+              // TTL expired: remove from active dead set, record for SWR re-probe, and PRESERVE failureCount!
+              KNOWN_DEAD_STEAM_COVER_APP_IDS.delete(entry.appId);
+              this.expiredDeadSteamUnhashedAppIds.add(entry.appId);
+              if (entry.countNum === undefined) {
+                this.deadSteamFailureCounts.set(entry.appId, 1);
               }
             }
           }
+
+          if (!hasDeadSteamSchemaV2) {
+            localStorage.setItem(STORAGE_KEY_DEAD_STEAM_SCHEMA_V2, '1');
+            if (burstPurgedIds.size > 0) {
+              this.persistDeadSteamUnhashedState();
+            }
+          }
+        }
+      }
+
+      // 5. Load SHA1-hashed dead Steam cover registry (strictly isolated from KNOWN_DEAD_STEAM_COVER_APP_IDS)
+      const rawDeadHashed = localStorage.getItem(STORAGE_KEY_DEAD_STEAM_HASHED_V2);
+      if (rawDeadHashed) {
+        try {
+          const parsedHashed: unknown = JSON.parse(rawDeadHashed);
+          if (parsedHashed && typeof parsedHashed === 'object' && !Array.isArray(parsedHashed)) {
+            const now = Date.now();
+            for (const [key, rec] of Object.entries(parsedHashed as Record<string, unknown>)) {
+              if (!/^\d+:[a-f0-9]{40}$/i.test(key) || !rec || typeof rec !== 'object') continue;
+              const typedRec = rec as { cachedAt?: unknown; failureCount?: unknown };
+              const cachedAt = Number(typedRec.cachedAt || 0);
+              const failureCount = Math.min(
+                MAX_DEAD_STEAM_FAILURE_COUNT,
+                Math.max(1, Math.floor(Number(typedRec.failureCount || 1)))
+              );
+              if (cachedAt <= 0) continue;
+              const normKey = key.toLowerCase();
+              this.deadSteamHashedEntries.set(normKey, { cachedAt, failureCount });
+              if (now - cachedAt < computeAdaptive404RetryDelayMs(failureCount)) {
+                KNOWN_DEAD_STEAM_HASHED_KEYS.add(normKey);
+              } else {
+                KNOWN_DEAD_STEAM_HASHED_KEYS.delete(normKey);
+              }
+            }
+          }
+        } catch {
+          // Ignore malformed hashed registry
         }
       }
     } catch {
@@ -645,10 +1133,14 @@ export class IgdbCoverService {
     if (typeof window === 'undefined') return;
     const gen = this.cacheGeneration;
     try {
-      const [vaultCovers, vaultGog] = await Promise.all([
-        vaultGet<Record<string, unknown>>(STORAGE_KEY_IGDB_COVERS),
-        vaultGet<Record<string, unknown>>(STORAGE_KEY_GOG_BOXART),
-      ]);
+      const [vaultCovers, vaultGog, vaultDeadSteam, vaultDeadCounts, vaultDeadHashed] =
+        await Promise.all([
+          vaultGet<Record<string, unknown>>(STORAGE_KEY_IGDB_COVERS),
+          vaultGet<Record<string, unknown>>(STORAGE_KEY_GOG_BOXART),
+          vaultGet<Record<string, unknown>>(STORAGE_KEY_DEAD_STEAM_COVERS),
+          vaultGet<Record<string, unknown>>(STORAGE_KEY_DEAD_STEAM_COVER_COUNTS),
+          vaultGet<Record<string, unknown>>(STORAGE_KEY_DEAD_STEAM_HASHED_V2),
+        ]);
       if (gen !== this.cacheGeneration) return;
 
       if (vaultCovers && typeof vaultCovers === 'object' && !Array.isArray(vaultCovers)) {
@@ -690,6 +1182,65 @@ export class IgdbCoverService {
               this.setGogCacheBounded(k, null);
               this.gogNegativeTimestamps.set(k, cachedAt);
             }
+          }
+        }
+      }
+
+      if (vaultDeadCounts && typeof vaultDeadCounts === 'object' && !Array.isArray(vaultDeadCounts)) {
+        for (const [idStr, rawCount] of Object.entries(vaultDeadCounts)) {
+          const appId = Number(idStr);
+          if (Number.isFinite(appId) && appId > 0 && typeof rawCount === 'number' && rawCount > 0) {
+            const clamped = Math.min(MAX_DEAD_STEAM_FAILURE_COUNT, Math.floor(rawCount));
+            const existingCount = this.deadSteamFailureCounts.get(appId) || 0;
+            if (clamped > existingCount) {
+              this.deadSteamFailureCounts.set(appId, clamped);
+            }
+          }
+        }
+      }
+
+      if (vaultDeadSteam && typeof vaultDeadSteam === 'object' && !Array.isArray(vaultDeadSteam)) {
+        const now = Date.now();
+        for (const [idStr, ts] of Object.entries(vaultDeadSteam)) {
+          const appId = Number(idStr);
+          const tsNum = typeof ts === 'number' ? ts : 0;
+          if (!Number.isFinite(appId) || appId <= 0 || tsNum <= 0) continue;
+          const existingTs = this.deadSteamTimestamps.get(appId) || 0;
+          if (tsNum <= existingTs) continue;
+          const count = this.deadSteamFailureCounts.get(appId);
+          const ttlMs =
+            count !== undefined ? computeAdaptive404RetryDelayMs(count) : DEAD_STEAM_COVER_TTL_MS;
+          this.deadSteamTimestamps.set(appId, tsNum);
+          if (now - tsNum < ttlMs) {
+            KNOWN_DEAD_STEAM_COVER_APP_IDS.add(appId);
+            this.expiredDeadSteamUnhashedAppIds.delete(appId);
+          } else {
+            KNOWN_DEAD_STEAM_COVER_APP_IDS.delete(appId);
+            this.expiredDeadSteamUnhashedAppIds.add(appId);
+            if (count === undefined) {
+              this.deadSteamFailureCounts.set(appId, 1);
+            }
+          }
+        }
+      }
+
+      if (vaultDeadHashed && typeof vaultDeadHashed === 'object' && !Array.isArray(vaultDeadHashed)) {
+        const now = Date.now();
+        for (const [key, rec] of Object.entries(vaultDeadHashed)) {
+          if (!/^\d+:[a-f0-9]{40}$/i.test(key) || !rec || typeof rec !== 'object') continue;
+          const typedRec = rec as { cachedAt?: unknown; failureCount?: unknown };
+          const cachedAt = Number(typedRec.cachedAt || 0);
+          const failureCount = Math.min(
+            MAX_DEAD_STEAM_FAILURE_COUNT,
+            Math.max(1, Math.floor(Number(typedRec.failureCount || 1)))
+          );
+          if (cachedAt <= 0) continue;
+          const normKey = key.toLowerCase();
+          const existing = this.deadSteamHashedEntries.get(normKey);
+          if (existing && existing.cachedAt >= cachedAt) continue;
+          this.deadSteamHashedEntries.set(normKey, { cachedAt, failureCount });
+          if (now - cachedAt < computeAdaptive404RetryDelayMs(failureCount)) {
+            KNOWN_DEAD_STEAM_HASHED_KEYS.add(normKey);
           }
         }
       }
@@ -896,14 +1447,6 @@ export class IgdbCoverService {
     if (!title || !title.trim()) return true;
     this.ensureInitialized();
     const { cleanRaw, norm, effectiveReleaseYear, cacheKey } = this.resolveCacheKeys(title, releaseYear);
-    const lower = cleanRaw.toLowerCase();
-
-    const curated =
-      NORMALIZED_KNOWN_IGDB_COVERS.get(lower) ||
-      NORMALIZED_KNOWN_IGDB_COVERS.get(norm) ||
-      KNOWN_IGDB_COVERS[lower] ||
-      KNOWN_IGDB_COVERS[norm];
-    if (curated) return true;
 
     if (this.cache.has(cacheKey)) {
       const val = this.cache.get(cacheKey);
@@ -930,7 +1473,7 @@ export class IgdbCoverService {
   }
 
   /**
-   * Fast synchronous lookup against curated mappings and local storage cache.
+   * Fast synchronous lookup against local storage and in-memory cover caches.
    * Returns instant image URL or null.
    */
   getIgdbCoverInstant(title?: string, steamAppId?: number, gameId?: string): string | null {
@@ -942,18 +1485,6 @@ export class IgdbCoverService {
       const lower = cleanRaw.toLowerCase();
       const norm = normalizeKey(cleanRaw);
 
-      // 1. Curated official covers take precedence over dynamic / local cache
-      const match =
-        NORMALIZED_KNOWN_IGDB_COVERS.get(lower) ||
-        NORMALIZED_KNOWN_IGDB_COVERS.get(norm) ||
-        KNOWN_IGDB_COVERS[lower] ||
-        KNOWN_IGDB_COVERS[norm];
-
-      if (match) {
-        return match;
-      }
-
-      // 2. Dynamic cache
       if (this.cache.has(norm)) {
         return this.cache.get(norm) || null;
       }
@@ -967,18 +1498,6 @@ export class IgdbCoverService {
       const lowerId = cleanId.toLowerCase();
       const normId = normalizeKey(cleanId);
 
-      // 1. Curated official covers take precedence over dynamic / local cache
-      const match =
-        NORMALIZED_KNOWN_IGDB_COVERS.get(lowerId) ||
-        NORMALIZED_KNOWN_IGDB_COVERS.get(normId) ||
-        KNOWN_IGDB_COVERS[lowerId] ||
-        KNOWN_IGDB_COVERS[normId];
-
-      if (match) {
-        return match;
-      }
-
-      // 2. Dynamic cache
       if (this.cache.has(normId)) {
         return this.cache.get(normId) || null;
       }
@@ -1007,13 +1526,6 @@ export class IgdbCoverService {
 
     // Short-circuit both positive and valid negative cache hits before scheduling or tracking any task
     if (this.hasAttemptedIgdbCover(cleanRaw, releaseYear)) {
-      const lower = cleanRaw.toLowerCase();
-      const curated =
-        NORMALIZED_KNOWN_IGDB_COVERS.get(lower) ||
-        NORMALIZED_KNOWN_IGDB_COVERS.get(norm) ||
-        KNOWN_IGDB_COVERS[lower] ||
-        KNOWN_IGDB_COVERS[norm];
-      if (curated) return curated;
       if (this.cache.has(cacheKey)) {
         return this.cache.get(cacheKey) ?? null;
       }

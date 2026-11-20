@@ -55,14 +55,14 @@ export function getSteamCategoryIconUrl(id: number): string {
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 import { requestScheduler, RequestPriority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
-import { vaultDelete, vaultGet, vaultSet } from '../storage/indexedDbVault';
+import { isIndexedDbAvailable, vaultDelete, vaultGet, vaultSet } from '../storage/indexedDbVault';
 import {
   evictStagedCache,
   loadStagedCache,
   saveStagedCache,
   STAGED_CACHE_PREFIX,
 } from '../storage/stagedCacheService';
-import { stripHtmlToPlainSynopsis } from './fallbackMetadataProvider';
+import { stripHtmlToPlainSynopsis } from '../common/synopsisTextUtils';
 
 const STEAM_APPDETAILS_404_KEY_PREFIX = `${STAGED_CACHE_PREFIX}steam_appdetails_404_v1_`;
 const STEAM_APPDETAILS_404_TTL_MS = 14 * 24 * 60 * 60 * 1000;
@@ -287,6 +287,7 @@ export type StoreBrowseAssets = SteamStoreBrowseAssets;
 
 const STORAGE_KEY_BROWSE_ASSETS = 'antigravity_steam_browse_assets_v1';
 const BROWSE_ASSETS_BATCH_CHUNK_SIZE = 80;
+const MAX_BROWSE_ASSETS_CACHE_ENTRIES = 5000;
 
 function toLightweightSteamDigest(meta: SteamEnrichedMetadata): SteamEnrichedMetadata {
   return {
@@ -332,21 +333,64 @@ export class SteamApiService {
   private inFlightBrowseAssets = new Map<number, Promise<SteamStoreBrowseAssets | null>>();
   private browseCacheLoaded = false;
 
+  private setBrowseAssetsEntry(appId: number, entry: SteamStoreBrowseAssets): void {
+    if (this.browseAssetsCache.has(appId)) {
+      this.browseAssetsCache.delete(appId);
+    }
+    this.browseAssetsCache.set(appId, entry);
+    while (this.browseAssetsCache.size > MAX_BROWSE_ASSETS_CACHE_ENTRIES) {
+      const oldestKey = this.browseAssetsCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.browseAssetsCache.delete(oldestKey);
+    }
+  }
+
+  public async hydrateBrowseAssetsFromVault(): Promise<number> {
+    if (typeof window === 'undefined') return 0;
+    try {
+      const vaultData = await vaultGet<Record<string, SteamStoreBrowseAssets>>(
+        STORAGE_KEY_BROWSE_ASSETS
+      );
+      if (!vaultData || typeof vaultData !== 'object' || Array.isArray(vaultData)) return 0;
+      let loaded = 0;
+      for (const [k, v] of Object.entries(vaultData)) {
+        const id = Number(k);
+        if (
+          Number.isFinite(id) &&
+          id > 0 &&
+          v &&
+          typeof v === 'object' &&
+          !this.browseAssetsCache.has(id)
+        ) {
+          if (v.capsuleImage || v.headerImage || v.iconUrl) {
+            this.setBrowseAssetsEntry(id, v);
+            loaded++;
+          }
+        }
+      }
+      return loaded;
+    } catch {
+      return 0;
+    }
+  }
+
   private loadBrowseAssetsCache(): void {
     if (this.browseCacheLoaded) return;
     this.browseCacheLoaded = true;
     try {
-      if (typeof localStorage === 'undefined') return;
-      const raw = localStorage.getItem(STORAGE_KEY_BROWSE_ASSETS);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object') {
-        for (const [k, v] of Object.entries(parsed)) {
-          const id = Number(k);
-          if (Number.isFinite(id) && id > 0 && v && typeof v === 'object') {
-            const entry = v as SteamStoreBrowseAssets;
-            if (entry.capsuleImage || entry.headerImage || entry.iconUrl) {
-              this.browseAssetsCache.set(id, entry);
+      if (typeof localStorage !== 'undefined') {
+        const raw = localStorage.getItem(STORAGE_KEY_BROWSE_ASSETS);
+        if (raw) {
+          const parsed: unknown = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+              const id = Number(k);
+              if (Number.isFinite(id) && id > 0 && v && typeof v === 'object') {
+                const entry = v as SteamStoreBrowseAssets;
+                if (entry.capsuleImage || entry.headerImage || entry.iconUrl) {
+                  this.setBrowseAssetsEntry(id, entry);
+                }
+              }
             }
           }
         }
@@ -354,21 +398,33 @@ export class SteamApiService {
     } catch {
       // Ignore storage errors
     }
+    if (isIndexedDbAvailable()) {
+      void this.hydrateBrowseAssetsFromVault();
+    }
   }
 
   private saveBrowseAssetsCache(): void {
-    try {
-      if (typeof localStorage === 'undefined') return;
-      const obj: Record<string, SteamStoreBrowseAssets> = {};
-      const entries = Array.from(this.browseAssetsCache.entries()).slice(-1000);
-      for (const [k, v] of entries) {
-        if (v.capsuleImage || v.headerImage || v.iconUrl) {
-          obj[String(k)] = v;
-        }
+    const obj: Record<string, SteamStoreBrowseAssets> = {};
+    const entries = Array.from(this.browseAssetsCache.entries()).slice(
+      -MAX_BROWSE_ASSETS_CACHE_ENTRIES
+    );
+    for (const [k, v] of entries) {
+      if (v.capsuleImage || v.headerImage || v.iconUrl) {
+        obj[String(k)] = v;
       }
-      localStorage.setItem(STORAGE_KEY_BROWSE_ASSETS, JSON.stringify(obj));
+    }
+    let mirroredToVault = false;
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(STORAGE_KEY_BROWSE_ASSETS, JSON.stringify(obj));
+      }
     } catch {
-      // Ignore quota errors
+      // Quota fallback: mirror the full 5,000-entry browse asset cache into IndexedDB vault
+      mirroredToVault = true;
+      void vaultSet(STORAGE_KEY_BROWSE_ASSETS, obj);
+    }
+    if (!mirroredToVault && isIndexedDbAvailable()) {
+      void vaultSet(STORAGE_KEY_BROWSE_ASSETS, obj);
     }
   }
 
@@ -491,7 +547,7 @@ export class SteamApiService {
         if (!resolved || resolved === cached) {
           return cached || null;
         }
-        this.browseAssetsCache.set(appId, resolved);
+        this.setBrowseAssetsEntry(appId, resolved);
         this.saveBrowseAssetsCache();
 
         if (typeof window !== 'undefined') {
@@ -570,7 +626,7 @@ export class SteamApiService {
             const prevCached = this.browseAssetsCache.get(itemAppId);
             const resolved = this.parseStoreBrowseItemAssets(itemAppId, item?.assets, prevCached);
             if (resolved && resolved !== prevCached) {
-              this.browseAssetsCache.set(itemAppId, resolved);
+              this.setBrowseAssetsEntry(itemAppId, resolved);
               result.set(itemAppId, resolved);
               updatedAny = true;
               if (typeof window !== 'undefined') {

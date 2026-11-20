@@ -3,6 +3,7 @@ import { StorefrontIntegration, StorefrontCredentials } from '../../contracts/in
 import {
   CanonicalGame,
   GamePlatformOwnership,
+  StoreAchievementSummary,
   XboxGamePassSyncMode,
   XboxOwnershipType,
   XboxSubscriptionSummary,
@@ -18,11 +19,14 @@ import { xboxIntegration } from './xboxIntegration';
 import {
   mergeScannedSteamGames,
   pickBestEnrichedMetadata,
-  pickPreferredCapsuleImage,
   pickPreferredDetailedDescription,
-  pickPreferredHeaderImage,
   pickPreferredReleaseDate,
 } from '../storage/librarySync';
+import {
+  reconcileCapsuleImage,
+  reconcileHeaderImage,
+  type ArtworkRecoveryContext,
+} from '../storage/metadataReconciliation';
 import { truncateHtmlSafely } from '../steam/steamApi';
 import { GOG_USER_LIBRARY, EPIC_USER_LIBRARY } from '../storage/storefrontLibraries';
 import {
@@ -482,12 +486,16 @@ export interface SaveCatalogOptions {
 }
 
 const MODAL_CLOSE_FLUSH_DEBOUNCE_MS = 250;
+const SMALL_DELTA_MAX_DIRTY_GAMES = 20;
+const SMALL_DELTA_SNAPSHOT_DEBOUNCE_MS = 3000;
 
 let inMemoryCatalogCache: CanonicalGame[] | null = null;
 let inMemoryCatalogRawRef: string | null = null;
 let lastPersistedVaultCatalogIds: Set<string> | null = null;
 let pendingCatalogSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let modalCloseFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingSnapshotMirrorTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingSnapshotGames: CanonicalGame[] | null = null;
 let pendingCatalogGames: CanonicalGame[] | null = null;
 let pendingCatalogNeedsSanitize = false;
 let pendingCatalogNeedsOverrides = false;
@@ -655,7 +663,7 @@ const PROACTIVE_SLIM_LOCALSTORAGE_GAME_COUNT_THRESHOLD = 350;
 
 const slimmedGameWeakMemo = new WeakMap<CanonicalGame, CanonicalGame>();
 
-function slimGameForLocalStorageQuota(game: CanonicalGame): CanonicalGame {
+export function slimGameForLocalStorageQuota(game: CanonicalGame): CanonicalGame {
   if (!game || typeof game !== 'object') return game;
   const memoized = slimmedGameWeakMemo.get(game);
   if (memoized !== undefined) return memoized;
@@ -670,8 +678,15 @@ function slimGameForLocalStorageQuota(game: CanonicalGame): CanonicalGame {
   const slim: CanonicalGame = { ...game };
   Reflect.deleteProperty(slim, 'detailedDescription');
   Reflect.deleteProperty(slim, 'aboutTheGame');
+  Reflect.deleteProperty(slim, 'shortDescription');
   Reflect.deleteProperty(slim, 'screenshots');
   Reflect.deleteProperty(slim, 'movies');
+  if (slim.sortTitle === slim.title) {
+    Reflect.deleteProperty(slim, 'sortTitle');
+  }
+  if (slim.originalStoreTitle === slim.title) {
+    Reflect.deleteProperty(slim, 'originalStoreTitle');
+  }
   if (game.enrichedMetadata && typeof game.enrichedMetadata === 'object') {
     const prevMeta = game.enrichedMetadata;
     const hasScreenshotsCount = Array.isArray(prevMeta.screenshots)
@@ -680,29 +695,48 @@ function slimGameForLocalStorageQuota(game: CanonicalGame): CanonicalGame {
     const hasMoviesCount = Array.isArray(prevMeta.movies)
       ? prevMeta.movies.length
       : (prevMeta.hasMoviesCount ?? topMoviesLen);
-    const slimMeta: NonNullable<CanonicalGame['enrichedMetadata']> & {
-      __quotaSlimmed?: boolean;
-    } = {
-      ...prevMeta,
+    // Drop all fields already mirrored at top-level CanonicalGame (`name`, `shortDescription`,
+    // `headerImage`, `capsuleImage`, `developers`, `publishers`, `genres`, `tags`, `categories`,
+    // `dlc`, `releaseDate`, `metacritic`, `reviewSummary`, etc.) so 1,275+ games stay < 1.2 MB
+    // in localStorage while preserving `__quotaSlimmed: true` and instant first-paint semantics.
+    const compactMeta: Record<string, unknown> = {
+      appId: prevMeta.appId,
       __quotaSlimmed: true,
-      hasScreenshotsCount,
-      hasMoviesCount,
-      systemRequirements: {},
     };
-    Reflect.deleteProperty(slimMeta, 'detailedDescription');
-    Reflect.deleteProperty(slimMeta, 'aboutTheGame');
-    Reflect.deleteProperty(slimMeta, 'screenshots');
-    Reflect.deleteProperty(slimMeta, 'movies');
-    Reflect.deleteProperty(slimMeta, 'languageOptions');
-    Reflect.deleteProperty(slimMeta, 'supportedLanguages');
-    if (prevMeta.achievements && typeof prevMeta.achievements === 'object') {
-      slimMeta.achievements = { total: prevMeta.achievements.total };
+    if (prevMeta.metadataQuality !== undefined) {
+      compactMeta.metadataQuality = prevMeta.metadataQuality;
     }
-    Reflect.deleteProperty(slimMeta, 'pcRequirements');
-    Reflect.deleteProperty(slimMeta, 'pcRequirementsHtml');
-    Reflect.deleteProperty(slimMeta, 'macRequirements');
-    Reflect.deleteProperty(slimMeta, 'linuxRequirements');
-    slim.enrichedMetadata = slimMeta;
+    if (prevMeta.enrichedSource !== undefined) {
+      compactMeta.enrichedSource = prevMeta.enrichedSource;
+    }
+    if (typeof prevMeta.enrichedAt === 'number') {
+      compactMeta.enrichedAt = prevMeta.enrichedAt;
+    }
+    if (typeof prevMeta.lastMediaSyncAttemptAt === 'number') {
+      compactMeta.lastMediaSyncAttemptAt = prevMeta.lastMediaSyncAttemptAt;
+    }
+    if (prevMeta.mediaSyncOutcome !== undefined) {
+      compactMeta.mediaSyncOutcome = prevMeta.mediaSyncOutcome;
+    }
+    if (typeof prevMeta.mediaSyncFailureCount === 'number') {
+      compactMeta.mediaSyncFailureCount = prevMeta.mediaSyncFailureCount;
+    }
+    if (hasScreenshotsCount > 0) {
+      compactMeta.hasScreenshotsCount = hasScreenshotsCount;
+    }
+    if (hasMoviesCount > 0) {
+      compactMeta.hasMoviesCount = hasMoviesCount;
+    }
+    if (prevMeta.platforms && typeof prevMeta.platforms === 'object') {
+      compactMeta.platforms = prevMeta.platforms;
+    }
+    if (prevMeta.achievements && typeof prevMeta.achievements === 'object') {
+      compactMeta.achievements = { total: prevMeta.achievements.total };
+    }
+    if (prevMeta.xboxDeliveryHints && typeof prevMeta.xboxDeliveryHints === 'object') {
+      compactMeta.xboxDeliveryHints = prevMeta.xboxDeliveryHints;
+    }
+    slim.enrichedMetadata = compactMeta as unknown as NonNullable<CanonicalGame['enrichedMetadata']>;
   }
   slimmedGameWeakMemo.set(game, slim);
   slimmedGameWeakMemo.set(slim, slim);
@@ -946,83 +980,9 @@ function collectDroppedAndSelfHealedCatalogDelta(
   };
 }
 
-function writeCatalogToLocalStorage(
-  cleaned: CanonicalGame[],
-  dirtyIds?: ReadonlySet<string> | null,
-  removedIds?: ReadonlySet<string> | null
-): void {
-  const previousInMemory = inMemoryCatalogCache;
-  const compacted = cleaned.map(compactGameForStorage);
-  inMemoryCatalogCache = compacted;
-
+function persistCatalogSnapshotToIdbAndLocalStorage(compacted: CanonicalGame[]): void {
   // Primary rich persistence in IndexedDB vault (non-blocking, GB-scale quota)
   void vaultSet(IDB_KEY_MAIN_CATALOG, compacted);
-
-  const isFullCatalogWrite = dirtyIds === null || dirtyIds === undefined;
-  if (isFullCatalogWrite) {
-    const nextIdSet = new Set<string>();
-    for (const g of compacted) {
-      if (g?.id) nextIdSet.add(g.id);
-    }
-    const removedIdSet = new Set<string>();
-    if (Array.isArray(previousInMemory) && previousInMemory.length > 0) {
-      for (const pg of previousInMemory) {
-        if (pg?.id && !nextIdSet.has(pg.id)) {
-          removedIdSet.add(pg.id);
-        }
-      }
-    }
-    if (lastPersistedVaultCatalogIds && lastPersistedVaultCatalogIds.size > 0) {
-      for (const prevId of lastPersistedVaultCatalogIds) {
-        if (prevId && !nextIdSet.has(prevId)) {
-          removedIdSet.add(prevId);
-        }
-      }
-    }
-    if (removedIdSet.size > 0) {
-      deleteOrphanedGamesFromOfflineVault(Array.from(removedIdSet));
-    }
-    lastPersistedVaultCatalogIds = nextIdSet;
-  } else if (removedIds && removedIds.size > 0) {
-    const nextIdSet = new Set<string>();
-    for (const g of compacted) {
-      if (g?.id) nextIdSet.add(g.id);
-    }
-    const confirmedRemoved: string[] = [];
-    for (const remId of removedIds) {
-      if (remId && !nextIdSet.has(remId)) {
-        confirmedRemoved.push(remId);
-        lastPersistedVaultCatalogIds?.delete(remId);
-      }
-    }
-    if (confirmedRemoved.length > 0) {
-      deleteOrphanedGamesFromOfflineVault(confirmedRemoved);
-    }
-  }
-
-  // Mirror catalog snapshot to Electron SQLite offlineVault when available (non-blocking).
-  // For incremental updates where dirtyIds is known and smaller than the catalog, send ONLY
-  // the compacted dirty slice across IPC instead of structured-cloning all unchanged games!
-  if (typeof window !== 'undefined' && window.electronAPI?.offlineVault?.upsertGames) {
-    try {
-      const ipcPayload =
-        dirtyIds !== null && dirtyIds !== undefined
-          ? dirtyIds.size === 0
-            ? []
-            : dirtyIds.size < compacted.length
-              ? compacted.filter((g) => Boolean(g && dirtyIds.has(g.id)))
-              : compacted
-          : compacted;
-      if (!isFullCatalogWrite && lastPersistedVaultCatalogIds) {
-        for (const g of ipcPayload) {
-          if (g?.id) lastPersistedVaultCatalogIds.add(g.id);
-        }
-      }
-      if (ipcPayload.length > 0) {
-        void window.electronAPI.offlineVault.upsertGames(ipcPayload)?.catch?.(() => {});
-      }
-    } catch {}
-  }
 
   const storage = getSafeStorage();
   if (!storage) {
@@ -1116,6 +1076,120 @@ function writeCatalogToLocalStorage(
       storage.removeItem(STORAGE_KEY_CUSTOM_GAMES);
     } catch {}
   }
+}
+
+function scheduleDebouncedCatalogSnapshotMirror(compacted: CanonicalGame[]): void {
+  pendingSnapshotGames = compacted;
+  if (pendingSnapshotMirrorTimer) {
+    clearTimeout(pendingSnapshotMirrorTimer);
+    pendingSnapshotMirrorTimer = null;
+  }
+  pendingSnapshotMirrorTimer = setTimeout(() => {
+    pendingSnapshotMirrorTimer = null;
+    const snap = pendingSnapshotGames;
+    pendingSnapshotGames = null;
+    if (snap) {
+      persistCatalogSnapshotToIdbAndLocalStorage(snap);
+    }
+  }, SMALL_DELTA_SNAPSHOT_DEBOUNCE_MS);
+}
+
+function writeCatalogToLocalStorage(
+  cleaned: CanonicalGame[],
+  dirtyIds?: ReadonlySet<string> | null,
+  removedIds?: ReadonlySet<string> | null,
+  writeOptions?: { deferSnapshotMirror?: boolean }
+): void {
+  const previousInMemory = inMemoryCatalogCache;
+  const compacted = cleaned.map(compactGameForStorage);
+  inMemoryCatalogCache = compacted;
+
+  const isFullCatalogWrite = dirtyIds === null || dirtyIds === undefined;
+  if (isFullCatalogWrite) {
+    const nextIdSet = new Set<string>();
+    for (const g of compacted) {
+      if (g?.id) nextIdSet.add(g.id);
+    }
+    const removedIdSet = new Set<string>();
+    if (Array.isArray(previousInMemory) && previousInMemory.length > 0) {
+      for (const pg of previousInMemory) {
+        if (pg?.id && !nextIdSet.has(pg.id)) {
+          removedIdSet.add(pg.id);
+        }
+      }
+    }
+    if (lastPersistedVaultCatalogIds && lastPersistedVaultCatalogIds.size > 0) {
+      for (const prevId of lastPersistedVaultCatalogIds) {
+        if (prevId && !nextIdSet.has(prevId)) {
+          removedIdSet.add(prevId);
+        }
+      }
+    }
+    if (removedIdSet.size > 0) {
+      deleteOrphanedGamesFromOfflineVault(Array.from(removedIdSet));
+    }
+    lastPersistedVaultCatalogIds = nextIdSet;
+  } else if (removedIds && removedIds.size > 0) {
+    const nextIdSet = new Set<string>();
+    for (const g of compacted) {
+      if (g?.id) nextIdSet.add(g.id);
+    }
+    const confirmedRemoved: string[] = [];
+    for (const remId of removedIds) {
+      if (remId && !nextIdSet.has(remId)) {
+        confirmedRemoved.push(remId);
+        lastPersistedVaultCatalogIds?.delete(remId);
+      }
+    }
+    if (confirmedRemoved.length > 0) {
+      deleteOrphanedGamesFromOfflineVault(confirmedRemoved);
+    }
+  }
+
+  // Mirror catalog snapshot to Electron SQLite offlineVault when available (non-blocking).
+  // For incremental updates where dirtyIds is known and smaller than the catalog, send ONLY
+  // the compacted dirty slice across IPC instead of structured-cloning all unchanged games!
+  if (typeof window !== 'undefined' && window.electronAPI?.offlineVault?.upsertGames) {
+    try {
+      const ipcPayload =
+        dirtyIds !== null && dirtyIds !== undefined
+          ? dirtyIds.size === 0
+            ? []
+            : dirtyIds.size < compacted.length
+              ? compacted.filter((g) => Boolean(g && dirtyIds.has(g.id)))
+              : compacted
+          : compacted;
+      if (!isFullCatalogWrite && lastPersistedVaultCatalogIds) {
+        for (const g of ipcPayload) {
+          if (g?.id) lastPersistedVaultCatalogIds.add(g.id);
+        }
+      }
+      if (ipcPayload.length > 0) {
+        void window.electronAPI.offlineVault.upsertGames(ipcPayload)?.catch?.(() => {});
+      }
+    } catch {}
+  }
+
+  const isSmallDeltaOnLargeCatalog = Boolean(
+    writeOptions?.deferSnapshotMirror === true &&
+      dirtyIds !== null &&
+      dirtyIds !== undefined &&
+      dirtyIds.size > 0 &&
+      dirtyIds.size <= SMALL_DELTA_MAX_DIRTY_GAMES &&
+      compacted.length > PROACTIVE_SLIM_LOCALSTORAGE_GAME_COUNT_THRESHOLD
+  );
+
+  if (isSmallDeltaOnLargeCatalog) {
+    scheduleDebouncedCatalogSnapshotMirror(compacted);
+    return;
+  }
+
+  if (pendingSnapshotMirrorTimer) {
+    clearTimeout(pendingSnapshotMirrorTimer);
+    pendingSnapshotMirrorTimer = null;
+  }
+  pendingSnapshotGames = null;
+  persistCatalogSnapshotToIdbAndLocalStorage(compacted);
 }
 
 /**
@@ -1277,11 +1351,12 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
         cleaned.length !== vaultCatalog.length ||
         platformOrVersionHealed
       ) {
-        void vaultSet(IDB_KEY_MAIN_CATALOG, mergedCache);
         const storage = getSafeStorage();
         const existingRaw = storage?.getItem(STORAGE_KEY_MAIN_CATALOG);
         if (existingRaw && !existingRaw.includes('"__idbVaultOnly":true')) {
           writeCatalogToLocalStorage(mergedCache);
+        } else {
+          void vaultSet(IDB_KEY_MAIN_CATALOG, mergedCache);
         }
       }
       return mergedCache;
@@ -1312,6 +1387,10 @@ export function flushPendingCatalogSave(): void {
     clearTimeout(modalCloseFlushTimer);
     modalCloseFlushTimer = null;
   }
+  if (pendingSnapshotMirrorTimer) {
+    clearTimeout(pendingSnapshotMirrorTimer);
+    pendingSnapshotMirrorTimer = null;
+  }
   if (pendingCatalogGames !== null && typeof window !== 'undefined') {
     try {
       let toWrite = pendingCatalogGames;
@@ -1337,6 +1416,7 @@ export function flushPendingCatalogSave(): void {
         );
       }
       pendingCatalogGames = null;
+      pendingSnapshotGames = null;
       pendingCatalogNeedsSanitize = false;
       pendingCatalogNeedsOverrides = false;
       pendingIsFullCatalogSync = false;
@@ -1347,11 +1427,24 @@ export function flushPendingCatalogSave(): void {
     } catch (err) {
       console.error('[IntegrationStorage] Failed to flush pending catalog save:', err);
     }
+    return;
+  }
+  if (pendingSnapshotGames !== null && typeof window !== 'undefined') {
+    const snap = pendingSnapshotGames;
+    pendingSnapshotGames = null;
+    try {
+      persistCatalogSnapshotToIdbAndLocalStorage(snap);
+    } catch (err) {
+      console.error('[IntegrationStorage] Failed to flush pending catalog snapshot:', err);
+    }
   }
 }
 
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
   window.addEventListener('beforeunload', () => {
+    flushPendingCatalogSave();
+  });
+  window.addEventListener('pagehide', () => {
     flushPendingCatalogSave();
   });
   window.addEventListener('antigravity:modal-overlay-changed', (e: Event) => {
@@ -1415,7 +1508,7 @@ export function loadCurrentCatalog(): CanonicalGame[] {
 
   try {
     if (
-      (pendingCatalogGames !== null || !isTestEnv()) &&
+      (pendingCatalogGames !== null || pendingSnapshotGames !== null || !isTestEnv()) &&
       inMemoryCatalogCache !== null
     ) {
       return applyUserOverridesToCatalog(inMemoryCatalogCache, userOverrides);
@@ -1517,6 +1610,63 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
     const incomingDirtyIds = collectDirtyGameIdsFromOptions(options);
     const incomingRemovedIds = collectRemovedGameIdsFromOptions(options);
     const isIncrementalCall = incomingDirtyIds !== null;
+
+    const isSmallDirtySliceOnLargeCatalog =
+      !options?.immediate &&
+      incomingDirtyIds !== null &&
+      !pendingIsFullCatalogSync &&
+      incomingDirtyIds.length > 0 &&
+      incomingDirtyIds.length <= SMALL_DELTA_MAX_DIRTY_GAMES &&
+      games.length > PROACTIVE_SLIM_LOCALSTORAGE_GAME_COUNT_THRESHOLD &&
+      (isTestEnv() || !isModalOverlayOpen());
+
+    if (isSmallDirtySliceOnLargeCatalog && incomingDirtyIds !== null) {
+      if (
+        lastPersistedVaultCatalogIds === null &&
+        Array.isArray(inMemoryCatalogCache) &&
+        inMemoryCatalogCache.length > 0
+      ) {
+        lastPersistedVaultCatalogIds = new Set(
+          inMemoryCatalogCache.map((g) => g?.id).filter((id): id is string => Boolean(id))
+        );
+      }
+      const mergedDirty = new Set<string>(pendingDirtyGameIds);
+      const mergedRemoved = new Set<string>(pendingRemovedGameIds);
+      for (const id of incomingDirtyIds) {
+        mergedDirty.add(id);
+        mergedRemoved.delete(id);
+      }
+      for (const id of incomingRemovedIds) {
+        mergedRemoved.add(id);
+        mergedDirty.delete(id);
+      }
+      if (mergedDirty.size <= SMALL_DELTA_MAX_DIRTY_GAMES) {
+        pendingCatalogGames = null;
+        pendingCatalogNeedsSanitize = false;
+        pendingCatalogNeedsOverrides = false;
+        pendingDirtyGameIds.clear();
+        pendingRemovedGameIds.clear();
+        pendingModalDeferStartedAt = null;
+        if (pendingCatalogSaveTimer) {
+          clearTimeout(pendingCatalogSaveTimer);
+          pendingCatalogSaveTimer = null;
+        }
+        if (modalCloseFlushTimer) {
+          clearTimeout(modalCloseFlushTimer);
+          modalCloseFlushTimer = null;
+        }
+        const userOverrides = loadUserOverrides();
+        const withOverrides = applyUserOverridesToCatalog(games, userOverrides);
+        const cleaned = options?.skipSanitize ? withOverrides : sanitizeGameCatalog(withOverrides);
+        writeCatalogToLocalStorage(
+          cleaned,
+          mergedDirty,
+          mergedRemoved.size > 0 ? mergedRemoved : null,
+          { deferSnapshotMirror: true }
+        );
+        return;
+      }
+    }
 
     if (!options?.immediate && !isTestEnv()) {
       const hadPendingSave = pendingCatalogGames !== null;
@@ -1649,6 +1799,11 @@ export function clearIntegrationStorage(): void {
     clearTimeout(modalCloseFlushTimer);
     modalCloseFlushTimer = null;
   }
+  if (pendingSnapshotMirrorTimer) {
+    clearTimeout(pendingSnapshotMirrorTimer);
+    pendingSnapshotMirrorTimer = null;
+  }
+  pendingSnapshotGames = null;
   pendingCatalogGames = null;
   pendingCatalogNeedsSanitize = false;
   pendingCatalogNeedsOverrides = false;
@@ -1669,6 +1824,148 @@ export function clearIntegrationStorage(): void {
     storage.removeItem(STORAGE_KEY_VERIFIED_ENTITLEMENTS);
     storage.removeItem(STORAGE_KEY_XBOX_PROFILE);
   } catch {}
+}
+
+function areStringArraysEqual(
+  a?: readonly string[] | null,
+  b?: readonly string[] | null
+): boolean {
+  if (a === b) return true;
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function areAchievementSummariesEqual(
+  a?: StoreAchievementSummary | null,
+  b?: StoreAchievementSummary | null
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.unlocked === b.unlocked &&
+    a.total === b.total &&
+    a.percentage === b.percentage &&
+    a.isMastered === b.isMastered &&
+    a.source === b.source &&
+    a.syncedAt === b.syncedAt &&
+    a.hasConflict === b.hasConflict &&
+    a.conflictDetails === b.conflictDetails &&
+    a.gamerscore?.earned === b.gamerscore?.earned &&
+    a.gamerscore?.total === b.gamerscore?.total &&
+    a.xp?.earned === b.xp?.earned &&
+    a.xp?.total === b.xp?.total
+  );
+}
+
+function arePlatformOsFlagsEqual(
+  a?: GamePlatformOwnership['platforms'],
+  b?: GamePlatformOwnership['platforms']
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return areStringArraysEqual(a as readonly string[], b as readonly string[]);
+  }
+  if (Array.isArray(a) || Array.isArray(b)) return false;
+  return a.windows === b.windows && a.mac === b.mac && a.linux === b.linux;
+}
+
+function arePlatformOwnershipsEqual(
+  a: GamePlatformOwnership,
+  b: GamePlatformOwnership
+): boolean {
+  if (a === b) return true;
+  return (
+    a.platformId === b.platformId &&
+    a.platformGameId === b.platformGameId &&
+    a.storefrontAppId === b.storefrontAppId &&
+    a.namespace === b.namespace &&
+    a.catalogItemId === b.catalogItemId &&
+    a.originalTitle === b.originalTitle &&
+    Boolean(a.installed) === Boolean(b.installed) &&
+    a.installPath === b.installPath &&
+    a.executablePath === b.executablePath &&
+    a.installSize === b.installSize &&
+    a.version === b.version &&
+    a.launchArguments === b.launchArguments &&
+    a.isWindowsBinaryOnMac === b.isWindowsBinaryOnMac &&
+    a.playtimeMinutes === b.playtimeMinutes &&
+    a.lastPlayed === b.lastPlayed &&
+    areAchievementSummariesEqual(a.achievements, b.achievements) &&
+    arePlatformOsFlagsEqual(a.platforms, b.platforms) &&
+    a.xboxProductId === b.xboxProductId &&
+    a.packageFamilyName === b.packageFamilyName &&
+    a.appUserModelId === b.appUserModelId &&
+    a.xboxTitleId === b.xboxTitleId &&
+    a.scid === b.scid &&
+    a.msaAppId === b.msaAppId &&
+    a.ownershipType === b.ownershipType &&
+    a.gamePassTier === b.gamePassTier &&
+    areStringArraysEqual(a.satisfyingPassIds, b.satisfyingPassIds) &&
+    a.subscriptionTierId === b.subscriptionTierId &&
+    a.subscriptionExpired === b.subscriptionExpired &&
+    a.isLeavingSoon === b.isLeavingSoon &&
+    a.isRecentlyAddedToGamePass === b.isRecentlyAddedToGamePass &&
+    a.isCrossPlatformLauncherRuntime === b.isCrossPlatformLauncherRuntime &&
+    a.isExternalLauncherStubPackage === b.isExternalLauncherStubPackage &&
+    a.externalLauncher === b.externalLauncher &&
+    a.externalLauncherUrl === b.externalLauncherUrl &&
+    a.xboxBottleCompatibilityReason === b.xboxBottleCompatibilityReason &&
+    a.xboxBottleCompatibilityTier === b.xboxBottleCompatibilityTier &&
+    a.maxDownloadSizeBytes === b.maxDownloadSizeBytes &&
+    a.pcMaxInstallSizeBytes === b.pcMaxInstallSizeBytes &&
+    a.chainedLauncherHandoff === b.chainedLauncherHandoff &&
+    a.externalStorefrontHandoff === b.externalStorefrontHandoff &&
+    a.chainedExternalInstallId === b.chainedExternalInstallId &&
+    a.chainedHandoffTopology === b.chainedHandoffTopology &&
+    a.epicPartnerRegistryPath === b.epicPartnerRegistryPath &&
+    a.requiresKernelAntiCheat === b.requiresKernelAntiCheat &&
+    a.kernelAntiCheatName === b.kernelAntiCheatName &&
+    a.antiCheatName === b.antiCheatName
+  );
+}
+
+function areCanonicalGamesShallowEqual(a: CanonicalGame, b: CanonicalGame): boolean {
+  if (a === b) return true;
+  if (
+    a.id !== b.id ||
+    a.title !== b.title ||
+    a.sortTitle !== b.sortTitle ||
+    a.steamAppId !== b.steamAppId ||
+    a.headerImage !== b.headerImage ||
+    a.capsuleImage !== b.capsuleImage ||
+    a.iconUrl !== b.iconUrl ||
+    a.shortDescription !== b.shortDescription ||
+    a.detailedDescription !== b.detailedDescription ||
+    a.releaseDate !== b.releaseDate ||
+    a.isVerifiedEntitlement !== b.isVerifiedEntitlement ||
+    a.isExplicitNonSteam !== b.isExplicitNonSteam ||
+    a.matchConfidence !== b.matchConfidence ||
+    a.needsMatchReview !== b.needsMatchReview ||
+    a.requiresKernelAntiCheat !== b.requiresKernelAntiCheat ||
+    a.antiCheatName !== b.antiCheatName ||
+    a.reviewSummary !== b.reviewSummary ||
+    a.enrichedMetadata !== b.enrichedMetadata
+  ) {
+    return false;
+  }
+  if (
+    !areStringArraysEqual(a.developers, b.developers) ||
+    !areStringArraysEqual(a.publishers, b.publishers) ||
+    !areStringArraysEqual(a.genres, b.genres) ||
+    !areStringArraysEqual(a.tags, b.tags)
+  ) {
+    return false;
+  }
+  if (a.platforms.length !== b.platforms.length) return false;
+  for (let i = 0; i < a.platforms.length; i++) {
+    if (!arePlatformOwnershipsEqual(a.platforms[i], b.platforms[i])) return false;
+  }
+  return true;
 }
 
 export interface MergeStorefrontGamesOptions {
@@ -1718,7 +2015,11 @@ export function mergeStorefrontGames(
   }
 
   const merged = currentCatalog.map((g) => {
-    if (g.id.startsWith('steam-') && g.steamAppId) {
+    if (
+      g.id.startsWith('steam-') &&
+      g.steamAppId &&
+      g.platforms.some((p) => p.platformId === 'steam' && p.platformGameId !== String(g.steamAppId))
+    ) {
       return {
         ...g,
         platforms: g.platforms.map((p) => {
@@ -2191,18 +2492,23 @@ export function mergeStorefrontGames(
                   ? platformOwnership.lastPlayed
                   : platformOwnership.lastPlayed || p.lastPlayed,
               playtimeMinutes: nextPlaytimeMinutes,
-              achievements: reconcileAchievementSummaries(
-                p.achievements,
-                platformOwnership.achievements,
-                { title: newGame.title, appId: newGame.steamAppId, store: storefrontId }
-              ),
+              achievements: (() => {
+                const reconciled = reconcileAchievementSummaries(
+                  p.achievements,
+                  platformOwnership.achievements,
+                  { title: newGame.title, appId: newGame.steamAppId, store: storefrontId }
+                );
+                return areAchievementSummariesEqual(p.achievements, reconciled)
+                  ? p.achievements
+                  : reconciled;
+              })(),
             });
             if (mergedInstallSize !== undefined) {
               nextPlat.installSize = mergedInstallSize;
             } else {
               delete nextPlat.installSize;
             }
-            return nextPlat;
+            return arePlatformOwnershipsEqual(p, nextPlat) ? p : nextPlat;
           })
         : [
             ...existing.platforms,
@@ -2224,107 +2530,181 @@ export function mergeStorefrontGames(
             ),
           ];
 
+      const platformsRef =
+        hasPlatform &&
+        updatedPlatforms.length === existing.platforms.length &&
+        updatedPlatforms.every((p, idx) => p === existing.platforms[idx])
+          ? existing.platforms
+          : updatedPlatforms;
+
       const mergedSteamAppId = existing.isExplicitNonSteam
         ? undefined
         : existing.steamAppId || newGame.steamAppId;
 
-      merged[existingIndex] = {
-        ...existing,
-        title: preferStorefrontTitle ? newGame.title : existing.title,
-        sortTitle: preferStorefrontTitle ? (newGame.sortTitle || existing.sortTitle) : existing.sortTitle,
-        headerImage:
-          pickPreferredHeaderImage(existing.headerImage, newGame.headerImage) ||
-          existing.headerImage ||
-          newGame.headerImage,
-        capsuleImage: pickPreferredCapsuleImage(existing.capsuleImage, newGame.capsuleImage),
-        iconUrl: !isUnsuitableHeaderUrl(existing.iconUrl) ? existing.iconUrl : (newGame.iconUrl || newGame.capsuleImage || newGame.headerImage),
+      const gogPlatForArt = platformsRef.find((p) => p.platformId === 'gog');
+      const artworkCtx: ArtworkRecoveryContext = {
+        gameId: existing.id,
+        title: existing.title,
         steamAppId: mergedSteamAppId,
-        id: mergedSteamAppId ? `steam-${mergedSteamAppId}` : existing.id,
-        platforms: updatedPlatforms,
-        developers: (existing.developers && existing.developers.length > 0) ? existing.developers : newGame.developers,
-        publishers: (existing.publishers && existing.publishers.length > 0) ? existing.publishers : newGame.publishers,
-        genres: (existing.genres && existing.genres.length > 0) ? existing.genres : newGame.genres,
-        tags: (() => {
-          if (storefrontId !== 'xbox') {
-            return existing.tags && existing.tags.length > 0 ? existing.tags : newGame.tags;
-          }
-          const updatedXboxPlat = updatedPlatforms.find((p) => p.platformId === 'xbox');
-          const existingNonSubTags = Array.isArray(existing.tags)
-            ? existing.tags.filter((t) => !XBOX_SUBSCRIPTION_TAG_RE.test(String(t || '').trim()))
-            : [];
-          const incomingNonSubTags = Array.isArray(newGame.tags)
-            ? newGame.tags.filter((t) => !XBOX_SUBSCRIPTION_TAG_RE.test(String(t || '').trim()))
-            : [];
-          const baseNonSubTags =
-            existingNonSubTags.length > 0 ? existingNonSubTags : incomingNonSubTags;
+        gogId: gogPlatForArt?.platformGameId,
+        userOverrideCapsule: existingOverride?.capsuleImage,
+        userOverrideHeader: existingOverride?.headerImage,
+      };
+      const nextHeaderImage =
+        reconcileHeaderImage(existing.headerImage, newGame.headerImage, artworkCtx) ||
+        existing.headerImage ||
+        newGame.headerImage;
+      const nextCapsuleImage = reconcileCapsuleImage(
+        existing.capsuleImage,
+        newGame.capsuleImage,
+        { ...artworkCtx, headerUrl: nextHeaderImage }
+      );
+      const nextIconUrl = !isUnsuitableHeaderUrl(existing.iconUrl)
+        ? existing.iconUrl
+        : newGame.iconUrl || newGame.capsuleImage || newGame.headerImage;
 
-          const deduped: string[] = [];
-          const seenLower = new Set<string>();
-          for (const tag of baseNonSubTags) {
-            const trimmed = String(tag || '').trim();
+      const nextTitle = preferStorefrontTitle ? newGame.title : existing.title;
+      const nextSortTitle = preferStorefrontTitle
+        ? newGame.sortTitle || existing.sortTitle
+        : existing.sortTitle;
+      const nextId = mergedSteamAppId ? `steam-${mergedSteamAppId}` : existing.id;
+      const nextDevelopers =
+        existing.developers && existing.developers.length > 0
+          ? existing.developers
+          : newGame.developers;
+      const nextPublishers =
+        existing.publishers && existing.publishers.length > 0
+          ? existing.publishers
+          : newGame.publishers;
+      const nextGenres =
+        existing.genres && existing.genres.length > 0 ? existing.genres : newGame.genres;
+      const nextTags = (() => {
+        if (storefrontId !== 'xbox') {
+          return existing.tags && existing.tags.length > 0 ? existing.tags : newGame.tags;
+        }
+        const updatedXboxPlat = platformsRef.find((p) => p.platformId === 'xbox');
+        const existingNonSubTags = Array.isArray(existing.tags)
+          ? existing.tags.filter((t) => !XBOX_SUBSCRIPTION_TAG_RE.test(String(t || '').trim()))
+          : [];
+        const incomingNonSubTags = Array.isArray(newGame.tags)
+          ? newGame.tags.filter((t) => !XBOX_SUBSCRIPTION_TAG_RE.test(String(t || '').trim()))
+          : [];
+        const baseNonSubTags =
+          existingNonSubTags.length > 0 ? existingNonSubTags : incomingNonSubTags;
+
+        const deduped: string[] = [];
+        const seenLower = new Set<string>();
+        for (const tag of baseNonSubTags) {
+          const trimmed = String(tag || '').trim();
+          if (!trimmed) continue;
+          const key = trimmed.toLowerCase();
+          if (!seenLower.has(key)) {
+            seenLower.add(key);
+            deduped.push(trimmed);
+          }
+        }
+
+        if (updatedXboxPlat?.ownershipType !== 'owned' && !updatedXboxPlat?.subscriptionExpired) {
+          const incomingSubTags = Array.isArray(newGame.tags)
+            ? newGame.tags.filter((t) => XBOX_SUBSCRIPTION_TAG_RE.test(String(t || '').trim()))
+            : [];
+          for (const subTag of incomingSubTags) {
+            const trimmed = String(subTag || '').trim();
             if (!trimmed) continue;
+            if (/^leaving\s+soon$/i.test(trimmed) && !updatedXboxPlat?.isLeavingSoon) {
+              continue;
+            }
+            if (
+              /^recently\s+added$/i.test(trimmed) &&
+              !updatedXboxPlat?.isRecentlyAddedToGamePass
+            ) {
+              continue;
+            }
             const key = trimmed.toLowerCase();
             if (!seenLower.has(key)) {
               seenLower.add(key);
               deduped.push(trimmed);
             }
           }
+        }
 
-          if (updatedXboxPlat?.ownershipType !== 'owned' && !updatedXboxPlat?.subscriptionExpired) {
-            const incomingSubTags = Array.isArray(newGame.tags)
-              ? newGame.tags.filter((t) => XBOX_SUBSCRIPTION_TAG_RE.test(String(t || '').trim()))
-              : [];
-            for (const subTag of incomingSubTags) {
-              const trimmed = String(subTag || '').trim();
-              if (!trimmed) continue;
-              if (/^leaving\s+soon$/i.test(trimmed) && !updatedXboxPlat?.isLeavingSoon) {
-                continue;
-              }
-              if (
-                /^recently\s+added$/i.test(trimmed) &&
-                !updatedXboxPlat?.isRecentlyAddedToGamePass
-              ) {
-                continue;
-              }
-              const key = trimmed.toLowerCase();
-              if (!seenLower.has(key)) {
-                seenLower.add(key);
-                deduped.push(trimmed);
-              }
-            }
-          }
+        return areStringArraysEqual(existing.tags, deduped) ? existing.tags : deduped;
+      })();
+      const nextShortDescription = existing.shortDescription || newGame.shortDescription;
+      const nextDetailedDescription = pickPreferredDetailedDescription(
+        existing.detailedDescription,
+        newGame.detailedDescription
+      );
+      const nextReleaseDate =
+        pickPreferredReleaseDate(existing.releaseDate, newGame.releaseDate) ||
+        existing.releaseDate ||
+        newGame.releaseDate;
+      const nextReviewSummary = existing.reviewSummary || newGame.reviewSummary;
+      const nextIsVerifiedEntitlement =
+        existing.isVerifiedEntitlement || newGame.isVerifiedEntitlement;
+      const nextMatchConfidence = existing.matchConfidence ?? newGame.matchConfidence;
+      const nextNeedsMatchReview = existing.needsMatchReview ?? newGame.needsMatchReview;
+      const nextRequiresKernelAntiCheat =
+        existing.requiresKernelAntiCheat || newGame.requiresKernelAntiCheat;
+      const nextAntiCheatName = existing.antiCheatName || newGame.antiCheatName;
+      const nextEnrichedMetadata = pickBestEnrichedMetadata(
+        existing.enrichedMetadata,
+        newGame.enrichedMetadata
+      );
 
-          return deduped;
-        })(),
-        shortDescription: existing.shortDescription || newGame.shortDescription,
-        detailedDescription: pickPreferredDetailedDescription(
-          existing.detailedDescription,
-          newGame.detailedDescription
-        ),
-        releaseDate:
-          pickPreferredReleaseDate(existing.releaseDate, newGame.releaseDate) ||
-          existing.releaseDate ||
-          newGame.releaseDate,
-        reviewSummary: existing.reviewSummary || newGame.reviewSummary,
-        isVerifiedEntitlement: existing.isVerifiedEntitlement || newGame.isVerifiedEntitlement,
-        matchConfidence: existing.matchConfidence ?? newGame.matchConfidence,
-        needsMatchReview: existing.needsMatchReview ?? newGame.needsMatchReview,
-        ...(existing.requiresKernelAntiCheat || newGame.requiresKernelAntiCheat
-          ? {
-              requiresKernelAntiCheat:
-                existing.requiresKernelAntiCheat || newGame.requiresKernelAntiCheat,
-            }
-          : {}),
-        ...(existing.antiCheatName || newGame.antiCheatName
-          ? {
-              antiCheatName: existing.antiCheatName || newGame.antiCheatName,
-            }
-          : {}),
-        enrichedMetadata: pickBestEnrichedMetadata(
-          existing.enrichedMetadata,
-          newGame.enrichedMetadata
-        ),
-      };
+      const gameUnchanged =
+        nextTitle === existing.title &&
+        nextSortTitle === existing.sortTitle &&
+        nextHeaderImage === existing.headerImage &&
+        nextCapsuleImage === existing.capsuleImage &&
+        nextIconUrl === existing.iconUrl &&
+        mergedSteamAppId === existing.steamAppId &&
+        nextId === existing.id &&
+        platformsRef === existing.platforms &&
+        areStringArraysEqual(nextDevelopers, existing.developers) &&
+        areStringArraysEqual(nextPublishers, existing.publishers) &&
+        areStringArraysEqual(nextGenres, existing.genres) &&
+        areStringArraysEqual(nextTags, existing.tags) &&
+        nextShortDescription === existing.shortDescription &&
+        nextDetailedDescription === existing.detailedDescription &&
+        nextReleaseDate === existing.releaseDate &&
+        nextReviewSummary === existing.reviewSummary &&
+        nextIsVerifiedEntitlement === existing.isVerifiedEntitlement &&
+        nextMatchConfidence === existing.matchConfidence &&
+        nextNeedsMatchReview === existing.needsMatchReview &&
+        nextRequiresKernelAntiCheat === existing.requiresKernelAntiCheat &&
+        nextAntiCheatName === existing.antiCheatName &&
+        nextEnrichedMetadata === existing.enrichedMetadata;
+
+      merged[existingIndex] = gameUnchanged
+        ? existing
+        : {
+            ...existing,
+            title: nextTitle,
+            sortTitle: nextSortTitle,
+            headerImage: nextHeaderImage,
+            capsuleImage: nextCapsuleImage,
+            iconUrl: nextIconUrl,
+            steamAppId: mergedSteamAppId,
+            id: nextId,
+            platforms: platformsRef,
+            developers: nextDevelopers,
+            publishers: nextPublishers,
+            genres: nextGenres,
+            tags: nextTags,
+            shortDescription: nextShortDescription,
+            detailedDescription: nextDetailedDescription,
+            releaseDate: nextReleaseDate,
+            reviewSummary: nextReviewSummary,
+            isVerifiedEntitlement: nextIsVerifiedEntitlement,
+            matchConfidence: nextMatchConfidence,
+            needsMatchReview: nextNeedsMatchReview,
+            ...(nextRequiresKernelAntiCheat
+              ? { requiresKernelAntiCheat: nextRequiresKernelAntiCheat }
+              : {}),
+            ...(nextAntiCheatName ? { antiCheatName: nextAntiCheatName } : {}),
+            enrichedMetadata: nextEnrichedMetadata,
+          };
 
       if (existingOverride) {
         merged[existingIndex] = applyUserOverrideToGame(merged[existingIndex], existingOverride);
@@ -3097,7 +3477,7 @@ export function mergeUpdatedGamePreservingLivePlatformState(
           ? livePlat.lastPlayed
           : incPlat.lastPlayed
         : incPlat.lastPlayed || livePlat.lastPlayed;
-    const nextAchievements = reconcileAchievementSummaries(
+    const rawReconciledAchievements = reconcileAchievementSummaries(
       livePlat.achievements,
       incPlat.achievements,
       {
@@ -3106,6 +3486,12 @@ export function mergeUpdatedGamePreservingLivePlatformState(
         store: incPlat.platformId,
       }
     );
+    const nextAchievements = areAchievementSummariesEqual(
+      incPlat.achievements,
+      rawReconciledAchievements
+    )
+      ? incPlat.achievements
+      : rawReconciledAchievements;
 
     const nextXboxProductId = incPlat.xboxProductId || livePlat.xboxProductId;
     const nextPfn = incPlat.packageFamilyName || livePlat.packageFamilyName;
@@ -3264,15 +3650,16 @@ export function mergeUpdatedGamePreservingLivePlatformState(
     }
   }
 
-  if (!platformsChanged && !enrichedChanged) {
-    return incomingGame;
-  }
+  const candidateMerged =
+    !platformsChanged && !enrichedChanged
+      ? incomingGame
+      : {
+          ...incomingGame,
+          ...(platformsChanged ? { platforms: mergedPlatforms } : {}),
+          ...(enrichedChanged ? { enrichedMetadata: bestEnriched } : {}),
+        };
 
-  return {
-    ...incomingGame,
-    ...(platformsChanged ? { platforms: mergedPlatforms } : {}),
-    ...(enrichedChanged ? { enrichedMetadata: bestEnriched } : {}),
-  };
+  return areCanonicalGamesShallowEqual(liveGame, candidateMerged) ? liveGame : candidateMerged;
 }
 
 export function mergeHydratedCatalogPreservingLiveState(
@@ -3385,6 +3772,13 @@ export function mergeHydratedCatalogPreservingLiveState(
       merged.push(lg);
       indexGameIntoMergedSets(lg);
     }
+  }
+
+  if (
+    merged.length === liveGames.length &&
+    merged.every((m, idx) => m === liveGames[idx])
+  ) {
+    return liveGames;
   }
 
   return merged;

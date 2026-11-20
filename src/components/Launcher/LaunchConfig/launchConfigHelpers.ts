@@ -120,13 +120,6 @@ export const CROSSOVER_BACKEND_OPTIONS: {
   };
 });
 
-export const WINDOWS_QUICK_ENV_TOGGLES: {
-  key: string;
-  value: string;
-  label: string;
-  desc: string;
-}[] = [{ key: 'DXVK_HUD', value: '1', label: 'DXVK Overlay HUD', desc: 'DXVK_HUD=1' }];
-
 export function stripManagedEnvVars(
   env?: Record<string, string>
 ): Record<string, string> | undefined {

@@ -60,6 +60,11 @@ const {
   syncXboxCloudSaves,
   pruneCloudSaveStateForGame,
   buildCloudSyncTelemetryPayload,
+  resolveXboxSaveLocations,
+  loadPendingCloudUploads,
+  enqueuePendingCloudUpload,
+  replayPendingCloudUpload,
+  replayPendingCloudUploads,
   createCloudSaveRunner,
 } = require('./cloudSaveEngine.cjs');
 
@@ -74,6 +79,8 @@ const {
   resolveIsolatedHomedirAndUserData,
   emitSessionUpdated,
   activeSessions,
+  inFlightLaunchesByGameId,
+  inFlightLaunchAbortControllers,
   inFlightPostSessionByGame,
   pendingBottleLaunches,
   inFlightPostSessionByBottle,
@@ -83,6 +90,7 @@ const {
   pausedByInGameTaskIds,
   inFlightPostSessionPromises,
   recentDisplaySanitizeCache,
+  pendingWineRegSyncByPrefix,
   setBoundedMapEntry,
   evictExecutableDiscoveryCacheForPath,
   trimLauncherEngineMemory,
@@ -91,6 +99,7 @@ const {
   resolveWindowsNodeShebangSpawn,
   openExternalUri,
   resolveHostLocaleInfo,
+  isNetworkOnlineForLaunch,
   clearMacQuarantineAsync,
   findLegendaryBinary,
   findGogdlBinary,
@@ -146,6 +155,8 @@ const {
   resolveWineLayerMoltenVkPath,
   doesWineLayerHaveMoltenVkHudDeadlock,
   ensureWineMetalPreloadDylib,
+  stripKeysFromCxEnv,
+  applyUnifiedPerformanceHudEnv,
   resolveSipSafeWineBinaryAndPreloadEnv,
   resolveWineserverBinary,
   shutdownWinePrefix,
@@ -153,6 +164,8 @@ const {
   resolveBottleEpicLauncherExe,
   sanitizeWinePrefixDisplayConfigs,
   applyCrossOverPerGameSettings,
+  buildDisplaySanitizeCacheKey,
+  predictTargetBottlePrefix,
   ensureCompatibilityLayerReady,
   cleanNonApfsAppleDoubleTwins,
   alignWineMsyncWithLiveBottle,
@@ -163,6 +176,7 @@ const {
 const {
   unregisterEpicFirstPartyLauncher,
   getLegendaryConfigDir,
+  renewEpicTokensSingleFlight,
   ensureLegendaryConfigAndAuth,
   collectLocalEpicMetadataAndSupport,
   resolveEpicAppAndPlatforms,
@@ -174,6 +188,7 @@ const {
 const {
   syncGogGameToGalaxy,
   unregisterGogFirstPartyLauncher,
+  renewGogTokensSingleFlight,
   ensureGogdlAuthConfig,
   ensureGogGalaxyBackgroundService,
   resolveGogGalaxyClientBinaryPath,
@@ -437,63 +452,14 @@ function getLiveBottleDaemonEnvContract(bottlePath) {
 /**
  * Reset in-memory supervisor daemon contract tracking for deterministic isolated tests.
  */
+/** @type {Set<{ record: Record<string, any>, options: Record<string, any> }>} */
+const activePostExitCloudUploadJobs = new Set();
+
 function resetSupervisorStateForTests() {
   liveBottleDaemonEnvContractByPrefix.clear();
-}
-
-/**
- * Remove specific environment variable assignments from a CrossOver `CX_ENV` string while
- * preserving all remaining quoted or unquoted tokens cleanly.
- *
- * @param {string | undefined | null} cxEnvStr
- * @param {string[]} keysToRemove
- * @returns {string}
- */
-function stripKeysFromCxEnv(cxEnvStr, keysToRemove) {
-  if (!cxEnvStr || typeof cxEnvStr !== 'string') return '';
-  const removeSet = new Set(
-    (Array.isArray(keysToRemove) ? keysToRemove : []).map((k) => String(k || '').trim())
-  );
-  if (removeSet.size === 0) return cxEnvStr;
-  /** @type {string[]} */
-  const tokens = [];
-  let i = 0;
-  const n = cxEnvStr.length;
-  while (i < n) {
-    while (i < n && /\s/.test(cxEnvStr[i])) i += 1;
-    if (i >= n) break;
-    const start = i;
-    let inSingle = false;
-    let inDouble = false;
-    while (i < n) {
-      const ch = cxEnvStr[i];
-      if (ch === '\\' && !inSingle && i + 1 < n) {
-        i += 2;
-        continue;
-      }
-      if (ch === "'" && !inDouble) {
-        inSingle = !inSingle;
-        i += 1;
-        continue;
-      }
-      if (ch === '"' && !inSingle) {
-        inDouble = !inDouble;
-        i += 1;
-        continue;
-      }
-      if (!inSingle && !inDouble && /\s/.test(ch)) {
-        break;
-      }
-      i += 1;
-    }
-    const rawTok = cxEnvStr.slice(start, i);
-    const eqIdx = rawTok.indexOf('=');
-    const key = eqIdx > 0 ? rawTok.slice(0, eqIdx).trim() : '';
-    if (!key || !removeSet.has(key)) {
-      tokens.push(rawTok);
-    }
-  }
-  return tokens.join(' ');
+  inFlightLaunchesByGameId.clear();
+  inFlightLaunchAbortControllers.clear();
+  activePostExitCloudUploadJobs.clear();
 }
 
 const DISPLAY_SCALER_ENV_KEYS = Object.freeze([
@@ -925,10 +891,8 @@ function sanitizeBottleBackgroundClientWakeEnv(clientEnv, launchConfig) {
 }
 
 /**
- * Guard against the Apple `libMTLHud.dylib` + older `libMoltenVK.dylib` static-initializer Thread 0
- * deadlock. When the Wine loader allows `DYLD_INSERT_LIBRARIES`, inject `libone_metal_preload.dylib`;
- * when Hardened Runtime / AMFI strips `DYLD_INSERT_LIBRARIES`, suppress `MTL_HUD_ENABLED` and fall
- * back to `DXVK_HUD` when running on DXVK / open-source Wine.
+ * Backward-compatible wrapper routing to the single authoritative `applyUnifiedPerformanceHudEnv`
+ * implementation in `macNativeInstallerAndCodesign.cjs`.
  *
  * @param {any} chosenLayer
  * @param {Record<string, any>} env
@@ -937,78 +901,19 @@ function sanitizeBottleBackgroundClientWakeEnv(clientEnv, launchConfig) {
  * @param {string} [gameId]
  */
 function applyMoltenVkMetalHudDeadlockGuard(chosenLayer, env, launchConfig, options, gameId = '') {
-  if (
-    !env ||
-    env.MTL_HUD_ENABLED !== '1' ||
-    !chosenLayer?.binaryPath ||
-    !doesWineLayerHaveMoltenVkHudDeadlock(chosenLayer.binaryPath)
-  ) {
-    return;
-  }
-  const allowsDyldInsert =
-    typeof macNativeInstallerAndCodesign.doesWineLoaderAllowDyldInsert === 'function'
-      ? Boolean(macNativeInstallerAndCodesign.doesWineLoaderAllowDyldInsert(chosenLayer.binaryPath))
-      : true;
-  if (!allowsDyldInsert) {
-    delete env.MTL_HUD_ENABLED;
-    delete env.ONE_LAUNCHER_MOLTENVK_PATH;
-    const audioClampActive =
-      options?.enableAudioBufferClamp === true || launchConfig?.audioBufferClamp === true;
-    const hasCustomUserDyldInsert = Boolean(launchConfig?.environmentVariables?.DYLD_INSERT_LIBRARIES);
-    if (!audioClampActive && env.DYLD_INSERT_LIBRARIES) {
-      const remainingInsert = String(env.DYLD_INSERT_LIBRARIES)
-        .split(/:(?![\\/])/)
-        .map((s) => s.trim())
-        .filter((s) => s && !s.endsWith('libone_metal_preload.dylib'));
-      if (remainingInsert.length > 0) {
-        env.DYLD_INSERT_LIBRARIES = remainingInsert.join(':');
-      } else {
-        delete env.DYLD_INSERT_LIBRARIES;
-      }
-    }
-    if (typeof env.CX_ENV === 'string' && env.CX_ENV) {
-      const cxKeysToStrip =
-        audioClampActive || hasCustomUserDyldInsert
-          ? ['MTL_HUD_ENABLED']
-          : ['MTL_HUD_ENABLED', 'DYLD_INSERT_LIBRARIES'];
-      const cleanedCxEnv = stripKeysFromCxEnv(env.CX_ENV, cxKeysToStrip);
-      if (cleanedCxEnv) {
-        env.CX_ENV = cleanedCxEnv;
-      } else {
-        delete env.CX_ENV;
-      }
-    }
-    if (!env.DXVK_HUD && (env.CX_GRAPHICS_BACKEND === 'dxvk' || chosenLayer.type === 'wine')) {
-      env.DXVK_HUD = 'devinfo,fps,frametimes';
-    }
-    diagLog.warn('launchGame.suppressedDeadlockingMetalHudUnderHardenedRuntime', {
-      gameId: gameId || undefined,
-      binaryPath: chosenLayer.binaryPath,
-      layerType: chosenLayer.type,
-    });
-    return;
-  }
-
-  const preloadDylib = ensureWineMetalPreloadDylib(options || {});
-  const moltenVkPath = resolveWineLayerMoltenVkPath(chosenLayer.binaryPath);
-  if (preloadDylib) {
-    const existingInsert = String(env.DYLD_INSERT_LIBRARIES || '')
-      .split(/:(?![\\/])/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (!existingInsert.includes(preloadDylib)) {
-      existingInsert.unshift(preloadDylib);
-    }
-    env.DYLD_INSERT_LIBRARIES = existingInsert.join(':');
-    resolveSipSafeWineBinaryAndPreloadEnv(chosenLayer.binaryPath, env, {
-      layerType: chosenLayer?.type,
-    });
-    if (moltenVkPath) {
-      env.ONE_LAUNCHER_MOLTENVK_PATH = moltenVkPath;
-    }
-  } else {
-    delete env.MTL_HUD_ENABLED;
-  }
+  return applyUnifiedPerformanceHudEnv({
+    env,
+    launchConfig: launchConfig || {},
+    chosenLayer,
+    backend: env?.CX_GRAPHICS_BACKEND || launchConfig?.crossoverGraphicsBackend || '',
+    platform: options?.platform || process.platform,
+    useCompatLayer: Boolean(chosenLayer),
+    wineBinaryPath: chosenLayer?.binaryPath || '',
+    options: options || {},
+    gameId,
+    respectExistingEnvMetalHud: true,
+    syncCxEnv: true,
+  });
 }
 
 /**
@@ -2455,12 +2360,12 @@ function hasActivePostSessionWork() {
   return inFlightPostSessionPromises.size > 0;
 }
 
-async function waitForActivePostSessionWork(timeoutMs = 10000) {
+async function waitForActivePostSessionWork(timeoutMs = 20000) {
   if (inFlightPostSessionPromises.size === 0) {
     return { completed: true, remaining: 0 };
   }
   const activeSnapshot = Array.from(inFlightPostSessionPromises);
-  const safeTimeoutMs = Math.max(250, Math.min(30000, Number(timeoutMs) || 10000));
+  const safeTimeoutMs = Math.max(250, Math.min(30000, Number(timeoutMs) || 20000));
   let timedOut = false;
   await Promise.race([
     Promise.allSettled(activeSnapshot),
@@ -2472,9 +2377,19 @@ async function waitForActivePostSessionWork(timeoutMs = 10000) {
       if (typeof timer.unref === 'function') timer.unref();
     }),
   ]);
+  let persistedPendingUploads = 0;
+  if (timedOut && activePostExitCloudUploadJobs.size > 0) {
+    for (const job of Array.from(activePostExitCloudUploadJobs)) {
+      try {
+        await enqueuePendingCloudUpload(job.record, job.options);
+        persistedPendingUploads += 1;
+      } catch {}
+    }
+  }
   return {
     completed: !timedOut && inFlightPostSessionPromises.size === 0,
     remaining: inFlightPostSessionPromises.size,
+    ...(persistedPendingUploads > 0 ? { persistedPendingUploads } : {}),
   };
 }
 
@@ -2735,6 +2650,29 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
           path.resolve(other.winePrefix) === resolvedPrefix
       ));
 
+  const shouldQueueFailedPostExitUpload = (/** @type {any} */ res) => {
+    if (!res || res.synced === true) return false;
+    const reason = String(res.reason || '').toLowerCase();
+    if (
+      !reason ||
+      reason === 'skipped_in_test' ||
+      reason === 'no_cloud_saves_configured' ||
+      reason === 'no_cloud_save_folder_or_skipped' ||
+      reason === 'nothing_to_sync' ||
+      reason === 'title_storage_not_provisioned' ||
+      reason === 'missing_client_id' ||
+      reason === 'missing_app_name' ||
+      reason === 'missing_game_id' ||
+      reason === 'missing_scid_or_pfn' ||
+      reason === 'no_resolvable_save_locations' ||
+      reason === 'broad_known_folder_root_blocked' ||
+      reason === 'unsafe_cloud_save_path_rejected'
+    ) {
+      return false;
+    }
+    return true;
+  };
+
   // 1. Run post-exit Cloud Save uploads & Bottle Steam cloud_log barrier FIRST (before wineserver -k!)
   /** @type {Promise<any>} */
   let epicCloudSaveSyncPromise = Promise.resolve({ synced: false });
@@ -2743,6 +2681,21 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
     stoppedSession.platformId === 'epic' &&
     entry.session?.launchMethod !== 'storefront_uri'
   ) {
+    const epicUploadJob = {
+      record: {
+        gameId: stoppedSession.gameId,
+        platformId: 'epic',
+        platformGameId: entry.platformGameId || stoppedSession.platformGameId,
+        title: stoppedSession.title,
+        lastSyncedAt: Number(entry.lastPreLaunchCloudSyncAt || 0) || 0,
+        installPath: entry.installPath,
+        winePrefix: entry.winePrefix,
+        useCompatLayer: Boolean(entry.winePrefix),
+        savePaths: [],
+      },
+      options: mergedOptions,
+    };
+    activePostExitCloudUploadJobs.add(epicUploadJob);
     epicCloudSaveSyncPromise = trackPostSessionPromise(
       syncEpicCloudSaves(
         {
@@ -2760,17 +2713,27 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
           installPath: entry.installPath,
         }
       )
-        .then((/** @type {any} */ res) => {
+        .then(async (/** @type {any} */ res) => {
+          if (res?.resolvedSavePath) {
+            epicUploadJob.record.savePaths = [String(res.resolvedSavePath)];
+          }
+          if (shouldQueueFailedPostExitUpload(res)) {
+            await enqueuePendingCloudUpload(epicUploadJob.record, mergedOptions).catch(() => {});
+          }
           emitCloudSyncTelemetry('post_exit', res);
           return res;
         })
-        .catch((/** @type {any} */ err) => {
+        .catch(async (/** @type {any} */ err) => {
           const failRes = {
             synced: false,
             reason: err && err.message ? err.message : 'sync_failed',
           };
+          await enqueuePendingCloudUpload(epicUploadJob.record, mergedOptions).catch(() => {});
           emitCloudSyncTelemetry('post_exit', failRes);
           return failRes;
+        })
+        .finally(() => {
+          activePostExitCloudUploadJobs.delete(epicUploadJob);
         })
     );
   }
@@ -2782,6 +2745,21 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
     stoppedSession.platformId === 'gog' &&
     entry.session?.launchMethod !== 'storefront_uri'
   ) {
+    const gogUploadJob = {
+      record: {
+        gameId: stoppedSession.gameId,
+        platformId: 'gog',
+        platformGameId: entry.platformGameId || stoppedSession.platformGameId,
+        title: stoppedSession.title,
+        lastSyncedAt: Number(entry.lastPreLaunchCloudSyncAt || 0) || 0,
+        installPath: entry.installPath,
+        winePrefix: entry.winePrefix,
+        useCompatLayer: Boolean(entry.winePrefix),
+        savePaths: [],
+      },
+      options: mergedOptions,
+    };
+    activePostExitCloudUploadJobs.add(gogUploadJob);
     gogCloudSaveSyncPromise = trackPostSessionPromise(
       syncGogCloudSaves(
         {
@@ -2799,17 +2777,32 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
           installPath: entry.installPath,
         }
       )
-        .then((/** @type {any} */ res) => {
+        .then(async (/** @type {any} */ res) => {
+          if (Array.isArray(res?.locations)) {
+            gogUploadJob.record.savePaths = res.locations
+              .map((l) => l?.resolvedPath)
+              .filter(Boolean);
+          }
+          if (res?.clientId) {
+            gogUploadJob.record.gogClientId = res.clientId;
+          }
+          if (shouldQueueFailedPostExitUpload(res)) {
+            await enqueuePendingCloudUpload(gogUploadJob.record, mergedOptions).catch(() => {});
+          }
           emitCloudSyncTelemetry('post_exit', res);
           return res;
         })
-        .catch((/** @type {any} */ err) => {
+        .catch(async (/** @type {any} */ err) => {
           const failRes = {
             synced: false,
             reason: err && err.message ? err.message : 'sync_failed',
           };
+          await enqueuePendingCloudUpload(gogUploadJob.record, mergedOptions).catch(() => {});
           emitCloudSyncTelemetry('post_exit', failRes);
           return failRes;
+        })
+        .finally(() => {
+          activePostExitCloudUploadJobs.delete(gogUploadJob);
         })
     );
   }
@@ -2820,6 +2813,49 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
     (stoppedSession.platformId === 'xbox' && !entry.isChainedPublisherLauncher) ||
     entry.xboxLoopbackServer
   ) {
+    const xboxResolvedLocs = (() => {
+      try {
+        return resolveXboxSaveLocations(
+          {
+            packageFamilyName: entry.packageFamilyName,
+            scid: entry.scid,
+            fallbackScid: entry.fallbackScid,
+            msaAppId: entry.msaAppId,
+            xboxTitleId: entry.xboxTitleId,
+            installPath: entry.installPath,
+          },
+          {
+            ...mergedOptions,
+            useCompatLayer: Boolean(entry.winePrefix),
+            winePrefix: entry.winePrefix,
+          }
+        );
+      } catch {
+        return null;
+      }
+    })();
+    const xboxUploadJob = {
+      record: {
+        gameId: stoppedSession.gameId,
+        platformId: 'xbox',
+        platformGameId: entry.platformGameId || stoppedSession.platformGameId,
+        title: stoppedSession.title,
+        lastSyncedAt: Number(entry.lastPreLaunchCloudSyncAt || 0) || 0,
+        installPath: entry.installPath,
+        winePrefix: entry.winePrefix,
+        useCompatLayer: Boolean(entry.winePrefix),
+        packageFamilyName: entry.packageFamilyName,
+        scid: entry.scid,
+        fallbackScid: entry.fallbackScid,
+        msaAppId: entry.msaAppId,
+        xboxTitleId: entry.xboxTitleId,
+        xboxProductId: entry.xboxProductId,
+        appUserModelId: entry.appUserModelId,
+        savePaths: [xboxResolvedLocs?.wgsUserDir, xboxResolvedLocs?.wgsRootDir].filter(Boolean),
+      },
+      options: mergedOptions,
+    };
+    activePostExitCloudUploadJobs.add(xboxUploadJob);
     xboxCloudSaveSyncPromise = trackPostSessionPromise(
       (async () => {
         try {
@@ -2892,6 +2928,12 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
                   userDataDir: getUserDataDir(mergedOptions.userDataDir),
                 }
               );
+              if (shouldQueueFailedPostExitUpload(res)) {
+                await enqueuePendingCloudUpload(
+                  { ...xboxUploadJob.record, ...(activeScid ? { scid: activeScid } : {}) },
+                  mergedOptions
+                ).catch(() => {});
+              }
               emitCloudSyncTelemetry('post_exit', res);
               lastRes = res;
             }
@@ -2904,9 +2946,11 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
             provider: 'xbox_connected_storage',
             reason: err && err.message ? err.message : 'sync_failed',
           };
+          await enqueuePendingCloudUpload(xboxUploadJob.record, mergedOptions).catch(() => {});
           emitCloudSyncTelemetry('post_exit', failRes);
           return failRes;
         } finally {
+          activePostExitCloudUploadJobs.delete(xboxUploadJob);
           if (entry.xboxLoopbackServer && typeof entry.xboxLoopbackServer.close === 'function') {
             try {
               await entry.xboxLoopbackServer.close();
@@ -3108,11 +3152,14 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
 
   /** @type {Promise<any>} */
   let hostSteamCloudSyncPromise = Promise.resolve({ completed: true, reason: 'no_active_cloud_job' });
+  const willEphemeralShutdownHandleHostSteamCloud = Boolean(
+    entry.wokeSteamByLauncher && lifecyclePolicy === 'minimal_and_close_if_started'
+  );
   if (
     !crashedEarly &&
     stoppedSession.platformId === 'steam' &&
     !entry.bottleSteamRoot &&
-    !entry.wokeSteamByLauncher &&
+    !willEphemeralShutdownHandleHostSteamCloud &&
     (entry.steamAppId || entry.platformGameId)
   ) {
     const cleanHostAppId = String(entry.steamAppId || entry.platformGameId || '')
@@ -5267,8 +5314,124 @@ async function launchChainedPublisherGame(ctx) {
  * C) Direct Game Launcher, Process Monitor & Playtime Tracker
  */
 async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ options = {}) {
+  const gameId = String(
+    payload.gameId || `${payload.platformId || 'custom'}-${payload.platformGameId || 'game'}`
+  );
+  if (activeSessions.has(gameId)) {
+    const existing = activeSessions.get(gameId);
+    return {
+      success: true,
+      message: 'Game is already running',
+      session: { ...existing.session },
+    };
+  }
+  if (inFlightLaunchesByGameId.has(gameId)) {
+    return inFlightLaunchesByGameId.get(gameId);
+  }
+
+  const launchAbortController = new AbortController();
+  const callerSignal = options?.signal;
+  /** @type {(() => void) | null} */
+  let onCallerAbort = null;
+  if (callerSignal) {
+    if (callerSignal.aborted) {
+      launchAbortController.abort(callerSignal.reason);
+    } else if (typeof callerSignal.addEventListener === 'function') {
+      onCallerAbort = () => launchAbortController.abort(callerSignal.reason);
+      callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    }
+  }
+  inFlightLaunchAbortControllers.set(gameId, launchAbortController);
+
+  const launchOpts = { ...options, signal: launchAbortController.signal };
+  const rawPromise = launchGameInternal(payload, launchOpts, gameId, launchAbortController.signal);
+  const trackedPromise = rawPromise.finally(() => {
+    if (inFlightLaunchesByGameId.get(gameId) === trackedPromise) {
+      inFlightLaunchesByGameId.delete(gameId);
+    }
+    if (inFlightLaunchAbortControllers.get(gameId) === launchAbortController) {
+      inFlightLaunchAbortControllers.delete(gameId);
+    }
+    if (callerSignal && onCallerAbort && typeof callerSignal.removeEventListener === 'function') {
+      try {
+        callerSignal.removeEventListener('abort', onCallerAbort);
+      } catch {}
+    }
+  });
+  inFlightLaunchesByGameId.set(gameId, trackedPromise);
+  return trackedPromise;
+}
+
+async function launchGameInternal(
+  /** @type {any} */ payload = {},
+  /** @type {any} */ options = {},
+  /** @type {string} */ gameId = '',
+  /** @type {AbortSignal | null} */ launchSignal = null
+) {
   let lockedPlatformId = '';
   let lockedBottlePrefix = '';
+  const isLaunchAborted = () => Boolean(launchSignal?.aborted);
+  const abortedLaunchResult = () => ({
+    success: false,
+    cancelled: true,
+    error: 'Launch cancelled by user.',
+  });
+  const acquireOrTransferBottleLock = async (/** @type {string | null | undefined} */ prefixPath) => {
+    if (!prefixPath) return;
+    const resolvedTargetPrefix = path.resolve(prefixPath);
+    if (lockedBottlePrefix === resolvedTargetPrefix) {
+      return;
+    }
+    // Increment new prefix BEFORE releasing old prefix so the new bottle is protected without any gap
+    pendingBottleLaunches.set(
+      resolvedTargetPrefix,
+      (pendingBottleLaunches.get(resolvedTargetPrefix) || 0) + 1
+    );
+    if (lockedBottlePrefix) {
+      const prevOld = pendingBottleLaunches.get(lockedBottlePrefix) || 0;
+      if (prevOld <= 1) {
+        pendingBottleLaunches.delete(lockedBottlePrefix);
+      } else {
+        pendingBottleLaunches.set(lockedBottlePrefix, prevOld - 1);
+      }
+    }
+    lockedBottlePrefix = resolvedTargetPrefix;
+
+    if (inFlightPostSessionByBottle.has(resolvedTargetPrefix)) {
+      const bottleInFlightPromise = inFlightPostSessionByBottle.get(resolvedTargetPrefix);
+      emitSessionUpdated(
+        {
+          gameId,
+          platformId: payload.platformId || 'custom',
+          status: 'starting',
+          event: 'starting',
+          statusMessage: 'Waiting for Wine bottle post-exit cloud sync...',
+        },
+        options
+      );
+      const bottleBarrierTimeoutMs = Math.max(
+        0,
+        Number(options.postSessionBarrierTimeoutMs ?? 20000)
+      );
+      await Promise.race([
+        bottleInFlightPromise,
+        new Promise((resolve) => {
+          const t = setTimeout(resolve, bottleBarrierTimeoutMs);
+          if (typeof t.unref === 'function') t.unref();
+          if (launchSignal && typeof launchSignal.addEventListener === 'function') {
+            launchSignal.addEventListener(
+              'abort',
+              () => {
+                clearTimeout(t);
+                resolve(undefined);
+              },
+              { once: true }
+            );
+          }
+        }),
+      ]);
+    }
+  };
   const releasePendingBottleLock = () => {
     if (!lockedBottlePrefix) return;
     const prev = pendingBottleLaunches.get(lockedBottlePrefix) || 0;
@@ -5291,9 +5454,9 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
   };
 
   try {
-    const gameId = String(
-      payload.gameId || `${payload.platformId || 'custom'}-${payload.platformGameId || 'game'}`
-    );
+    if (isLaunchAborted()) {
+      return abortedLaunchResult();
+    }
     if (activeSessions.has(gameId)) {
       const existing = activeSessions.get(gameId);
       return {
@@ -5344,8 +5507,21 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
         new Promise((resolve) => {
           const t = setTimeout(resolve, barrierTimeoutMs);
           if (typeof t.unref === 'function') t.unref();
+          if (launchSignal && typeof launchSignal.addEventListener === 'function') {
+            launchSignal.addEventListener(
+              'abort',
+              () => {
+                clearTimeout(t);
+                resolve(undefined);
+              },
+              { once: true }
+            );
+          }
         }),
       ]);
+      if (isLaunchAborted()) {
+        return abortedLaunchResult();
+      }
       if (activeSessions.has(gameId)) {
         const existing = activeSessions.get(gameId);
         return {
@@ -6356,6 +6532,8 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
         appDefaultsMap: {},
         validatedDllNames: [],
       };
+      let initialAppLocalProxyDirsKey = '';
+      let lastPreLaunchCloudSyncAt = 0;
       /** @type {string[]} */
       let mergedCompatTargetExeNames = [];
       /** @type {() => Promise<void>} */
@@ -6554,6 +6732,9 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             ...(preCompatParadoxExe ? [path.dirname(preCompatParadoxExe)] : []),
             ...(effectiveCaps?.targetExePaths || []).map((p) => path.dirname(p)),
           ].filter(Boolean);
+          initialAppLocalProxyDirsKey = Array.from(
+            new Set(preCompatProxyCandidateDirs.map((d) => path.resolve(d)))
+          ).join('|');
           initialAppLocalProxyInfo = discoverValidatedAppLocalProxyDllOverrides(
             preCompatProxyCandidateDirs,
             effectiveCaps?.effectiveMachine || 'unknown',
@@ -6575,6 +6756,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
 
           const compatLayerCapOptions = {
             ...options,
+            gameId,
             runnerType: chosenLayer.type,
             isPreviewRunner:
               chosenLayer.type === 'crossover_preview' ||
@@ -6605,12 +6787,123 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
           outerCompatLayerCapOptions = compatLayerCapOptions;
           outerEffectiveCompatLaunchConfig = effectiveCompatLaunchConfig;
 
+          const isUnmockedHostBottleInVitest =
+            Boolean(process.env.VITEST || process.env.NODE_ENV === 'test') &&
+            !options.allowBottleClientWakeInTest &&
+            ((typeof options.bottleClientSpawnFn !== 'function' &&
+              typeof options.gameSpawnFn !== 'function' &&
+              typeof options.spawnFn !== 'function') ||
+              String((chosenLayer && chosenLayer.binaryPath) || '').startsWith('/Applications/'));
+
+          // L-02: Acquire `pendingBottleLaunches` and await `inFlightPostSessionByBottle` BEFORE
+          // `ensureCompatibilityLayerReady` mutates bottle registry/config or runs idle `wineserver -k`.
+          const predictedPrefix = predictTargetBottlePrefix(
+            chosenLayer,
+            effectiveCompatLaunchConfig,
+            compatLayerCapOptions
+          );
+          if (predictedPrefix) {
+            await acquireOrTransferBottleLock(predictedPrefix);
+            if (isLaunchAborted()) {
+              return abortedLaunchResult();
+            }
+          }
+
+          const checkHasOtherActiveSessionInPrefix = (/** @type {string} */ prefixKey) =>
+            Boolean(prefixKey) &&
+            ((pendingBottleLaunches.get(prefixKey) || 0) > 1 ||
+              Array.from(activeSessions.entries()).some(
+                ([activeId, activeEntry]) =>
+                  activeId !== gameId &&
+                  !activeEntry.finalized &&
+                  activeEntry.winePrefix &&
+                  path.resolve(activeEntry.winePrefix) === prefixKey
+              ));
+
+          const computeNeedBottleClientsForPrefix = (/** @type {string | null} */ prefixDir) => {
+            if (!prefixDir || isUnmockedHostBottleInVitest) {
+              return { needSteam: false, needGog: false, needEpic: false };
+            }
+            let needSteam = false;
+            let needGog = false;
+            let needEpic = false;
+            if (payload.platformId === 'steam') {
+              const bSteam = resolveBottleSteamExe(prefixDir);
+              needSteam = Boolean(
+                bSteam &&
+                  effectiveSteamAppId &&
+                  !isFastMinimalBypass &&
+                  !options.disableBottleSteamLaunch &&
+                  !options.disableBottleStorefrontLaunch
+              );
+            } else if (payload.platformId === 'gog') {
+              const bGog = resolveBottleGogGalaxyExe(prefixDir);
+              const gogSdk =
+                options.strictGalaxySdkCheck === true
+                  ? doesGogInstallUseGalaxySdk(localInstallDir, resolvedExePath)
+                  : true;
+              needGog = Boolean(
+                bGog &&
+                  !isFastMinimalBypass &&
+                  options.usesGalaxySdk !== false &&
+                  gogSdk &&
+                  !options.disableBottleGogLaunch &&
+                  !options.disableBottleStorefrontLaunch
+              );
+            } else if (payload.platformId === 'epic') {
+              const bEpic = resolveBottleEpicLauncherExe(prefixDir);
+              needEpic = Boolean(
+                bEpic &&
+                  !isFastMinimalBypass &&
+                  !options.disableBottleEpicLaunch &&
+                  !options.disableBottleStorefrontLaunch
+              );
+            }
+            return { needSteam, needGog, needEpic };
+          };
+
+          // Run idle `wineserver -k` BEFORE `ensureCompatibilityLayerReady` when no bottle client is needed,
+          // so `applyCrossOverPerGameSettings` writes static `.reg` files cleanly once with zero wasted live `reg.exe import`.
+          let ranPreCompatIdleShutdownForPrefix = '';
+          if (predictedPrefix && !checkHasOtherActiveSessionInPrefix(lockedBottlePrefix)) {
+            if (
+              !isTestEnvironment(options) &&
+              resolvedExePath &&
+              resolvedExePath.toLowerCase().endsWith('.exe')
+            ) {
+              await killPosixProcessesMatchingWinExe(
+                resolvedExePath,
+                'SIGKILL',
+                localInstallDir || predictedPrefix || ''
+              );
+            }
+            const preClientNeed = computeNeedBottleClientsForPrefix(predictedPrefix);
+            if (!preClientNeed.needSteam && !preClientNeed.needGog && !preClientNeed.needEpic) {
+              const candidateWineserver = resolveWineserverBinary(chosenLayer.binaryPath);
+              const canRunWineserver =
+                Boolean(candidateWineserver && predictedPrefix) &&
+                (!options.homedir ||
+                  String(candidateWineserver).startsWith(options.homedir) ||
+                  String(candidateWineserver).startsWith(os.tmpdir()) ||
+                  String(candidateWineserver).startsWith('/private/var/folders') ||
+                  String(candidateWineserver).startsWith('/var/folders'));
+              if (canRunWineserver) {
+                deleteBottleDaemonEnvContract(predictedPrefix);
+                await shutdownWinePrefix(chosenLayer.binaryPath, predictedPrefix, 2000);
+                ranPreCompatIdleShutdownForPrefix = path.resolve(predictedPrefix);
+              }
+            }
+          }
+
           compatResult = await ensureCompatibilityLayerReady(
             chosenLayer,
             effectiveCompatLaunchConfig,
             env,
             compatLayerCapOptions
           );
+          if (isLaunchAborted()) {
+            return abortedLaunchResult();
+          }
 
           if (
             chosenLayer.type === 'crossover' ||
@@ -6662,37 +6955,11 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             };
           }
 
+          // Cleanly transfer bottle lock & await post-session barrier if `compatResult.winePrefix` diverged from `predictedPrefix`
           if (targetWinePrefix) {
-            const resolvedTargetPrefix = path.resolve(targetWinePrefix);
-            lockedBottlePrefix = resolvedTargetPrefix;
-            pendingBottleLaunches.set(
-              resolvedTargetPrefix,
-              (pendingBottleLaunches.get(resolvedTargetPrefix) || 0) + 1
-            );
-
-            if (inFlightPostSessionByBottle.has(resolvedTargetPrefix)) {
-              const bottleInFlightPromise = inFlightPostSessionByBottle.get(resolvedTargetPrefix);
-              emitSessionUpdated(
-                {
-                  gameId,
-                  platformId: payload.platformId || 'custom',
-                  status: 'starting',
-                  event: 'starting',
-                  statusMessage: 'Waiting for Wine bottle post-exit cloud sync...',
-                },
-                options
-              );
-              const bottleBarrierTimeoutMs = Math.max(
-                0,
-                Number(options.postSessionBarrierTimeoutMs ?? 20000)
-              );
-              await Promise.race([
-                bottleInFlightPromise,
-                new Promise((resolve) => {
-                  const t = setTimeout(resolve, bottleBarrierTimeoutMs);
-                  if (typeof t.unref === 'function') t.unref();
-                }),
-              ]);
+            await acquireOrTransferBottleLock(targetWinePrefix);
+            if (isLaunchAborted()) {
+              return abortedLaunchResult();
             }
           }
 
@@ -6700,21 +6967,20 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             alignWineMsyncWithLiveBottle(targetWinePrefix, env);
           }
 
-          applyMoltenVkMetalHudDeadlockGuard(
-            chosenLayer,
+          applyUnifiedPerformanceHudEnv({
             env,
-            effectiveCompatLaunchConfig,
+            launchConfig: effectiveCompatLaunchConfig,
+            perfSettings: effectivePerfPolicy,
+            chosenLayer,
+            backend: env.CX_GRAPHICS_BACKEND || effectiveCompatLaunchConfig?.crossoverGraphicsBackend || '',
+            platform,
+            useCompatLayer: true,
+            wineBinaryPath: chosenLayer?.binaryPath || '',
             options,
-            gameId
-          );
-
-          const isUnmockedHostBottleInVitest =
-            Boolean(process.env.VITEST || process.env.NODE_ENV === 'test') &&
-            !options.allowBottleClientWakeInTest &&
-            ((typeof options.bottleClientSpawnFn !== 'function' &&
-              typeof options.gameSpawnFn !== 'function' &&
-              typeof options.spawnFn !== 'function') ||
-              String((chosenLayer && chosenLayer.binaryPath) || '').startsWith('/Applications/'));
+            gameId,
+            respectExistingEnvMetalHud: true,
+            syncCxEnv: true,
+          });
 
           if (payload.platformId === 'steam' && targetWinePrefix && !isUnmockedHostBottleInVitest) {
             bottleSteamExe = resolveBottleSteamExe(targetWinePrefix);
@@ -6882,19 +7148,27 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
           };
 
           if (!hasOtherActiveSessionInPrefix) {
+            const resolvedPrefixForShutdown = targetWinePrefix ? path.resolve(targetWinePrefix) : '';
+            const alreadyShutDownIdlePrefix =
+              Boolean(resolvedPrefixForShutdown) &&
+              ranPreCompatIdleShutdownForPrefix === resolvedPrefixForShutdown;
             if (
-              !isTestEnvironment(options) &&
-              resolvedExePath &&
-              resolvedExePath.toLowerCase().endsWith('.exe')
+              !alreadyShutDownIdlePrefix &&
+              !shouldLaunchViaBottleSteam &&
+              !shouldWakeBottleGog &&
+              !shouldWakeBottleEpic
             ) {
-              await killPosixProcessesMatchingWinExe(
-                resolvedExePath,
-                'SIGKILL',
-                localInstallDir || targetWinePrefix || ''
-              );
-            }
-
-            if (!shouldLaunchViaBottleSteam && !shouldWakeBottleGog && !shouldWakeBottleEpic) {
+              if (
+                !isTestEnvironment(options) &&
+                resolvedExePath &&
+                resolvedExePath.toLowerCase().endsWith('.exe')
+              ) {
+                await killPosixProcessesMatchingWinExe(
+                  resolvedExePath,
+                  'SIGKILL',
+                  localInstallDir || targetWinePrefix || ''
+                );
+              }
               const candidateWineserver = resolveWineserverBinary(chosenLayer.binaryPath);
               const canRunWineserver =
                 Boolean(candidateWineserver && targetWinePrefix) &&
@@ -6907,20 +7181,6 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               if (canRunWineserver) {
                 deleteBottleDaemonEnvContract(targetWinePrefix);
                 await shutdownWinePrefix(chosenLayer.binaryPath, targetWinePrefix, 2000);
-                if (targetWinePrefix && fs.existsSync(targetWinePrefix)) {
-                  try {
-                    applyCrossOverPerGameSettings(
-                      targetWinePrefix,
-                      compatLayerCapOptions.exeName || '',
-                      effectiveCompatLaunchConfig,
-                      {
-                        ...compatLayerCapOptions,
-                        skipRegistrySpawn: true,
-                        skipLiveWineRegSync: true,
-                      }
-                    );
-                  } catch {}
-                }
               }
             }
           }
@@ -6949,7 +7209,13 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
                 ? path.resolve(localInstallDir)
                 : '';
             const effectiveSanitizeHighRes = launchConfig.crossoverHighResolutionMode;
-            const sanitizeKey = `${path.resolve(targetWinePrefix)}:${String(effectiveSanitizeHighRes)}:${String(effectivePerfPolicy.effectiveDisplayScalingMode)}:${String(effectivePerfPolicy.effectiveDisplayAspectRatio)}:${installDirKey}`;
+            const sanitizeKey = buildDisplaySanitizeCacheKey({
+              prefixPath: targetWinePrefix,
+              highResolutionMode: effectiveSanitizeHighRes,
+              displayScalingMode: effectivePerfPolicy.effectiveDisplayScalingMode,
+              displayAspectRatio: effectivePerfPolicy.effectiveDisplayAspectRatio,
+              installDir: installDirKey,
+            });
             const lastSanitizedAt = recentDisplaySanitizeCache.get(sanitizeKey) || 0;
             if (
               options.forceSanitizeDisplayConfigs === true ||
@@ -6973,6 +7239,39 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
       }
 
       if (resolvedExePath) {
+        if (isLaunchAborted()) {
+          return abortedLaunchResult();
+        }
+        // L-10: Replay any interrupted post-exit cloud upload for this game in conflict-safe bidirectional mode before launching
+        if (
+          payload.platformId &&
+          ['gog', 'epic', 'xbox'].includes(String(payload.platformId).toLowerCase()) &&
+          isNetworkOnlineForLaunch(options)
+        ) {
+          try {
+            const queuedUploads = loadPendingCloudUploads(options);
+            const matchingPending = queuedUploads.find(
+              (item) =>
+                item.gameId === gameId &&
+                String(item.platformId).toLowerCase() === String(payload.platformId).toLowerCase()
+            );
+            if (matchingPending) {
+              await replayPendingCloudUpload(
+                matchingPending,
+                { syncGogCloudSaves, syncEpicCloudSaves, syncXboxCloudSaves },
+                {
+                  ...options,
+                  useCompatLayer,
+                  winePrefix: targetWinePrefix,
+                  installPath: localInstallDir || payload.installPath,
+                }
+              );
+            }
+          } catch (replayErr) {
+            diagLog.warn('launchGame.pendingCloudUploadReplay', replayErr, { gameId });
+          }
+        }
+
         if (payload.platformId === 'steam' && effectiveSteamAppId) {
           env.SteamAppId = effectiveSteamAppId;
           env.SteamGameId = effectiveSteamAppId;
@@ -6991,13 +7290,23 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
         }
 
         if (payload.platformId === 'epic') {
+          let sharedEpicLegAuth = null;
+          if (!options.skipAuthRefresh && !options.legendaryConfigDir && !options.legendaryConfigPath) {
+            try {
+              sharedEpicLegAuth = await ensureLegendaryConfigAndAuth(options);
+            } catch {}
+          }
           try {
             const epicPreSyncRes = await syncEpicCloudSaves(payload, 'pre_launch', {
               ...options,
+              ...(sharedEpicLegAuth ? { prefetchedLegAuth: sharedEpicLegAuth } : {}),
               useCompatLayer,
               winePrefix: targetWinePrefix,
               installPath: localInstallDir || payload.installPath,
             });
+            if (epicPreSyncRes && epicPreSyncRes.synced) {
+              lastPreLaunchCloudSyncAt = Date.now();
+            }
             emitPreLaunchCloudTelemetry(epicPreSyncRes);
           } catch (/** @type {any} */ epicSyncErr) {
             emitPreLaunchCloudTelemetry({
@@ -7005,8 +7314,14 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               reason: epicSyncErr && epicSyncErr.message ? epicSyncErr.message : 'sync_failed',
             });
           }
+          if (isLaunchAborted()) {
+            return abortedLaunchResult();
+          }
           try {
-            const epicAuth = await resolveEpicLaunchAuthArguments(payload, options);
+            const epicAuth = await resolveEpicLaunchAuthArguments(payload, {
+              ...options,
+              ...(sharedEpicLegAuth ? { prefetchedLegAuth: sharedEpicLegAuth } : {}),
+            });
             if (epicAuth && Array.isArray(epicAuth.args)) {
               for (const flag of epicAuth.args) {
                 const flagPrefix = String(flag).split('=')[0].toLowerCase();
@@ -7027,6 +7342,9 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               winePrefix: targetWinePrefix,
               installPath: localInstallDir || payload.installPath,
             });
+            if (gogPreSyncRes && gogPreSyncRes.synced) {
+              lastPreLaunchCloudSyncAt = Date.now();
+            }
             emitPreLaunchCloudTelemetry(gogPreSyncRes);
           } catch (/** @type {any} */ gogSyncErr) {
             emitPreLaunchCloudTelemetry({
@@ -7110,8 +7428,13 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               return { xboxAuthProvider, xboxSession: options.xboxSession };
             }
             let xboxSession = null;
-            let encounteredOfflineNetworkError = Boolean(options.offline === true);
-            if (xboxAuthProvider && typeof xboxAuthProvider.getValidXboxSession === 'function') {
+            let encounteredOfflineNetworkError =
+              Boolean(options.offline === true) || !isNetworkOnlineForLaunch(options);
+            if (
+              !encounteredOfflineNetworkError &&
+              xboxAuthProvider &&
+              typeof xboxAuthProvider.getValidXboxSession === 'function'
+            ) {
               try {
                 xboxSession = await xboxAuthProvider.getValidXboxSession();
               } catch (/** @type {any} */ authErr) {
@@ -7213,6 +7536,9 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
                 xboxPreSyncRes.resolvedScid.trim()
               ) {
                 resolvedXboxScid = xboxPreSyncRes.resolvedScid.trim().toLowerCase();
+              }
+              if (xboxPreSyncRes && xboxPreSyncRes.synced) {
+                lastPreLaunchCloudSyncAt = Date.now();
               }
               emitPreLaunchCloudTelemetry(xboxPreSyncRes);
               return xboxPreSyncRes;
@@ -7885,11 +8211,17 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               ...(resolvedParadoxDirectExe ? [path.dirname(resolvedParadoxDirectExe)] : []),
               ...(effectiveCaps?.targetExePaths || []).map((p) => path.dirname(p)),
             ].filter(Boolean);
-            const appLocalProxyInfo = discoverValidatedAppLocalProxyDllOverrides(
-              proxyCandidateDirs,
-              effectiveCaps?.effectiveMachine || 'unknown',
-              options
-            );
+            const proxyDirsKey = Array.from(
+              new Set(proxyCandidateDirs.map((d) => path.resolve(d)))
+            ).join('|');
+            const appLocalProxyInfo =
+              initialAppLocalProxyDirsKey && proxyDirsKey === initialAppLocalProxyDirsKey
+                ? initialAppLocalProxyInfo
+                : discoverValidatedAppLocalProxyDllOverrides(
+                    proxyCandidateDirs,
+                    effectiveCaps?.effectiveMachine || 'unknown',
+                    options
+                  );
             if (appLocalProxyInfo.hasOverrides) {
               env.WINEDLLOVERRIDES = mergeWineDllOverrides(
                 env.WINEDLLOVERRIDES,
@@ -7998,16 +8330,59 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             actualLaunchMethod = `compatibility_layer:${chosenCompatLayer.type}`;
           }
         } else if (platform === 'darwin' && resolvedExePath) {
+          // Bug B Fix: apply unified Performance HUD env on native macOS launches AND forward
+          // `--env MTL_HUD_ENABLED=1` (plus validated user env vars) before `-a` for `/usr/bin/open`.
+          applyUnifiedPerformanceHudEnv({
+            env,
+            launchConfig,
+            perfSettings: effectivePerfPolicy,
+            chosenLayer: null,
+            backend: '',
+            platform,
+            useCompatLayer: false,
+            options,
+            gameId,
+          });
+          const buildMacOpenEnvArgs = () => {
+            /** @type {string[]} */
+            const openEnvArgs = [];
+            /** @type {Set<string>} */
+            const seenKeys = new Set();
+            if (env.MTL_HUD_ENABLED === '1') {
+              openEnvArgs.push('--env', 'MTL_HUD_ENABLED=1');
+              seenKeys.add('MTL_HUD_ENABLED');
+            }
+            const rawUserEnv =
+              launchConfig.environmentVariables &&
+              typeof launchConfig.environmentVariables === 'object'
+                ? launchConfig.environmentVariables
+                : null;
+            if (rawUserEnv) {
+              for (const rawKey of Object.keys(rawUserEnv)) {
+                const cleanKey = String(rawKey || '').trim();
+                if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(cleanKey)) continue;
+                if (seenKeys.has(cleanKey)) continue;
+                if (env[cleanKey] === undefined) continue;
+                const valStr = String(env[cleanKey]);
+                if (valStr.includes('\0')) continue;
+                openEnvArgs.push('--env', `${cleanKey}=${valStr}`);
+                seenKeys.add(cleanKey);
+              }
+            }
+            return openEnvArgs;
+          };
           const appBundleMatch = String(resolvedExePath).match(/^(.*?\.app)(?:[\\/]|$)/i);
           const enclosingAppBundle = appBundleMatch && appBundleMatch[1] ? appBundleMatch[1] : null;
           if (
             enclosingAppBundle &&
-            !isTestEnvironment(options) &&
-            typeof options.spawnFn !== 'function' &&
-            options.preferDirectMacBinary !== true
+            (options.forceMacOpenLaunch === true ||
+              (!isTestEnvironment(options) &&
+                typeof options.spawnFn !== 'function' &&
+                options.preferDirectMacBinary !== true))
           ) {
             spawnCmd = '/usr/bin/open';
             spawnArgs = [
+              ...buildMacOpenEnvArgs(),
               '-W',
               '-a',
               enclosingAppBundle,
@@ -8015,12 +8390,18 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             ];
           } else if (resolvedExePath.endsWith('.app')) {
             const innerBin = resolveMacAppBundleBinary(resolvedExePath);
-            if (innerBin && innerBin !== resolvedExePath && fs.existsSync(innerBin)) {
+            if (
+              options.forceMacOpenLaunch !== true &&
+              innerBin &&
+              innerBin !== resolvedExePath &&
+              fs.existsSync(innerBin)
+            ) {
               spawnCmd = innerBin;
               spawnArgs = [...args];
             } else {
               spawnCmd = '/usr/bin/open';
               spawnArgs = [
+                ...buildMacOpenEnvArgs(),
                 '-W',
                 '-a',
                 resolvedExePath,
@@ -8038,10 +8419,32 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
           winClientlessPrimaryXgrDll &&
           resolvedExePath !== 'explorer.exe'
         ) {
+          applyUnifiedPerformanceHudEnv({
+            env,
+            launchConfig,
+            perfSettings: effectivePerfPolicy,
+            chosenLayer: null,
+            backend: '',
+            platform,
+            useCompatLayer: false,
+            options,
+            gameId,
+          });
           spawnCmd = winClientlessLauncherExe;
           spawnArgs = ['--dll', winClientlessPrimaryXgrDll, '--', resolvedExePath, ...args];
           actualLaunchMethod = 'xbox_win_clientless_injector';
         } else {
+          applyUnifiedPerformanceHudEnv({
+            env,
+            launchConfig,
+            perfSettings: effectivePerfPolicy,
+            chosenLayer: null,
+            backend: '',
+            platform,
+            useCompatLayer: false,
+            options,
+            gameId,
+          });
           spawnArgs = [...args];
         }
       }
@@ -8060,11 +8463,14 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               try {
                 const appMatch = String(spawnCmd).match(/^(.*?\.app)(?:\/|$)/i);
                 const targetQuarantinePath = appMatch ? appMatch[1] : spawnCmd;
-                if (localInstallDir && fs.existsSync(localInstallDir)) {
-                  await clearMacQuarantineAsync(localInstallDir, options);
-                }
-                if (targetQuarantinePath && targetQuarantinePath !== localInstallDir) {
-                  await clearMacQuarantineAsync(targetQuarantinePath, options);
+                const primaryQuarantineTarget =
+                  targetQuarantinePath && fs.existsSync(targetQuarantinePath)
+                    ? targetQuarantinePath
+                    : localInstallDir && fs.existsSync(localInstallDir)
+                      ? localInstallDir
+                      : null;
+                if (primaryQuarantineTarget) {
+                  await clearMacQuarantineAsync(primaryQuarantineTarget, options);
                 }
               } catch {}
             }
@@ -8077,11 +8483,14 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             try {
               const appMatch = String(resolvedExePath).match(/^(.*?\.app)(?:\/|$)/i);
               const targetQuarantinePath = appMatch ? appMatch[1] : resolvedExePath;
-              if (localInstallDir && fs.existsSync(localInstallDir)) {
-                await clearMacQuarantineAsync(localInstallDir, options);
-              }
-              if (targetQuarantinePath && targetQuarantinePath !== localInstallDir) {
-                await clearMacQuarantineAsync(targetQuarantinePath, options);
+              const primaryQuarantineTarget =
+                targetQuarantinePath && fs.existsSync(targetQuarantinePath)
+                  ? targetQuarantinePath
+                  : localInstallDir && fs.existsSync(localInstallDir)
+                    ? localInstallDir
+                    : null;
+              if (primaryQuarantineTarget) {
+                await clearMacQuarantineAsync(primaryQuarantineTarget, options);
               }
             } catch {}
           }
@@ -8493,6 +8902,23 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             }
           }
 
+          // L-08: Await any late `upsertWineUserRegKey` / live `reg.exe import` immediately before spawning
+          if (targetWinePrefix) {
+            const pendingRegBeforeSpawn = pendingWineRegSyncByPrefix.get(
+              path.resolve(targetWinePrefix)
+            );
+            if (pendingRegBeforeSpawn) {
+              try {
+                await pendingRegBeforeSpawn;
+              } catch {}
+            }
+          }
+
+          // L-01: Final cancellation barrier right before spawning so cancelled launches never ghost-spawn
+          if (isLaunchAborted()) {
+            return abortedLaunchResult();
+          }
+
           /** @type {any} */
           let child = null;
           if (activatedXboxPid > 0) {
@@ -8748,6 +9174,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               appUserModelId: resolvedXboxAumid || undefined,
               wasXboxAppRunningAtStart,
               wokeXboxAppByLauncher: false,
+              lastPreLaunchCloudSyncAt,
               displayStatusTimer: null,
               lastObservedDisplayStatusMtimeMs: 0,
             };
@@ -9697,6 +10124,9 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
       }
     }
 
+    if (isLaunchAborted()) {
+      return abortedLaunchResult();
+    }
     if (!steamMinimalSpawnedResult && !gogCliSpawned) {
       const shouldBackgroundUriOpen =
         payload.platformId === 'gog' &&
@@ -9969,11 +10399,36 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
       }
     }
 
+    const requestedGameId = reqObj.gameId ? String(reqObj.gameId).trim() : '';
     if (!targetEntry || !targetKey) {
+      if (requestedGameId && inFlightLaunchAbortControllers.has(requestedGameId)) {
+        const launchCtrl = inFlightLaunchAbortControllers.get(requestedGameId);
+        try {
+          launchCtrl?.abort(new Error('Launch cancelled by user'));
+        } catch {}
+        emitSessionUpdated({
+          gameId: requestedGameId,
+          status: 'stopped',
+          event: 'stopped',
+          cancelled: true,
+          statusMessage: 'Launch cancelled',
+        });
+        return {
+          success: true,
+          cancelled: true,
+          message: 'Cancelled in-flight game launch.',
+        };
+      }
       return {
         success: false,
         error: 'No active running game session found.',
       };
+    }
+
+    if (inFlightLaunchAbortControllers.has(targetKey)) {
+      try {
+        inFlightLaunchAbortControllers.get(targetKey)?.abort(new Error('Launch stopped by user'));
+      } catch {}
     }
 
     targetEntry.stopping = true;
@@ -10118,10 +10573,15 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
         targetEntry.wasBottleEpicRunning ||
         targetEntry.isChainedPublisherLauncher ||
         entryPlatformId === 'epic' ||
-        entryPlatformId === 'gog'
+        entryPlatformId === 'gog' ||
+        entryPlatformId === 'xbox' ||
+        Boolean(targetEntry.xboxLoopbackServer)
     );
     const stopHostPlatform =
       mergedStopOptions.platform || options.platform || reqObj.platform || process.platform;
+
+    let resolvedWineserverForStop = null;
+    let canRunWineserverForStop = false;
     if (
       stopHostPlatform !== 'win32' &&
       sessionWinePrefix &&
@@ -10143,35 +10603,47 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
           normWineserver.startsWith(normTmpDir) ||
           normWineserver.startsWith('/private/var/folders') ||
           normWineserver.startsWith('/var/folders'));
-      if (needsDeferredPrefixShutdownForCloud) {
-        if (canRunWineserver) {
-          targetEntry.deferredPrefixShutdownToFinalize = true;
-        }
-      } else {
-        const resolvedSessionPrefix = path.resolve(sessionWinePrefix);
-        const hasOtherActiveSessionInPrefix =
-          (pendingBottleLaunches.get(resolvedSessionPrefix) || 0) > 0 ||
-          Array.from(activeSessions.entries()).some(
-            ([k, e]) =>
-              k !== targetKey &&
-              !e.finalized &&
-              e.winePrefix &&
-              path.resolve(e.winePrefix) === resolvedSessionPrefix
-          );
-        if (!hasOtherActiveSessionInPrefix && canRunWineserver) {
-          targetEntry.wineShutdownHandledByStopGame = true;
-          deleteBottleDaemonEnvContract(sessionWinePrefix);
-          await shutdownWinePrefix(resolvedWineserver, sessionWinePrefix, 2500);
-        }
+      resolvedWineserverForStop = resolvedWineserver;
+      canRunWineserverForStop = canRunWineserver;
+      if (needsDeferredPrefixShutdownForCloud && canRunWineserver) {
+        targetEntry.deferredPrefixShutdownToFinalize = true;
       }
     }
 
+    // Always allow the 500ms graceful SIGTERM exit window BEFORE falling back to `wineserver -k` or SIGKILL
+    let exitedGracefully = false;
     if (pid) {
-      const exitedGracefully = await waitForProcessExit(
+      exitedGracefully = await waitForProcessExit(
         usesLatchedPublisherChildPid || elevatedTargetPid > 0 ? null : targetEntry.child,
         pid,
         500
       );
+    }
+
+    if (
+      !needsDeferredPrefixShutdownForCloud &&
+      canRunWineserverForStop &&
+      resolvedWineserverForStop &&
+      sessionWinePrefix
+    ) {
+      const resolvedSessionPrefix = path.resolve(sessionWinePrefix);
+      const hasOtherActiveSessionInPrefix =
+        (pendingBottleLaunches.get(resolvedSessionPrefix) || 0) > 0 ||
+        Array.from(activeSessions.entries()).some(
+          ([k, e]) =>
+            k !== targetKey &&
+            !e.finalized &&
+            e.winePrefix &&
+            path.resolve(e.winePrefix) === resolvedSessionPrefix
+        );
+      if (!hasOtherActiveSessionInPrefix) {
+        targetEntry.wineShutdownHandledByStopGame = true;
+        deleteBottleDaemonEnvContract(sessionWinePrefix);
+        await shutdownWinePrefix(resolvedWineserverForStop, sessionWinePrefix, 2500);
+      }
+    }
+
+    if (pid) {
       if (!exitedGracefully && isProcessAlive(pid)) {
         if (stopPlatform === 'win32') {
           try {
@@ -11741,7 +12213,7 @@ async function syncSessionPlaytimeToStorefront(
       let refreshedToken = null;
       if (refreshToken && typeof renewFn === 'function') {
         try {
-          const renewed = await renewFn(refreshToken);
+          const renewed = await renewEpicTokensSingleFlight(refreshToken, (tok) => renewFn(tok));
           if (renewed?.access_token) {
             refreshedToken = renewed.access_token;
             if (activeStoreSync && typeof activeStoreSync.saveTokens === 'function') {
@@ -11915,7 +12387,7 @@ async function syncSessionPlaytimeToStorefront(
           : null);
       if (typeof renewGogFn === 'function') {
         try {
-          const renewed = await renewGogFn(refreshToken);
+          const renewed = await renewGogTokensSingleFlight(refreshToken, (tok) => renewGogFn(tok));
           if (renewed?.access_token) {
             accessToken = renewed.access_token;
             if (activeStoreSync && typeof activeStoreSync.saveTokens === 'function') {
@@ -13448,6 +13920,13 @@ function shutdownLauncherEngine(/** @type {any} */ options = {}) {
   trimLauncherEngineMemory();
 }
 
+async function replayPendingCloudUploadsForSupervisor(/** @type {any} */ options = {}) {
+  return replayPendingCloudUploads(
+    { syncGogCloudSaves, syncEpicCloudSaves, syncXboxCloudSaves },
+    options
+  );
+}
+
 module.exports = {
   parseLaunchArguments,
   doesCrossOverBinarySupportWaitChildren,
@@ -13455,6 +13934,7 @@ module.exports = {
   computeBottleGraphicsEnvContract,
   getLiveBottleDaemonEnvContract,
   resetSupervisorStateForTests,
+  applyMoltenVkMetalHudDeadlockGuard,
   findLiveBottleGameChildPid,
   isSafeBottleChainedGameDirToDelete,
   collectChainedGameCandidateExeNames,
@@ -13470,6 +13950,7 @@ module.exports = {
   waitForActivePostSessionWork,
   syncGogCloudSaves,
   syncEpicCloudSaves,
+  replayPendingCloudUploads: replayPendingCloudUploadsForSupervisor,
   waitForSteamColdStartupCloudReady,
   waitForSteamCloudSyncCompletion,
   finalizeGameSession,

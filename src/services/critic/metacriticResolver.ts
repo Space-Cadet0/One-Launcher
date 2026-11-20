@@ -16,6 +16,7 @@ import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 export interface MetacriticBundle {
   critic: CriticScoreData | null;
   user: CriticScoreData | null;
+  offlinePartialUserScore?: boolean;
 }
 
 export const SPECIAL_CHAR_TRANSLITERATION: Record<string, string> = {
@@ -821,6 +822,8 @@ function parseMetacriticDocument(html: string): Document | null {
 
 export class MetacriticResolver {
   private cache = new Map<string, MetacriticBundle>();
+  private cacheKeysByTitle = new Map<string, Set<string>>();
+  private cacheKeyToTitleKeys = new Map<string, string[]>();
   private inFlight = new Map<string, Promise<MetacriticBundle>>();
   private transientFailureTitles = new Set<string>();
 
@@ -828,19 +831,64 @@ export class MetacriticResolver {
     try {
       onlineLifecycleManager.onOnline(() => {
         this.transientFailureTitles.clear();
+        const partialKeys: string[] = [];
+        for (const [k, bundle] of this.cache.entries()) {
+          if (bundle.offlinePartialUserScore) {
+            partialKeys.push(k);
+          }
+        }
+        for (const k of partialKeys) {
+          this.deleteCacheKey(k);
+        }
       });
     } catch {}
   }
 
-  private setCacheBounded(key: string, bundle: MetacriticBundle): void {
+  private deleteCacheKey(key: string): void {
+    this.cache.delete(key);
+    this.inFlight.delete(key);
+    const titleKeys = this.cacheKeyToTitleKeys.get(key);
+    if (titleKeys) {
+      for (const tk of titleKeys) {
+        const set = this.cacheKeysByTitle.get(tk);
+        if (set) {
+          set.delete(key);
+          if (set.size === 0) this.cacheKeysByTitle.delete(tk);
+        }
+      }
+      this.cacheKeyToTitleKeys.delete(key);
+    }
+  }
+
+  private setCacheBounded(key: string, bundle: MetacriticBundle, rawTitle?: string): void {
     if (this.cache.has(key)) {
-      this.cache.delete(key);
+      this.deleteCacheKey(key);
     }
     this.cache.set(key, bundle);
+    const titleKeys: string[] = [];
+    const titleLower = (rawTitle || '').trim().toLowerCase();
+    if (titleLower) {
+      titleKeys.push(titleLower);
+      const norm = normalizeTitleKey(titleLower);
+      if (norm && norm !== titleLower) {
+        titleKeys.push(norm);
+      }
+    }
+    if (titleKeys.length > 0) {
+      this.cacheKeyToTitleKeys.set(key, titleKeys);
+      for (const tk of titleKeys) {
+        let set = this.cacheKeysByTitle.get(tk);
+        if (!set) {
+          set = new Set<string>();
+          this.cacheKeysByTitle.set(tk, set);
+        }
+        set.add(key);
+      }
+    }
     while (this.cache.size > MAX_METACRITIC_CACHE_ENTRIES) {
       const oldest = this.cache.keys().next().value;
       if (oldest === undefined) break;
-      this.cache.delete(oldest);
+      this.deleteCacheKey(oldest);
     }
   }
 
@@ -865,7 +913,12 @@ export class MetacriticResolver {
     const anchorSlug = rawAnchorSlug && isAnchorSlugCompatible(title, rawAnchorSlug) ? rawAnchorSlug : undefined;
     const cacheKey = `${title.toLowerCase()}${releaseYear ? `:${releaseYear}` : ''}${anchorSlug ? `:${anchorSlug}` : ''}`;
     if (this.cache.has(cacheKey)) {
-      return this.cache.get(cacheKey)!;
+      const cached = this.cache.get(cacheKey)!;
+      if (cached.offlinePartialUserScore && onlineLifecycleManager.isOnline()) {
+        this.deleteCacheKey(cacheKey);
+      } else {
+        return cached;
+      }
     }
 
     if (this.inFlight.has(cacheKey)) {
@@ -897,8 +950,12 @@ export class MetacriticResolver {
             isVerified: true,
             isSynthetic: false,
           };
-          const bundle: MetacriticBundle = { critic: anchorCritic, user: null };
-          this.setCacheBounded(cacheKey, bundle);
+          const bundle: MetacriticBundle = {
+            critic: anchorCritic,
+            user: null,
+            offlinePartialUserScore: true,
+          };
+          this.setCacheBounded(cacheKey, bundle, title);
           return bundle;
         }
       }
@@ -1290,7 +1347,7 @@ export class MetacriticResolver {
         const critic = await evaluateSlug(primaryAnchorSlug, true);
         if (critic) {
           const bundle: MetacriticBundle = { critic, user: fallbackUser };
-          this.setCacheBounded(cacheKey, bundle);
+          this.setCacheBounded(cacheKey, bundle, title);
           return bundle;
         }
       }
@@ -1317,7 +1374,7 @@ export class MetacriticResolver {
         const critic = await evaluateSlug(slug, isAnchor);
         if (critic) {
           const bundle: MetacriticBundle = { critic, user: fallbackUser };
-          this.setCacheBounded(cacheKey, bundle);
+          this.setCacheBounded(cacheKey, bundle, title);
           return bundle;
         }
       }
@@ -1352,7 +1409,7 @@ export class MetacriticResolver {
             const critic = await evaluateSlug(s, isAnchor);
             if (critic) {
               const bundle: MetacriticBundle = { critic, user: fallbackUser };
-              this.setCacheBounded(cacheKey, bundle);
+              this.setCacheBounded(cacheKey, bundle, title);
               return bundle;
             }
           }
@@ -1391,7 +1448,7 @@ export class MetacriticResolver {
                 isSynthetic: false,
               };
               const bundle: MetacriticBundle = { critic: jsonCritic, user: fallbackUser };
-              this.setCacheBounded(cacheKey, bundle);
+              this.setCacheBounded(cacheKey, bundle, title);
               return bundle;
             }
           }
@@ -1421,8 +1478,14 @@ export class MetacriticResolver {
             isVerified: true,
             isSynthetic: false,
           };
-          const bundle: MetacriticBundle = { critic: anchorCritic, user: fallbackUser };
-          this.setCacheBounded(cacheKey, bundle);
+          const bundle: MetacriticBundle = {
+            critic: anchorCritic,
+            user: fallbackUser,
+            ...(!onlineLifecycleManager.isOnline() && !fallbackUser
+              ? { offlinePartialUserScore: true }
+              : {}),
+          };
+          this.setCacheBounded(cacheKey, bundle, title);
           return bundle;
         }
       }
@@ -1433,7 +1496,7 @@ export class MetacriticResolver {
         this.transientFailureTitles.add(title.toLowerCase());
         return finalBundle;
       }
-      this.setCacheBounded(cacheKey, finalBundle);
+      this.setCacheBounded(cacheKey, finalBundle, title);
       return finalBundle;
     })().finally(() => {
       this.inFlight.delete(cacheKey);
@@ -1482,8 +1545,33 @@ export class MetacriticResolver {
     return bundle.critic || bundle.user;
   }
 
+  public evictForGame(rawTitle?: string | null): void {
+    const titleLower = (rawTitle || '').trim().toLowerCase();
+    if (!titleLower) return;
+    this.transientFailureTitles.delete(titleLower);
+    const keysToDelete = new Set<string>([titleLower]);
+    const exactSet = this.cacheKeysByTitle.get(titleLower);
+    if (exactSet) {
+      for (const k of exactSet) keysToDelete.add(k);
+    }
+    const normTitle = normalizeTitleKey(titleLower);
+    if (normTitle && normTitle !== titleLower) {
+      this.transientFailureTitles.delete(normTitle);
+      keysToDelete.add(normTitle);
+      const normSet = this.cacheKeysByTitle.get(normTitle);
+      if (normSet) {
+        for (const k of normSet) keysToDelete.add(k);
+      }
+    }
+    for (const k of keysToDelete) {
+      this.deleteCacheKey(k);
+    }
+  }
+
   clearCache(): void {
     this.cache.clear();
+    this.cacheKeysByTitle.clear();
+    this.cacheKeyToTitleKeys.clear();
     this.inFlight.clear();
     this.transientFailureTitles.clear();
   }

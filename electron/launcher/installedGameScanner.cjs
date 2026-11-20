@@ -53,7 +53,6 @@ const {
   extractBottleRootFromPath,
   inspectBottleConfMetadata,
   listAllInitializedBottlePaths,
-  detectCompatibilityLayers,
   extractSiblingLauncherStem,
   resolveSiblingLauncherStub,
 } = macNativeInstallerAndCodesign;
@@ -62,10 +61,8 @@ const {
   collectXboxScanDirectories,
   inspectInstalledXboxGameDir,
 } = require('./windowsXboxAppxAndMsixvcOrchestrator.cjs');
-const {
-  syncEpicFirstPartyLauncher,
-  collectLocalEpicMetadataAndSupport,
-} = require('./epicLegendaryAndEosCoordinator.cjs');
+const epicLegendaryAndEosCoordinator = require('./epicLegendaryAndEosCoordinator.cjs');
+const { syncEpicFirstPartyLauncher } = epicLegendaryAndEosCoordinator;
 const { syncGogFirstPartyLauncher } = require('./gogRegistryAndDirectInstaller.cjs');
 const {
   normalizeChainedHandoffId,
@@ -150,7 +147,12 @@ function doChainedPublisherTitlesMatch(titleA, titleB) {
   return false;
 }
 
-function loadChainedCatalogIndex(userDataDir, /** @type {any} */ options = {}, /** @type {any[]} */ managedRecords = []) {
+function loadChainedCatalogIndex(
+  userDataDir,
+  /** @type {any} */ options = {},
+  /** @type {any[]} */ managedRecords = [],
+  /** @type {any} */ epicLocalOrGetter = null
+) {
   /** @type {Map<string, { platformGameId: string, xboxProductId?: string, title: string }>} */
   const xboxHandoffByFullKey = new Map();
   /** @type {Map<string, { platformGameId: string, xboxProductId?: string, title: string }>} */
@@ -340,7 +342,12 @@ function loadChainedCatalogIndex(userDataDir, /** @type {any} */ options = {}, /
   }
 
   try {
-    const epicLocal = collectLocalEpicMetadataAndSupport(options);
+    const epicLocal =
+      typeof epicLocalOrGetter === 'function'
+        ? epicLocalOrGetter()
+        : epicLocalOrGetter && typeof epicLocalOrGetter === 'object'
+          ? epicLocalOrGetter
+          : epicLegendaryAndEosCoordinator.collectLocalEpicMetadataAndSupport(options);
     if (Array.isArray(epicLocal?.metaSummaries)) {
       for (const s of epicLocal.metaSummaries) {
         if (!s || !s.appName) continue;
@@ -475,217 +482,1668 @@ function resolveBottleLayerMetadata(bottlePath, /** @type {any[]} */ detectedLay
   };
 }
 
-/**
- * Multi-Storefront & Multi-Drive Read-Only Installation Scanner.
- * Zero file/folder mutations during scanning; preserves external-drive records when unmounted.
- */
-function scanAllInstalledGames(/** @type {any} */ options = {}) {
-  try {
-    const isDefaultProdScan =
-      !options.platform &&
-      !options.homedir &&
-      !options.customRoots &&
-      !options.userDataDir &&
-      !options.forceRefresh &&
-      !options.syncFirstParty &&
-      !options.eglManifestsDir &&
-      !options.gogGalaxyConfigPath &&
-      !options.gogGalaxyStorageDir &&
-      !options.xboxGamesDirs &&
-      !options.windowsDriveRoots &&
-      !options.gamingServicesRegistryOutput &&
-      !options.catalogGames &&
-      !options.bottlePath &&
-      !options.bottlePaths &&
-      !options.strictPe;
+const ASYNC_SCAN_YIELD_CHUNK = 4;
 
-    const lastProductionScanCache = getLastProductionScanCache();
-    if (
-      isDefaultProdScan &&
-      lastProductionScanCache.result &&
-      Date.now() - lastProductionScanCache.timestamp < 3000
-    ) {
-      const cachedInstalledGames = lastProductionScanCache.result.installedGames.map(
-        (/** @type {any} */ g) => ({ ...g })
-      );
-      const cachedEpicSupport = { ...(lastProductionScanCache.result.epicPlatformSupport || {}) };
-      try {
-        Object.defineProperty(cachedInstalledGames, 'epicPlatformSupport', {
-          value: cachedEpicSupport,
-          enumerable: false,
-          configurable: true,
-        });
-      } catch {}
-      return {
+/**
+ * Yield cleanly to the Node/Electron event loop so IPC messages, timers, and UI frames
+ * are never starved during multi-storefront installed-game scans.
+ *
+ * @returns {Promise<void>}
+ */
+function yieldToEventLoop() {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+/**
+ * Check the 3-second default production scan cache and return a cloned copy if fresh.
+ *
+ * @param {any} options
+ * @returns {{ isDefaultProdScan: boolean, cachedResult: any | null }}
+ */
+function checkDefaultProdScanCache(options) {
+  const isDefaultProdScan =
+    !options.platform &&
+    !options.homedir &&
+    !options.customRoots &&
+    !options.userDataDir &&
+    !options.forceRefresh &&
+    !options.syncFirstParty &&
+    !options.eglManifestsDir &&
+    !options.gogGalaxyConfigPath &&
+    !options.gogGalaxyStorageDir &&
+    !options.xboxGamesDirs &&
+    !options.windowsDriveRoots &&
+    !options.gamingServicesRegistryOutput &&
+    !options.catalogGames &&
+    !options.bottlePath &&
+    !options.bottlePaths &&
+    !options.strictPe;
+
+  const lastProductionScanCache = getLastProductionScanCache();
+  if (
+    isDefaultProdScan &&
+    lastProductionScanCache.result &&
+    Date.now() - lastProductionScanCache.timestamp < 3000
+  ) {
+    const cachedInstalledGames = lastProductionScanCache.result.installedGames.map(
+      (/** @type {any} */ g) => ({ ...g })
+    );
+    const cachedEpicSupport = { ...(lastProductionScanCache.result.epicPlatformSupport || {}) };
+    try {
+      Object.defineProperty(cachedInstalledGames, 'epicPlatformSupport', {
+        value: cachedEpicSupport,
+        enumerable: false,
+        configurable: true,
+      });
+    } catch {}
+    return {
+      isDefaultProdScan,
+      cachedResult: {
         success: true,
         installedGames: cachedInstalledGames,
         installedSteamAppIds: [...lastProductionScanCache.result.installedSteamAppIds],
         epicPlatformSupport: cachedEpicSupport,
-      };
-    }
+      },
+    };
+  }
+  return { isDefaultProdScan, cachedResult: null };
+}
 
-    const platform = options.platform || process.platform;
-    const homedir = options.homedir || os.homedir();
-    const customRoots = Array.isArray(options.customRoots) ? options.customRoots : [];
-    const userDataDir = getUserDataDir(options.userDataDir);
-    const isIsolatedTest = Boolean(
-      options.homedir || (options.customRoots && options.customRoots.length > 0)
+/**
+ * Initialize shared per-scan state with memoized single-call `detectCompatibilityLayers`
+ * and `collectLocalEpicMetadataAndSupport` getters so neither runs more than once per scan.
+ *
+ * @param {any} options
+ * @param {boolean} isDefaultProdScan
+ * @param {boolean} skipWin32BackgroundPrewarm
+ */
+function createScanContext(options, isDefaultProdScan, skipWin32BackgroundPrewarm) {
+  const platform = options.platform || process.platform;
+  const homedir = options.homedir || os.homedir();
+  const customRoots = Array.isArray(options.customRoots) ? options.customRoots : [];
+  const userDataDir = getUserDataDir(options.userDataDir);
+  const isIsolatedTest = Boolean(
+    options.homedir || (options.customRoots && options.customRoots.length > 0)
+  );
+
+  if (platform === 'win32' && !skipWin32BackgroundPrewarm) {
+    primeXboxDiscoveryCachesAsync(options).catch(() => {});
+    if (!isTestEnvironment(options) || options.prewarmWindowsCaches === true) {
+      const prewarmOpts = options.prewarmWindowsCaches === true ? options : { platform };
+      refreshWindowsStorefrontRegistryCacheAsync(prewarmOpts).catch(() => {});
+      refreshHostWindowsKnownFoldersAsync(prewarmOpts).catch(() => {});
+      discoverWindowsLocalDrivesAsync(prewarmOpts).catch(() => {});
+    }
+  }
+
+  /** @type {Record<string, any>} */
+  let launchConfigs = {};
+  try {
+    launchConfigs = getGameLaunchConfigs({ userDataDir }) || {};
+  } catch (cfgErr) {
+    diagLog.warn(
+      'scanAllInstalledGames.stageError',
+      cfgErr,
+      { stage: 'launch_configs' },
+      { userDataDir }
     );
+  }
 
-    if (platform === 'win32') {
-      primeXboxDiscoveryCachesAsync(options).catch(() => {});
-      if (!isTestEnvironment(options) || options.prewarmWindowsCaches === true) {
-        const prewarmOpts =
-          options.prewarmWindowsCaches === true ? options : { platform };
-        refreshWindowsStorefrontRegistryCacheAsync(prewarmOpts).catch(() => {});
-        refreshHostWindowsKnownFoldersAsync(prewarmOpts).catch(() => {});
-        discoverWindowsLocalDrivesAsync(prewarmOpts).catch(() => {});
-      }
+  const discoveredMap = new Map();
+  /** @type {number[]} */
+  const installedSteamAppIds = [];
+  /** @type {Set<string>} */
+  const steamInstalledDirPaths = new Set();
+
+  /** @type {any[]} */
+  let preloadedManagedRecords = [];
+  /** @type {Set<string>} */
+  const managedCompletedKeys = new Set();
+  try {
+    const rawManagedRecords = loadManagedInstalledGames(userDataDir);
+    preloadedManagedRecords = rawManagedRecords.filter(
+      (rec) => !isGdkStubExecutablePath(rec?.executablePath)
+    );
+    if (preloadedManagedRecords.length !== rawManagedRecords.length) {
+      saveManagedInstalledGames(preloadedManagedRecords, userDataDir);
     }
-
-    /** @type {Record<string, any>} */
-    let launchConfigs = {};
-    try {
-      launchConfigs = getGameLaunchConfigs({ userDataDir }) || {};
-    } catch (cfgErr) {
-      diagLog.warn(
-        'scanAllInstalledGames.stageError',
-        cfgErr,
-        { stage: 'launch_configs' },
-        { userDataDir }
-      );
-    }
-
-    const discoveredMap = new Map();
-    /** @type {number[]} */
-    const installedSteamAppIds = [];
-
-    /** @type {any[]} */
-    let preloadedManagedRecords = [];
-    /** @type {Set<string>} */
-    const managedCompletedKeys = new Set();
-    try {
-      const rawManagedRecords = loadManagedInstalledGames(userDataDir);
-      preloadedManagedRecords = rawManagedRecords.filter(
-        (rec) => !isGdkStubExecutablePath(rec?.executablePath)
-      );
-      if (preloadedManagedRecords.length !== rawManagedRecords.length) {
-        saveManagedInstalledGames(preloadedManagedRecords, userDataDir);
-      }
-      for (const rec of preloadedManagedRecords) {
-        if (!rec || !rec.platformId || !rec.platformGameId) continue;
-        const cleanManagedId = String(rec.platformGameId)
-          .replace(/^(gog|steam|epic|xbox)-/i, '')
-          .toLowerCase();
-        managedCompletedKeys.add(`${String(rec.platformId).toLowerCase()}:${cleanManagedId}`);
-      }
-    } catch {}
-
-    const addRecord = (/** @type {any} */ record) => {
-      if (!record || !record.platformId || !record.platformGameId) return;
-      const cleanRecordId = String(record.platformGameId)
+    for (const rec of preloadedManagedRecords) {
+      if (!rec || !rec.platformId || !rec.platformGameId) continue;
+      const cleanManagedId = String(rec.platformGameId)
         .replace(/^(gog|steam|epic|xbox)-/i, '')
         .toLowerCase();
+      managedCompletedKeys.add(`${String(rec.platformId).toLowerCase()}:${cleanManagedId}`);
+    }
+  } catch {}
+
+  let hasDetectedDarwinLayers = false;
+  /** @type {any[]} */
+  let cachedDarwinLayers = [];
+  const getDetectedDarwinLayersOnce = () => {
+    if (platform !== 'darwin') return [];
+    if (!hasDetectedDarwinLayers) {
+      hasDetectedDarwinLayers = true;
+      if (Array.isArray(options.detectedLayers)) {
+        cachedDarwinLayers = options.detectedLayers;
+      } else {
+        const explicitHomedirOpt = options.homedir ? { homedir: options.homedir } : {};
+        cachedDarwinLayers =
+          macNativeInstallerAndCodesign.detectCompatibilityLayers({
+            ...options,
+            platform: 'darwin',
+            ...explicitHomedirOpt,
+          }) || [];
+      }
+    }
+    return cachedDarwinLayers;
+  };
+
+  let hasCollectedEpicLocal = false;
+  /** @type {any} */
+  let cachedEpicLocal = null;
+  const getEpicLocalMetadataOnce = () => {
+    if (!hasCollectedEpicLocal) {
+      hasCollectedEpicLocal = true;
+      cachedEpicLocal = epicLegendaryAndEosCoordinator.collectLocalEpicMetadataAndSupport(options);
+    }
+    return cachedEpicLocal;
+  };
+
+  const addRecord = (/** @type {any} */ record) => {
+    if (!record || !record.platformId || !record.platformGameId) return;
+    const cleanRecordId = String(record.platformGameId)
+      .replace(/^(gog|steam|epic|xbox)-/i, '')
+      .toLowerCase();
+    if (
+      !managedCompletedKeys.has(`${String(record.platformId).toLowerCase()}:${cleanRecordId}`) &&
+      isPathOrGameUnderIncompleteDownload(
+        record.installPath,
+        record.platformId,
+        record.platformGameId
+      )
+    ) {
+      return;
+    }
+    const key = `${record.platformId}:${record.platformGameId}`;
+    const existing = discoveredMap.get(key);
+    if (existing) {
+      if (existing.driveDisconnected && !record.driveDisconnected) {
+        discoveredMap.set(key, record);
+      } else if (!existing.driveDisconnected && record.driveDisconnected) {
+        // Keep mounted record over unmounted record
+      } else if (
+        platform === 'darwin' &&
+        ['steam', 'gog', 'epic', 'xbox'].includes(record.platformId) &&
+        Boolean(existing.isWindowsBinaryOnMac) !== Boolean(record.isWindowsBinaryOnMac)
+      ) {
+        const platPrefixRe = new RegExp(`^${record.platformId}[-_]`, 'i');
+        const cleanId = String(
+          record.storefrontAppId || record.appId || record.platformGameId || ''
+        ).replace(platPrefixRe, '');
+        let rawSaved =
+          launchConfigs[`${record.platformId}-${cleanId}`] ||
+          launchConfigs[`${record.platformId}_${cleanId}`] ||
+          launchConfigs[String(record.platformGameId)] ||
+          launchConfigs[cleanId] ||
+          null;
+        if (!rawSaved && cleanId) {
+          const lowerClean = cleanId.toLowerCase();
+          for (const [cfgKey, cfgVal] of Object.entries(launchConfigs)) {
+            if (!cfgVal || typeof cfgVal !== 'object') continue;
+            const kLower = cfgKey.toLowerCase();
+            if (
+              kLower === `${record.platformId}-${lowerClean}` ||
+              kLower === `${record.platformId}_${lowerClean}` ||
+              kLower === lowerClean ||
+              String(cfgVal.gameId || '').toLowerCase() ===
+                `${record.platformId}-${lowerClean}` ||
+              Boolean(
+                cfgVal.platformConfigs &&
+                  cfgVal.platformConfigs[record.platformId] &&
+                  kLower.includes(lowerClean)
+              )
+            ) {
+              rawSaved = cfgVal;
+              break;
+            }
+          }
+        }
+        const savedCfg = resolvePlatformLaunchConfig(rawSaved || {}, record.platformId);
+        const preferWinBottle = savedCfg?.launchMethod === 'compatibility_layer';
+        const preferred = preferWinBottle
+          ? record.isWindowsBinaryOnMac
+            ? record
+            : existing
+          : !record.isWindowsBinaryOnMac
+            ? record
+            : existing;
+        const secondary = preferred === record ? existing : record;
+        discoveredMap.set(key, {
+          ...secondary,
+          ...preferred,
+          executablePath: preferred.executablePath || secondary.executablePath,
+          installPath: preferred.installPath || secondary.installPath,
+          launchArguments: preferred.launchArguments || secondary.launchArguments,
+          isWindowsBinaryOnMac: Boolean(preferred.isWindowsBinaryOnMac),
+        });
+      } else {
+        discoveredMap.set(key, {
+          ...existing,
+          ...record,
+          executablePath: record.executablePath || existing.executablePath,
+          installPath: record.installPath || existing.installPath,
+          launchArguments: record.launchArguments || existing.launchArguments,
+        });
+      }
+    } else {
+      discoveredMap.set(key, record);
+    }
+    if (record.platformId === 'steam') {
+      const numId = Number(record.appId || record.platformGameId);
+      if (numId > 0 && !installedSteamAppIds.includes(numId)) {
+        installedSteamAppIds.push(numId);
+      }
+    }
+  };
+
+  return {
+    options,
+    isDefaultProdScan,
+    platform,
+    homedir,
+    customRoots,
+    userDataDir,
+    isIsolatedTest,
+    launchConfigs,
+    discoveredMap,
+    installedSteamAppIds,
+    steamInstalledDirPaths,
+    preloadedManagedRecords,
+    managedCompletedKeys,
+    getDetectedDarwinLayersOnce,
+    getEpicLocalMetadataOnce,
+    addRecord,
+  };
+}
+
+/**
+ * Shared Steam `appmanifest_<appId>.acf` processor used by both sync and async scanners.
+ *
+ * @param {any} ctx
+ * @param {string} steamappsDir
+ * @param {string} manifestPath
+ * @param {string} acfRawText
+ * @param {string | null} [preloadedInstallerXmlText]
+ */
+function processSteamManifestRecord(
+  ctx,
+  steamappsDir,
+  manifestPath,
+  acfRawText,
+  preloadedInstallerXmlText = null
+) {
+  const { platform, options, steamInstalledDirPaths, addRecord } = ctx;
+  /** @type {any} */
+  let parsed = null;
+  try {
+    parsed = parseSteamAcf(acfRawText);
+  } catch {}
+  if (!parsed || !parsed.appId) return;
+
+  // Skip Steamworks Common Redistributables
+  if (parsed.appId === 228980) return;
+
+  const installPath = parsed.installdir
+    ? path.join(steamappsDir, 'common', parsed.installdir)
+    : path.join(steamappsDir, 'common', String(parsed.appId));
+
+  const dirExists = fs.existsSync(installPath);
+  const stateFlags = parsed.StateFlags ? String(parsed.StateFlags).trim() : undefined;
+  const stateFlagsNum =
+    stateFlags !== undefined && /^\d+$/.test(stateFlags) ? Number(stateFlags) : NaN;
+  const bytesToDl = Number(parsed.BytesToDownload || 0);
+  const bytesDl = Number(parsed.BytesDownloaded || 0);
+  const isInstalledFlagSet = Number.isFinite(stateFlagsNum) && (stateFlagsNum & 4) === 4;
+  const isActivelyDownloading = Boolean(
+    !isInstalledFlagSet &&
+      ((Number.isFinite(stateFlagsNum) &&
+        (stateFlagsNum & (2 | 256 | 512 | 1024 | 2048)) !== 0) ||
+        (stateFlags && bytesToDl > 0 && bytesDl < bytesToDl))
+  );
+
+  if (isActivelyDownloading) {
+    return;
+  }
+
+  if (!dirExists) {
+    if (isExternalVolumeUnmounted(installPath, options)) {
+      const isInsideBottle = /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(installPath);
+      addRecord({
+        platformId: 'steam',
+        platformGameId: String(parsed.appId),
+        appId: parsed.appId,
+        title: parsed.name,
+        name: parsed.name,
+        installPath,
+        installSize: parseByteCountOrFormattedSize(parsed.SizeOnDisk),
+        version: parsed.buildid ? String(parsed.buildid) : undefined,
+        manifestPath,
+        runner: 'steam',
+        isWindowsBinaryOnMac: Boolean(platform === 'darwin' && isInsideBottle),
+        driveDisconnected: true,
+      });
+    }
+    return;
+  }
+
+  const appInfoSpec = resolveSteamAppInfoLaunchSpec(steamappsDir, parsed.appId, installPath, {
+    platform,
+  });
+  let installerDataParsed = null;
+  if (typeof preloadedInstallerXmlText === 'string' && preloadedInstallerXmlText) {
+    try {
+      installerDataParsed = parseSteamEaInstallerDataXml(preloadedInstallerXmlText);
+    } catch {}
+  } else if (preloadedInstallerXmlText === null) {
+    const installerXmlCandidates = [
+      path.join(installPath, '__Installer', 'installerdata.xml'),
+      path.join(installPath, '__installer', 'installerdata.xml'),
+    ];
+    for (const xmlPath of installerXmlCandidates) {
+      if (!fs.existsSync(xmlPath)) continue;
+      try {
+        installerDataParsed = parseSteamEaInstallerDataXml(fs.readFileSync(xmlPath, 'utf8'));
+        if (installerDataParsed) break;
+      } catch {}
+    }
+  }
+
+  const steamChainedHandoff = resolveAnyChainedHandoffId(
+    appInfoSpec?.chainedLauncherHandoff || (installerDataParsed?.isEaChained ? 'ea' : null)
+  );
+  const steamRequiresProtocolLaunch = Boolean(
+    appInfoSpec?.requiresStorefrontProtocolLaunch || steamChainedHandoff
+  );
+  const steamChainedContentId = installerDataParsed?.contentId || undefined;
+
+  const exeDiscovery =
+    appInfoSpec && appInfoSpec.executablePath
+      ? {
+          executablePath: appInfoSpec.launchArguments
+            ? appInfoSpec.executablePath
+            : resolveSiblingLauncherStub(appInfoSpec.executablePath, installPath),
+          isWindowsBinaryOnMac: appInfoSpec.isWindowsBinaryOnMac,
+        }
+      : findPrimaryExecutable(installPath, {
+          platform,
+          hintName: parsed.name,
+          readOnly: true,
+        });
+
+  if (!exeDiscovery.executablePath && !steamRequiresProtocolLaunch) {
+    return;
+  }
+
+  steamInstalledDirPaths.add(path.resolve(installPath).toLowerCase());
+  const isInsideBottle = /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(installPath);
+  const launchArguments =
+    appInfoSpec?.launchArguments ||
+    (exeDiscovery.executablePath
+      ? resolveDefaultEngineLaunchArguments(installPath, exeDiscovery.executablePath)
+      : undefined);
+
+  addRecord({
+    platformId: 'steam',
+    platformGameId: String(parsed.appId),
+    appId: parsed.appId,
+    title: parsed.name,
+    name: parsed.name,
+    installPath,
+    ...(exeDiscovery.executablePath ? { executablePath: exeDiscovery.executablePath } : {}),
+    ...(launchArguments ? { launchArguments } : {}),
+    ...(steamChainedHandoff
+      ? {
+          chainedLauncherHandoff: steamChainedHandoff,
+          externalStorefrontHandoff: steamChainedHandoff,
+          chainedHandoffTopology: 'storefront_depot_uri',
+        }
+      : {}),
+    ...(steamRequiresProtocolLaunch ? { requiresStorefrontProtocolLaunch: true } : {}),
+    ...(steamChainedContentId ? { chainedExternalInstallId: steamChainedContentId } : {}),
+    ...(appInfoSpec?.protocolUri ? { protocolUri: appInfoSpec.protocolUri } : {}),
+    installSize: parseByteCountOrFormattedSize(parsed.SizeOnDisk),
+    version: parsed.buildid ? String(parsed.buildid) : undefined,
+    manifestPath,
+    runner: 'steam',
+    isWindowsBinaryOnMac:
+      Boolean(exeDiscovery.isWindowsBinaryOnMac) ||
+      (platform === 'darwin' && (isInsideBottle || Boolean(steamChainedHandoff))),
+  });
+}
+
+function getDarwinBottleContainerDirs(/** @type {any} */ ctx) {
+  if (ctx.platform !== 'darwin') return [];
+  const detectedDarwinLayers = ctx.getDetectedDarwinLayersOnce();
+  return Array.from(
+    new Set([
+      path.join(ctx.homedir, 'Library/Application Support/CrossOver/Bottles'),
+      path.join(ctx.homedir, 'Library/Application Support/CrossOver Preview/Bottles'),
+      path.join(ctx.homedir, 'Library/Application Support/CrossOver Preview arm64/Bottles'),
+      path.join(ctx.homedir, 'Games/OneLauncher/Bottles'),
+      path.join(ctx.homedir, 'Bottles'),
+      path.join(ctx.homedir, 'Library/Application Support/Whisky/Bottles'),
+      path.join(ctx.homedir, 'Library/Application Support/Mythic/Bottles'),
+      ...(Array.isArray(detectedDarwinLayers) ? detectedDarwinLayers : [])
+        .map((/** @type {any} */ l) => l?.bottlesDir)
+        .filter((/** @type {any} */ d) => typeof d === 'string' && d.trim()),
+    ])
+  );
+}
+
+function buildGogScanSources(/** @type {any} */ ctx, /** @type {string[]} */ discoveredBottleRoots) {
+  const { homedir, customRoots, userDataDir, isIsolatedTest } = ctx;
+  const gogSearchDirs = new Set([
+    path.join(homedir, 'Applications'),
+    path.join(homedir, 'Games'),
+    path.join(homedir, 'Games', 'OneLauncher', 'GOG'),
+    path.join(homedir, 'Games', 'Heroic'),
+    ...customRoots.map((/** @type {string} */ r) => toLocalFsPath(r, customRoots)),
+  ]);
+
+  for (const bottleRoot of discoveredBottleRoots) {
+    gogSearchDirs.add(path.join(bottleRoot, 'drive_c/Program Files (x86)/GOG Galaxy/Games'));
+    gogSearchDirs.add(path.join(bottleRoot, 'drive_c/Program Files/GOG Galaxy/Games'));
+    gogSearchDirs.add(path.join(bottleRoot, 'drive_c/GOG Games'));
+    gogSearchDirs.add(path.join(bottleRoot, 'drive_c/Games/OneLauncher/GOG'));
+  }
+
+  if (!isIsolatedTest) {
+    gogSearchDirs.add('/Applications');
+    gogSearchDirs.add('C:\\Program Files (x86)\\GOG Galaxy\\Games');
+    gogSearchDirs.add('C:\\Program Files\\GOG Galaxy\\Games');
+    gogSearchDirs.add('C:\\GOG Games');
+    gogSearchDirs.add('C:\\Games\\OneLauncher\\GOG');
+  }
+
+  const gogGalaxyConfigs = [
+    path.join(homedir, 'Library/Application Support/GOG.com/Galaxy/config.json'),
+    ...customRoots.map((/** @type {string} */ r) =>
+      path.join(toLocalFsPath(r, customRoots), 'config.json')
+    ),
+    ...discoveredBottleRoots.map((bRoot) =>
+      path.join(bRoot, 'drive_c/ProgramData/GOG.com/Galaxy/config.json')
+    ),
+  ];
+  if (!isIsolatedTest) {
+    gogGalaxyConfigs.push(
+      '/Users/Shared/GOG.com/Galaxy/config.json',
+      'C:\\ProgramData\\GOG.com\\Galaxy\\config.json'
+    );
+  }
+
+  const heroicGogFiles = [
+    path.join(userDataDir, 'gog_store/installed.json'),
+    path.join(homedir, 'Library/Application Support/heroic/gog_store/installed.json'),
+    path.join(homedir, '.config/heroic/gog_store/installed.json'),
+    path.join(homedir, 'AppData/Roaming/heroic/gog_store/installed.json'),
+    ...customRoots.map((/** @type {string} */ r) =>
+      path.join(toLocalFsPath(r, customRoots), 'gog_store/installed.json')
+    ),
+    ...customRoots.map((/** @type {string} */ r) =>
+      path.join(toLocalFsPath(r, customRoots), 'heroic/gog_store/installed.json')
+    ),
+  ];
+
+  return { gogSearchDirs, gogGalaxyConfigs, heroicGogFiles };
+}
+
+function applyGogGalaxyConfigJson(
+  /** @type {any} */ ctx,
+  /** @type {string} */ cfgPath,
+  /** @type {string} */ rawText,
+  /** @type {Set<string>} */ gogSearchDirs
+) {
+  try {
+    const cfgBottleRoot = extractBottleRootFromPath(cfgPath);
+    const cfg = JSON.parse(rawText);
+    if (cfg.libraryPath) {
+      const libLocal = cfgBottleRoot
+        ? fromWineWindowsPath(cfg.libraryPath, cfgBottleRoot)
+        : toLocalFsPath(cfg.libraryPath, ctx.customRoots);
+      if (libLocal) gogSearchDirs.add(libLocal);
+    }
+    if (Array.isArray(cfg.installed)) {
+      for (const item of cfg.installed) {
+        if (item.installPath) {
+          const itemLocal = cfgBottleRoot
+            ? fromWineWindowsPath(item.installPath, cfgBottleRoot)
+            : toLocalFsPath(item.installPath, ctx.customRoots);
+          if (itemLocal) gogSearchDirs.add(itemLocal);
+        }
+      }
+    }
+  } catch {}
+}
+
+function processGogInfoJson(
+  /** @type {any} */ ctx,
+  /** @type {string} */ infoFilePath,
+  /** @type {string} */ rawText
+) {
+  const { platform, managedCompletedKeys, addRecord } = ctx;
+  try {
+    const raw = JSON.parse(rawText);
+    const fileMatch = path.basename(infoFilePath).match(/^goggame-(\d+)\.info$/i);
+    const gameId = String(raw.gameId || raw.rootGameId || (fileMatch ? fileMatch[1] : ''));
+    if (!gameId) return;
+
+    const title = String(raw.name || raw.title || `GOG Game ${gameId}`);
+    if (/^(steam|epic|custom)-\d+$/i.test(title)) return;
+    let installPath = path.dirname(infoFilePath);
+
+    if (isPathUnderActiveDownload(installPath)) return;
+    if (
+      !managedCompletedKeys.has(`gog:${gameId.toLowerCase()}`) &&
+      (fs.existsSync(path.join(installPath, '.gogdl-resume')) ||
+        fs.existsSync(path.join(installPath, '.gogdl-download-cache')) ||
+        fs.existsSync(path.join(installPath, '.onelauncher-gog-v2-resume.json')))
+    ) {
+      return;
+    }
+
+    const normInfoDir = installPath.replace(/\\/g, '/');
+    if (normInfoDir.endsWith('/Contents/Resources')) {
+      const candidateParentDir = path.resolve(installPath, '..', '..');
+      if (candidateParentDir.toLowerCase().endsWith('.app')) {
+        const parentOfApp = path.dirname(candidateParentDir);
+        const parentBase = path.basename(parentOfApp).toLowerCase();
+        if (
+          parentOfApp &&
+          !/^(applications|gog|heroic|games|onelauncher)$/i.test(parentBase) &&
+          /[\\/](OneLauncher[\\/]GOG|GOG Galaxy[\\/]Games|Heroic)[\\/]/i.test(candidateParentDir)
+        ) {
+          installPath = parentOfApp;
+        } else {
+          installPath = candidateParentDir;
+        }
+      } else {
+        installPath = candidateParentDir;
+      }
       if (
-        !managedCompletedKeys.has(`${String(record.platformId).toLowerCase()}:${cleanRecordId}`) &&
-        isPathOrGameUnderIncompleteDownload(
-          record.installPath,
-          record.platformId,
-          record.platformGameId
-        )
+        !managedCompletedKeys.has(`gog:${gameId.toLowerCase()}`) &&
+        (fs.existsSync(path.join(installPath, '.gogdl-resume')) ||
+          fs.existsSync(path.join(installPath, '.gogdl-download-cache')) ||
+          fs.existsSync(path.join(installPath, '.onelauncher-gog-v2-resume.json')))
       ) {
         return;
       }
-      const key = `${record.platformId}:${record.platformGameId}`;
-      const existing = discoveredMap.get(key);
-      if (existing) {
-        if (existing.driveDisconnected && !record.driveDisconnected) {
-          discoveredMap.set(key, record);
-        } else if (!existing.driveDisconnected && record.driveDisconnected) {
-          // Keep mounted record over unmounted record
-        } else if (
-          platform === 'darwin' &&
-          ['steam', 'gog', 'epic', 'xbox'].includes(record.platformId) &&
-          Boolean(existing.isWindowsBinaryOnMac) !== Boolean(record.isWindowsBinaryOnMac)
+    }
+
+    let executablePath = undefined;
+    let launchArguments = undefined;
+    let isWindowsBinaryOnMac = false;
+
+    if (Array.isArray(raw.playTasks)) {
+      const isFileTask = (/** @type {any} */ t) =>
+        Boolean(t && t.path && (!t.type || String(t.type) === 'FileTask'));
+      let primaryTask = selectPreferredGogPlayTask(
+        raw.playTasks,
+        [path.dirname(infoFilePath), installPath],
+        { platform }
+      );
+      if (primaryTask && primaryTask.path) {
+        const baseName = path.basename(String(primaryTask.path).replace(/\\/g, '/'));
+        const stem = extractSiblingLauncherStem(baseName);
+        if (stem) {
+          const siblingName = `${stem.toLowerCase()}.exe`;
+          const siblingTask = raw.playTasks.find((/** @type {any} */ t) => {
+            if (!isFileTask(t)) return false;
+            const tBase = path.basename(String(t.path).replace(/\\/g, '/')).toLowerCase();
+            return tBase === siblingName;
+          });
+          if (siblingTask) {
+            primaryTask = siblingTask;
+          }
+        }
+      }
+      if (primaryTask && primaryTask.path) {
+        if (
+          primaryTask.arguments &&
+          typeof primaryTask.arguments === 'string' &&
+          primaryTask.arguments.trim()
         ) {
-          const platPrefixRe = new RegExp(`^${record.platformId}[-_]`, 'i');
-          const cleanId = String(
-            record.storefrontAppId || record.appId || record.platformGameId || ''
-          ).replace(platPrefixRe, '');
-          let rawSaved =
-            launchConfigs[`${record.platformId}-${cleanId}`] ||
-            launchConfigs[`${record.platformId}_${cleanId}`] ||
-            launchConfigs[String(record.platformGameId)] ||
-            launchConfigs[cleanId] ||
-            null;
-          if (!rawSaved && cleanId) {
-            const lowerClean = cleanId.toLowerCase();
-            for (const [cfgKey, cfgVal] of Object.entries(launchConfigs)) {
-              if (!cfgVal || typeof cfgVal !== 'object') continue;
-              const kLower = cfgKey.toLowerCase();
-              if (
-                kLower === `${record.platformId}-${lowerClean}` ||
-                kLower === `${record.platformId}_${lowerClean}` ||
-                kLower === lowerClean ||
-                String(cfgVal.gameId || '').toLowerCase() ===
-                  `${record.platformId}-${lowerClean}` ||
-                Boolean(
-                  cfgVal.platformConfigs &&
-                    cfgVal.platformConfigs[record.platformId] &&
-                    kLower.includes(lowerClean)
-                )
-              ) {
-                rawSaved = cfgVal;
-                break;
+          launchArguments = primaryTask.arguments.trim();
+        }
+        const relTaskPath = primaryTask.path.replace(/\\/g, path.sep);
+        const candidates = [
+          path.join(installPath, relTaskPath),
+          path.join(path.dirname(infoFilePath), relTaskPath),
+          path.join(path.resolve(path.dirname(infoFilePath), '..', '..'), relTaskPath),
+        ];
+        for (const c of candidates) {
+          if (fs.existsSync(c)) {
+            const resolvedCand = c.endsWith('.app') ? resolveMacAppBundleBinary(c) : c;
+            if (platform === 'darwin' && /[\\/]GOGLauncher$/i.test(String(resolvedCand || ''))) {
+              continue;
+            }
+            if (
+              platform === 'darwin' &&
+              resolvedCand &&
+              !resolvedCand.toLowerCase().endsWith('.exe') &&
+              inspectMacMachOHeader(resolvedCand).is32BitOnly
+            ) {
+              continue;
+            }
+            executablePath = resolvedCand || undefined;
+            break;
+          }
+        }
+        if (executablePath && !launchArguments) {
+          executablePath = resolveSiblingLauncherStub(executablePath, installPath);
+        }
+      }
+    }
+
+    if (!executablePath) {
+      const discovered = findPrimaryExecutable(installPath, {
+        platform,
+        hintName: title,
+        readOnly: true,
+      });
+      executablePath = resolveSiblingLauncherStub(discovered.executablePath, installPath);
+      isWindowsBinaryOnMac = discovered.isWindowsBinaryOnMac;
+    } else if (platform === 'darwin' && executablePath.toLowerCase().endsWith('.exe')) {
+      isWindowsBinaryOnMac = true;
+    }
+
+    addRecord({
+      platformId: 'gog',
+      platformGameId: gameId,
+      title,
+      installPath,
+      executablePath,
+      ...(launchArguments ? { launchArguments } : {}),
+      version: raw.version
+        ? String(raw.version)
+        : raw.buildId
+          ? String(raw.buildId)
+          : undefined,
+      manifestPath: infoFilePath,
+      runner: 'gog',
+      isWindowsBinaryOnMac,
+    });
+  } catch {}
+}
+
+function processHeroicGogFileJson(
+  /** @type {any} */ ctx,
+  /** @type {string} */ hgFile,
+  /** @type {string} */ rawText
+) {
+  const { platform, customRoots, options, addRecord } = ctx;
+  try {
+    const raw = JSON.parse(rawText);
+    const list = Array.isArray(raw)
+      ? raw
+      : Array.isArray(raw?.installed)
+        ? raw.installed
+        : Object.values(raw || {});
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
+      const gameId = String(item.appName || item.gameId || item.id || '');
+      const rawInstallPath = item.install_path || item.installPath;
+      if (!gameId || !rawInstallPath) continue;
+      const installPath = toLocalFsPath(rawInstallPath, customRoots);
+      const title = item.title || item.name || `GOG Game ${gameId}`;
+      const isWindowsGogItem =
+        platform === 'darwin' && String(item.platform || '').toLowerCase() === 'windows';
+
+      if (!installPath || !fs.existsSync(installPath)) {
+        if (isExternalVolumeUnmounted(String(rawInstallPath), options)) {
+          addRecord({
+            platformId: 'gog',
+            platformGameId: gameId,
+            title,
+            installPath: installPath || String(rawInstallPath),
+            executablePath: item.executable
+              ? toLocalFsPath(item.executable, customRoots) || String(item.executable)
+              : undefined,
+            installSize: parseByteCountOrFormattedSize(item.install_size ?? item.installSize),
+            version: item.version ? String(item.version) : undefined,
+            manifestPath: hgFile,
+            runner: 'gogdl',
+            isWindowsBinaryOnMac: isWindowsGogItem,
+            driveDisconnected: true,
+          });
+        }
+        continue;
+      }
+
+      const discovered = findPrimaryExecutable(installPath, {
+        platform,
+        hintName: title,
+        preferWindowsExecutable: isWindowsGogItem,
+        readOnly: true,
+      });
+      const itemExeCandidate = item.executable ? toLocalFsPath(item.executable, customRoots) : '';
+      const rawHeroicExe =
+        itemExeCandidate && fs.existsSync(itemExeCandidate)
+          ? itemExeCandidate
+          : discovered.executablePath || itemExeCandidate || undefined;
+      const resolvedHeroicExe = rawHeroicExe
+        ? resolveSiblingLauncherStub(rawHeroicExe, installPath)
+        : undefined;
+      const isWinOnMac =
+        discovered.isWindowsBinaryOnMac ||
+        isWindowsGogItem ||
+        Boolean(
+          platform === 'darwin' &&
+            resolvedHeroicExe &&
+            resolvedHeroicExe.toLowerCase().endsWith('.exe')
+        );
+
+      addRecord({
+        platformId: 'gog',
+        platformGameId: gameId,
+        title,
+        installPath,
+        executablePath: resolvedHeroicExe,
+        installSize: parseByteCountOrFormattedSize(item.install_size ?? item.installSize),
+        version: item.version ? String(item.version) : undefined,
+        manifestPath: hgFile,
+        runner: 'gogdl',
+        isWindowsBinaryOnMac: isWinOnMac,
+      });
+    }
+  } catch {}
+}
+
+function buildEpicScanSources(/** @type {any} */ ctx, /** @type {string[]} */ discoveredBottleRoots) {
+  const { platform, homedir, customRoots, userDataDir, isIsolatedTest, options } = ctx;
+  const epicManifestDirs = new Set([
+    path.join(homedir, 'Library/Application Support/Epic/EpicGamesLauncher/Data/Manifests'),
+    path.join(homedir, 'ProgramData/Epic/EpicGamesLauncher/Data/Manifests'),
+    ...discoveredBottleRoots.map((bRoot) =>
+      path.join(bRoot, 'drive_c/ProgramData/Epic/EpicGamesLauncher/Data/Manifests')
+    ),
+  ]);
+  if (!isIsolatedTest) {
+    epicManifestDirs.add('C:\\ProgramData\\Epic\\EpicGamesLauncher\\Data\\Manifests');
+    if (platform === 'win32') {
+      const regEpic = discoverWindowsEpicRegistryPaths(options);
+      if (regEpic.manifestsDir) {
+        epicManifestDirs.add(regEpic.manifestsDir);
+      }
+    }
+  }
+  for (const root of customRoots) {
+    const localRoot = toLocalFsPath(root, customRoots);
+    if (!localRoot) continue;
+    epicManifestDirs.add(localRoot);
+    epicManifestDirs.add(path.join(localRoot, 'Manifests'));
+    epicManifestDirs.add(path.join(localRoot, 'Data', 'Manifests'));
+    epicManifestDirs.add(path.join(localRoot, 'Epic/EpicGamesLauncher/Data/Manifests'));
+    epicManifestDirs.add(
+      path.join(localRoot, 'ProgramData/Epic/EpicGamesLauncher/Data/Manifests')
+    );
+  }
+
+  const launcherInstalledFiles = [
+    path.join(
+      homedir,
+      'Library/Application Support/Epic/UnrealEngineLauncher/LauncherInstalled.dat'
+    ),
+    ...discoveredBottleRoots.map((bRoot) =>
+      path.join(bRoot, 'drive_c/ProgramData/Epic/UnrealEngineLauncher/LauncherInstalled.dat')
+    ),
+    ...customRoots.map((/** @type {string} */ r) =>
+      path.join(toLocalFsPath(r, customRoots), 'LauncherInstalled.dat')
+    ),
+    ...customRoots.map((/** @type {string} */ r) =>
+      path.join(
+        toLocalFsPath(r, customRoots),
+        'Epic/UnrealEngineLauncher/LauncherInstalled.dat'
+      )
+    ),
+  ];
+  if (!isIsolatedTest) {
+    launcherInstalledFiles.push(
+      'C:\\ProgramData\\Epic\\UnrealEngineLauncher\\LauncherInstalled.dat'
+    );
+  }
+
+  const managedLegendaryInstalledPath = path.resolve(
+    path.join(userDataDir, 'legendaryConfig/legendary/installed.json')
+  );
+  const legendaryFiles = [
+    path.join(userDataDir, 'legendaryConfig/legendary/installed.json'),
+    path.join(
+      homedir,
+      'Library/Application Support/heroic/legendaryConfig/legendary/installed.json'
+    ),
+    path.join(homedir, '.config/legendary/installed.json'),
+    path.join(homedir, 'AppData/Roaming/heroic/legendaryConfig/legendary/installed.json'),
+    ...customRoots.map((/** @type {string} */ r) =>
+      path.join(toLocalFsPath(r, customRoots), 'installed.json')
+    ),
+    ...customRoots.map((/** @type {string} */ r) =>
+      path.join(toLocalFsPath(r, customRoots), 'legendary/installed.json')
+    ),
+    ...customRoots.map((/** @type {string} */ r) =>
+      path.join(toLocalFsPath(r, customRoots), 'heroic/legendaryConfig/legendary/installed.json')
+    ),
+  ];
+
+  return {
+    epicManifestDirs,
+    launcherInstalledFiles,
+    legendaryFiles,
+    managedLegendaryInstalledPath,
+  };
+}
+
+function processEpicItemJson(
+  /** @type {any} */ ctx,
+  /** @type {string | null} */ manifestBottleRoot,
+  /** @type {string} */ itemPath,
+  /** @type {string} */ rawText
+) {
+  const { platform, customRoots, userDataDir, isIsolatedTest, options, addRecord } = ctx;
+  try {
+    const item = JSON.parse(rawText);
+    if (item.bIsIncompleteInstall === true) return;
+
+    const appName = String(item.AppName || item.CatalogItemId || '');
+    if (!appName) return;
+
+    const title = String(item.DisplayName || appName);
+    const rawInstallLoc = item.InstallLocation || '';
+    const installPath = manifestBottleRoot
+      ? fromWineWindowsPath(rawInstallLoc, manifestBottleRoot)
+      : toLocalFsPath(rawInstallLoc, customRoots);
+
+    if (!installPath || !fs.existsSync(installPath)) {
+      const checkUnmountedPath = installPath || String(rawInstallLoc);
+      if (isExternalVolumeUnmounted(checkUnmountedPath, options)) {
+        addRecord({
+          platformId: 'epic',
+          platformGameId: appName,
+          title,
+          installPath: checkUnmountedPath,
+          installSize: parseByteCountOrFormattedSize(item.InstallSize),
+          version: item.AppVersionString ? String(item.AppVersionString) : undefined,
+          manifestPath: itemPath,
+          runner: 'epic',
+          isWindowsBinaryOnMac: Boolean(platform === 'darwin' && manifestBottleRoot),
+          driveDisconnected: true,
+        });
+      }
+      return;
+    }
+
+    let executablePath = undefined;
+    let isWindowsBinaryOnMac = Boolean(platform === 'darwin' && manifestBottleRoot);
+
+    if (item.LaunchExecutable) {
+      const cleanLaunchExe = String(item.LaunchExecutable).replace(/\\/g, path.sep);
+      const candidateExe = path.join(installPath, cleanLaunchExe);
+      if (fs.existsSync(candidateExe)) {
+        executablePath =
+          (candidateExe.endsWith('.app')
+            ? resolveMacAppBundleBinary(candidateExe)
+            : candidateExe) || undefined;
+      } else {
+        const discovered = findPrimaryExecutable(installPath, {
+          platform,
+          hintName: title,
+          readOnly: true,
+        });
+        executablePath = discovered.executablePath;
+        isWindowsBinaryOnMac = isWindowsBinaryOnMac || discovered.isWindowsBinaryOnMac;
+      }
+    } else {
+      const discovered = findPrimaryExecutable(installPath, {
+        platform,
+        hintName: title,
+        readOnly: true,
+      });
+      executablePath = discovered.executablePath;
+      isWindowsBinaryOnMac = isWindowsBinaryOnMac || discovered.isWindowsBinaryOnMac;
+    }
+
+    const launchArguments =
+      item.LaunchCommand && typeof item.LaunchCommand === 'string'
+        ? item.LaunchCommand.trim()
+        : '';
+
+    if (executablePath && !launchArguments) {
+      executablePath = resolveSiblingLauncherStub(executablePath, installPath);
+    }
+    if (!executablePath || !fs.existsSync(executablePath)) return;
+
+    if (
+      platform === 'darwin' &&
+      executablePath &&
+      executablePath.toLowerCase().endsWith('.exe')
+    ) {
+      isWindowsBinaryOnMac = true;
+    }
+
+    if (Boolean(options.userDataDir) || !isIsolatedTest) {
+      recordImportedEpicInstall({ appName, installPath, source: itemPath }, { userDataDir });
+    }
+
+    addRecord({
+      platformId: 'epic',
+      platformGameId: appName,
+      title,
+      installPath,
+      executablePath,
+      ...(launchArguments ? { launchArguments } : {}),
+      installSize: parseByteCountOrFormattedSize(item.InstallSize),
+      version: item.AppVersionString ? String(item.AppVersionString) : undefined,
+      manifestPath: itemPath,
+      runner: 'epic',
+      isWindowsBinaryOnMac,
+    });
+  } catch {}
+}
+
+function processEpicDatJson(
+  /** @type {any} */ ctx,
+  /** @type {string} */ datFile,
+  /** @type {string | null} */ datBottleRoot,
+  /** @type {string} */ rawText
+) {
+  const { platform, customRoots, userDataDir, isIsolatedTest, options, addRecord } = ctx;
+  try {
+    const dat = JSON.parse(rawText);
+    const list = Array.isArray(dat?.InstallationList) ? dat.InstallationList : [];
+    for (const entry of list) {
+      const appName = String(entry.AppName || entry.ArtifactId || '');
+      if (!appName || appName.startsWith('UE_')) continue;
+      const rawInstallLoc = entry.InstallLocation || '';
+      const installPath = datBottleRoot
+        ? fromWineWindowsPath(rawInstallLoc, datBottleRoot)
+        : toLocalFsPath(rawInstallLoc, customRoots);
+      if (!installPath || !fs.existsSync(installPath)) {
+        const checkUnmountedPath = installPath || String(rawInstallLoc);
+        if (isExternalVolumeUnmounted(checkUnmountedPath, options)) {
+          addRecord({
+            platformId: 'epic',
+            platformGameId: appName,
+            title: entry.DisplayName || path.basename(checkUnmountedPath) || appName,
+            installPath: checkUnmountedPath,
+            version: entry.AppVersion ? String(entry.AppVersion) : undefined,
+            manifestPath: datFile,
+            runner: 'epic',
+            isWindowsBinaryOnMac: Boolean(platform === 'darwin' && datBottleRoot),
+            driveDisconnected: true,
+          });
+        }
+        continue;
+      }
+
+      const discovered = findPrimaryExecutable(installPath, {
+        platform,
+        hintName: appName,
+        readOnly: true,
+      });
+      const effectiveEpicExe = resolveSiblingLauncherStub(discovered.executablePath, installPath);
+      if (!effectiveEpicExe || !fs.existsSync(effectiveEpicExe)) continue;
+
+      if (Boolean(options.userDataDir) || !isIsolatedTest) {
+        recordImportedEpicInstall({ appName, installPath, source: datFile }, { userDataDir });
+      }
+
+      addRecord({
+        platformId: 'epic',
+        platformGameId: appName,
+        title: entry.DisplayName || path.basename(installPath) || appName,
+        installPath,
+        executablePath: effectiveEpicExe,
+        version: entry.AppVersion ? String(entry.AppVersion) : undefined,
+        manifestPath: datFile,
+        runner: 'epic',
+        isWindowsBinaryOnMac:
+          discovered.isWindowsBinaryOnMac || Boolean(platform === 'darwin' && datBottleRoot),
+      });
+    }
+  } catch {}
+}
+
+function processLegendaryFileJson(
+  /** @type {any} */ ctx,
+  /** @type {string} */ legFile,
+  /** @type {boolean} */ isExternalLegFile,
+  /** @type {string} */ rawText
+) {
+  const { platform, customRoots, userDataDir, isIsolatedTest, options, addRecord } = ctx;
+  try {
+    const raw = JSON.parse(rawText);
+    const entries = Array.isArray(raw)
+      ? raw
+      : raw && typeof raw === 'object'
+        ? Object.entries(raw).map(([k, v]) =>
+            v && typeof v === 'object' ? { _mapKey: k, app_name: k, ...v } : null
+          )
+        : [];
+
+    for (const item of entries) {
+      if (!item || typeof item !== 'object') continue;
+      const appName = String(item.app_name || item.appName || '');
+      const rawInstallPath = item.install_path || item.installPath;
+      if (!appName || !rawInstallPath) continue;
+
+      const title = String(item.title || appName);
+      const installPath = toLocalFsPath(rawInstallPath, customRoots);
+      if (!installPath || !fs.existsSync(installPath)) {
+        const checkUnmountedPath = installPath || String(rawInstallPath);
+        if (isExternalVolumeUnmounted(checkUnmountedPath, options)) {
+          addRecord({
+            platformId: 'epic',
+            platformGameId: appName,
+            title,
+            installPath: checkUnmountedPath,
+            installSize: parseByteCountOrFormattedSize(item.install_size ?? item.installSize),
+            version: item.version ? String(item.version) : undefined,
+            manifestPath: legFile,
+            runner: 'legendary',
+            isWindowsBinaryOnMac: Boolean(
+              platform === 'darwin' &&
+                String(item.platform || '').toLowerCase() === 'windows'
+            ),
+            driveDisconnected: true,
+          });
+        }
+        continue;
+      }
+
+      let executablePath = undefined;
+      if (item.executable) {
+        const cleanExe = String(item.executable).replace(/\\/g, path.sep);
+        const candidate = path.isAbsolute(cleanExe) ? cleanExe : path.join(installPath, cleanExe);
+        executablePath = toLocalFsPath(candidate, customRoots);
+      }
+      const discovered = findPrimaryExecutable(installPath, {
+        platform,
+        hintName: title,
+        readOnly: true,
+      });
+      if (!executablePath || !fs.existsSync(executablePath)) {
+        executablePath = discovered.executablePath;
+      }
+      if (executablePath) {
+        executablePath = resolveSiblingLauncherStub(executablePath, installPath);
+      }
+      if (!executablePath || !fs.existsSync(executablePath)) {
+        continue;
+      }
+
+      if (isExternalLegFile && (Boolean(options.userDataDir) || !isIsolatedTest)) {
+        recordImportedEpicInstall({ appName, installPath, source: legFile }, { userDataDir });
+      }
+
+      const isWindowsBinaryOnMac =
+        discovered.isWindowsBinaryOnMac ||
+        (platform === 'darwin' &&
+          (String(item.platform || '').toLowerCase() === 'windows' ||
+            Boolean(executablePath && executablePath.toLowerCase().endsWith('.exe'))));
+
+      const launchArguments =
+        item.launch_parameters && typeof item.launch_parameters === 'string'
+          ? item.launch_parameters.trim()
+          : '';
+
+      addRecord({
+        platformId: 'epic',
+        platformGameId: appName,
+        title,
+        installPath,
+        executablePath,
+        ...(launchArguments ? { launchArguments } : {}),
+        installSize: parseByteCountOrFormattedSize(item.install_size ?? item.installSize),
+        version: item.version ? String(item.version) : undefined,
+        manifestPath: legFile,
+        runner: 'legendary',
+        isWindowsBinaryOnMac,
+      });
+    }
+  } catch {}
+}
+
+function processXboxCandidateDir(/** @type {any} */ ctx, /** @type {string} */ xboxDir) {
+  const xboxRecord = inspectInstalledXboxGameDir(xboxDir, {
+    platform: ctx.platform,
+    strictPe: Boolean(ctx.options.strictPe),
+  });
+  if (
+    xboxRecord &&
+    !(xboxRecord.isExternalLauncherStub && !xboxRecord.executablePath) &&
+    !isGdkStubExecutablePath(xboxRecord.executablePath)
+  ) {
+    ctx.addRecord(xboxRecord);
+  }
+}
+
+function collectDarwinChainedBottlePaths(/** @type {any} */ ctx) {
+  const { options, customRoots } = ctx;
+  const explicitHomedirOpt = options.homedir ? { homedir: options.homedir } : {};
+  const bottleSet = new Set(
+    listAllInitializedBottlePaths({
+      ...options,
+      platform: 'darwin',
+      ...explicitHomedirOpt,
+    })
+  );
+  for (const cr of customRoots) {
+    if (!cr || typeof cr !== 'string') continue;
+    const bRoot = extractBottleRootFromPath(cr);
+    if (bRoot && fs.existsSync(bRoot)) {
+      bottleSet.add(path.resolve(bRoot));
+    } else if (
+      fs.existsSync(path.join(cr, 'drive_c')) ||
+      fs.existsSync(path.join(cr, 'system.reg'))
+    ) {
+      bottleSet.add(path.resolve(cr));
+    }
+  }
+  return Array.from(bottleSet);
+}
+
+function reconcileChainedPublisherEntries(
+  /** @type {any} */ ctx,
+  /** @type {Array<{ found: any, isBottle: boolean, compatibilityLayer?: string, wineBottle?: string }>} */ discoveredPublisherEntries
+) {
+  if (discoveredPublisherEntries.length === 0) return;
+  const { userDataDir, options, preloadedManagedRecords, steamInstalledDirPaths, platform, addRecord } =
+    ctx;
+  const catalogIndex = loadChainedCatalogIndex(
+    userDataDir,
+    options,
+    preloadedManagedRecords,
+    ctx.getEpicLocalMetadataOnce
+  );
+  for (const item of discoveredPublisherEntries) {
+    const { found, isBottle, compatibilityLayer, wineBottle } = item;
+    if (
+      !found ||
+      !found.handoffId ||
+      !found.installPath ||
+      !found.executablePath ||
+      isGdkStubExecutablePath(found.executablePath)
+    ) {
+      continue;
+    }
+
+    const resolvedFoundPathLower = path.resolve(found.installPath).toLowerCase();
+    // Skip Steam depots (`steamapps/common/*`) that register in EA/Ubisoft Windows registry
+    // so Steam `storefront_depot_uri` games never emit duplicate `ea:<contentId>` cards or hijack other stores.
+    if (
+      /(?:^|[\\/])steamapps[\\/]common(?:[\\/]|$)/i.test(found.installPath) ||
+      steamInstalledDirPaths.has(resolvedFoundPathLower)
+    ) {
+      continue;
+    }
+
+    const handoffId = resolveAnyChainedHandoffId(found.handoffId) || found.handoffId;
+    const extId = found.externalInstallId ? String(found.externalInstallId) : '';
+    const matchKeys = Array.from(
+      new Set([
+        ...buildChainedTitleMatchKeys(found.title || ''),
+        ...buildChainedTitleMatchKeys(path.basename(found.installPath)),
+      ])
+    );
+
+    const managedPathMatch =
+      catalogIndex.managedByInstallPath.get(resolvedFoundPathLower) || null;
+    const extMatch =
+      !managedPathMatch && extId
+        ? catalogIndex.byExternalId.get(`${handoffId}:${extId.toLowerCase()}`) || null
+        : null;
+    let xboxMatch = null;
+    let epicMatch = null;
+    let standaloneMatch = null;
+    if (!managedPathMatch && !extMatch) {
+      for (const mk of matchKeys) {
+        xboxMatch = catalogIndex.xboxHandoffByFullKey.get(`${handoffId}:${mk}`) || null;
+        if (xboxMatch) break;
+      }
+      if (!xboxMatch) {
+        for (const mk of matchKeys) {
+          epicMatch = catalogIndex.epicHandoffByFullKey.get(`${handoffId}:${mk}`) || null;
+          if (epicMatch) break;
+        }
+      }
+      if (!xboxMatch && !epicMatch) {
+        for (const mk of matchKeys) {
+          xboxMatch = catalogIndex.xboxHandoffByBaseKey.get(`${handoffId}:${mk}`) || null;
+          if (xboxMatch) break;
+        }
+      }
+      if (!xboxMatch && !epicMatch) {
+        for (const mk of matchKeys) {
+          epicMatch = catalogIndex.epicHandoffByBaseKey.get(`${handoffId}:${mk}`) || null;
+          if (epicMatch) break;
+        }
+      }
+      if (!xboxMatch && !epicMatch) {
+        for (const mk of matchKeys) {
+          standaloneMatch = catalogIndex.standaloneByFullKey.get(`${handoffId}:${mk}`) || null;
+          if (standaloneMatch) break;
+        }
+      }
+      if (!xboxMatch && !epicMatch && !standaloneMatch) {
+        for (const mk of matchKeys) {
+          standaloneMatch = catalogIndex.standaloneByBaseKey.get(`${handoffId}:${mk}`) || null;
+          if (standaloneMatch) break;
+        }
+      }
+    }
+
+    let targetPlatformId = handoffId;
+    let targetPlatformGameId =
+      extId || normalizeComparableTitle(found.title || '') || path.basename(found.installPath);
+    /** @type {string | undefined} */
+    let xboxProductId = undefined;
+    let resolvedTitle = found.title || path.basename(found.installPath);
+    /** @type {string | undefined} */
+    let chainedHandoffTopology = undefined;
+
+    if (managedPathMatch) {
+      targetPlatformId = managedPathMatch.platformId;
+      targetPlatformGameId = managedPathMatch.platformGameId;
+      xboxProductId = managedPathMatch.xboxProductId;
+      if (managedPathMatch.title) resolvedTitle = managedPathMatch.title;
+      if (targetPlatformId === 'epic') {
+        chainedHandoffTopology = 'partner_launcher_link';
+      } else if (targetPlatformId === 'xbox') {
+        chainedHandoffTopology = 'publisher_managed';
+      }
+    } else if (extMatch) {
+      targetPlatformId = extMatch.platformId;
+      targetPlatformGameId = extMatch.platformGameId;
+      xboxProductId = extMatch.xboxProductId;
+      if (extMatch.title) resolvedTitle = extMatch.title;
+      if (targetPlatformId === 'epic') {
+        chainedHandoffTopology = 'partner_launcher_link';
+      } else if (targetPlatformId === 'xbox') {
+        chainedHandoffTopology = 'publisher_managed';
+      }
+    } else if (xboxMatch) {
+      targetPlatformId = 'xbox';
+      targetPlatformGameId = xboxMatch.platformGameId;
+      xboxProductId = xboxMatch.xboxProductId || xboxMatch.platformGameId;
+      if (xboxMatch.title) resolvedTitle = xboxMatch.title;
+      chainedHandoffTopology = 'publisher_managed';
+    } else if (epicMatch) {
+      targetPlatformId = 'epic';
+      targetPlatformGameId = epicMatch.platformGameId;
+      if (epicMatch.title) resolvedTitle = epicMatch.title;
+      chainedHandoffTopology = 'partner_launcher_link';
+    } else if (standaloneMatch) {
+      targetPlatformId = standaloneMatch.platformId;
+      targetPlatformGameId = standaloneMatch.platformGameId;
+      if (standaloneMatch.title) resolvedTitle = standaloneMatch.title;
+    }
+
+    const installSize = parseByteCountOrFormattedSize(found.installSizeBytes);
+    addRecord({
+      platformId: targetPlatformId,
+      platformGameId: targetPlatformGameId,
+      storefrontAppId: targetPlatformGameId,
+      ...(xboxProductId ? { xboxProductId } : {}),
+      title: resolvedTitle,
+      installPath: found.installPath,
+      executablePath: found.executablePath,
+      ...(installSize ? { installSize } : {}),
+      chainedLauncherHandoff: handoffId,
+      externalStorefrontHandoff: handoffId,
+      ...(chainedHandoffTopology ? { chainedHandoffTopology } : {}),
+      ...(extId ? { chainedExternalInstallId: extId } : {}),
+      runner: isBottle ? 'chained_bottle' : 'chained_host',
+      ...(isBottle
+        ? {
+            ...(compatibilityLayer ? { compatibilityLayer } : {}),
+            ...(wineBottle ? { wineBottle } : {}),
+            isWindowsBinaryOnMac: true,
+          }
+        : {
+            isWindowsBinaryOnMac:
+              platform === 'darwin' && String(found.executablePath).toLowerCase().endsWith('.exe'),
+          }),
+    });
+  }
+}
+
+function processManagedInstallRecord(/** @type {any} */ ctx, /** @type {any} */ rec) {
+  const { platform, customRoots, options, discoveredMap, addRecord } = ctx;
+  if (!rec || !rec.platformId || !rec.platformGameId) return;
+  if (isGdkStubExecutablePath(rec.executablePath)) return;
+  const localInstall = toLocalFsPath(rec.installPath, customRoots);
+  if (localInstall && fs.existsSync(localInstall)) {
+    const existingKey = `${rec.platformId}:${rec.platformGameId}`;
+    const existingDiscovered = discoveredMap.get(existingKey);
+    const isSameInstallDir = Boolean(
+      existingDiscovered &&
+        existingDiscovered.installPath &&
+        !existingDiscovered.driveDisconnected &&
+        path.resolve(existingDiscovered.installPath) === path.resolve(localInstall)
+    );
+    const matchedDiscovered = isSameInstallDir ? existingDiscovered : null;
+    const isChainedManagedRecord = Boolean(
+      rec.chainedLauncherHandoff || rec.externalStorefrontHandoff
+    );
+    if (rec.platformId === 'xbox' && !matchedDiscovered && !isChainedManagedRecord) {
+      const inspectedManagedXbox = inspectInstalledXboxGameDir(localInstall, {
+        platform,
+        strictPe: Boolean(options.strictPe),
+      });
+      if (
+        !inspectedManagedXbox ||
+        (inspectedManagedXbox.isExternalLauncherStub && !inspectedManagedXbox.executablePath)
+      ) {
+        return;
+      }
+    }
+    const recExeLocal = rec.executablePath ? toLocalFsPath(rec.executablePath, customRoots) : '';
+    const isRecExeValid =
+      Boolean(recExeLocal) &&
+      fs.existsSync(recExeLocal) &&
+      !isGdkStubExecutablePath(recExeLocal) &&
+      !isExcludedExecutable(path.basename(recExeLocal)) &&
+      !/\.com$/i.test(recExeLocal);
+    const discovered =
+      matchedDiscovered && matchedDiscovered.executablePath
+        ? {
+            executablePath: matchedDiscovered.executablePath,
+            isWindowsBinaryOnMac: matchedDiscovered.isWindowsBinaryOnMac,
+          }
+        : findPrimaryExecutable(localInstall, {
+            platform,
+            hintName: rec.title,
+            readOnly: true,
+          });
+    const rawEffectiveExe =
+      matchedDiscovered?.executablePath ||
+      (isRecExeValid ? recExeLocal : undefined) ||
+      discovered.executablePath;
+    const effectiveExe = resolveSiblingLauncherStub(rawEffectiveExe, localInstall);
+    if (!effectiveExe || !fs.existsSync(effectiveExe) || isGdkStubExecutablePath(effectiveExe)) {
+      return;
+    }
+    const effectiveLaunchArgs =
+      matchedDiscovered?.launchArguments ||
+      rec.launchArguments ||
+      resolveDefaultEngineLaunchArguments(localInstall, effectiveExe);
+    const inferredWinOnMac =
+      matchedDiscovered?.isWindowsBinaryOnMac !== undefined
+        ? matchedDiscovered.isWindowsBinaryOnMac
+        : rec.isWindowsBinaryOnMac !== undefined
+          ? rec.isWindowsBinaryOnMac
+          : Boolean(
+              discovered.isWindowsBinaryOnMac ||
+                (platform === 'darwin' &&
+                  ((effectiveExe && /\.exe$/i.test(effectiveExe)) ||
+                    /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(
+                      String(effectiveExe || rec.installPath || '')
+                    )))
+            );
+    const effectiveInstallSize =
+      parseByteCountOrFormattedSize(matchedDiscovered?.installSize) ||
+      parseByteCountOrFormattedSize(rec.installSize);
+    const effectiveRunner =
+      rec.runner && rec.runner !== 'one_launcher'
+        ? rec.runner
+        : matchedDiscovered?.runner || rec.runner || 'one_launcher';
+    addRecord({
+      ...rec,
+      installPath: localInstall,
+      executablePath: effectiveExe,
+      ...(effectiveLaunchArgs ? { launchArguments: effectiveLaunchArgs } : {}),
+      ...(effectiveInstallSize ? { installSize: effectiveInstallSize } : {}),
+      runner: effectiveRunner,
+      isWindowsBinaryOnMac: inferredWinOnMac,
+    });
+  } else if (rec.installPath && isExternalVolumeUnmounted(String(rec.installPath), options)) {
+    const preservedInstallSize = parseByteCountOrFormattedSize(rec.installSize);
+    addRecord({
+      ...rec,
+      installPath: localInstall || String(rec.installPath),
+      ...(preservedInstallSize ? { installSize: preservedInstallSize } : {}),
+      runner: rec.runner || 'one_launcher',
+      driveDisconnected: true,
+    });
+  }
+}
+
+function processCustomLaunchConfigEntry(/** @type {any} */ ctx, /** @type {any} */ cfg) {
+  const { platform, customRoots, discoveredMap, addRecord } = ctx;
+  if (!cfg || typeof cfg !== 'object') return;
+  const customEntries = [];
+  const seenPlatExe = new Set();
+
+  if (cfg.platformConfigs && typeof cfg.platformConfigs === 'object') {
+    for (const [platId, prof] of Object.entries(cfg.platformConfigs)) {
+      if (!prof || typeof prof !== 'object' || !prof.customExecutablePath) continue;
+      const customExe = toLocalFsPath(prof.customExecutablePath, customRoots);
+      if (!customExe) continue;
+      const dedupeKey = `${platId}:${customExe}`;
+      if (seenPlatExe.has(dedupeKey)) continue;
+      seenPlatExe.add(dedupeKey);
+      customEntries.push({
+        platId,
+        customExe,
+        workingDirectory: prof.workingDirectory,
+      });
+    }
+  }
+
+  if (cfg.customExecutablePath) {
+    const platId = cfg.preferredPlatformId || 'custom';
+    const customExe = toLocalFsPath(cfg.customExecutablePath, customRoots);
+    if (customExe) {
+      const dedupeKey = `${platId}:${customExe}`;
+      if (!seenPlatExe.has(dedupeKey)) {
+        seenPlatExe.add(dedupeKey);
+        customEntries.push({
+          platId,
+          customExe,
+          workingDirectory: cfg.workingDirectory,
+        });
+      }
+    }
+  }
+
+  for (const entry of customEntries) {
+    const { platId, customExe, workingDirectory } = entry;
+    if (customExe && fs.existsSync(customExe)) {
+      const platformGameId = String(cfg.gameId).replace(/^(steam|gog|epic|xbox|custom)-/, '');
+      const installPath = workingDirectory
+        ? toLocalFsPath(workingDirectory, customRoots)
+        : path.dirname(customExe);
+      const alreadyDiscovered = Array.from(discoveredMap.values()).some(
+        (r) =>
+          r &&
+          (platId === 'custom' || r.platformId === platId) &&
+          ((installPath && r.installPath === installPath) ||
+            (customExe && r.executablePath === customExe))
+      );
+      if (alreadyDiscovered) continue;
+      addRecord({
+        platformId: platId,
+        platformGameId,
+        storefrontAppId: String(cfg.gameId),
+        title: cfg.title || String(cfg.gameId),
+        installPath,
+        executablePath: customExe,
+        runner: 'custom',
+        isWindowsBinaryOnMac: platform === 'darwin' && customExe.toLowerCase().endsWith('.exe'),
+      });
+    }
+  }
+}
+
+function enrichSingleInstalledGameRecord(/** @type {any} */ g) {
+  if (!g || g.driveDisconnected || !g.installPath || typeof g.installPath !== 'string') {
+    return;
+  }
+  try {
+    const localInstallDir = toLocalFsPath(g.installPath);
+    if (!localInstallDir || !fs.existsSync(localInstallDir)) return;
+    const acMarkers = detectKernelAntiCheatMarkersInDir(localInstallDir);
+    if (
+      acMarkers.kernelAntiCheatName ||
+      acMarkers.requiresKernelAntiCheat ||
+      acMarkers.storyModeBypassAvailable
+    ) {
+      if (g.requiresKernelAntiCheat === undefined) {
+        g.requiresKernelAntiCheat = acMarkers.requiresKernelAntiCheat;
+      }
+      if (!g.kernelAntiCheatName && acMarkers.kernelAntiCheatName) {
+        g.kernelAntiCheatName = acMarkers.kernelAntiCheatName;
+      }
+      if (acMarkers.storyModeBypassAvailable) {
+        g.storyModeBypassAvailable = true;
+      }
+    }
+    if (g.executablePath && !g.paradoxDirectGameExe) {
+      const exeBase = path.posix.basename(String(g.executablePath).replace(/\\/g, '/'));
+      if (/^dowser\.exe$/i.test(exeBase)) {
+        const pdx = resolveParadoxLauncherSettings(
+          toLocalFsPath(g.executablePath) || localInstallDir,
+          localInstallDir
+        );
+        if (pdx.paradoxDirectGameExe) {
+          g.paradoxDirectGameExe = pdx.paradoxDirectGameExe;
+        }
+      }
+    }
+  } catch {}
+}
+
+function finalizeScanContext(/** @type {any} */ ctx, /** @type {any[]} */ installedGames) {
+  const { options, userDataDir, installedSteamAppIds, isDefaultProdScan } = ctx;
+  let epicPlatformSupport = {};
+  try {
+    const metaRes = ctx.getEpicLocalMetadataOnce();
+    epicPlatformSupport = metaRes?.epicPlatformSupport || {};
+  } catch (stageErr) {
+    diagLog.warn(
+      'scanAllInstalledGames.stageError',
+      stageErr,
+      { stage: 'epic_metadata' },
+      { userDataDir }
+    );
+  }
+  try {
+    Object.defineProperty(installedGames, 'epicPlatformSupport', {
+      value: epicPlatformSupport,
+      enumerable: false,
+      configurable: true,
+    });
+  } catch {}
+
+  if (!options.skipFirstPartySync) {
+    const epicFingerprint = installedGames
+      .filter((g) => g && g.platformId === 'epic' && !g.driveDisconnected)
+      .map((g) => `${g.platformGameId}:${g.installPath}`)
+      .sort()
+      .join('|');
+    const isSyncableGogInstall = (/** @type {any} */ g) =>
+      Boolean(
+        g &&
+          g.platformId === 'gog' &&
+          !g.driveDisconnected &&
+          g.runner !== 'custom' &&
+          g.runner !== 'gog_galaxy' &&
+          g.installPath &&
+          !isPathUnderActiveDownload(g.installPath)
+      );
+    const gogFingerprint = installedGames
+      .filter(isSyncableGogInstall)
+      .map((g) => `${g.platformGameId}:${g.installPath}`)
+      .sort()
+      .join('|');
+
+    const runFirstPartySyncSynchronously = Boolean(
+      options.homedir ||
+        options.syncFirstParty === true ||
+        options.eglManifestsDir ||
+        options.gogGalaxyConfigPath ||
+        options.gogGalaxyStorageDir
+    );
+
+    if (runFirstPartySyncSynchronously) {
+      try {
+        if (installedGames.some((g) => g && g.platformId === 'epic' && !g.driveDisconnected)) {
+          syncEpicFirstPartyLauncher({ ...options, fromAutoScan: true });
+        }
+      } catch {}
+      try {
+        for (const g of installedGames) {
+          if (isSyncableGogInstall(g)) {
+            syncGogFirstPartyLauncher(g, { ...options, fromAutoScan: true });
+          }
+        }
+      } catch {}
+    } else {
+      if (epicFingerprint && epicFingerprint !== getLastSyncedEpicFingerprint()) {
+        setLastSyncedEpicFingerprint(epicFingerprint);
+        setImmediate(() => {
+          try {
+            syncEpicFirstPartyLauncher({ ...options, fromAutoScan: true });
+          } catch {}
+        });
+      }
+      if (gogFingerprint && gogFingerprint !== getLastSyncedGogFingerprint()) {
+        setLastSyncedGogFingerprint(gogFingerprint);
+        setImmediate(() => {
+          try {
+            for (const g of installedGames) {
+              if (isSyncableGogInstall(g)) {
+                syncGogFirstPartyLauncher(g, { ...options, fromAutoScan: true });
               }
             }
-          }
-          const savedCfg = resolvePlatformLaunchConfig(rawSaved || {}, record.platformId);
-          const preferWinBottle = savedCfg?.launchMethod === 'compatibility_layer';
-          const preferred = preferWinBottle
-            ? record.isWindowsBinaryOnMac
-              ? record
-              : existing
-            : !record.isWindowsBinaryOnMac
-              ? record
-              : existing;
-          const secondary = preferred === record ? existing : record;
-          discoveredMap.set(key, {
-            ...secondary,
-            ...preferred,
-            executablePath: preferred.executablePath || secondary.executablePath,
-            installPath: preferred.installPath || secondary.installPath,
-            launchArguments: preferred.launchArguments || secondary.launchArguments,
-            isWindowsBinaryOnMac: Boolean(preferred.isWindowsBinaryOnMac),
-          });
-        } else {
-          discoveredMap.set(key, {
-            ...existing,
-            ...record,
-            executablePath: record.executablePath || existing.executablePath,
-            installPath: record.installPath || existing.installPath,
-            launchArguments: record.launchArguments || existing.launchArguments,
-          });
-        }
-      } else {
-        discoveredMap.set(key, record);
+          } catch {}
+        });
       }
-      if (record.platformId === 'steam') {
-        const numId = Number(record.appId || record.platformGameId);
-        if (numId > 0 && !installedSteamAppIds.includes(numId)) {
-          installedSteamAppIds.push(numId);
-        }
-      }
-    };
+    }
+  }
 
-    // =========================================================================
-    // 1. STEAM MULTI-LIBRARY SCANNER (Read-only; never mutates manifests or common/)
-    // =========================================================================
-    /** @type {Set<string>} */
-    const steamInstalledDirPaths = new Set();
+  if (isDefaultProdScan) {
+    setLastProductionScanCache({
+      timestamp: Date.now(),
+      result: { installedGames, installedSteamAppIds, epicPlatformSupport },
+    });
+  }
+
+  return {
+    success: true,
+    installedGames,
+    installedSteamAppIds,
+    epicPlatformSupport,
+  };
+}
+
+/**
+ * Multi-Storefront & Multi-Drive Read-Only Installation Scanner (Synchronous).
+ * Zero file/folder mutations during scanning; preserves external-drive records when unmounted.
+ * Calls `detectCompatibilityLayers` and `collectLocalEpicMetadataAndSupport` at most once per scan.
+ */
+function scanAllInstalledGames(/** @type {any} */ options = {}) {
+  try {
+    const { isDefaultProdScan, cachedResult } = checkDefaultProdScanCache(options);
+    if (cachedResult) return cachedResult;
+
+    const ctx = createScanContext(options, isDefaultProdScan, false);
+    const { platform, homedir, customRoots, userDataDir } = ctx;
+
+    // 1. STEAM MULTI-LIBRARY SCANNER
     try {
       const { steamappsDirs } = discoverSteamLocations(options);
-
       for (const steamappsDir of steamappsDirs) {
         /** @type {string[]} */
         let files = [];
@@ -694,144 +2152,16 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
         } catch {
           continue;
         }
-
         for (const file of files) {
           if (!/^appmanifest_\d+\.acf$/i.test(file)) continue;
           const manifestPath = path.join(steamappsDir, file);
-          /** @type {any} */
-          let parsed = null;
+          let rawAcf = '';
           try {
-            parsed = parseSteamAcf(fs.readFileSync(manifestPath, 'utf8'));
-          } catch {}
-          if (!parsed || !parsed.appId) continue;
-
-          // Skip Steamworks Common Redistributables
-          if (parsed.appId === 228980) continue;
-
-          const installPath = parsed.installdir
-            ? path.join(steamappsDir, 'common', parsed.installdir)
-            : path.join(steamappsDir, 'common', String(parsed.appId));
-
-          const dirExists = fs.existsSync(installPath);
-          const stateFlags = parsed.StateFlags ? String(parsed.StateFlags).trim() : undefined;
-          const stateFlagsNum =
-            stateFlags !== undefined && /^\d+$/.test(stateFlags) ? Number(stateFlags) : NaN;
-          const bytesToDl = Number(parsed.BytesToDownload || 0);
-          const bytesDl = Number(parsed.BytesDownloaded || 0);
-          const isInstalledFlagSet = Number.isFinite(stateFlagsNum) && (stateFlagsNum & 4) === 4;
-          const isActivelyDownloading = Boolean(
-            !isInstalledFlagSet &&
-              ((Number.isFinite(stateFlagsNum) &&
-                (stateFlagsNum & (2 | 256 | 512 | 1024 | 2048)) !== 0) ||
-                (stateFlags && bytesToDl > 0 && bytesDl < bytesToDl))
-          );
-
-          if (isActivelyDownloading) {
+            rawAcf = fs.readFileSync(manifestPath, 'utf8');
+          } catch {
             continue;
           }
-
-          if (!dirExists) {
-            if (isExternalVolumeUnmounted(installPath, options)) {
-              const isInsideBottle = /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(installPath);
-              addRecord({
-                platformId: 'steam',
-                platformGameId: String(parsed.appId),
-                appId: parsed.appId,
-                title: parsed.name,
-                name: parsed.name,
-                installPath,
-                installSize: parseByteCountOrFormattedSize(parsed.SizeOnDisk),
-                version: parsed.buildid ? String(parsed.buildid) : undefined,
-                manifestPath,
-                runner: 'steam',
-                isWindowsBinaryOnMac: Boolean(platform === 'darwin' && isInsideBottle),
-                driveDisconnected: true,
-              });
-            }
-            continue;
-          }
-
-          const appInfoSpec = resolveSteamAppInfoLaunchSpec(
-            steamappsDir,
-            parsed.appId,
-            installPath,
-            { platform }
-          );
-          let installerDataParsed = null;
-          const installerXmlCandidates = [
-            path.join(installPath, '__Installer', 'installerdata.xml'),
-            path.join(installPath, '__installer', 'installerdata.xml'),
-          ];
-          for (const xmlPath of installerXmlCandidates) {
-            if (!fs.existsSync(xmlPath)) continue;
-            try {
-              installerDataParsed = parseSteamEaInstallerDataXml(fs.readFileSync(xmlPath, 'utf8'));
-              if (installerDataParsed) break;
-            } catch {}
-          }
-
-          const steamChainedHandoff = resolveAnyChainedHandoffId(
-            appInfoSpec?.chainedLauncherHandoff ||
-              (installerDataParsed?.isEaChained ? 'ea' : null)
-          );
-          const steamRequiresProtocolLaunch = Boolean(
-            appInfoSpec?.requiresStorefrontProtocolLaunch || steamChainedHandoff
-          );
-          const steamChainedContentId = installerDataParsed?.contentId || undefined;
-
-          const exeDiscovery =
-            appInfoSpec && appInfoSpec.executablePath
-              ? {
-                  executablePath: appInfoSpec.launchArguments
-                    ? appInfoSpec.executablePath
-                    : resolveSiblingLauncherStub(appInfoSpec.executablePath, installPath),
-                  isWindowsBinaryOnMac: appInfoSpec.isWindowsBinaryOnMac,
-                }
-              : findPrimaryExecutable(installPath, {
-                  platform,
-                  hintName: parsed.name,
-                  readOnly: true,
-                });
-
-          if (!exeDiscovery.executablePath && !steamRequiresProtocolLaunch) {
-            continue;
-          }
-
-          steamInstalledDirPaths.add(path.resolve(installPath).toLowerCase());
-          const isInsideBottle = /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(installPath);
-          const launchArguments =
-            appInfoSpec?.launchArguments ||
-            (exeDiscovery.executablePath
-              ? resolveDefaultEngineLaunchArguments(installPath, exeDiscovery.executablePath)
-              : undefined);
-
-          addRecord({
-            platformId: 'steam',
-            platformGameId: String(parsed.appId),
-            appId: parsed.appId,
-            title: parsed.name,
-            name: parsed.name,
-            installPath,
-            ...(exeDiscovery.executablePath ? { executablePath: exeDiscovery.executablePath } : {}),
-            ...(launchArguments ? { launchArguments } : {}),
-            ...(steamChainedHandoff
-              ? {
-                  chainedLauncherHandoff: steamChainedHandoff,
-                  externalStorefrontHandoff: steamChainedHandoff,
-                  chainedHandoffTopology: 'storefront_depot_uri',
-                }
-              : {}),
-            ...(steamRequiresProtocolLaunch ? { requiresStorefrontProtocolLaunch: true } : {}),
-            ...(steamChainedContentId ? { chainedExternalInstallId: steamChainedContentId } : {}),
-            ...(appInfoSpec?.protocolUri ? { protocolUri: appInfoSpec.protocolUri } : {}),
-            installSize: parseByteCountOrFormattedSize(parsed.SizeOnDisk),
-            version: parsed.buildid ? String(parsed.buildid) : undefined,
-            manifestPath,
-            runner: 'steam',
-            isWindowsBinaryOnMac:
-              Boolean(exeDiscovery.isWindowsBinaryOnMac) ||
-              (platform === 'darwin' && (isInsideBottle || Boolean(steamChainedHandoff))),
-          });
+          processSteamManifestRecord(ctx, steamappsDir, manifestPath, rawAcf, null);
         }
       }
     } catch (stageErr) {
@@ -843,257 +2173,33 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
       );
     }
 
-    // =========================================================================
-    // 2. GOG.COM SCANNER (GOG Galaxy + Heroic + macOS /Applications + Managed + Bottles)
-    // =========================================================================
+    // 2. GOG.COM SCANNER (+ Darwin Bottles discovery reusing single detectCompatibilityLayers call)
+    /** @type {string[]} */
     const discoveredBottleRoots = [];
-    if (platform === 'darwin') {
-      const detectedDarwinLayers = detectCompatibilityLayers({
-        platform,
-        homedir,
-        ...(options.customApplicationsDir
-          ? { customApplicationsDir: options.customApplicationsDir }
-          : {}),
-        ...(options.applicationsDirs ? { applicationsDirs: options.applicationsDirs } : {}),
-      });
-      const scanBottleContainers = Array.from(
-        new Set([
-          path.join(homedir, 'Library/Application Support/CrossOver/Bottles'),
-          path.join(homedir, 'Library/Application Support/CrossOver Preview/Bottles'),
-          path.join(homedir, 'Library/Application Support/CrossOver Preview arm64/Bottles'),
-          path.join(homedir, 'Games/OneLauncher/Bottles'),
-          path.join(homedir, 'Bottles'),
-          path.join(homedir, 'Library/Application Support/Whisky/Bottles'),
-          path.join(homedir, 'Library/Application Support/Mythic/Bottles'),
-          ...(Array.isArray(detectedDarwinLayers) ? detectedDarwinLayers : [])
-            .map((/** @type {any} */ l) => l?.bottlesDir)
-            .filter((/** @type {any} */ d) => typeof d === 'string' && d.trim()),
-        ])
-      );
-      for (const bottlesDir of scanBottleContainers) {
-        if (!fs.existsSync(bottlesDir)) continue;
-        try {
-          const entries = fs.readdirSync(bottlesDir, { withFileTypes: true });
-          for (const entry of entries) {
-            if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-            discoveredBottleRoots.push(path.join(bottlesDir, entry.name));
-          }
-        } catch {}
-      }
+    for (const bottlesDir of getDarwinBottleContainerDirs(ctx)) {
+      if (!fs.existsSync(bottlesDir)) continue;
+      try {
+        const entries = fs.readdirSync(bottlesDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+          discoveredBottleRoots.push(path.join(bottlesDir, entry.name));
+        }
+      } catch {}
     }
 
     try {
-      const gogSearchDirs = new Set([
-        path.join(homedir, 'Applications'),
-        path.join(homedir, 'Games'),
-        path.join(homedir, 'Games', 'OneLauncher', 'GOG'),
-        path.join(homedir, 'Games', 'Heroic'),
-        ...customRoots.map((/** @type {string} */ r) => toLocalFsPath(r, customRoots)),
-      ]);
-
-      for (const bottleRoot of discoveredBottleRoots) {
-        gogSearchDirs.add(path.join(bottleRoot, 'drive_c/Program Files (x86)/GOG Galaxy/Games'));
-        gogSearchDirs.add(path.join(bottleRoot, 'drive_c/Program Files/GOG Galaxy/Games'));
-        gogSearchDirs.add(path.join(bottleRoot, 'drive_c/GOG Games'));
-        gogSearchDirs.add(path.join(bottleRoot, 'drive_c/Games/OneLauncher/GOG'));
-      }
-
-      if (!isIsolatedTest) {
-        gogSearchDirs.add('/Applications');
-        gogSearchDirs.add('C:\\Program Files (x86)\\GOG Galaxy\\Games');
-        gogSearchDirs.add('C:\\Program Files\\GOG Galaxy\\Games');
-        gogSearchDirs.add('C:\\GOG Games');
-        gogSearchDirs.add('C:\\Games\\OneLauncher\\GOG');
-      }
-
-      const gogGalaxyConfigs = [
-        path.join(homedir, 'Library/Application Support/GOG.com/Galaxy/config.json'),
-        ...customRoots.map((/** @type {string} */ r) =>
-          path.join(toLocalFsPath(r, customRoots), 'config.json')
-        ),
-        ...discoveredBottleRoots.map((bRoot) =>
-          path.join(bRoot, 'drive_c/ProgramData/GOG.com/Galaxy/config.json')
-        ),
-      ];
-      if (!isIsolatedTest) {
-        gogGalaxyConfigs.push(
-          '/Users/Shared/GOG.com/Galaxy/config.json',
-          'C:\\ProgramData\\GOG.com\\Galaxy\\config.json'
-        );
-      }
+      const { gogSearchDirs, gogGalaxyConfigs, heroicGogFiles } = buildGogScanSources(
+        ctx,
+        discoveredBottleRoots
+      );
       for (const cfgPath of gogGalaxyConfigs) {
-        if (fs.existsSync(cfgPath)) {
-          try {
-            const cfgBottleRoot = extractBottleRootFromPath(cfgPath);
-            const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-            if (cfg.libraryPath) {
-              const libLocal = cfgBottleRoot
-                ? fromWineWindowsPath(cfg.libraryPath, cfgBottleRoot)
-                : toLocalFsPath(cfg.libraryPath, customRoots);
-              if (libLocal) gogSearchDirs.add(libLocal);
-            }
-            if (Array.isArray(cfg.installed)) {
-              for (const item of cfg.installed) {
-                if (item.installPath) {
-                  const itemLocal = cfgBottleRoot
-                    ? fromWineWindowsPath(item.installPath, cfgBottleRoot)
-                    : toLocalFsPath(item.installPath, customRoots);
-                  if (itemLocal) gogSearchDirs.add(itemLocal);
-                }
-              }
-            }
-          } catch {}
-        }
+        if (!fs.existsSync(cfgPath)) continue;
+        try {
+          applyGogGalaxyConfigJson(ctx, cfgPath, fs.readFileSync(cfgPath, 'utf8'), gogSearchDirs);
+        } catch {}
       }
 
-      const parseGogInfoFile = (/** @type {string} */ infoFilePath) => {
-        try {
-          const raw = JSON.parse(fs.readFileSync(infoFilePath, 'utf8'));
-          const fileMatch = path.basename(infoFilePath).match(/^goggame-(\d+)\.info$/i);
-          const gameId = String(raw.gameId || raw.rootGameId || (fileMatch ? fileMatch[1] : ''));
-          if (!gameId) return;
-
-          const title = String(raw.name || raw.title || `GOG Game ${gameId}`);
-          if (/^(steam|epic|custom)-\d+$/i.test(title)) return;
-          let installPath = path.dirname(infoFilePath);
-
-          if (isPathUnderActiveDownload(installPath)) return;
-          if (
-            !managedCompletedKeys.has(`gog:${gameId.toLowerCase()}`) &&
-            (fs.existsSync(path.join(installPath, '.gogdl-resume')) ||
-              fs.existsSync(path.join(installPath, '.gogdl-download-cache')) ||
-              fs.existsSync(path.join(installPath, '.onelauncher-gog-v2-resume.json')))
-          ) {
-            return;
-          }
-
-          const normInfoDir = installPath.replace(/\\/g, '/');
-          if (normInfoDir.endsWith('/Contents/Resources')) {
-            const candidateParentDir = path.resolve(installPath, '..', '..');
-            if (candidateParentDir.toLowerCase().endsWith('.app')) {
-              const parentOfApp = path.dirname(candidateParentDir);
-              const parentBase = path.basename(parentOfApp).toLowerCase();
-              if (
-                parentOfApp &&
-                !/^(applications|gog|heroic|games|onelauncher)$/i.test(parentBase) &&
-                /[\\/](OneLauncher[\\/]GOG|GOG Galaxy[\\/]Games|Heroic)[\\/]/i.test(
-                  candidateParentDir
-                )
-              ) {
-                installPath = parentOfApp;
-              } else {
-                installPath = candidateParentDir;
-              }
-            } else {
-              installPath = candidateParentDir;
-            }
-            if (
-              !managedCompletedKeys.has(`gog:${gameId.toLowerCase()}`) &&
-              (fs.existsSync(path.join(installPath, '.gogdl-resume')) ||
-                fs.existsSync(path.join(installPath, '.gogdl-download-cache')) ||
-                fs.existsSync(path.join(installPath, '.onelauncher-gog-v2-resume.json')))
-            ) {
-              return;
-            }
-          }
-
-          let executablePath = undefined;
-          let launchArguments = undefined;
-          let isWindowsBinaryOnMac = false;
-
-          if (Array.isArray(raw.playTasks)) {
-            const isFileTask = (/** @type {any} */ t) =>
-              Boolean(t && t.path && (!t.type || String(t.type) === 'FileTask'));
-            let primaryTask = selectPreferredGogPlayTask(
-              raw.playTasks,
-              [path.dirname(infoFilePath), installPath],
-              { platform }
-            );
-            if (primaryTask && primaryTask.path) {
-              const baseName = path.basename(String(primaryTask.path).replace(/\\/g, '/'));
-              const stem = extractSiblingLauncherStem(baseName);
-              if (stem) {
-                const siblingName = `${stem.toLowerCase()}.exe`;
-                const siblingTask = raw.playTasks.find((/** @type {any} */ t) => {
-                  if (!isFileTask(t)) return false;
-                  const tBase = path.basename(String(t.path).replace(/\\/g, '/')).toLowerCase();
-                  return tBase === siblingName;
-                });
-                if (siblingTask) {
-                  primaryTask = siblingTask;
-                }
-              }
-            }
-            if (primaryTask && primaryTask.path) {
-              if (
-                primaryTask.arguments &&
-                typeof primaryTask.arguments === 'string' &&
-                primaryTask.arguments.trim()
-              ) {
-                launchArguments = primaryTask.arguments.trim();
-              }
-              const relTaskPath = primaryTask.path.replace(/\\/g, path.sep);
-              const candidates = [
-                path.join(installPath, relTaskPath),
-                path.join(path.dirname(infoFilePath), relTaskPath),
-                path.join(path.resolve(path.dirname(infoFilePath), '..', '..'), relTaskPath),
-              ];
-              for (const c of candidates) {
-                if (fs.existsSync(c)) {
-                  const resolvedCand = c.endsWith('.app') ? resolveMacAppBundleBinary(c) : c;
-                  if (platform === 'darwin' && /[\\/]GOGLauncher$/i.test(String(resolvedCand || ''))) {
-                    continue;
-                  }
-                  if (
-                    platform === 'darwin' &&
-                    resolvedCand &&
-                    !resolvedCand.toLowerCase().endsWith('.exe') &&
-                    inspectMacMachOHeader(resolvedCand).is32BitOnly
-                  ) {
-                    continue;
-                  }
-                  executablePath = resolvedCand || undefined;
-                  break;
-                }
-              }
-              if (executablePath && !launchArguments) {
-                executablePath = resolveSiblingLauncherStub(executablePath, installPath);
-              }
-            }
-          }
-
-          if (!executablePath) {
-            const discovered = findPrimaryExecutable(installPath, {
-              platform,
-              hintName: title,
-              readOnly: true,
-            });
-            executablePath = resolveSiblingLauncherStub(discovered.executablePath, installPath);
-            isWindowsBinaryOnMac = discovered.isWindowsBinaryOnMac;
-          } else if (platform === 'darwin' && executablePath.toLowerCase().endsWith('.exe')) {
-            isWindowsBinaryOnMac = true;
-          }
-
-          addRecord({
-            platformId: 'gog',
-            platformGameId: gameId,
-            title,
-            installPath,
-            executablePath,
-            ...(launchArguments ? { launchArguments } : {}),
-            version: raw.version
-              ? String(raw.version)
-              : raw.buildId
-                ? String(raw.buildId)
-                : undefined,
-            manifestPath: infoFilePath,
-            runner: 'gog',
-            isWindowsBinaryOnMac,
-          });
-        } catch {}
-      };
-
-      const scanDirForGogInfo = (/** @type {string} */ dirPath, depth = 0) => {
+      const scanDirForGogInfoSync = (/** @type {string} */ dirPath, depth = 0) => {
         if (depth > 3 || !dirPath || !fs.existsSync(dirPath)) return;
         if (isPathUnderActiveDownload(dirPath)) return;
         /** @type {fs.Dirent[]} */
@@ -1103,12 +2209,13 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
         } catch {
           return;
         }
-
         for (const entry of entries) {
           if (entry.name.startsWith('.')) continue;
           const full = path.join(dirPath, entry.name);
           if (entry.isFile() && /^goggame-\d+\.info$/i.test(entry.name)) {
-            parseGogInfoFile(full);
+            try {
+              processGogInfoJson(ctx, full, fs.readFileSync(full, 'utf8'));
+            } catch {}
           } else if (entry.isDirectory()) {
             if (entry.name.toLowerCase().endsWith('.app')) {
               const resDir = path.join(full, 'Contents', 'Resources');
@@ -1117,115 +2224,29 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
                   const resFiles = fs.readdirSync(resDir);
                   for (const rf of resFiles) {
                     if (/^goggame-\d+\.info$/i.test(rf)) {
-                      parseGogInfoFile(path.join(resDir, rf));
+                      const rfPath = path.join(resDir, rf);
+                      try {
+                        processGogInfoJson(ctx, rfPath, fs.readFileSync(rfPath, 'utf8'));
+                      } catch {}
                     }
                   }
                 } catch {}
               }
             } else if (dirPath !== '/Applications') {
-              scanDirForGogInfo(full, depth + 1);
+              scanDirForGogInfoSync(full, depth + 1);
             }
           }
         }
       };
 
       for (const gogDir of gogSearchDirs) {
-        scanDirForGogInfo(gogDir, 0);
+        scanDirForGogInfoSync(gogDir, 0);
       }
-
-      const heroicGogFiles = [
-        path.join(userDataDir, 'gog_store/installed.json'),
-        path.join(homedir, 'Library/Application Support/heroic/gog_store/installed.json'),
-        path.join(homedir, '.config/heroic/gog_store/installed.json'),
-        path.join(homedir, 'AppData/Roaming/heroic/gog_store/installed.json'),
-        ...customRoots.map((/** @type {string} */ r) =>
-          path.join(toLocalFsPath(r, customRoots), 'gog_store/installed.json')
-        ),
-        ...customRoots.map((/** @type {string} */ r) =>
-          path.join(toLocalFsPath(r, customRoots), 'heroic/gog_store/installed.json')
-        ),
-      ];
 
       for (const hgFile of heroicGogFiles) {
         if (!fs.existsSync(hgFile)) continue;
         try {
-          const raw = JSON.parse(fs.readFileSync(hgFile, 'utf8'));
-          const list = Array.isArray(raw)
-            ? raw
-            : Array.isArray(raw?.installed)
-              ? raw.installed
-              : Object.values(raw || {});
-          for (const item of list) {
-            if (!item || typeof item !== 'object') continue;
-            const gameId = String(item.appName || item.gameId || item.id || '');
-            const rawInstallPath = item.install_path || item.installPath;
-            if (!gameId || !rawInstallPath) continue;
-            const installPath = toLocalFsPath(rawInstallPath, customRoots);
-            const title = item.title || item.name || `GOG Game ${gameId}`;
-            const isWindowsGogItem =
-              platform === 'darwin' && String(item.platform || '').toLowerCase() === 'windows';
-
-            if (!installPath || !fs.existsSync(installPath)) {
-              if (isExternalVolumeUnmounted(String(rawInstallPath), options)) {
-                addRecord({
-                  platformId: 'gog',
-                  platformGameId: gameId,
-                  title,
-                  installPath: installPath || String(rawInstallPath),
-                  executablePath: item.executable
-                    ? toLocalFsPath(item.executable, customRoots) || String(item.executable)
-                    : undefined,
-                  installSize: parseByteCountOrFormattedSize(
-                    item.install_size ?? item.installSize
-                  ),
-                  version: item.version ? String(item.version) : undefined,
-                  manifestPath: hgFile,
-                  runner: 'gogdl',
-                  isWindowsBinaryOnMac: isWindowsGogItem,
-                  driveDisconnected: true,
-                });
-              }
-              continue;
-            }
-
-            const discovered = findPrimaryExecutable(installPath, {
-              platform,
-              hintName: title,
-              preferWindowsExecutable: isWindowsGogItem,
-              readOnly: true,
-            });
-            const itemExeCandidate = item.executable
-              ? toLocalFsPath(item.executable, customRoots)
-              : '';
-            const rawHeroicExe =
-              itemExeCandidate && fs.existsSync(itemExeCandidate)
-                ? itemExeCandidate
-                : discovered.executablePath || itemExeCandidate || undefined;
-            const resolvedHeroicExe = rawHeroicExe
-              ? resolveSiblingLauncherStub(rawHeroicExe, installPath)
-              : undefined;
-            const isWinOnMac =
-              discovered.isWindowsBinaryOnMac ||
-              isWindowsGogItem ||
-              Boolean(
-                platform === 'darwin' &&
-                  resolvedHeroicExe &&
-                  resolvedHeroicExe.toLowerCase().endsWith('.exe')
-              );
-
-            addRecord({
-              platformId: 'gog',
-              platformGameId: gameId,
-              title,
-              installPath,
-              executablePath: resolvedHeroicExe,
-              installSize: parseByteCountOrFormattedSize(item.install_size ?? item.installSize),
-              version: item.version ? String(item.version) : undefined,
-              manifestPath: hgFile,
-              runner: 'gogdl',
-              isWindowsBinaryOnMac: isWinOnMac,
-            });
-          }
+          processHeroicGogFileJson(ctx, hgFile, fs.readFileSync(hgFile, 'utf8'));
         } catch {}
       }
     } catch (stageErr) {
@@ -1237,37 +2258,14 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
       );
     }
 
-    // =========================================================================
-    // 3. EPIC GAMES STORE SCANNER (Epic Games Launcher + Heroic / Legendary + Bottles)
-    // =========================================================================
+    // 3. EPIC GAMES STORE SCANNER
     try {
-      const epicManifestDirs = new Set([
-        path.join(homedir, 'Library/Application Support/Epic/EpicGamesLauncher/Data/Manifests'),
-        path.join(homedir, 'ProgramData/Epic/EpicGamesLauncher/Data/Manifests'),
-        ...discoveredBottleRoots.map((bRoot) =>
-          path.join(bRoot, 'drive_c/ProgramData/Epic/EpicGamesLauncher/Data/Manifests')
-        ),
-      ]);
-      if (!isIsolatedTest) {
-        epicManifestDirs.add('C:\\ProgramData\\Epic\\EpicGamesLauncher\\Data\\Manifests');
-        if (platform === 'win32') {
-          const regEpic = discoverWindowsEpicRegistryPaths(options);
-          if (regEpic.manifestsDir) {
-            epicManifestDirs.add(regEpic.manifestsDir);
-          }
-        }
-      }
-      for (const root of customRoots) {
-        const localRoot = toLocalFsPath(root, customRoots);
-        if (!localRoot) continue;
-        epicManifestDirs.add(localRoot);
-        epicManifestDirs.add(path.join(localRoot, 'Manifests'));
-        epicManifestDirs.add(path.join(localRoot, 'Data', 'Manifests'));
-        epicManifestDirs.add(path.join(localRoot, 'Epic/EpicGamesLauncher/Data/Manifests'));
-        epicManifestDirs.add(
-          path.join(localRoot, 'ProgramData/Epic/EpicGamesLauncher/Data/Manifests')
-        );
-      }
+      const {
+        epicManifestDirs,
+        launcherInstalledFiles,
+        legendaryFiles,
+        managedLegendaryInstalledPath,
+      } = buildEpicScanSources(ctx, discoveredBottleRoots);
 
       for (const manifestDir of epicManifestDirs) {
         if (!fs.existsSync(manifestDir)) continue;
@@ -1278,325 +2276,29 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
         } catch {
           continue;
         }
-
         const manifestBottleRoot = extractBottleRootFromPath(manifestDir);
-
         for (const file of files) {
           if (!file.toLowerCase().endsWith('.item')) continue;
           const itemPath = path.join(manifestDir, file);
           try {
-            const item = JSON.parse(fs.readFileSync(itemPath, 'utf8'));
-            if (item.bIsIncompleteInstall === true) continue;
-
-            const appName = String(item.AppName || item.CatalogItemId || '');
-            if (!appName) continue;
-
-            const title = String(item.DisplayName || appName);
-            const rawInstallLoc = item.InstallLocation || '';
-            const installPath = manifestBottleRoot
-              ? fromWineWindowsPath(rawInstallLoc, manifestBottleRoot)
-              : toLocalFsPath(rawInstallLoc, customRoots);
-
-            if (!installPath || !fs.existsSync(installPath)) {
-              const checkUnmountedPath = installPath || String(rawInstallLoc);
-              if (isExternalVolumeUnmounted(checkUnmountedPath, options)) {
-                addRecord({
-                  platformId: 'epic',
-                  platformGameId: appName,
-                  title,
-                  installPath: checkUnmountedPath,
-                  installSize: parseByteCountOrFormattedSize(item.InstallSize),
-                  version: item.AppVersionString ? String(item.AppVersionString) : undefined,
-                  manifestPath: itemPath,
-                  runner: 'epic',
-                  isWindowsBinaryOnMac: Boolean(platform === 'darwin' && manifestBottleRoot),
-                  driveDisconnected: true,
-                });
-              }
-              continue;
-            }
-
-            let executablePath = undefined;
-            let isWindowsBinaryOnMac = Boolean(platform === 'darwin' && manifestBottleRoot);
-
-            if (item.LaunchExecutable) {
-              const cleanLaunchExe = String(item.LaunchExecutable).replace(/\\/g, path.sep);
-              const candidateExe = path.join(installPath, cleanLaunchExe);
-              if (fs.existsSync(candidateExe)) {
-                executablePath =
-                  (candidateExe.endsWith('.app')
-                    ? resolveMacAppBundleBinary(candidateExe)
-                    : candidateExe) || undefined;
-              } else {
-                const discovered = findPrimaryExecutable(installPath, {
-                  platform,
-                  hintName: title,
-                  readOnly: true,
-                });
-                executablePath = discovered.executablePath;
-                isWindowsBinaryOnMac = isWindowsBinaryOnMac || discovered.isWindowsBinaryOnMac;
-              }
-            } else {
-              const discovered = findPrimaryExecutable(installPath, {
-                platform,
-                hintName: title,
-                readOnly: true,
-              });
-              executablePath = discovered.executablePath;
-              isWindowsBinaryOnMac = isWindowsBinaryOnMac || discovered.isWindowsBinaryOnMac;
-            }
-
-            const launchArguments =
-              item.LaunchCommand && typeof item.LaunchCommand === 'string'
-                ? item.LaunchCommand.trim()
-                : '';
-
-            if (executablePath && !launchArguments) {
-              executablePath = resolveSiblingLauncherStub(executablePath, installPath);
-            }
-            if (!executablePath || !fs.existsSync(executablePath)) continue;
-
-            if (
-              platform === 'darwin' &&
-              executablePath &&
-              executablePath.toLowerCase().endsWith('.exe')
-            ) {
-              isWindowsBinaryOnMac = true;
-            }
-
-            if (Boolean(options.userDataDir) || !isIsolatedTest) {
-              recordImportedEpicInstall(
-                { appName, installPath, source: itemPath },
-                { userDataDir }
-              );
-            }
-
-            addRecord({
-              platformId: 'epic',
-              platformGameId: appName,
-              title,
-              installPath,
-              executablePath,
-              ...(launchArguments ? { launchArguments } : {}),
-              installSize: parseByteCountOrFormattedSize(item.InstallSize),
-              version: item.AppVersionString ? String(item.AppVersionString) : undefined,
-              manifestPath: itemPath,
-              runner: 'epic',
-              isWindowsBinaryOnMac,
-            });
+            processEpicItemJson(ctx, manifestBottleRoot, itemPath, fs.readFileSync(itemPath, 'utf8'));
           } catch {}
         }
-      }
-
-      const launcherInstalledFiles = [
-        path.join(
-          homedir,
-          'Library/Application Support/Epic/UnrealEngineLauncher/LauncherInstalled.dat'
-        ),
-        ...discoveredBottleRoots.map((bRoot) =>
-          path.join(bRoot, 'drive_c/ProgramData/Epic/UnrealEngineLauncher/LauncherInstalled.dat')
-        ),
-        ...customRoots.map((/** @type {string} */ r) =>
-          path.join(toLocalFsPath(r, customRoots), 'LauncherInstalled.dat')
-        ),
-        ...customRoots.map((/** @type {string} */ r) =>
-          path.join(
-            toLocalFsPath(r, customRoots),
-            'Epic/UnrealEngineLauncher/LauncherInstalled.dat'
-          )
-        ),
-      ];
-      if (!isIsolatedTest) {
-        launcherInstalledFiles.push(
-          'C:\\ProgramData\\Epic\\UnrealEngineLauncher\\LauncherInstalled.dat'
-        );
       }
 
       for (const datFile of launcherInstalledFiles) {
         if (!fs.existsSync(datFile)) continue;
         const datBottleRoot = extractBottleRootFromPath(datFile);
         try {
-          const dat = JSON.parse(fs.readFileSync(datFile, 'utf8'));
-          const list = Array.isArray(dat?.InstallationList) ? dat.InstallationList : [];
-          for (const entry of list) {
-            const appName = String(entry.AppName || entry.ArtifactId || '');
-            if (!appName || appName.startsWith('UE_')) continue;
-            const rawInstallLoc = entry.InstallLocation || '';
-            const installPath = datBottleRoot
-              ? fromWineWindowsPath(rawInstallLoc, datBottleRoot)
-              : toLocalFsPath(rawInstallLoc, customRoots);
-            if (!installPath || !fs.existsSync(installPath)) {
-              const checkUnmountedPath = installPath || String(rawInstallLoc);
-              if (isExternalVolumeUnmounted(checkUnmountedPath, options)) {
-                addRecord({
-                  platformId: 'epic',
-                  platformGameId: appName,
-                  title: entry.DisplayName || path.basename(checkUnmountedPath) || appName,
-                  installPath: checkUnmountedPath,
-                  version: entry.AppVersion ? String(entry.AppVersion) : undefined,
-                  manifestPath: datFile,
-                  runner: 'epic',
-                  isWindowsBinaryOnMac: Boolean(platform === 'darwin' && datBottleRoot),
-                  driveDisconnected: true,
-                });
-              }
-              continue;
-            }
-
-            const discovered = findPrimaryExecutable(installPath, {
-              platform,
-              hintName: appName,
-              readOnly: true,
-            });
-            const effectiveEpicExe = resolveSiblingLauncherStub(discovered.executablePath, installPath);
-            if (!effectiveEpicExe || !fs.existsSync(effectiveEpicExe)) continue;
-
-            if (Boolean(options.userDataDir) || !isIsolatedTest) {
-              recordImportedEpicInstall(
-                { appName, installPath, source: datFile },
-                { userDataDir }
-              );
-            }
-
-            addRecord({
-              platformId: 'epic',
-              platformGameId: appName,
-              title: entry.DisplayName || path.basename(installPath) || appName,
-              installPath,
-              executablePath: effectiveEpicExe,
-              version: entry.AppVersion ? String(entry.AppVersion) : undefined,
-              manifestPath: datFile,
-              runner: 'epic',
-              isWindowsBinaryOnMac:
-                discovered.isWindowsBinaryOnMac ||
-                Boolean(platform === 'darwin' && datBottleRoot),
-            });
-          }
+          processEpicDatJson(ctx, datFile, datBottleRoot, fs.readFileSync(datFile, 'utf8'));
         } catch {}
       }
-
-      const managedLegendaryInstalledPath = path.resolve(
-        path.join(userDataDir, 'legendaryConfig/legendary/installed.json')
-      );
-      const legendaryFiles = [
-        path.join(userDataDir, 'legendaryConfig/legendary/installed.json'),
-        path.join(
-          homedir,
-          'Library/Application Support/heroic/legendaryConfig/legendary/installed.json'
-        ),
-        path.join(homedir, '.config/legendary/installed.json'),
-        path.join(homedir, 'AppData/Roaming/heroic/legendaryConfig/legendary/installed.json'),
-        ...customRoots.map((/** @type {string} */ r) =>
-          path.join(toLocalFsPath(r, customRoots), 'installed.json')
-        ),
-        ...customRoots.map((/** @type {string} */ r) =>
-          path.join(toLocalFsPath(r, customRoots), 'legendary/installed.json')
-        ),
-        ...customRoots.map((/** @type {string} */ r) =>
-          path.join(toLocalFsPath(r, customRoots), 'heroic/legendaryConfig/legendary/installed.json')
-        ),
-      ];
 
       for (const legFile of legendaryFiles) {
         if (!fs.existsSync(legFile)) continue;
         const isExternalLegFile = path.resolve(legFile) !== managedLegendaryInstalledPath;
         try {
-          const raw = JSON.parse(fs.readFileSync(legFile, 'utf8'));
-          const entries = Array.isArray(raw)
-            ? raw
-            : raw && typeof raw === 'object'
-              ? Object.entries(raw).map(([k, v]) =>
-                  v && typeof v === 'object' ? { _mapKey: k, app_name: k, ...v } : null
-                )
-              : [];
-
-          for (const item of entries) {
-            if (!item || typeof item !== 'object') continue;
-            const appName = String(item.app_name || item.appName || '');
-            const rawInstallPath = item.install_path || item.installPath;
-            if (!appName || !rawInstallPath) continue;
-
-            const title = String(item.title || appName);
-            const installPath = toLocalFsPath(rawInstallPath, customRoots);
-            if (!installPath || !fs.existsSync(installPath)) {
-              const checkUnmountedPath = installPath || String(rawInstallPath);
-              if (isExternalVolumeUnmounted(checkUnmountedPath, options)) {
-                addRecord({
-                  platformId: 'epic',
-                  platformGameId: appName,
-                  title,
-                  installPath: checkUnmountedPath,
-                  installSize: parseByteCountOrFormattedSize(
-                    item.install_size ?? item.installSize
-                  ),
-                  version: item.version ? String(item.version) : undefined,
-                  manifestPath: legFile,
-                  runner: 'legendary',
-                  isWindowsBinaryOnMac: Boolean(
-                    platform === 'darwin' &&
-                      String(item.platform || '').toLowerCase() === 'windows'
-                  ),
-                  driveDisconnected: true,
-                });
-              }
-              continue;
-            }
-
-            let executablePath = undefined;
-            if (item.executable) {
-              const cleanExe = String(item.executable).replace(/\\/g, path.sep);
-              const candidate = path.isAbsolute(cleanExe)
-                ? cleanExe
-                : path.join(installPath, cleanExe);
-              executablePath = toLocalFsPath(candidate, customRoots);
-            }
-            const discovered = findPrimaryExecutable(installPath, {
-              platform,
-              hintName: title,
-              readOnly: true,
-            });
-            if (!executablePath || !fs.existsSync(executablePath)) {
-              executablePath = discovered.executablePath;
-            }
-            if (executablePath) {
-              executablePath = resolveSiblingLauncherStub(executablePath, installPath);
-            }
-            if (!executablePath || !fs.existsSync(executablePath)) {
-              continue;
-            }
-
-            if (isExternalLegFile && (Boolean(options.userDataDir) || !isIsolatedTest)) {
-              recordImportedEpicInstall(
-                { appName, installPath, source: legFile },
-                { userDataDir }
-              );
-            }
-
-            const isWindowsBinaryOnMac =
-              discovered.isWindowsBinaryOnMac ||
-              (platform === 'darwin' &&
-                (String(item.platform || '').toLowerCase() === 'windows' ||
-                  Boolean(executablePath && executablePath.toLowerCase().endsWith('.exe'))));
-
-            const launchArguments =
-              item.launch_parameters && typeof item.launch_parameters === 'string'
-                ? item.launch_parameters.trim()
-                : '';
-
-            addRecord({
-              platformId: 'epic',
-              platformGameId: appName,
-              title,
-              installPath,
-              executablePath,
-              ...(launchArguments ? { launchArguments } : {}),
-              installSize: parseByteCountOrFormattedSize(item.install_size ?? item.installSize),
-              version: item.version ? String(item.version) : undefined,
-              manifestPath: legFile,
-              runner: 'legendary',
-              isWindowsBinaryOnMac,
-            });
-          }
+          processLegendaryFileJson(ctx, legFile, isExternalLegFile, fs.readFileSync(legFile, 'utf8'));
         } catch {}
       }
     } catch (stageErr) {
@@ -1608,9 +2310,7 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
       );
     }
 
-    // =========================================================================
-    // 3.5 XBOX / PC GAME PASS SCANNER (Windows .GamingRoot / GamingServices + macOS Bottle MSIXVC)
-    // =========================================================================
+    // 3.5 XBOX / PC GAME PASS SCANNER
     try {
       const xboxCandidateDirs = collectXboxScanDirectories({
         ...options,
@@ -1618,17 +2318,7 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
         customRoots,
       });
       for (const xboxDir of xboxCandidateDirs) {
-        const xboxRecord = inspectInstalledXboxGameDir(xboxDir, {
-          platform,
-          strictPe: Boolean(options.strictPe),
-        });
-        if (
-          xboxRecord &&
-          !(xboxRecord.isExternalLauncherStub && !xboxRecord.executablePath) &&
-          !isGdkStubExecutablePath(xboxRecord.executablePath)
-        ) {
-          addRecord(xboxRecord);
-        }
+        processXboxCandidateDir(ctx, xboxDir);
       }
     } catch (stageErr) {
       diagLog.warn(
@@ -1639,40 +2329,14 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
       );
     }
 
-    // =========================================================================
-    // 3.6 CHAINED PUBLISHER LAUNCHERS SCANNER (Ubisoft Connect / EA App / Battle.net / Rockstar / Riot)
-    // =========================================================================
+    // 3.6 CHAINED PUBLISHER LAUNCHERS SCANNER (reuses cached Compatibility Layers array)
     try {
       /** @type {Array<{ found: any, isBottle: boolean, compatibilityLayer?: string, wineBottle?: string }>} */
       const discoveredPublisherEntries = [];
-
       if (platform === 'darwin') {
-        const explicitHomedirOpt = options.homedir ? { homedir: options.homedir } : {};
-        const detectedLayers = detectCompatibilityLayers({
-          ...options,
-          platform: 'darwin',
-          ...explicitHomedirOpt,
-        });
-        const bottleSet = new Set(
-          listAllInitializedBottlePaths({
-            ...options,
-            platform: 'darwin',
-            ...explicitHomedirOpt,
-          })
-        );
-        for (const cr of customRoots) {
-          if (!cr || typeof cr !== 'string') continue;
-          const bRoot = extractBottleRootFromPath(cr);
-          if (bRoot && fs.existsSync(bRoot)) {
-            bottleSet.add(path.resolve(bRoot));
-          } else if (
-            fs.existsSync(path.join(cr, 'drive_c')) ||
-            fs.existsSync(path.join(cr, 'system.reg'))
-          ) {
-            bottleSet.add(path.resolve(cr));
-          }
-        }
-        for (const bottlePath of bottleSet) {
+        const detectedLayers = ctx.getDetectedDarwinLayersOnce();
+        const bottlePaths = collectDarwinChainedBottlePaths(ctx);
+        for (const bottlePath of bottlePaths) {
           const layerMeta = resolveBottleLayerMetadata(bottlePath, detectedLayers);
           const bottleGames = scanBottlePublisherInstalledGames(bottlePath, {
             ...options,
@@ -1705,169 +2369,7 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
           discoveredPublisherEntries.push({ found, isBottle: false });
         }
       }
-
-      if (discoveredPublisherEntries.length > 0) {
-        const catalogIndex = loadChainedCatalogIndex(
-          userDataDir,
-          options,
-          preloadedManagedRecords
-        );
-        for (const item of discoveredPublisherEntries) {
-          const { found, isBottle, compatibilityLayer, wineBottle } = item;
-          if (
-            !found ||
-            !found.handoffId ||
-            !found.installPath ||
-            !found.executablePath ||
-            isGdkStubExecutablePath(found.executablePath)
-          ) {
-            continue;
-          }
-
-          const resolvedFoundPathLower = path.resolve(found.installPath).toLowerCase();
-          // Skip Steam depots (`steamapps/common/*`) that register in EA/Ubisoft Windows registry
-          // so Steam `storefront_depot_uri` games never emit duplicate `ea:<contentId>` cards or hijack other stores.
-          if (
-            /(?:^|[\\/])steamapps[\\/]common(?:[\\/]|$)/i.test(found.installPath) ||
-            steamInstalledDirPaths.has(resolvedFoundPathLower)
-          ) {
-            continue;
-          }
-
-          const handoffId = resolveAnyChainedHandoffId(found.handoffId) || found.handoffId;
-          const extId = found.externalInstallId ? String(found.externalInstallId) : '';
-          const matchKeys = Array.from(
-            new Set([
-              ...buildChainedTitleMatchKeys(found.title || ''),
-              ...buildChainedTitleMatchKeys(path.basename(found.installPath)),
-            ])
-          );
-
-          const managedPathMatch =
-            catalogIndex.managedByInstallPath.get(resolvedFoundPathLower) || null;
-          const extMatch =
-            !managedPathMatch && extId
-              ? catalogIndex.byExternalId.get(`${handoffId}:${extId.toLowerCase()}`) || null
-              : null;
-          let xboxMatch = null;
-          let epicMatch = null;
-          let standaloneMatch = null;
-          if (!managedPathMatch && !extMatch) {
-            for (const mk of matchKeys) {
-              xboxMatch = catalogIndex.xboxHandoffByFullKey.get(`${handoffId}:${mk}`) || null;
-              if (xboxMatch) break;
-            }
-            if (!xboxMatch) {
-              for (const mk of matchKeys) {
-                epicMatch = catalogIndex.epicHandoffByFullKey.get(`${handoffId}:${mk}`) || null;
-                if (epicMatch) break;
-              }
-            }
-            if (!xboxMatch && !epicMatch) {
-              for (const mk of matchKeys) {
-                xboxMatch = catalogIndex.xboxHandoffByBaseKey.get(`${handoffId}:${mk}`) || null;
-                if (xboxMatch) break;
-              }
-            }
-            if (!xboxMatch && !epicMatch) {
-              for (const mk of matchKeys) {
-                epicMatch = catalogIndex.epicHandoffByBaseKey.get(`${handoffId}:${mk}`) || null;
-                if (epicMatch) break;
-              }
-            }
-            if (!xboxMatch && !epicMatch) {
-              for (const mk of matchKeys) {
-                standaloneMatch =
-                  catalogIndex.standaloneByFullKey.get(`${handoffId}:${mk}`) || null;
-                if (standaloneMatch) break;
-              }
-            }
-            if (!xboxMatch && !epicMatch && !standaloneMatch) {
-              for (const mk of matchKeys) {
-                standaloneMatch =
-                  catalogIndex.standaloneByBaseKey.get(`${handoffId}:${mk}`) || null;
-                if (standaloneMatch) break;
-              }
-            }
-          }
-
-          let targetPlatformId = handoffId;
-          let targetPlatformGameId =
-            extId ||
-            normalizeComparableTitle(found.title || '') ||
-            path.basename(found.installPath);
-          /** @type {string | undefined} */
-          let xboxProductId = undefined;
-          let resolvedTitle = found.title || path.basename(found.installPath);
-          /** @type {string | undefined} */
-          let chainedHandoffTopology = undefined;
-
-          if (managedPathMatch) {
-            targetPlatformId = managedPathMatch.platformId;
-            targetPlatformGameId = managedPathMatch.platformGameId;
-            xboxProductId = managedPathMatch.xboxProductId;
-            if (managedPathMatch.title) resolvedTitle = managedPathMatch.title;
-            if (targetPlatformId === 'epic') {
-              chainedHandoffTopology = 'partner_launcher_link';
-            } else if (targetPlatformId === 'xbox') {
-              chainedHandoffTopology = 'publisher_managed';
-            }
-          } else if (extMatch) {
-            targetPlatformId = extMatch.platformId;
-            targetPlatformGameId = extMatch.platformGameId;
-            xboxProductId = extMatch.xboxProductId;
-            if (extMatch.title) resolvedTitle = extMatch.title;
-            if (targetPlatformId === 'epic') {
-              chainedHandoffTopology = 'partner_launcher_link';
-            } else if (targetPlatformId === 'xbox') {
-              chainedHandoffTopology = 'publisher_managed';
-            }
-          } else if (xboxMatch) {
-            targetPlatformId = 'xbox';
-            targetPlatformGameId = xboxMatch.platformGameId;
-            xboxProductId = xboxMatch.xboxProductId || xboxMatch.platformGameId;
-            if (xboxMatch.title) resolvedTitle = xboxMatch.title;
-            chainedHandoffTopology = 'publisher_managed';
-          } else if (epicMatch) {
-            targetPlatformId = 'epic';
-            targetPlatformGameId = epicMatch.platformGameId;
-            if (epicMatch.title) resolvedTitle = epicMatch.title;
-            chainedHandoffTopology = 'partner_launcher_link';
-          } else if (standaloneMatch) {
-            targetPlatformId = standaloneMatch.platformId;
-            targetPlatformGameId = standaloneMatch.platformGameId;
-            if (standaloneMatch.title) resolvedTitle = standaloneMatch.title;
-          }
-
-          const installSize = parseByteCountOrFormattedSize(found.installSizeBytes);
-          addRecord({
-            platformId: targetPlatformId,
-            platformGameId: targetPlatformGameId,
-            storefrontAppId: targetPlatformGameId,
-            ...(xboxProductId ? { xboxProductId } : {}),
-            title: resolvedTitle,
-            installPath: found.installPath,
-            executablePath: found.executablePath,
-            ...(installSize ? { installSize } : {}),
-            chainedLauncherHandoff: handoffId,
-            externalStorefrontHandoff: handoffId,
-            ...(chainedHandoffTopology ? { chainedHandoffTopology } : {}),
-            ...(extId ? { chainedExternalInstallId: extId } : {}),
-            runner: isBottle ? 'chained_bottle' : 'chained_host',
-            ...(isBottle
-              ? {
-                  ...(compatibilityLayer ? { compatibilityLayer } : {}),
-                  ...(wineBottle ? { wineBottle } : {}),
-                  isWindowsBinaryOnMac: true,
-                }
-              : {
-                  isWindowsBinaryOnMac:
-                    platform === 'darwin' &&
-                    String(found.executablePath).toLowerCase().endsWith('.exe'),
-                }),
-          });
-        }
-      }
+      reconcileChainedPublisherEntries(ctx, discoveredPublisherEntries);
     } catch (stageErr) {
       diagLog.warn(
         'scanAllInstalledGames.stageError',
@@ -1877,119 +2379,10 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
       );
     }
 
-    // =========================================================================
-    // 4. ONE LAUNCHER MANAGED INSTALLS (Read-only; never wipes unmounted external drives)
-    // =========================================================================
+    // 4. ONE LAUNCHER MANAGED INSTALLS
     try {
-      const managedRecords = preloadedManagedRecords;
-      for (const rec of managedRecords) {
-        if (!rec || !rec.platformId || !rec.platformGameId) continue;
-        if (isGdkStubExecutablePath(rec.executablePath)) continue;
-        const localInstall = toLocalFsPath(rec.installPath, customRoots);
-        if (localInstall && fs.existsSync(localInstall)) {
-          const existingKey = `${rec.platformId}:${rec.platformGameId}`;
-          const existingDiscovered = discoveredMap.get(existingKey);
-          const isSameInstallDir = Boolean(
-            existingDiscovered &&
-              existingDiscovered.installPath &&
-              !existingDiscovered.driveDisconnected &&
-              path.resolve(existingDiscovered.installPath) === path.resolve(localInstall)
-          );
-          const matchedDiscovered = isSameInstallDir ? existingDiscovered : null;
-          const isChainedManagedRecord = Boolean(
-            rec.chainedLauncherHandoff || rec.externalStorefrontHandoff
-          );
-          if (rec.platformId === 'xbox' && !matchedDiscovered && !isChainedManagedRecord) {
-            const inspectedManagedXbox = inspectInstalledXboxGameDir(localInstall, {
-              platform,
-              strictPe: Boolean(options.strictPe),
-            });
-            if (
-              !inspectedManagedXbox ||
-              (inspectedManagedXbox.isExternalLauncherStub &&
-                !inspectedManagedXbox.executablePath)
-            ) {
-              continue;
-            }
-          }
-          const recExeLocal = rec.executablePath
-            ? toLocalFsPath(rec.executablePath, customRoots)
-            : '';
-          const isRecExeValid =
-            Boolean(recExeLocal) &&
-            fs.existsSync(recExeLocal) &&
-            !isGdkStubExecutablePath(recExeLocal) &&
-            !isExcludedExecutable(path.basename(recExeLocal)) &&
-            !/\.com$/i.test(recExeLocal);
-          const discovered =
-            matchedDiscovered && matchedDiscovered.executablePath
-              ? {
-                  executablePath: matchedDiscovered.executablePath,
-                  isWindowsBinaryOnMac: matchedDiscovered.isWindowsBinaryOnMac,
-                }
-              : findPrimaryExecutable(localInstall, {
-                  platform,
-                  hintName: rec.title,
-                  readOnly: true,
-                });
-          const rawEffectiveExe =
-            matchedDiscovered?.executablePath ||
-            (isRecExeValid ? recExeLocal : undefined) ||
-            discovered.executablePath;
-          const effectiveExe = resolveSiblingLauncherStub(rawEffectiveExe, localInstall);
-          if (
-            !effectiveExe ||
-            !fs.existsSync(effectiveExe) ||
-            isGdkStubExecutablePath(effectiveExe)
-          ) {
-            continue;
-          }
-          const effectiveLaunchArgs =
-            matchedDiscovered?.launchArguments ||
-            rec.launchArguments ||
-            resolveDefaultEngineLaunchArguments(localInstall, effectiveExe);
-          const inferredWinOnMac =
-            matchedDiscovered?.isWindowsBinaryOnMac !== undefined
-              ? matchedDiscovered.isWindowsBinaryOnMac
-              : rec.isWindowsBinaryOnMac !== undefined
-                ? rec.isWindowsBinaryOnMac
-                : Boolean(
-                    discovered.isWindowsBinaryOnMac ||
-                      (platform === 'darwin' &&
-                        ((effectiveExe && /\.exe$/i.test(effectiveExe)) ||
-                          /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(
-                            String(effectiveExe || rec.installPath || '')
-                          )))
-                  );
-          const effectiveInstallSize =
-            parseByteCountOrFormattedSize(matchedDiscovered?.installSize) ||
-            parseByteCountOrFormattedSize(rec.installSize);
-          const effectiveRunner =
-            rec.runner && rec.runner !== 'one_launcher'
-              ? rec.runner
-              : matchedDiscovered?.runner || rec.runner || 'one_launcher';
-          addRecord({
-            ...rec,
-            installPath: localInstall,
-            executablePath: effectiveExe,
-            ...(effectiveLaunchArgs ? { launchArguments: effectiveLaunchArgs } : {}),
-            ...(effectiveInstallSize ? { installSize: effectiveInstallSize } : {}),
-            runner: effectiveRunner,
-            isWindowsBinaryOnMac: inferredWinOnMac,
-          });
-        } else if (
-          rec.installPath &&
-          isExternalVolumeUnmounted(String(rec.installPath), options)
-        ) {
-          const preservedInstallSize = parseByteCountOrFormattedSize(rec.installSize);
-          addRecord({
-            ...rec,
-            installPath: localInstall || String(rec.installPath),
-            ...(preservedInstallSize ? { installSize: preservedInstallSize } : {}),
-            runner: rec.runner || 'one_launcher',
-            driveDisconnected: true,
-          });
-        }
+      for (const rec of ctx.preloadedManagedRecords) {
+        processManagedInstallRecord(ctx, rec);
       }
     } catch (stageErr) {
       diagLog.warn(
@@ -2000,78 +2393,10 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
       );
     }
 
-    // =========================================================================
-    // 5. CUSTOM LAUNCH CONFIG OVERRIDES & LOCAL EPIC METADATA
-    // =========================================================================
+    // 5. CUSTOM LAUNCH CONFIG OVERRIDES
     try {
-      for (const cfg of Object.values(launchConfigs)) {
-        if (!cfg || typeof cfg !== 'object') continue;
-        const customEntries = [];
-        const seenPlatExe = new Set();
-
-        if (cfg.platformConfigs && typeof cfg.platformConfigs === 'object') {
-          for (const [platId, prof] of Object.entries(cfg.platformConfigs)) {
-            if (!prof || typeof prof !== 'object' || !prof.customExecutablePath) continue;
-            const customExe = toLocalFsPath(prof.customExecutablePath, customRoots);
-            if (!customExe) continue;
-            const dedupeKey = `${platId}:${customExe}`;
-            if (seenPlatExe.has(dedupeKey)) continue;
-            seenPlatExe.add(dedupeKey);
-            customEntries.push({
-              platId,
-              customExe,
-              workingDirectory: prof.workingDirectory,
-            });
-          }
-        }
-
-        if (cfg.customExecutablePath) {
-          const platId = cfg.preferredPlatformId || 'custom';
-          const customExe = toLocalFsPath(cfg.customExecutablePath, customRoots);
-          if (customExe) {
-            const dedupeKey = `${platId}:${customExe}`;
-            if (!seenPlatExe.has(dedupeKey)) {
-              seenPlatExe.add(dedupeKey);
-              customEntries.push({
-                platId,
-                customExe,
-                workingDirectory: cfg.workingDirectory,
-              });
-            }
-          }
-        }
-
-        for (const entry of customEntries) {
-          const { platId, customExe, workingDirectory } = entry;
-          if (customExe && fs.existsSync(customExe)) {
-            const platformGameId = String(cfg.gameId).replace(
-              /^(steam|gog|epic|xbox|custom)-/,
-              ''
-            );
-            const installPath = workingDirectory
-              ? toLocalFsPath(workingDirectory, customRoots)
-              : path.dirname(customExe);
-            const alreadyDiscovered = Array.from(discoveredMap.values()).some(
-              (r) =>
-                r &&
-                (platId === 'custom' || r.platformId === platId) &&
-                ((installPath && r.installPath === installPath) ||
-                  (customExe && r.executablePath === customExe))
-            );
-            if (alreadyDiscovered) continue;
-            addRecord({
-              platformId: platId,
-              platformGameId,
-              storefrontAppId: String(cfg.gameId),
-              title: cfg.title || String(cfg.gameId),
-              installPath,
-              executablePath: customExe,
-              runner: 'custom',
-              isWindowsBinaryOnMac:
-                platform === 'darwin' && customExe.toLowerCase().endsWith('.exe'),
-            });
-          }
-        }
+      for (const cfg of Object.values(ctx.launchConfigs)) {
+        processCustomLaunchConfigEntry(ctx, cfg);
       }
     } catch (stageErr) {
       diagLog.warn(
@@ -2082,144 +2407,12 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
       );
     }
 
-    const installedGames = Array.from(discoveredMap.values());
+    // 6. POST-PASS ENRICHMENT & FINALIZATION
+    const installedGames = Array.from(ctx.discoveredMap.values());
     for (const g of installedGames) {
-      if (!g || g.driveDisconnected || !g.installPath || typeof g.installPath !== 'string') {
-        continue;
-      }
-      try {
-        const localInstallDir = toLocalFsPath(g.installPath);
-        if (!localInstallDir || !fs.existsSync(localInstallDir)) continue;
-        const acMarkers = detectKernelAntiCheatMarkersInDir(localInstallDir);
-        if (
-          acMarkers.kernelAntiCheatName ||
-          acMarkers.requiresKernelAntiCheat ||
-          acMarkers.storyModeBypassAvailable
-        ) {
-          if (g.requiresKernelAntiCheat === undefined) {
-            g.requiresKernelAntiCheat = acMarkers.requiresKernelAntiCheat;
-          }
-          if (!g.kernelAntiCheatName && acMarkers.kernelAntiCheatName) {
-            g.kernelAntiCheatName = acMarkers.kernelAntiCheatName;
-          }
-          if (acMarkers.storyModeBypassAvailable) {
-            g.storyModeBypassAvailable = true;
-          }
-        }
-        if (g.executablePath && !g.paradoxDirectGameExe) {
-          const exeBase = path.posix.basename(String(g.executablePath).replace(/\\/g, '/'));
-          if (/^dowser\.exe$/i.test(exeBase)) {
-            const pdx = resolveParadoxLauncherSettings(
-              toLocalFsPath(g.executablePath) || localInstallDir,
-              localInstallDir
-            );
-            if (pdx.paradoxDirectGameExe) {
-              g.paradoxDirectGameExe = pdx.paradoxDirectGameExe;
-            }
-          }
-        }
-      } catch {}
+      enrichSingleInstalledGameRecord(g);
     }
-    let epicPlatformSupport = {};
-    try {
-      const metaRes = collectLocalEpicMetadataAndSupport(options);
-      epicPlatformSupport = metaRes?.epicPlatformSupport || {};
-    } catch (stageErr) {
-      diagLog.warn(
-        'scanAllInstalledGames.stageError',
-        stageErr,
-        { stage: 'epic_metadata' },
-        { userDataDir }
-      );
-    }
-    try {
-      Object.defineProperty(installedGames, 'epicPlatformSupport', {
-        value: epicPlatformSupport,
-        enumerable: false,
-        configurable: true,
-      });
-    } catch {}
-
-    if (!options.skipFirstPartySync) {
-      const epicFingerprint = installedGames
-        .filter((g) => g && g.platformId === 'epic' && !g.driveDisconnected)
-        .map((g) => `${g.platformGameId}:${g.installPath}`)
-        .sort()
-        .join('|');
-      const isSyncableGogInstall = (/** @type {any} */ g) =>
-        Boolean(
-          g &&
-            g.platformId === 'gog' &&
-            !g.driveDisconnected &&
-            g.runner !== 'custom' &&
-            g.runner !== 'gog_galaxy' &&
-            g.installPath &&
-            !isPathUnderActiveDownload(g.installPath)
-        );
-      const gogFingerprint = installedGames
-        .filter(isSyncableGogInstall)
-        .map((g) => `${g.platformGameId}:${g.installPath}`)
-        .sort()
-        .join('|');
-
-      const runFirstPartySyncSynchronously = Boolean(
-        options.homedir ||
-          options.syncFirstParty === true ||
-          options.eglManifestsDir ||
-          options.gogGalaxyConfigPath ||
-          options.gogGalaxyStorageDir
-      );
-
-      if (runFirstPartySyncSynchronously) {
-        try {
-          if (installedGames.some((g) => g && g.platformId === 'epic' && !g.driveDisconnected)) {
-            syncEpicFirstPartyLauncher({ ...options, fromAutoScan: true });
-          }
-        } catch {}
-        try {
-          for (const g of installedGames) {
-            if (isSyncableGogInstall(g)) {
-              syncGogFirstPartyLauncher(g, { ...options, fromAutoScan: true });
-            }
-          }
-        } catch {}
-      } else {
-        if (epicFingerprint && epicFingerprint !== getLastSyncedEpicFingerprint()) {
-          setLastSyncedEpicFingerprint(epicFingerprint);
-          setImmediate(() => {
-            try {
-              syncEpicFirstPartyLauncher({ ...options, fromAutoScan: true });
-            } catch {}
-          });
-        }
-        if (gogFingerprint && gogFingerprint !== getLastSyncedGogFingerprint()) {
-          setLastSyncedGogFingerprint(gogFingerprint);
-          setImmediate(() => {
-            try {
-              for (const g of installedGames) {
-                if (isSyncableGogInstall(g)) {
-                  syncGogFirstPartyLauncher(g, { ...options, fromAutoScan: true });
-                }
-              }
-            } catch {}
-          });
-        }
-      }
-    }
-
-    if (isDefaultProdScan) {
-      setLastProductionScanCache({
-        timestamp: Date.now(),
-        result: { installedGames, installedSteamAppIds, epicPlatformSupport },
-      });
-    }
-
-    return {
-      success: true,
-      installedGames,
-      installedSteamAppIds,
-      epicPlatformSupport,
-    };
+    return finalizeScanContext(ctx, installedGames);
   } catch (/** @type {any} */ err) {
     return {
       success: false,
@@ -2232,26 +2425,377 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
 }
 
 /**
- * Async wrapper around `scanAllInstalledGames` that pre-warms Windows registry,
- * known-folder, and drive-root caches asynchronously before scanning so IPC calls
- * on `win32` never block the Electron main thread on cold synchronous `reg.exe` spawns.
+ * Non-blocking async multi-storefront installation scanner using `fs.promises` and clean
+ * `setImmediate` yields between storefront trees and item chunks so scanning 30+ installed games
+ * never stalls Electron's main thread while preserving 100% parity with `scanAllInstalledGames`.
  */
 async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
-  const platform = options.platform || process.platform;
-  if (platform === 'win32') {
-    const prewarmOpts = options.prewarmWindowsCaches === true ? options : { platform };
-    /** @type {Promise<any>[]} */
-    const tasks = [primeXboxDiscoveryCachesAsync(options).catch(() => {})];
-    if (!isTestEnvironment(options) || options.prewarmWindowsCaches === true) {
-      tasks.push(
-        refreshWindowsStorefrontRegistryCacheAsync(prewarmOpts).catch(() => {}),
-        refreshHostWindowsKnownFoldersAsync(prewarmOpts).catch(() => {}),
-        discoverWindowsLocalDrivesAsync(prewarmOpts).catch(() => {})
+  try {
+    const platform = options.platform || process.platform;
+    if (platform === 'win32') {
+      const prewarmOpts = options.prewarmWindowsCaches === true ? options : { platform };
+      /** @type {Promise<any>[]} */
+      const tasks = [primeXboxDiscoveryCachesAsync(options).catch(() => {})];
+      if (!isTestEnvironment(options) || options.prewarmWindowsCaches === true) {
+        tasks.push(
+          refreshWindowsStorefrontRegistryCacheAsync(prewarmOpts).catch(() => {}),
+          refreshHostWindowsKnownFoldersAsync(prewarmOpts).catch(() => {}),
+          discoverWindowsLocalDrivesAsync(prewarmOpts).catch(() => {})
+        );
+      }
+      await Promise.all(tasks);
+    }
+
+    const { isDefaultProdScan, cachedResult } = checkDefaultProdScanCache(options);
+    if (cachedResult) return cachedResult;
+
+    const ctx = createScanContext(options, isDefaultProdScan, true);
+    const { homedir, customRoots, userDataDir } = ctx;
+
+    // 1. STEAM MULTI-LIBRARY SCANNER (async fs.promises + chunked yielding)
+    try {
+      const { steamappsDirs } = discoverSteamLocations(options);
+      let steamProcessed = 0;
+      for (const steamappsDir of steamappsDirs) {
+        /** @type {string[]} */
+        let files = [];
+        try {
+          files = await fs.promises.readdir(steamappsDir);
+        } catch {
+          continue;
+        }
+        for (const file of files) {
+          if (!/^appmanifest_\d+\.acf$/i.test(file)) continue;
+          const manifestPath = path.join(steamappsDir, file);
+          let rawAcf = '';
+          try {
+            rawAcf = await fs.promises.readFile(manifestPath, 'utf8');
+          } catch {
+            continue;
+          }
+          // Pre-read EA installerdata.xml asynchronously when present
+          let preloadedXml = '';
+          try {
+            const parsedPeek = parseSteamAcf(rawAcf);
+            if (parsedPeek && parsedPeek.appId && parsedPeek.appId !== 228980) {
+              const installPath = parsedPeek.installdir
+                ? path.join(steamappsDir, 'common', parsedPeek.installdir)
+                : path.join(steamappsDir, 'common', String(parsedPeek.appId));
+              for (const xmlPath of [
+                path.join(installPath, '__Installer', 'installerdata.xml'),
+                path.join(installPath, '__installer', 'installerdata.xml'),
+              ]) {
+                try {
+                  preloadedXml = await fs.promises.readFile(xmlPath, 'utf8');
+                  if (preloadedXml) break;
+                } catch {}
+              }
+            }
+          } catch {}
+          processSteamManifestRecord(ctx, steamappsDir, manifestPath, rawAcf, preloadedXml);
+          steamProcessed += 1;
+          if (steamProcessed % ASYNC_SCAN_YIELD_CHUNK === 0) {
+            await yieldToEventLoop();
+          }
+        }
+      }
+    } catch (stageErr) {
+      diagLog.warn(
+        'scanAllInstalledGames.stageError',
+        stageErr,
+        { stage: 'steam' },
+        { userDataDir }
       );
     }
-    await Promise.all(tasks);
+
+    await yieldToEventLoop();
+
+    // 2. GOG.COM SCANNER (+ async Darwin Bottles enumeration reusing single detectCompatibilityLayers call)
+    /** @type {string[]} */
+    const discoveredBottleRoots = [];
+    for (const bottlesDir of getDarwinBottleContainerDirs(ctx)) {
+      try {
+        const entries = await fs.promises.readdir(bottlesDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+          discoveredBottleRoots.push(path.join(bottlesDir, entry.name));
+        }
+      } catch {}
+    }
+
+    try {
+      const { gogSearchDirs, gogGalaxyConfigs, heroicGogFiles } = buildGogScanSources(
+        ctx,
+        discoveredBottleRoots
+      );
+      for (const cfgPath of gogGalaxyConfigs) {
+        try {
+          const rawCfg = await fs.promises.readFile(cfgPath, 'utf8');
+          applyGogGalaxyConfigJson(ctx, cfgPath, rawCfg, gogSearchDirs);
+        } catch {}
+      }
+
+      let gogVisited = 0;
+      const scanDirForGogInfoAsync = async (/** @type {string} */ dirPath, depth = 0) => {
+        if (depth > 3 || !dirPath) return;
+        if (isPathUnderActiveDownload(dirPath)) return;
+        /** @type {fs.Dirent[]} */
+        let entries = [];
+        try {
+          entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        gogVisited += 1;
+        if (gogVisited % ASYNC_SCAN_YIELD_CHUNK === 0) {
+          await yieldToEventLoop();
+        }
+        for (const entry of entries) {
+          if (entry.name.startsWith('.')) continue;
+          const full = path.join(dirPath, entry.name);
+          if (entry.isFile() && /^goggame-\d+\.info$/i.test(entry.name)) {
+            try {
+              const rawInfo = await fs.promises.readFile(full, 'utf8');
+              processGogInfoJson(ctx, full, rawInfo);
+            } catch {}
+          } else if (entry.isDirectory()) {
+            if (entry.name.toLowerCase().endsWith('.app')) {
+              const resDir = path.join(full, 'Contents', 'Resources');
+              try {
+                const resFiles = await fs.promises.readdir(resDir);
+                for (const rf of resFiles) {
+                  if (/^goggame-\d+\.info$/i.test(rf)) {
+                    const rfPath = path.join(resDir, rf);
+                    try {
+                      const rawInfo = await fs.promises.readFile(rfPath, 'utf8');
+                      processGogInfoJson(ctx, rfPath, rawInfo);
+                    } catch {}
+                  }
+                }
+              } catch {}
+            } else if (dirPath !== '/Applications') {
+              await scanDirForGogInfoAsync(full, depth + 1);
+            }
+          }
+        }
+      };
+
+      for (const gogDir of gogSearchDirs) {
+        await scanDirForGogInfoAsync(gogDir, 0);
+      }
+
+      for (const hgFile of heroicGogFiles) {
+        try {
+          const rawHg = await fs.promises.readFile(hgFile, 'utf8');
+          processHeroicGogFileJson(ctx, hgFile, rawHg);
+        } catch {}
+      }
+    } catch (stageErr) {
+      diagLog.warn(
+        'scanAllInstalledGames.stageError',
+        stageErr,
+        { stage: 'gog' },
+        { userDataDir }
+      );
+    }
+
+    await yieldToEventLoop();
+
+    // 3. EPIC GAMES STORE SCANNER (async fs.promises + chunked yielding)
+    try {
+      const {
+        epicManifestDirs,
+        launcherInstalledFiles,
+        legendaryFiles,
+        managedLegendaryInstalledPath,
+      } = buildEpicScanSources(ctx, discoveredBottleRoots);
+
+      let epicProcessed = 0;
+      for (const manifestDir of epicManifestDirs) {
+        /** @type {string[]} */
+        let files = [];
+        try {
+          files = await fs.promises.readdir(manifestDir);
+        } catch {
+          continue;
+        }
+        const manifestBottleRoot = extractBottleRootFromPath(manifestDir);
+        for (const file of files) {
+          if (!file.toLowerCase().endsWith('.item')) continue;
+          const itemPath = path.join(manifestDir, file);
+          try {
+            const rawItem = await fs.promises.readFile(itemPath, 'utf8');
+            processEpicItemJson(ctx, manifestBottleRoot, itemPath, rawItem);
+          } catch {}
+          epicProcessed += 1;
+          if (epicProcessed % ASYNC_SCAN_YIELD_CHUNK === 0) {
+            await yieldToEventLoop();
+          }
+        }
+      }
+
+      for (const datFile of launcherInstalledFiles) {
+        const datBottleRoot = extractBottleRootFromPath(datFile);
+        try {
+          const rawDat = await fs.promises.readFile(datFile, 'utf8');
+          processEpicDatJson(ctx, datFile, datBottleRoot, rawDat);
+        } catch {}
+      }
+
+      for (const legFile of legendaryFiles) {
+        const isExternalLegFile = path.resolve(legFile) !== managedLegendaryInstalledPath;
+        try {
+          const rawLeg = await fs.promises.readFile(legFile, 'utf8');
+          processLegendaryFileJson(ctx, legFile, isExternalLegFile, rawLeg);
+        } catch {}
+      }
+    } catch (stageErr) {
+      diagLog.warn(
+        'scanAllInstalledGames.stageError',
+        stageErr,
+        { stage: 'epic' },
+        { userDataDir }
+      );
+    }
+
+    await yieldToEventLoop();
+
+    // 3.5 XBOX / PC GAME PASS SCANNER
+    try {
+      const xboxCandidateDirs = collectXboxScanDirectories({
+        ...options,
+        platform,
+        customRoots,
+      });
+      for (let i = 0; i < xboxCandidateDirs.length; i++) {
+        processXboxCandidateDir(ctx, xboxCandidateDirs[i]);
+        if ((i + 1) % ASYNC_SCAN_YIELD_CHUNK === 0) {
+          await yieldToEventLoop();
+        }
+      }
+    } catch (stageErr) {
+      diagLog.warn(
+        'scanAllInstalledGames.stageError',
+        stageErr,
+        { stage: 'xbox' },
+        { userDataDir }
+      );
+    }
+
+    await yieldToEventLoop();
+
+    // 3.6 CHAINED PUBLISHER LAUNCHERS SCANNER (reuses cached Compatibility Layers array)
+    try {
+      /** @type {Array<{ found: any, isBottle: boolean, compatibilityLayer?: string, wineBottle?: string }>} */
+      const discoveredPublisherEntries = [];
+      if (platform === 'darwin') {
+        const detectedLayers = ctx.getDetectedDarwinLayersOnce();
+        const bottlePaths = collectDarwinChainedBottlePaths(ctx);
+        for (let i = 0; i < bottlePaths.length; i++) {
+          const bottlePath = bottlePaths[i];
+          const layerMeta = resolveBottleLayerMetadata(bottlePath, detectedLayers);
+          const bottleGames = scanBottlePublisherInstalledGames(bottlePath, {
+            ...options,
+            homedir,
+          });
+          for (const found of bottleGames) {
+            discoveredPublisherEntries.push({
+              found,
+              isBottle: true,
+              compatibilityLayer: layerMeta.compatibilityLayer,
+              wineBottle: found.bottleName || layerMeta.wineBottle,
+            });
+          }
+          await yieldToEventLoop();
+        }
+        const hostMacPublisherGames = scanHostPublisherInstalledGames({
+          ...options,
+          platform: 'darwin',
+          homedir,
+        });
+        for (const found of hostMacPublisherGames) {
+          discoveredPublisherEntries.push({ found, isBottle: false });
+        }
+      } else if (platform === 'win32') {
+        const hostWinPublisherGames = scanHostPublisherInstalledGames({
+          ...options,
+          platform: 'win32',
+          homedir,
+        });
+        for (const found of hostWinPublisherGames) {
+          discoveredPublisherEntries.push({ found, isBottle: false });
+        }
+      }
+      reconcileChainedPublisherEntries(ctx, discoveredPublisherEntries);
+    } catch (stageErr) {
+      diagLog.warn(
+        'scanAllInstalledGames.stageError',
+        stageErr,
+        { stage: 'chained_publisher_launchers' },
+        { userDataDir }
+      );
+    }
+
+    await yieldToEventLoop();
+
+    // 4. ONE LAUNCHER MANAGED INSTALLS
+    try {
+      for (let i = 0; i < ctx.preloadedManagedRecords.length; i++) {
+        processManagedInstallRecord(ctx, ctx.preloadedManagedRecords[i]);
+        if ((i + 1) % ASYNC_SCAN_YIELD_CHUNK === 0) {
+          await yieldToEventLoop();
+        }
+      }
+    } catch (stageErr) {
+      diagLog.warn(
+        'scanAllInstalledGames.stageError',
+        stageErr,
+        { stage: 'managed_installs' },
+        { userDataDir }
+      );
+    }
+
+    await yieldToEventLoop();
+
+    // 5. CUSTOM LAUNCH CONFIG OVERRIDES
+    try {
+      const cfgValues = Object.values(ctx.launchConfigs);
+      for (let i = 0; i < cfgValues.length; i++) {
+        processCustomLaunchConfigEntry(ctx, cfgValues[i]);
+        if ((i + 1) % ASYNC_SCAN_YIELD_CHUNK === 0) {
+          await yieldToEventLoop();
+        }
+      }
+    } catch (stageErr) {
+      diagLog.warn(
+        'scanAllInstalledGames.stageError',
+        stageErr,
+        { stage: 'custom_overrides' },
+        { userDataDir }
+      );
+    }
+
+    await yieldToEventLoop();
+
+    // 6. POST-PASS ENRICHMENT (chunked yielding across 30+ installed dirs) & FINALIZATION
+    const installedGames = Array.from(ctx.discoveredMap.values());
+    for (let i = 0; i < installedGames.length; i++) {
+      enrichSingleInstalledGameRecord(installedGames[i]);
+      if ((i + 1) % ASYNC_SCAN_YIELD_CHUNK === 0) {
+        await yieldToEventLoop();
+      }
+    }
+
+    return finalizeScanContext(ctx, installedGames);
+  } catch (/** @type {any} */ err) {
+    return {
+      success: false,
+      error: err.message,
+      installedGames: [],
+      installedSteamAppIds: [],
+      epicPlatformSupport: {},
+    };
   }
-  return scanAllInstalledGames(options);
 }
 
 module.exports = {

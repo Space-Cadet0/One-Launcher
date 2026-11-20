@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const { execFile, execFileSync } = require('node:child_process');
 
 const {
+  diagLog,
   getElectron,
   getMainWindow,
   getUserDataDir,
@@ -278,6 +279,8 @@ function computeMacAppBundleStatSignature(appBundlePath) {
     const bundleSt = fs.statSync(appBundlePath);
     const infoPlistPath = path.join(appBundlePath, 'Contents', 'Info.plist');
     const plistSt = fs.existsSync(infoPlistPath) ? fs.statSync(infoPlistPath) : null;
+    const codeResourcesPath = path.join(appBundlePath, 'Contents', '_CodeSignature', 'CodeResources');
+    const codeResSt = fs.existsSync(codeResourcesPath) ? fs.statSync(codeResourcesPath) : null;
     const innerBin = resolveMacAppBundleBinary(appBundlePath);
     const binSt =
       innerBin && innerBin !== appBundlePath && fs.existsSync(innerBin)
@@ -285,13 +288,98 @@ function computeMacAppBundleStatSignature(appBundlePath) {
         : null;
     return [
       `${bundleSt.dev}:${bundleSt.ino}:${Math.trunc(bundleSt.mtimeMs)}`,
-      plistSt ? `${plistSt.dev}:${plistSt.ino}:${Math.trunc(plistSt.mtimeMs)}` : 'no-plist',
+      plistSt ? `${plistSt.dev}:${plistSt.ino}:${Math.trunc(plistSt.mtimeMs)}:${plistSt.size}` : 'no-plist',
+      codeResSt ? `${codeResSt.dev}:${codeResSt.ino}:${Math.trunc(codeResSt.mtimeMs)}:${codeResSt.size}` : 'no-coderes',
       binSt ? `${binSt.dev}:${binSt.ino}:${Math.trunc(binSt.mtimeMs)}:${binSt.size}` : 'no-bin',
     ].join('|');
   } catch {
     return null;
   }
 }
+
+const CODESIGN_DISK_CACHE_MAX_ENTRIES = 500;
+/** @type {Set<string>} */
+const loadedCodesignCacheDirs = new Set();
+
+function getCodesignDiskCachePath(/** @type {any} */ options = {}) {
+  try {
+    const userDataDir = getUserDataDir(options?.userDataDir);
+    if (!userDataDir) return null;
+    return path.join(userDataDir, 'one_launcher_codesign_cache.json');
+  } catch {
+    return null;
+  }
+}
+
+function hydrateCodesignDiskCache(/** @type {any} */ options = {}) {
+  const cachePath = getCodesignDiskCachePath(options);
+  if (!cachePath) return;
+  if (loadedCodesignCacheDirs.has(cachePath) && macCodesignValidCache.size > 0) return;
+  loadedCodesignCacheDirs.add(cachePath);
+  try {
+    if (!fs.existsSync(cachePath)) return;
+    const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const [bundleKey, sigVal] of Object.entries(parsed)) {
+        if (typeof bundleKey === 'string' && typeof sigVal === 'string' && !macCodesignValidCache.has(bundleKey)) {
+          setBoundedMapEntry(macCodesignValidCache, bundleKey, sigVal, CODESIGN_DISK_CACHE_MAX_ENTRIES);
+        }
+      }
+    }
+  } catch {}
+}
+
+function persistCodesignDiskCacheEntry(appBundlePath, statSig, /** @type {any} */ options = {}) {
+  if (!appBundlePath || !statSig) return;
+  const cachePath = getCodesignDiskCachePath(options);
+  if (!cachePath) return;
+  try {
+    /** @type {Record<string, string>} */
+    let onDisk = {};
+    if (fs.existsSync(cachePath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          onDisk = parsed;
+        }
+      } catch {}
+    }
+    if (onDisk[appBundlePath] === statSig) {
+      return;
+    }
+    onDisk[appBundlePath] = statSig;
+    const keys = Object.keys(onDisk);
+    if (keys.length > CODESIGN_DISK_CACHE_MAX_ENTRIES) {
+      const dropCount = keys.length - CODESIGN_DISK_CACHE_MAX_ENTRIES;
+      for (let i = 0; i < dropCount; i += 1) {
+        delete onDisk[keys[i]];
+      }
+    }
+    atomicWriteFileSync(cachePath, JSON.stringify(onDisk, null, 2));
+  } catch {}
+}
+
+function isCodesignTimeoutError(/** @type {any} */ err) {
+  if (!err || typeof err !== 'object') return false;
+  if (err.killed === true) return true;
+  const code = String(err.code || '').toUpperCase();
+  if (code === 'ETIMEDOUT' || code === 'ETIME') return true;
+  const sig = String(err.signal || '').toUpperCase();
+  if (sig === 'SIGTERM' || sig === 'SIGKILL') return true;
+  const msg = String(err.message || '');
+  return /timed?\s*out/i.test(msg);
+}
+
+function hasTrustedAppleOrDeveloperAuthority(outputText) {
+  const text = String(outputText || '');
+  return /^\s*Authority\s*=\s*(?:Developer ID Application:|Apple Distribution:|Mac App Store|Apple Worldwide Developer Relations|Software Signing)/im.test(
+    text
+  );
+}
+
+registerExternalCacheInvalidator(() => {
+  loadedCodesignCacheDirs.clear();
+});
 
 function readMacBundleIdFromInfoPlist(appBundlePath) {
   const infoPlistPath = path.join(appBundlePath, 'Contents', 'Info.plist');
@@ -430,9 +518,9 @@ function signMacAppBundleInsideOutSync(appBundlePath, bundleId, execFileSyncImpl
     stdio: 'ignore',
     timeout: 15000,
   });
-  execFileSyncImpl('codesign', ['--verify', '--deep', '--strict', appBundlePath], {
+  execFileSyncImpl('codesign', ['--verify', '--strict', appBundlePath], {
     stdio: 'ignore',
-    timeout: 5000,
+    timeout: 15000,
   });
 }
 
@@ -455,7 +543,7 @@ async function signMacAppBundleInsideOutAsync(appBundlePath, bundleId, runCmd) {
     appBundlePath,
   ];
   await runCmd('codesign', outerSignArgs, 15000);
-  await runCmd('codesign', ['--verify', '--deep', '--strict', appBundlePath], 5000);
+  await runCmd('codesign', ['--verify', '--strict', appBundlePath], 15000);
 }
 
 function ensureMacAppCodeSignatureValid(targetPath, /** @type {any} */ options = {}) {
@@ -473,7 +561,11 @@ function ensureMacAppCodeSignatureValid(targetPath, /** @type {any} */ options =
   }
 
   const useCache =
-    typeof options.execFileSyncFn !== 'function' && options.forceCodesignRecheck !== true;
+    (typeof options.execFileSyncFn !== 'function' || options.useCodesignCache === true) &&
+    options.forceCodesignRecheck !== true;
+  if (useCache) {
+    hydrateCodesignDiskCache(options);
+  }
   const statSig = useCache ? computeMacAppBundleStatSignature(appBundlePath) : null;
   if (useCache && statSig && macCodesignValidCache.get(appBundlePath) === statSig) {
     return { verified: true, repaired: false, cached: true, appBundlePath };
@@ -486,37 +578,96 @@ function ensureMacAppCodeSignatureValid(targetPath, /** @type {any} */ options =
     ensureMacExecutablePermissions(appBundlePath);
   } catch {}
 
+  // O(1) quarantine check before running recursive `xattr -dr`
+  let hasQuarantine = true;
   try {
-    execFileSyncImpl('xattr', ['-dr', 'com.apple.quarantine', appBundlePath], {
-      stdio: 'ignore',
-      timeout: 4000,
+    const xattrOut = execFileSyncImpl('xattr', ['-p', 'com.apple.quarantine', appBundlePath], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 2000,
     });
-  } catch {
+    if (execFileSyncImpl === execFileSync && !String(xattrOut || '').trim()) {
+      hasQuarantine = false;
+    }
+  } catch (/** @type {any} */ probeErr) {
+    const errText = `${probeErr?.stderr || ''} ${probeErr?.message || ''}`;
+    if (
+      /No such xattr/i.test(errText) ||
+      (probeErr?.status === 1 && !/ENOENT|EACCES|EPERM/i.test(errText))
+    ) {
+      hasQuarantine = false;
+    }
+  }
+  if (hasQuarantine) {
     try {
-      execFileSyncImpl('xattr', ['-cr', appBundlePath], {
+      execFileSyncImpl('xattr', ['-dr', 'com.apple.quarantine', appBundlePath], {
         stdio: 'ignore',
         timeout: 4000,
       });
-    } catch {}
+    } catch {
+      try {
+        execFileSyncImpl('xattr', ['-cr', appBundlePath], {
+          stdio: 'ignore',
+          timeout: 4000,
+        });
+      } catch {}
+    }
   }
 
   try {
-    execFileSyncImpl('codesign', ['--verify', '--deep', '--strict', appBundlePath], {
+    execFileSyncImpl('codesign', ['--verify', '--strict', appBundlePath], {
       stdio: 'ignore',
-      timeout: 5000,
+      timeout: 15000,
     });
     if (useCache) {
       const postSig = computeMacAppBundleStatSignature(appBundlePath);
-      if (postSig) setBoundedMapEntry(macCodesignValidCache, appBundlePath, postSig, 500);
+      if (postSig) {
+        setBoundedMapEntry(macCodesignValidCache, appBundlePath, postSig, CODESIGN_DISK_CACHE_MAX_ENTRIES);
+        persistCodesignDiskCacheEntry(appBundlePath, postSig, options);
+      }
     }
     return { verified: true, repaired: false, appBundlePath };
-  } catch {
+  } catch (/** @type {any} */ verifyErr) {
+    if (isCodesignTimeoutError(verifyErr)) {
+      diagLog.warn('codesign.verifyTimedOut', 'Skipped ad-hoc re-sign after codesign --verify timeout', {
+        appBundlePath,
+      });
+      return { verified: false, repaired: false, timedOut: true, appBundlePath };
+    }
+    try {
+      const dvOut = execFileSyncImpl('codesign', ['-dv', '--verbose=2', appBundlePath], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 5000,
+      });
+      if (hasTrustedAppleOrDeveloperAuthority(dvOut)) {
+        diagLog.warn(
+          'codesign.refusedAdHocResignTrustedAuthority',
+          'Refused to overwrite Developer ID / Apple Distribution signature with ad-hoc signature',
+          { appBundlePath }
+        );
+        return { verified: false, repaired: false, preservedTrustedSignature: true, appBundlePath };
+      }
+    } catch (/** @type {any} */ dvErr) {
+      const combinedDvErr = `${dvErr?.stdout || ''}\n${dvErr?.stderr || ''}\n${dvErr?.message || ''}`;
+      if (hasTrustedAppleOrDeveloperAuthority(combinedDvErr)) {
+        diagLog.warn(
+          'codesign.refusedAdHocResignTrustedAuthority',
+          'Refused to overwrite Developer ID / Apple Distribution signature with ad-hoc signature',
+          { appBundlePath }
+        );
+        return { verified: false, repaired: false, preservedTrustedSignature: true, appBundlePath };
+      }
+    }
     try {
       const bundleId = readMacBundleIdFromInfoPlist(appBundlePath);
       signMacAppBundleInsideOutSync(appBundlePath, bundleId, execFileSyncImpl);
       if (useCache) {
         const postSig = computeMacAppBundleStatSignature(appBundlePath);
-        if (postSig) setBoundedMapEntry(macCodesignValidCache, appBundlePath, postSig, 500);
+        if (postSig) {
+          setBoundedMapEntry(macCodesignValidCache, appBundlePath, postSig, CODESIGN_DISK_CACHE_MAX_ENTRIES);
+          persistCodesignDiskCacheEntry(appBundlePath, postSig, options);
+        }
       }
       return { verified: true, repaired: true, appBundlePath, bundleId: bundleId || null };
     } catch {
@@ -542,10 +693,13 @@ async function ensureMacAppCodeSignatureValidAsync(targetPath, /** @type {any} *
     return { verified: false, repaired: false, appBundlePath: null };
   }
 
+  const hasCustomExec =
+    typeof options.execFileFn === 'function' || typeof options.execFileImpl === 'function';
   const useCache =
-    typeof options.execFileFn !== 'function' &&
-    typeof options.execFileImpl !== 'function' &&
-    options.forceCodesignRecheck !== true;
+    (!hasCustomExec || options.useCodesignCache === true) && options.forceCodesignRecheck !== true;
+  if (useCache) {
+    hydrateCodesignDiskCache(options);
+  }
   const statSig = useCache ? computeMacAppBundleStatSignature(appBundlePath) : null;
   if (useCache && statSig && macCodesignValidCache.get(appBundlePath) === statSig) {
     return { verified: true, repaired: false, cached: true, appBundlePath };
@@ -561,10 +715,24 @@ async function ensureMacAppCodeSignatureValidAsync(targetPath, /** @type {any} *
   const runCmd = (/** @type {string} */ cmd, /** @type {string[]} */ cmdArgs, /** @type {number} */ timeout) =>
     new Promise((resolve, reject) => {
       try {
-        execFileImpl(cmd, cmdArgs, { timeout }, (/** @type {any} */ err) => {
-          if (err) reject(err);
-          else resolve(true);
-        });
+        execFileImpl(
+          cmd,
+          cmdArgs,
+          { timeout },
+          (/** @type {any} */ err, /** @type {any} */ stdout, /** @type {any} */ stderr) => {
+            if (err) {
+              if (stdout !== undefined && err && typeof err === 'object' && err.stdout === undefined) {
+                err.stdout = stdout;
+              }
+              if (stderr !== undefined && err && typeof err === 'object' && err.stderr === undefined) {
+                err.stderr = stderr;
+              }
+              reject(err);
+            } else {
+              resolve({ stdout: String(stdout || ''), stderr: String(stderr || '') });
+            }
+          }
+        );
       } catch (err) {
         reject(err);
       }
@@ -574,29 +742,60 @@ async function ensureMacAppCodeSignatureValidAsync(targetPath, /** @type {any} *
     ensureMacExecutablePermissions(appBundlePath);
   } catch {}
 
-  // Strictly await quarantine attribute stripping BEFORE codesign verification & launch
+  // O(1) quarantine check & deduplicated clearing via clearMacQuarantineAsync (avoids 3x recursive xattr -dr)
   try {
-    await runCmd('xattr', ['-dr', 'com.apple.quarantine', appBundlePath], 6000);
-  } catch {
-    try {
-      await clearMacQuarantineAsync(appBundlePath, { ...options, force: true });
-    } catch {}
-  }
+    await clearMacQuarantineAsync(appBundlePath, options);
+  } catch {}
 
   try {
-    await runCmd('codesign', ['--verify', '--deep', '--strict', appBundlePath], 5000);
+    await runCmd('codesign', ['--verify', '--strict', appBundlePath], 15000);
     if (useCache) {
       const postSig = computeMacAppBundleStatSignature(appBundlePath);
-      if (postSig) setBoundedMapEntry(macCodesignValidCache, appBundlePath, postSig, 500);
+      if (postSig) {
+        setBoundedMapEntry(macCodesignValidCache, appBundlePath, postSig, CODESIGN_DISK_CACHE_MAX_ENTRIES);
+        persistCodesignDiskCacheEntry(appBundlePath, postSig, options);
+      }
     }
     return { verified: true, repaired: false, appBundlePath };
-  } catch {
+  } catch (/** @type {any} */ verifyErr) {
+    if (isCodesignTimeoutError(verifyErr)) {
+      diagLog.warn('codesign.verifyTimedOut', 'Skipped ad-hoc re-sign after codesign --verify timeout', {
+        appBundlePath,
+      });
+      return { verified: false, repaired: false, timedOut: true, appBundlePath };
+    }
+    try {
+      const dvRes = /** @type {{ stdout?: string, stderr?: string }} */ (
+        await runCmd('codesign', ['-dv', '--verbose=2', appBundlePath], 5000)
+      );
+      if (hasTrustedAppleOrDeveloperAuthority(`${dvRes?.stdout || ''}\n${dvRes?.stderr || ''}`)) {
+        diagLog.warn(
+          'codesign.refusedAdHocResignTrustedAuthority',
+          'Refused to overwrite Developer ID / Apple Distribution signature with ad-hoc signature',
+          { appBundlePath }
+        );
+        return { verified: false, repaired: false, preservedTrustedSignature: true, appBundlePath };
+      }
+    } catch (/** @type {any} */ dvErr) {
+      const combinedDvErr = `${dvErr?.stdout || ''}\n${dvErr?.stderr || ''}\n${dvErr?.message || ''}`;
+      if (hasTrustedAppleOrDeveloperAuthority(combinedDvErr)) {
+        diagLog.warn(
+          'codesign.refusedAdHocResignTrustedAuthority',
+          'Refused to overwrite Developer ID / Apple Distribution signature with ad-hoc signature',
+          { appBundlePath }
+        );
+        return { verified: false, repaired: false, preservedTrustedSignature: true, appBundlePath };
+      }
+    }
     try {
       const bundleId = readMacBundleIdFromInfoPlist(appBundlePath);
       await signMacAppBundleInsideOutAsync(appBundlePath, bundleId, runCmd);
       if (useCache) {
         const postSig = computeMacAppBundleStatSignature(appBundlePath);
-        if (postSig) setBoundedMapEntry(macCodesignValidCache, appBundlePath, postSig, 500);
+        if (postSig) {
+          setBoundedMapEntry(macCodesignValidCache, appBundlePath, postSig, CODESIGN_DISK_CACHE_MAX_ENTRIES);
+          persistCodesignDiskCacheEntry(appBundlePath, postSig, options);
+        }
       }
       return { verified: true, repaired: true, appBundlePath, bundleId: bundleId || null };
     } catch {
@@ -2993,6 +3192,7 @@ function recordRunnerInstallReceipt(installedPath, runnerType, releaseVersion, o
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     const existingReceipts = readRunnerInstallReceipts(options);
     const normKey = normalizeReceiptAppPath(installedPath);
+    invalidateCompatLayersCache();
     const nextPayload = {
       schemaVersion: 1,
       receipts: {
@@ -3516,6 +3716,38 @@ function compareRunnerVersions(vA, vB) {
   );
 }
 
+const COMPAT_LAYERS_CACHE_TTL_MS = 60_000;
+/** @type {Map<string, { timestamp: number, layers: any[] }>} */
+const compatLayersCache = new Map();
+
+function invalidateCompatLayersCache() {
+  compatLayersCache.clear();
+}
+
+registerExternalCacheInvalidator(invalidateCompatLayersCache);
+
+function cloneCompatLayersList(/** @type {any[]} */ layers) {
+  return layers.map((layer) => {
+    if (!layer || typeof layer !== 'object') return layer;
+    return {
+      ...layer,
+      ...(Array.isArray(layer.availableBottles)
+        ? { availableBottles: [...layer.availableBottles] }
+        : {}),
+      ...(layer.bottleDetails && typeof layer.bottleDetails === 'object'
+        ? {
+            bottleDetails: Object.fromEntries(
+              Object.entries(layer.bottleDetails).map(([k, v]) => [
+                k,
+                v && typeof v === 'object' ? { ...v } : v,
+              ])
+            ),
+          }
+        : {}),
+    };
+  });
+}
+
 function detectCompatibilityLayers(/** @type {any} */ options = {}) {
   const platform = options.platform || process.platform;
   if (platform !== 'darwin') {
@@ -3542,6 +3774,14 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
     }
   }
 
+  const hostArch = String(options?.arch || process.arch || 'arm64');
+  const darwinKernelMajor =
+    options?.darwinKernelMajor !== undefined
+      ? Number(options.darwinKernelMajor)
+      : process.platform === 'darwin'
+        ? Number(String(os.release() || '25.0.0').split('.')[0]) || 25
+        : 25;
+
   const sharedCrossOverBottlesDir = path.join(
     homedir,
     'Library/Application Support/CrossOver/Bottles'
@@ -3554,6 +3794,41 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
     homedir,
     'Library/Application Support/CrossOver Preview arm64/Bottles'
   );
+
+  const statDirStamp = (/** @type {string} */ dirPath) => {
+    try {
+      const st = fs.statSync(dirPath);
+      return `${st.ino}:${Math.trunc(st.mtimeMs)}`;
+    } catch {
+      return '0';
+    }
+  };
+
+  const bypassCache =
+    options.forceRefresh === true ||
+    options.forceFresh === true ||
+    options.bypassCache === true ||
+    typeof options.execFileSyncFn === 'function' ||
+    typeof options.execFileFn === 'function';
+  const compatCacheKey = [
+    platform,
+    hostArch,
+    String(darwinKernelMajor),
+    path.resolve(homedir),
+    appsDirs.map((d) => `${path.resolve(d)}#${statDirStamp(d)}`).join(','),
+    statDirStamp(sharedCrossOverBottlesDir),
+    statDirStamp(previewSpecBottlesDir),
+    statDirStamp(previewArm64SpecBottlesDir),
+    String(Boolean(options.preferLegacy32BitOpenGlWine)),
+    options.userDataDir ? path.resolve(options.userDataDir) : '',
+  ].join('|');
+
+  if (!bypassCache) {
+    const cached = compatLayersCache.get(compatCacheKey);
+    if (cached && Date.now() - cached.timestamp < COMPAT_LAYERS_CACHE_TTL_MS) {
+      return cloneCompatLayersList(cached.layers);
+    }
+  }
 
   const effectivePreviewBottlesDir = hasValidInitializedBottles(previewSpecBottlesDir, false)
     ? previewSpecBottlesDir
@@ -3572,13 +3847,6 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
     ? previewArm64SpecBottlesDir
     : effectivePreviewBottlesDir;
 
-  const hostArch = String(options?.arch || process.arch || 'arm64');
-  const darwinKernelMajor =
-    options?.darwinKernelMajor !== undefined
-      ? Number(options.darwinKernelMajor)
-      : process.platform === 'darwin'
-        ? Number(String(os.release() || '25.0.0').split('.')[0]) || 25
-        : 25;
   const layerHostDlssCaps = {
     hostArch,
     darwinKernelMajor,
@@ -4139,6 +4407,15 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
     const bReady = isLayerReady(b) ? 1 : 0;
     return bReady - aReady;
   });
+
+  if (!bypassCache) {
+    setBoundedMapEntry(
+      compatLayersCache,
+      compatCacheKey,
+      { timestamp: Date.now(), layers: cloneCompatLayersList(layers) },
+      32
+    );
+  }
 
   return layers;
 }
@@ -5802,6 +6079,7 @@ async function updateCompatibilityLayer(/** @type {any} */ payload = {}, /** @ty
     const mockRunnerFn = effectiveOptions.mockUpdater || effectiveOptions.mockUpdateRunnerDirect;
     if (typeof mockRunnerFn === 'function') {
       const mockRes = (await mockRunnerFn(effectivePayload, effectiveOptions)) || {};
+      invalidateCompatLayersCache();
       const detectedLayers =
         mockRes.detectedLayers ||
         (Array.isArray(effectiveOptions.layers) ? effectiveOptions.layers : detectCompatibilityLayers(effectiveOptions));
@@ -6180,6 +6458,7 @@ async function updateCompatibilityLayer(/** @type {any} */ payload = {}, /** @ty
           runnerType === 'crossover_preview' &&
           (payload.switchToStableCrossOver === true ||
             Boolean(directRes && directRes.switchedToStableCrossOver));
+        invalidateCompatLayersCache();
         const detectedLayers =
           (/** @type {any} */ (directRes))?.detectedLayers ||
           (Array.isArray(options.layers) ? options.layers : detectCompatibilityLayers(options));
@@ -6373,6 +6652,7 @@ async function updateCompatibilityLayer(/** @type {any} */ payload = {}, /** @ty
       }
     }
 
+    invalidateCompatLayersCache();
     const detectedLayers = detectCompatibilityLayers(options);
     const afterLayer = detectedLayers.find((l) => l.type === runnerType);
     const newVersion = afterLayer?.version;
@@ -6437,6 +6717,7 @@ async function updateCompatibilityLayer(/** @type {any} */ payload = {}, /** @ty
   try {
     return await runPromise;
   } finally {
+    invalidateCompatLayersCache();
     const cur = activeCompatRunnerOps.get(runnerType);
     if (cur && cur.promise === runPromise) {
       activeCompatRunnerOps.delete(runnerType);
@@ -6719,6 +7000,7 @@ async function installCompatibilityLayer(
             });
           });
         }
+        invalidateCompatLayersCache();
         const layers = detectCompatibilityLayers(options);
         if (layers.some((l) => l.type === runnerType)) {
           emitCompatibilityRunnerProgress(
@@ -6842,6 +7124,7 @@ async function installCompatibilityLayer(
             }),
         });
         if (directRes && directRes.installed) {
+          invalidateCompatLayersCache();
           try {
             require('./environmentHealthProber.cjs').invalidateProberRunnerUpdatesCache({
               skipPreviewUrlCacheClear: true,
@@ -7078,6 +7361,7 @@ async function installCompatibilityLayer(
   try {
     return await runPromise;
   } finally {
+    invalidateCompatLayersCache();
     const cur = activeCompatRunnerOps.get(runnerType);
     if (cur && cur.promise === runPromise) {
       activeCompatRunnerOps.delete(runnerType);
@@ -7306,6 +7590,341 @@ function parseCxEnvShellwordTokens(rawCxEnv) {
     tokens.push({ key, rawToken });
   }
   return tokens;
+}
+
+/**
+ * Remove specific environment variable assignments from a CrossOver `CX_ENV` string while
+ * preserving all remaining quoted or unquoted tokens cleanly.
+ *
+ * @param {string | undefined | null} cxEnvStr
+ * @param {string[]} keysToRemove
+ * @returns {string}
+ */
+function stripKeysFromCxEnv(cxEnvStr, keysToRemove) {
+  if (!cxEnvStr || typeof cxEnvStr !== 'string') return '';
+  const removeSet = new Set(
+    (Array.isArray(keysToRemove) ? keysToRemove : []).map((k) => String(k || '').trim())
+  );
+  if (removeSet.size === 0) return cxEnvStr;
+  const parsed = parseCxEnvShellwordTokens(cxEnvStr);
+  return parsed
+    .filter((entry) => !entry.key || !removeSet.has(entry.key))
+    .map((entry) => entry.rawToken)
+    .join(' ');
+}
+
+/**
+ * Single authoritative Performance HUD / Overlay environment resolver across macOS Native,
+ * macOS Bottled (CrossOver / Preview / arm64 / GPTK / Wine), and Windows Native launches.
+ *
+ * - Fixes Bug A: under Hardened Runtime + deadlocking MoltenVK (`hasDeadlock && !loaderAllowsDyldInsert`),
+ *   strips `MTL_HUD_ENABLED` and unconditionally sets `env.DXVK_HUD = userCustomDxvkHud || 'devinfo,fps,frametimes'`
+ *   on DXVK / open-source Wine (NEVER blocked by legacy `cfg.dxvkHud === false`).
+ * - Prevents double overlays: when `MTL_HUD_ENABLED='1'` IS active, deletes `env.DXVK_HUD` unless
+ *   explicitly supplied in `cfg.environmentVariables.DXVK_HUD`.
+ * - Fixes Bug B: sets `env.MTL_HUD_ENABLED='1'` for native macOS launches (`!useCompatLayer && platform === 'darwin'`).
+ * - Preserves `libone_metal_preload.dylib` in `DYLD_INSERT_LIBRARIES` when `audioBufferClamp` is active.
+ *
+ * @param {Record<string, any>} params
+ * @returns {{
+ *   hudEnabled: boolean,
+ *   mode: 'none' | 'metal_hud' | 'dxvk_hud' | 'suppressed_deadlock',
+ *   appliedMetalHud: boolean,
+ *   appliedDxvkHud: boolean,
+ *   usedPreloadDylib: boolean
+ * }}
+ */
+function applyUnifiedPerformanceHudEnv(params = {}) {
+  const env = params && typeof params.env === 'object' ? params.env : null;
+  if (!env) {
+    return {
+      hudEnabled: false,
+      mode: 'none',
+      appliedMetalHud: false,
+      appliedDxvkHud: false,
+      usedPreloadDylib: false,
+    };
+  }
+  const cfg = params.launchConfig && typeof params.launchConfig === 'object' ? params.launchConfig : {};
+  const effectiveOptions = params.options && typeof params.options === 'object' ? params.options : {};
+  const perfSettings =
+    params.perfSettings && typeof params.perfSettings === 'object'
+      ? params.perfSettings
+      : getLauncherPerformanceSettings(effectiveOptions);
+  const hostPlatform = params.platform || effectiveOptions.platform || process.platform;
+  const chosenLayer = params.chosenLayer || null;
+  const useCompatLayer =
+    params.useCompatLayer !== undefined ? Boolean(params.useCompatLayer) : Boolean(chosenLayer);
+  const candidateWineBin = String(params.wineBinaryPath || chosenLayer?.binaryPath || '');
+  const effectiveBackend = String(
+    params.backend || env.CX_GRAPHICS_BACKEND || cfg.crossoverGraphicsBackend || ''
+  )
+    .trim()
+    .toLowerCase();
+  const userEnv =
+    cfg.environmentVariables && typeof cfg.environmentVariables === 'object'
+      ? cfg.environmentVariables
+      : {};
+  const userCustomDxvkHud =
+    typeof userEnv.DXVK_HUD === 'string' && userEnv.DXVK_HUD.trim() ? userEnv.DXVK_HUD.trim() : '';
+  const userCustomMetalHud =
+    typeof userEnv.MTL_HUD_ENABLED === 'string' && userEnv.MTL_HUD_ENABLED.trim()
+      ? userEnv.MTL_HUD_ENABLED.trim()
+      : '';
+  const audioClampActive =
+    cfg.audioBufferClamp === true || effectiveOptions.enableAudioBufferClamp === true;
+  const hasCustomUserDyldInsert = Boolean(
+    typeof userEnv.DYLD_INSERT_LIBRARIES === 'string' && userEnv.DYLD_INSERT_LIBRARIES.trim()
+  );
+
+  const perfHudSetting =
+    cfg.performanceHud === 'on' || cfg.performanceHud === 'off' || cfg.performanceHud === 'default'
+      ? cfg.performanceHud
+      : undefined;
+  const hasLegacyBool = typeof cfg.metalHud === 'boolean' || typeof cfg.dxvkHud === 'boolean';
+  const explicitlyOff =
+    perfHudSetting === 'off' ||
+    (!perfHudSetting && hasLegacyBool && cfg.metalHud !== true && cfg.dxvkHud !== true);
+
+  const configHudEnabled =
+    perfHudSetting === 'on'
+      ? true
+      : perfHudSetting === 'off'
+        ? false
+        : !perfHudSetting && hasLegacyBool
+          ? Boolean(cfg.metalHud === true || cfg.dxvkHud === true)
+          : Boolean(perfSettings?.defaultPerformanceHud);
+
+  const userRequestedMetalHud =
+    !explicitlyOff &&
+    (userCustomMetalHud === '1' ||
+      (params.respectExistingEnvMetalHud === true && env.MTL_HUD_ENABLED === '1'));
+  const userRequestedDxvkHud = !explicitlyOff && Boolean(userCustomDxvkHud);
+  const hudEnabled = configHudEnabled || userRequestedMetalHud || userRequestedDxvkHud;
+
+  const stripPreloadFromDyldInsertIfAllowed = () => {
+    if (!audioClampActive && env.DYLD_INSERT_LIBRARIES) {
+      const remainingInsert = String(env.DYLD_INSERT_LIBRARIES)
+        .split(/:(?![\\/])/)
+        .map((s) => s.trim())
+        .filter((s) => s && !s.endsWith('libone_metal_preload.dylib'));
+      if (remainingInsert.length > 0) {
+        env.DYLD_INSERT_LIBRARIES = remainingInsert.join(':');
+      } else {
+        delete env.DYLD_INSERT_LIBRARIES;
+      }
+    }
+  };
+
+  const stripCxEnvKeys = (/** @type {string[]} */ keys) => {
+    if (typeof env.CX_ENV === 'string' && env.CX_ENV) {
+      const cleaned = stripKeysFromCxEnv(env.CX_ENV, keys);
+      if (cleaned) {
+        env.CX_ENV = cleaned;
+      } else {
+        delete env.CX_ENV;
+      }
+    }
+  };
+
+  if (!hudEnabled) {
+    delete env.MTL_HUD_ENABLED;
+    delete env.ONE_LAUNCHER_MOLTENVK_PATH;
+    if (!userEnv.MVK_ICD_LIBRARY_PATH) {
+      delete env.MVK_ICD_LIBRARY_PATH;
+    }
+    if (explicitlyOff || !userCustomDxvkHud) {
+      delete env.DXVK_HUD;
+    }
+    stripPreloadFromDyldInsertIfAllowed();
+    const cxStrip = ['MTL_HUD_ENABLED'];
+    if (explicitlyOff || !userCustomDxvkHud) {
+      cxStrip.push('DXVK_HUD');
+    }
+    if (!audioClampActive && !hasCustomUserDyldInsert) {
+      cxStrip.push('DYLD_INSERT_LIBRARIES');
+    }
+    stripCxEnvKeys(cxStrip);
+    return {
+      hudEnabled: false,
+      mode: 'none',
+      appliedMetalHud: false,
+      appliedDxvkHud: false,
+      usedPreloadDylib: false,
+    };
+  }
+
+  // Windows native (or non-macOS) launch: DXVK_HUD only
+  if (hostPlatform !== 'darwin' && !useCompatLayer) {
+    delete env.MTL_HUD_ENABLED;
+    env.DXVK_HUD = userCustomDxvkHud || 'devinfo,fps,frametimes';
+    return {
+      hudEnabled: true,
+      mode: 'dxvk_hud',
+      appliedMetalHud: false,
+      appliedDxvkHud: true,
+      usedPreloadDylib: false,
+    };
+  }
+
+  // Native macOS launch (`!useCompatLayer && hostPlatform === 'darwin'`): Fixes Bug B
+  if (!useCompatLayer && hostPlatform === 'darwin') {
+    if (userRequestedDxvkHud && !configHudEnabled && !userRequestedMetalHud) {
+      env.DXVK_HUD = userCustomDxvkHud;
+      delete env.MTL_HUD_ENABLED;
+      return {
+        hudEnabled: true,
+        mode: 'dxvk_hud',
+        appliedMetalHud: false,
+        appliedDxvkHud: true,
+        usedPreloadDylib: false,
+      };
+    }
+    env.MTL_HUD_ENABLED =
+      userCustomMetalHud && userCustomMetalHud !== '0' ? userCustomMetalHud : '1';
+    if (userCustomDxvkHud) {
+      env.DXVK_HUD = userCustomDxvkHud;
+    } else {
+      delete env.DXVK_HUD;
+    }
+    return {
+      hudEnabled: true,
+      mode: 'metal_hud',
+      appliedMetalHud: true,
+      appliedDxvkHud: Boolean(env.DXVK_HUD),
+      usedPreloadDylib: false,
+    };
+  }
+
+  // Bottled macOS launch (CrossOver / Preview / arm64 / GPTK / Wine)
+  if (userRequestedDxvkHud && !configHudEnabled && !userRequestedMetalHud) {
+    env.DXVK_HUD = userCustomDxvkHud;
+    delete env.MTL_HUD_ENABLED;
+    stripCxEnvKeys(['MTL_HUD_ENABLED']);
+    return {
+      hudEnabled: true,
+      mode: 'dxvk_hud',
+      appliedMetalHud: false,
+      appliedDxvkHud: true,
+      usedPreloadDylib: false,
+    };
+  }
+
+  const hasDeadlock =
+    typeof params.hasMoltenVkHudDeadlock === 'boolean'
+      ? params.hasMoltenVkHudDeadlock
+      : typeof effectiveOptions.hasMoltenVkHudDeadlock === 'boolean'
+        ? effectiveOptions.hasMoltenVkHudDeadlock
+        : Boolean(candidateWineBin && doesWineLayerHaveMoltenVkHudDeadlock(candidateWineBin));
+  const loaderAllowsDyldInsert =
+    typeof params.loaderAllowsDyldInsert === 'boolean'
+      ? params.loaderAllowsDyldInsert
+      : typeof effectiveOptions.loaderAllowsDyldInsert === 'boolean'
+        ? effectiveOptions.loaderAllowsDyldInsert
+        : !candidateWineBin || doesWineLoaderAllowDyldInsert(candidateWineBin);
+  const canFallbackToDxvkHud = effectiveBackend === 'dxvk' || chosenLayer?.type === 'wine';
+
+  if (!hasDeadlock) {
+    env.MTL_HUD_ENABLED = '1';
+    if (userCustomDxvkHud) {
+      env.DXVK_HUD = userCustomDxvkHud;
+    } else {
+      delete env.DXVK_HUD;
+      stripCxEnvKeys(['DXVK_HUD']);
+    }
+    return {
+      hudEnabled: true,
+      mode: 'metal_hud',
+      appliedMetalHud: true,
+      appliedDxvkHud: Boolean(env.DXVK_HUD),
+      usedPreloadDylib: false,
+    };
+  }
+
+  if (loaderAllowsDyldInsert) {
+    const preloadDylib = ensureWineMetalPreloadDylib(effectiveOptions);
+    const moltenVkPath = resolveWineLayerMoltenVkPath(candidateWineBin);
+    if (preloadDylib) {
+      env.MTL_HUD_ENABLED = '1';
+      const existingInsert = String(env.DYLD_INSERT_LIBRARIES || '')
+        .split(/:(?![\\/])/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (!existingInsert.includes(preloadDylib)) {
+        existingInsert.unshift(preloadDylib);
+      }
+      env.DYLD_INSERT_LIBRARIES = existingInsert.join(':');
+      if (params.syncCxEnv === true) {
+        resolveSipSafeWineBinaryAndPreloadEnv(candidateWineBin, env, {
+          layerType: chosenLayer?.type,
+        });
+      }
+      if (moltenVkPath) {
+        env.MVK_ICD_LIBRARY_PATH = moltenVkPath;
+        env.ONE_LAUNCHER_MOLTENVK_PATH = moltenVkPath;
+      }
+      if (userCustomDxvkHud) {
+        env.DXVK_HUD = userCustomDxvkHud;
+      } else {
+        delete env.DXVK_HUD;
+        stripCxEnvKeys(['DXVK_HUD']);
+      }
+      return {
+        hudEnabled: true,
+        mode: 'metal_hud',
+        appliedMetalHud: true,
+        appliedDxvkHud: Boolean(env.DXVK_HUD),
+        usedPreloadDylib: true,
+      };
+    }
+  }
+
+  // Hardened Runtime (or unavailable preload dylib) + deadlocking MoltenVK -> Fixes Bug A!
+  delete env.MTL_HUD_ENABLED;
+  delete env.ONE_LAUNCHER_MOLTENVK_PATH;
+  stripPreloadFromDyldInsertIfAllowed();
+  stripCxEnvKeys(
+    audioClampActive || hasCustomUserDyldInsert
+      ? ['MTL_HUD_ENABLED']
+      : ['MTL_HUD_ENABLED', 'DYLD_INSERT_LIBRARIES']
+  );
+
+  if (canFallbackToDxvkHud) {
+    // Unconditionally enable DXVK_HUD (NEVER blocked by legacy cfg.dxvkHud === false)
+    env.DXVK_HUD = userCustomDxvkHud || 'devinfo,fps,frametimes';
+    diagLog.warn('launchGame.suppressedDeadlockingMetalHudUnderHardenedRuntime', {
+      gameId: params.gameId || undefined,
+      binaryPath: candidateWineBin,
+      layerType: chosenLayer?.type,
+      fallback: 'dxvk_hud',
+    });
+    return {
+      hudEnabled: true,
+      mode: 'dxvk_hud',
+      appliedMetalHud: false,
+      appliedDxvkHud: true,
+      usedPreloadDylib: false,
+    };
+  }
+
+  if (userCustomDxvkHud) {
+    env.DXVK_HUD = userCustomDxvkHud;
+  } else {
+    delete env.DXVK_HUD;
+  }
+  diagLog.warn('launchGame.suppressedDeadlockingMetalHudUnderHardenedRuntime', {
+    gameId: params.gameId || undefined,
+    binaryPath: candidateWineBin,
+    layerType: chosenLayer?.type,
+    fallback: 'none',
+  });
+  return {
+    hudEnabled: true,
+    mode: 'suppressed_deadlock',
+    appliedMetalHud: false,
+    appliedDxvkHud: Boolean(env.DXVK_HUD),
+    usedPreloadDylib: false,
+  };
 }
 
 /**
@@ -9405,64 +10024,19 @@ function applyCrossOverPerGameSettings(
   const loaderAllowsDyldInsert =
     !candidateWineBin || doesWineLoaderAllowDyldInsert(candidateWineBin);
 
-  if (cfg.metalHud === true) {
-    env.MTL_HUD_ENABLED = '1';
-    if (candidateWineBin && doesWineLayerHaveMoltenVkHudDeadlock(candidateWineBin)) {
-      if (loaderAllowsDyldInsert) {
-        const preloadDylib = ensureWineMetalPreloadDylib(effectiveOptions);
-        const moltenVkPath = resolveWineLayerMoltenVkPath(candidateWineBin);
-        if (preloadDylib) {
-          const existingInsert = String(env.DYLD_INSERT_LIBRARIES || '')
-            .split(/:(?![\\/])/)
-            .map((s) => s.trim())
-            .filter(Boolean);
-          if (!existingInsert.includes(preloadDylib)) {
-            existingInsert.unshift(preloadDylib);
-          }
-          env.DYLD_INSERT_LIBRARIES = existingInsert.join(':');
-          if (moltenVkPath) {
-            env.MVK_ICD_LIBRARY_PATH = moltenVkPath;
-            env.ONE_LAUNCHER_MOLTENVK_PATH = moltenVkPath;
-          }
-        } else {
-          delete env.MTL_HUD_ENABLED;
-          if (
-            cfg.dxvkHud !== false &&
-            !env.DXVK_HUD &&
-            (backend === 'dxvk' || chosenLayer?.type === 'wine')
-          ) {
-            env.DXVK_HUD = 'devinfo,fps,frametimes';
-          }
-        }
-      } else {
-        delete env.MTL_HUD_ENABLED;
-        if (
-          cfg.dxvkHud !== false &&
-          !env.DXVK_HUD &&
-          (backend === 'dxvk' || chosenLayer?.type === 'wine')
-        ) {
-          env.DXVK_HUD = 'devinfo,fps,frametimes';
-        }
-      }
-    }
-  } else if (cfg.metalHud === false) {
-    delete env.MTL_HUD_ENABLED;
-    delete env.ONE_LAUNCHER_MOLTENVK_PATH;
-    if (!cfg.environmentVariables?.MVK_ICD_LIBRARY_PATH) {
-      delete env.MVK_ICD_LIBRARY_PATH;
-    }
-    if (env.DYLD_INSERT_LIBRARIES && cfg.audioBufferClamp !== true && !effectiveOptions.enableAudioBufferClamp) {
-      const filteredInsert = String(env.DYLD_INSERT_LIBRARIES)
-        .split(/:(?![\\/])/)
-        .map((s) => s.trim())
-        .filter((s) => s && !s.endsWith('libone_metal_preload.dylib'));
-      if (filteredInsert.length > 0) {
-        env.DYLD_INSERT_LIBRARIES = filteredInsert.join(':');
-      } else {
-        delete env.DYLD_INSERT_LIBRARIES;
-      }
-    }
-  }
+  const hudPerfSettings = getLauncherPerformanceSettings(effectiveOptions);
+  const unifiedHudResult = applyUnifiedPerformanceHudEnv({
+    env,
+    launchConfig: cfg,
+    perfSettings: hudPerfSettings,
+    chosenLayer,
+    backend,
+    platform: effectiveOptions.platform || process.platform,
+    useCompatLayer: true,
+    wineBinaryPath: candidateWineBin,
+    options: effectiveOptions,
+    gameId: effectiveOptions.gameId || cfg.gameId || '',
+  });
 
   if (cfg.audioBufferClamp === false || effectiveOptions.enableAudioBufferClamp === false) {
     env.ONE_LAUNCHER_AUDIO_BUFFER_CLAMP = '0';
@@ -9479,17 +10053,11 @@ function applyCrossOverPerGameSettings(
         }
         env.DYLD_INSERT_LIBRARIES = existingInsert.join(':');
         env.ONE_LAUNCHER_AUDIO_BUFFER_CLAMP = '1';
-        if (cfg.metalHud !== true && !env.ONE_LAUNCHER_MOLTENVK_PATH) {
+        if (!unifiedHudResult.appliedMetalHud && !env.ONE_LAUNCHER_MOLTENVK_PATH) {
           env.ONE_LAUNCHER_METAL_PRELOAD = '0';
         }
       }
     }
-  }
-
-  if (cfg.dxvkHud === true) {
-    env.DXVK_HUD = env.DXVK_HUD || 'devinfo,fps,frametimes';
-  } else if (cfg.dxvkHud === false) {
-    delete env.DXVK_HUD;
   }
 
   const resolvedBottleMeta = isBottleDir ? inspectBottleConfMetadata(resolvedBottlePath) : {};
@@ -10726,10 +11294,16 @@ function applyCrossOverPerGameSettings(
           suppressGuiDialogs: true,
           layerType: chosenLayer?.type,
         });
+        const liveRegExec =
+          typeof effectiveOptions.execFileFn === 'function'
+            ? effectiveOptions.execFileFn
+            : typeof effectiveOptions.execFileImpl === 'function'
+              ? effectiveOptions.execFileImpl
+              : execFile;
         const runLiveRegAdd = (/** @type {string[]} */ regArgs) =>
           new Promise((resolve) => {
             try {
-              execFile(
+              liveRegExec(
                 aligned.wineBinary,
                 [...aligned.prefixArgs, ...regArgs],
                 { timeout: 2500, env: aligned.env },
@@ -10740,54 +11314,60 @@ function applyCrossOverPerGameSettings(
             }
           });
         const prefixKey = path.resolve(resolvedBottlePath);
-        const syncPromise = Promise.race([
-          Promise.all([
-            runLiveRegAdd([
-              'reg',
-              'add',
-              'HKCU\\Software\\Wine\\Mac Driver',
-              '/v',
-              'RetinaMode',
-              '/t',
-              'REG_SZ',
-              '/d',
-              retinaVal,
-              '/f',
-            ]),
-            runLiveRegAdd([
-              'reg',
-              'add',
-              'HKCU\\Control Panel\\Desktop',
-              '/v',
-              'LogPixels',
-              '/t',
-              'REG_DWORD',
-              '/d',
-              logPixelsDec,
-              '/f',
-            ]),
-            runLiveRegAdd([
-              'reg',
-              'add',
-              'HKCU\\Software\\Wine\\Fonts',
-              '/v',
-              'LogPixels',
-              '/t',
-              'REG_DWORD',
-              '/d',
-              logPixelsDec,
-              '/f',
-            ]),
-          ]),
-          new Promise((resolve) => {
-            const t = setTimeout(resolve, 3000);
-            if (typeof t.unref === 'function') t.unref();
-          }),
-        ]).finally(() => {
-          if (pendingWineRegSyncByPrefix.get(prefixKey) === syncPromise) {
-            pendingWineRegSyncByPrefix.delete(prefixKey);
-          }
-        });
+        const priorPending = pendingWineRegSyncByPrefix.get(prefixKey) || Promise.resolve();
+        const syncPromise = priorPending
+          .catch(() => {})
+          .then(() =>
+            Promise.race([
+              Promise.all([
+                runLiveRegAdd([
+                  'reg',
+                  'add',
+                  'HKCU\\Software\\Wine\\Mac Driver',
+                  '/v',
+                  'RetinaMode',
+                  '/t',
+                  'REG_SZ',
+                  '/d',
+                  retinaVal,
+                  '/f',
+                ]),
+                runLiveRegAdd([
+                  'reg',
+                  'add',
+                  'HKCU\\Control Panel\\Desktop',
+                  '/v',
+                  'LogPixels',
+                  '/t',
+                  'REG_DWORD',
+                  '/d',
+                  logPixelsDec,
+                  '/f',
+                ]),
+                runLiveRegAdd([
+                  'reg',
+                  'add',
+                  'HKCU\\Software\\Wine\\Fonts',
+                  '/v',
+                  'LogPixels',
+                  '/t',
+                  'REG_DWORD',
+                  '/d',
+                  logPixelsDec,
+                  '/f',
+                ]),
+              ]),
+              new Promise((resolve) => {
+                const t = setTimeout(resolve, 3000);
+                if (typeof t.unref === 'function') t.unref();
+              }),
+            ])
+          )
+          .finally(() => {
+            if (pendingWineRegSyncByPrefix.get(prefixKey) === syncPromise) {
+              pendingWineRegSyncByPrefix.delete(prefixKey);
+            }
+          });
         pendingWineRegSyncByPrefix.set(prefixKey, syncPromise);
       }
     } catch {}
@@ -10800,20 +11380,28 @@ function applyCrossOverPerGameSettings(
       effectiveOptions.sanitizeDisplayConfigs)
   ) {
     try {
+      const effectiveAspectRatio =
+        typeof effectiveOptions.displayAspectRatio === 'string' &&
+        effectiveOptions.displayAspectRatio
+          ? effectiveOptions.displayAspectRatio
+          : resolvedDisplayPolicy.effectiveDisplayAspectRatio || 'preserve_aspect';
       sanitizeWinePrefixDisplayConfigs(resolvedBottlePath, {
         ...effectiveOptions,
         displayScalingMode: effectiveScalingMode,
+        displayAspectRatio: effectiveAspectRatio,
         ...(typeof effectiveHighResolutionMode === 'boolean'
           ? { highResolutionMode: effectiveHighResolutionMode }
           : {}),
       });
-      const installDirKey =
-        typeof effectiveOptions.installDir === 'string' && effectiveOptions.installDir
-          ? path.resolve(effectiveOptions.installDir)
-          : '';
       setBoundedMapEntry(
         recentDisplaySanitizeCache,
-        `${path.resolve(resolvedBottlePath)}:${String(effectiveHighResolutionMode)}:${installDirKey}`,
+        buildDisplaySanitizeCacheKey({
+          prefixPath: resolvedBottlePath,
+          highResolutionMode: effectiveHighResolutionMode,
+          displayScalingMode: effectiveScalingMode,
+          displayAspectRatio: effectiveAspectRatio,
+          installDir: effectiveOptions.installDir,
+        }),
         Date.now(),
         256
       );
@@ -10821,6 +11409,31 @@ function applyCrossOverPerGameSettings(
   }
 
   return env;
+}
+
+/**
+ * Canonical cache key shared by `applyCrossOverPerGameSettings` and `launchGame` for
+ * `recentDisplaySanitizeCache` so display config sanitization runs once per launch.
+ *
+ * @param {{
+ *   prefixPath?: string | null,
+ *   highResolutionMode?: boolean | undefined,
+ *   displayScalingMode?: string | undefined,
+ *   displayAspectRatio?: string | undefined,
+ *   installDir?: string | null
+ * }} [params]
+ * @returns {string}
+ */
+function buildDisplaySanitizeCacheKey(params = {}) {
+  const prefixKey = params.prefixPath ? path.resolve(String(params.prefixPath)) : '';
+  const highResKey = String(params.highResolutionMode);
+  const scalingKey = String(params.displayScalingMode || 'auto_fullscreen');
+  const aspectKey = String(params.displayAspectRatio || 'preserve_aspect');
+  const installDirKey =
+    typeof params.installDir === 'string' && params.installDir.trim()
+      ? path.resolve(params.installDir.trim())
+      : '';
+  return `${prefixKey}:${highResKey}:${scalingKey}:${aspectKey}:${installDirKey}`;
 }
 
 /** @type {{ maxW: number, maxH: number, logW: number, logH: number, panelW: number, panelH: number } | null} */
@@ -11709,6 +12322,7 @@ async function provisionCrossOverBottleViaCxbottle(
             );
             return;
           }
+          invalidateCompatLayersCache();
           resolve(true);
         }
       );
@@ -11716,6 +12330,97 @@ async function provisionCrossOverBottleViaCxbottle(
       reject(err);
     }
   });
+}
+
+/**
+ * Pure, side-effect-free prediction of the target Wine/CrossOver prefix path that
+ * `ensureCompatibilityLayerReady` will operate on, so `launchGame` can acquire
+ * `pendingBottleLaunches` and await `inFlightPostSessionByBottle` BEFORE mutating the bottle.
+ *
+ * @param {any} chosenLayer
+ * @param {any} [launchConfig]
+ * @param {any} [options]
+ * @returns {string | null}
+ */
+function predictTargetBottlePrefix(chosenLayer, launchConfig = {}, options = {}) {
+  if (!chosenLayer || typeof chosenLayer !== 'object') return null;
+  if (launchConfig && typeof launchConfig.winePrefixPath === 'string' && launchConfig.winePrefixPath.trim()) {
+    return path.resolve(launchConfig.winePrefixPath.trim());
+  }
+  const homedir = options.homedir || os.homedir();
+  const isMockHomedir = Boolean(options.homedir || options.customApplicationsDir);
+
+  if (
+    chosenLayer.type === 'crossover' ||
+    chosenLayer.type === 'crossover_preview' ||
+    chosenLayer.type === 'crossover_preview_arm64'
+  ) {
+    const isArm64Runner = chosenLayer.type === 'crossover_preview_arm64';
+    const sharedBottlesDir = path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
+    const previewBottlesDir = path.join(
+      homedir,
+      'Library/Application Support/CrossOver Preview/Bottles'
+    );
+    const previewArm64BottlesDir = path.join(
+      homedir,
+      'Library/Application Support/CrossOver Preview arm64/Bottles'
+    );
+    const effectivePreviewBottlesDir = hasValidInitializedBottles(previewBottlesDir, false)
+      ? previewBottlesDir
+      : hasValidInitializedBottles(sharedBottlesDir, false)
+        ? sharedBottlesDir
+        : isMockHomedir && hasValidInitializedBottles(previewBottlesDir, true)
+          ? previewBottlesDir
+          : !isMockHomedir && fs.existsSync(sharedBottlesDir)
+            ? sharedBottlesDir
+            : previewBottlesDir;
+    const defaultBottlesDir =
+      chosenLayer.type === 'crossover'
+        ? sharedBottlesDir
+        : isArm64Runner
+          ? hasValidInitializedBottles(previewArm64BottlesDir, false)
+            ? previewArm64BottlesDir
+            : effectivePreviewBottlesDir
+          : effectivePreviewBottlesDir;
+
+    const bottlesDir = chosenLayer.bottlesDir || defaultBottlesDir;
+    const availableBottles = listBottleSubdirectories(bottlesDir, options);
+    const compatibleBottles = availableBottles.filter((bName) => {
+      const detailArch = chosenLayer.bottleDetails?.[bName]?.wineArch;
+      const metaArch =
+        detailArch || inspectBottleConfMetadata(path.join(bottlesDir, bName)).wineArch;
+      return isArm64Runner ? metaArch === 'arm64' : metaArch !== 'arm64';
+    });
+
+    let targetBottle = '';
+    const explicitBottleName =
+      launchConfig && typeof launchConfig.wineBottleName === 'string'
+        ? launchConfig.wineBottleName.trim()
+        : '';
+    if (explicitBottleName) {
+      if (!safeIsBottleSlug(explicitBottleName)) {
+        return null;
+      }
+      targetBottle = explicitBottleName;
+    } else if (isArm64Runner) {
+      targetBottle = compatibleBottles.includes('OneLauncher-arm64')
+        ? 'OneLauncher-arm64'
+        : compatibleBottles.length > 0 && safeIsBottleSlug(compatibleBottles[0])
+          ? compatibleBottles[0]
+          : 'OneLauncher-arm64';
+    } else if (compatibleBottles.includes('OneLauncher')) {
+      targetBottle = 'OneLauncher';
+    } else if (compatibleBottles.includes('default')) {
+      targetBottle = 'default';
+    } else if (compatibleBottles.length > 0 && safeIsBottleSlug(compatibleBottles[0])) {
+      targetBottle = compatibleBottles[0];
+    } else {
+      targetBottle = 'OneLauncher';
+    }
+    return path.resolve(path.join(bottlesDir, targetBottle));
+  }
+
+  return path.resolve(path.join(homedir, 'Games/OneLauncher/Prefixes/default'));
 }
 
 async function ensureCompatibilityLayerReady(
@@ -12026,6 +12731,7 @@ module.exports = {
   detectBundledD3DMetalVersions,
   compareRunnerVersions,
   detectCompatibilityLayers,
+  invalidateCompatLayersCache,
   provisionCrossOverBottleViaCxbottle,
   extractRunnerPreviewDate,
   extractCandidateLinksFromText,
@@ -12039,6 +12745,8 @@ module.exports = {
   resolveWineLayerMoltenVkPath,
   doesWineLayerHaveMoltenVkHudDeadlock,
   ensureWineMetalPreloadDylib,
+  stripKeysFromCxEnv,
+  applyUnifiedPerformanceHudEnv,
   mergeCxEnvVariables,
   deriveCrossOverRootFromBinaryPath,
   alignWineMsyncWithLiveBottle,
@@ -12057,6 +12765,8 @@ module.exports = {
   resolveEffectiveCrossOverGraphicsBackend,
   cleanNonApfsAppleDoubleTwins,
   applyCrossOverPerGameSettings,
+  buildDisplaySanitizeCacheKey,
+  predictTargetBottlePrefix,
   getHostMaxDisplayResolution,
   normalizeDosboxDisplayConfigs,
   sanitizeWinePrefixDisplayConfigs,

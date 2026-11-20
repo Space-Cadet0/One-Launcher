@@ -1622,12 +1622,49 @@ async function syncXboxTitleStorage(options = {}) {
 
   let lockAcquired = Boolean(alreadyLocked);
   let reacquiredExpiredSessionLock = false;
+  /** @type {Promise<any> | null} */
+  let inFlightSessionLockRecovery = null;
   let readOnlyFallback = false;
   let uploadedContainers = 0;
   let downloadedContainers = 0;
   let deletedRemoteContainers = 0;
+  let conflictDetected = false;
+  /** @type {string[]} */
+  const conflictContainerNames = [];
   let quotaBytes =
     Number(options.quotaBytes) > 0 ? Number(options.quotaBytes) : 256 * 1024 * 1024;
+  const maxBlobConcurrency = Math.max(
+    1,
+    Math.min(8, Number(options.blobConcurrency ?? 4) || 4)
+  );
+  const pendingUploadLastSyncedAt =
+    typeof options.pendingUploadLastSyncedAt === 'number' &&
+    Number.isFinite(options.pendingUploadLastSyncedAt) &&
+    options.pendingUploadLastSyncedAt > 0
+      ? options.pendingUploadLastSyncedAt
+      : 0;
+
+  /**
+   * Bounded concurrency limiter (default 4-way) for Xbox Title Storage container & blob transfers.
+   */
+  let activeLimiterCount = 0;
+  /** @type {Array<() => void>} */
+  const limiterWaiters = [];
+  const runWithBlobConcurrency = async (fn) => {
+    if (activeLimiterCount >= maxBlobConcurrency) {
+      await new Promise((resolve) => {
+        limiterWaiters.push(() => resolve(undefined));
+      });
+    }
+    activeLimiterCount += 1;
+    try {
+      return await fn();
+    } finally {
+      activeLimiterCount -= 1;
+      const nextWaiter = limiterWaiters.shift();
+      if (nextWaiter) nextWaiter();
+    }
+  };
 
   const computeUsedBytes = (containersMap) => {
     let total = 0;
@@ -1651,15 +1688,25 @@ async function syncXboxTitleStorage(options = {}) {
     } catch (writeErr) {
       if (
         alreadyLocked &&
-        !reacquiredExpiredSessionLock &&
+        (!reacquiredExpiredSessionLock || inFlightSessionLockRecovery) &&
         (writeErr?.status === 403 || writeErr?.status === 412)
       ) {
-        reacquiredExpiredSessionLock = true;
-        const lockInfo = await client.acquireLock(signal);
-        lockAcquired = lockInfo.locked;
-        if (lockInfo.quotaBytes > 0) {
-          quotaBytes = lockInfo.quotaBytes;
+        if (!inFlightSessionLockRecovery) {
+          reacquiredExpiredSessionLock = true;
+          inFlightSessionLockRecovery = Promise.resolve()
+            .then(() => client.acquireLock(signal))
+            .then((lockInfo) => {
+              lockAcquired = lockInfo.locked;
+              if (lockInfo.quotaBytes > 0) {
+                quotaBytes = lockInfo.quotaBytes;
+              }
+              return lockInfo;
+            })
+            .finally(() => {
+              inFlightSessionLockRecovery = null;
+            });
         }
+        await inFlightSessionLockRecovery;
         return await writeFn();
       }
       throw writeErr;
@@ -1770,6 +1817,8 @@ async function syncXboxTitleStorage(options = {}) {
       }
       const remoteByName = new Map(remoteList.map((r) => [r.name, r]));
 
+      /** @type {Array<{ remote: any, local: any }>} */
+      const containersToPull = [];
       for (const remote of remoteList) {
         if (pendingDeletions.has(remote.name)) {
           continue;
@@ -1779,25 +1828,53 @@ async function syncXboxTitleStorage(options = {}) {
         const localTimeMs = local ? Date.parse(local.modifiedIso || '') || 0 : 0;
         const remoteChanged = !local || local.remoteClientFileTime !== remote.clientFileTime;
 
+        // Conflict-aware guard during pending upload replay: if remote advanced past `lastSyncedAt`
+        // while local also has dirty edits, never silently overwrite newer remote progress.
+        const remoteAdvancedSinceLastSync =
+          pendingUploadLastSyncedAt > 0 &&
+          Boolean(local?.dirty) &&
+          remoteTimeMs > pendingUploadLastSyncedAt;
+        if (remoteAdvancedSinceLastSync && remoteTimeMs >= localTimeMs) {
+          conflictDetected = true;
+          conflictContainerNames.push(remote.name);
+        }
+
         const shouldPullRemote =
           !local ||
           (remoteChanged && !local.dirty) ||
-          (remoteChanged && local.dirty && remoteTimeMs > localTimeMs);
+          (remoteChanged && local.dirty && remoteTimeMs > localTimeMs) ||
+          (remoteAdvancedSinceLastSync && remoteTimeMs >= localTimeMs);
 
         if (shouldPullRemote) {
-          const atomsMap = await client.getContainerAtoms(remote.name, signal);
-          const downloadedBlobs = new Map();
-          for (const [blobName, atomToken] of atomsMap.entries()) {
-            const data = await client.downloadAtom(atomToken, signal);
-            downloadedBlobs.set(blobName, {
-              name: blobName,
-              blobGuid: generateUpperGuidHex(),
-              data,
-              size: data.length,
-              sha256: crypto.createHash('sha256').update(data).digest('hex'),
-              atom: atomToken,
-            });
-          }
+          containersToPull.push({ remote, local });
+        }
+      }
+
+      // Download remote containers and their blobs with 4-way bounded concurrency
+      await Promise.all(
+        containersToPull.map(async ({ remote, local }) => {
+          const atomsMap = await runWithBlobConcurrency(() =>
+            client.getContainerAtoms(remote.name, signal)
+          );
+          const downloadedEntries = await Promise.all(
+            Array.from(atomsMap.entries()).map(([blobName, atomToken]) =>
+              runWithBlobConcurrency(async () => {
+                const data = await client.downloadAtom(atomToken, signal);
+                return [
+                  blobName,
+                  {
+                    name: blobName,
+                    blobGuid: generateUpperGuidHex(),
+                    data,
+                    size: data.length,
+                    sha256: crypto.createHash('sha256').update(data).digest('hex'),
+                    atom: atomToken,
+                  },
+                ];
+              })
+            )
+          );
+          const downloadedBlobs = new Map(downloadedEntries);
 
           mergedContainers.set(remote.name, {
             name: remote.name,
@@ -1812,8 +1889,8 @@ async function syncXboxTitleStorage(options = {}) {
           });
           cloudPulledContainerNames.add(remote.name);
           downloadedContainers += 1;
-        }
-      }
+        })
+      );
 
       // Prune clean previously-synced local containers that were deleted remotely on another device
       for (const [cName, local] of Array.from(mergedContainers.entries())) {
@@ -1824,48 +1901,61 @@ async function syncXboxTitleStorage(options = {}) {
       }
     }
 
-    // Upload all dirty containers when write lock is held (fault-isolated per container)
+    // Upload all dirty containers when write lock is held (4-way bounded concurrency, fault-isolated per container)
     let firstUploadError = null;
     if (!readOnlyFallback) {
+      /** @type {Array<[string, any]>} */
+      const dirtyContainers = [];
       for (const [cName, container] of Array.from(mergedContainers.entries())) {
         if (!container.dirty) continue;
         if (!isValidTitleStorageContainerName(cName)) {
           mergedContainers.delete(cName);
           continue;
         }
-
-        try {
-          await runWithSessionLockRecovery(async () => {
-            const atomsObject = {};
-            for (const [bName, blob] of container.blobs.entries()) {
-              let atomToken = blob.atom;
-              if (!atomToken) {
-                atomToken = await client.uploadAtom(blob.data, signal);
-                blob.atom = atomToken;
-              }
-              atomsObject[bName] = atomToken;
-            }
-
-            const isoNow = container.modifiedIso || new Date().toISOString();
-            await client.putContainerManifest(
-              cName,
-              {
-                displayName: container.displayName || cName,
-                clientFileTime: isoNow,
-                atomsObject,
-              },
-              signal
-            );
-
-            container.dirty = false;
-            container.stateFlags = 0;
-            container.remoteClientFileTime = isoNow;
-          });
-          uploadedContainers += 1;
-        } catch (uploadErr) {
-          if (!firstUploadError) firstUploadError = uploadErr;
-        }
+        dirtyContainers.push([cName, container]);
       }
+
+      await Promise.all(
+        dirtyContainers.map(async ([cName, container]) => {
+          try {
+            await runWithSessionLockRecovery(async () => {
+              const uploadedPairs = await Promise.all(
+                Array.from(container.blobs.entries()).map(([bName, blob]) =>
+                  runWithBlobConcurrency(async () => {
+                    let atomToken = blob.atom;
+                    if (!atomToken) {
+                      atomToken = await client.uploadAtom(blob.data, signal);
+                      blob.atom = atomToken;
+                    }
+                    return [bName, atomToken];
+                  })
+                )
+              );
+              const atomsObject = Object.fromEntries(uploadedPairs);
+
+              const isoNow = container.modifiedIso || new Date().toISOString();
+              await runWithBlobConcurrency(() =>
+                client.putContainerManifest(
+                  cName,
+                  {
+                    displayName: container.displayName || cName,
+                    clientFileTime: isoNow,
+                    atomsObject,
+                  },
+                  signal
+                )
+              );
+
+              container.dirty = false;
+              container.stateFlags = 0;
+              container.remoteClientFileTime = isoNow;
+            });
+            uploadedContainers += 1;
+          } catch (uploadErr) {
+            if (!firstUploadError) firstUploadError = uploadErr;
+          }
+        })
+      );
     }
 
     await writeLocalWgsWorkspace(wgsUserDir, {
@@ -1930,6 +2020,7 @@ async function syncXboxTitleStorage(options = {}) {
       deletedRemoteContainers,
       containerCount: mergedContainers.size,
       lockHeld: lockAcquired,
+      ...(conflictDetected ? { conflictDetected: true, conflictContainerNames } : {}),
     };
   } catch (err) {
     if (lockAcquired && !keepLockHeld) {

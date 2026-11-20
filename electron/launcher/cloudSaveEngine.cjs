@@ -3,8 +3,13 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { execFile } = require('node:child_process');
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
+const {
+  getUserDataDir,
+  isNetworkOnlineForLaunch,
+} = require('./engineStateRegistry.cjs');
 const {
   copyRealDirBoundedSync,
   copyRealDirBoundedAsync,
@@ -1695,13 +1700,48 @@ function pruneGogCloudConfigsMap(cachedMap, maxEntries = MAX_GOG_CLOUD_CONFIG_CA
     sanitizedProductIds = Object.fromEntries(cappedPairs);
   }
 
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+  let sanitizedNoCloudIds = null;
+  if (
+    cachedMap.__noCloudProductIds &&
+    typeof cachedMap.__noCloudProductIds === 'object' &&
+    !Array.isArray(cachedMap.__noCloudProductIds)
+  ) {
+    const nowTs = Date.now();
+    const validNegPairs = Object.entries(cachedMap.__noCloudProductIds)
+      .map(
+        ([prodId, rawTs]) =>
+          /** @type {[string, number]} */ ([String(prodId || '').trim(), Number(rawTs)])
+      )
+      .filter(
+        ([prodId, tsNum]) =>
+          Boolean(prodId) && Number.isFinite(tsNum) && tsNum > 0 && nowTs - tsNum < SEVEN_DAYS_MS
+      );
+    const cappedNegPairs =
+      validNegPairs.length > MAX_GOG_PRODUCT_CLIENT_ID_CACHE_ENTRIES
+        ? validNegPairs.slice(-MAX_GOG_PRODUCT_CLIENT_ID_CACHE_ENTRIES)
+        : validNegPairs;
+    if (cappedNegPairs.length > 0) {
+      sanitizedNoCloudIds = Object.fromEntries(cappedNegPairs);
+    }
+  }
+
   const entries = Object.entries(cachedMap).filter(
-    ([k, v]) => k && k !== '__productClientIds' && v && typeof v === 'object' && !Array.isArray(v)
+    ([k, v]) =>
+      k &&
+      k !== '__productClientIds' &&
+      k !== '__noCloudProductIds' &&
+      v &&
+      typeof v === 'object' &&
+      !Array.isArray(v)
   );
 
   const pruned = {};
   if (sanitizedProductIds) {
     pruned.__productClientIds = sanitizedProductIds;
+  }
+  if (sanitizedNoCloudIds) {
+    pruned.__noCloudProductIds = sanitizedNoCloudIds;
   }
 
   if (entries.length <= maxEntries) {
@@ -1945,6 +1985,9 @@ function createCloudSaveRunner(deps) {
       if (!gameId) {
         return { synced: false, mode, reason: 'missing_game_id' };
       }
+      if (!isNetworkOnlineForLaunch(options)) {
+        return { synced: false, gameId, mode, offlineSkipped: true, reason: 'offline_skipped' };
+      }
 
       const { homedir, userDataDir } = resolveIsolatedHomedirAndUserData(options);
       const targetPlatform = options.platform || process.platform;
@@ -2054,11 +2097,32 @@ function createCloudSaveRunner(deps) {
         }
       }
 
+      const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+      if (
+        !clientId &&
+        !hasRemoteConfigOverride &&
+        options.forceCloudSaveSync !== true &&
+        cachedMap?.__noCloudProductIds &&
+        typeof cachedMap.__noCloudProductIds === 'object'
+      ) {
+        const negCachedAt = Number(cachedMap.__noCloudProductIds[gameId] || 0);
+        if (negCachedAt > 0 && Date.now() - negCachedAt < SEVEN_DAYS_MS) {
+          return {
+            synced: false,
+            gameId,
+            mode,
+            cachedNegative: true,
+            reason: 'no_cloud_saves_configured',
+          };
+        }
+      }
+
       if (!clientId && canUseNetwork) {
         const primaryOs = useWindowsLocations ? 'windows' : 'osx';
         const fallbackOs = primaryOs === 'osx' ? 'windows' : 'osx';
         const osCandidates = [primaryOs, fallbackOs];
         const generations = [2, 1];
+        let anyBuildsHttpJsonResponse = false;
 
         for (const gen of generations) {
           if (clientId) break;
@@ -2067,6 +2131,7 @@ function createCloudSaveRunner(deps) {
             const buildsUrl = `https://content-system.gog.com/products/${encodeURIComponent(gameId)}/os/${osCandidate}/builds?generation=${gen}`;
             const buildsJson = await fetchGogV1Json(buildsUrl, {}, 8000, effectiveFetchImpl);
             if (!buildsJson || typeof buildsJson !== 'object') continue;
+            anyBuildsHttpJsonResponse = true;
 
             const directCandidates = [
               ...(Array.isArray(buildsJson.items) ? buildsJson.items.map((it) => it?.clientId) : []),
@@ -2112,12 +2177,39 @@ function createCloudSaveRunner(deps) {
                 freshMap.__productClientIds = {};
               }
               freshMap.__productClientIds[gameId] = clientId;
+              if (freshMap.__noCloudProductIds && typeof freshMap.__noCloudProductIds === 'object') {
+                delete freshMap.__noCloudProductIds[gameId];
+              }
               const pruned = pruneGogCloudConfigsMap(freshMap, MAX_GOG_CLOUD_CONFIG_CACHE_ENTRIES);
               cachedMap = pruned;
               atomicWriteFileSync(configCachePath, JSON.stringify(pruned, null, 2));
             });
           } catch (prodCacheErr) {
             diagLog.warn('cloudSave.gogWriteProductClientIdCache', prodCacheErr, {
+              configCachePath,
+              gameId,
+            });
+          }
+        } else if (anyBuildsHttpJsonResponse) {
+          // Negative-cache confirmed non-cloud GOG product IDs for 7 days
+          try {
+            await withCloudManifestFileLock(configCachePath, async () => {
+              let freshMap = {};
+              try {
+                if (fs.existsSync(configCachePath)) {
+                  freshMap = JSON.parse(await fs.promises.readFile(configCachePath, 'utf8')) || {};
+                }
+              } catch {}
+              if (!freshMap.__noCloudProductIds || typeof freshMap.__noCloudProductIds !== 'object') {
+                freshMap.__noCloudProductIds = {};
+              }
+              freshMap.__noCloudProductIds[gameId] = Date.now();
+              const pruned = pruneGogCloudConfigsMap(freshMap, MAX_GOG_CLOUD_CONFIG_CACHE_ENTRIES);
+              cachedMap = pruned;
+              atomicWriteFileSync(configCachePath, JSON.stringify(pruned, null, 2));
+            });
+          } catch (negCacheErr) {
+            diagLog.warn('cloudSave.gogWriteNoCloudProductCache', negCacheErr, {
               configCachePath,
               gameId,
             });
@@ -2130,7 +2222,6 @@ function createCloudSaveRunner(deps) {
       }
 
       // 2. Fetch or read cached remote-config (7-day TTL, 250-entry LRU cap)
-      const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
       let remoteConfig = options.gogRemoteConfigOverride || null;
 
       if (!remoteConfig) {
@@ -2326,7 +2417,9 @@ function createCloudSaveRunner(deps) {
         }
 
         const locKey = `${gameId}:${useWindowsLocations ? 'windows' : 'osx'}:${loc.name}`;
-        const lastTs = Number(timestampsData.gog[locKey] || 0) || 0;
+        const lastTs =
+          Number(timestampsData.gog[locKey] || 0) ||
+          (Number(options.fallbackLastSyncTsSec) > 0 ? Math.floor(Number(options.fallbackLastSyncTsSec)) : 0);
         const hostLocPath = toHostFilesystemPath(loc.resolvedPath);
         const hygiene = await purgeOsMetadataAndCountRealFilesAsync(hostLocPath);
 
@@ -2505,6 +2598,9 @@ function createCloudSaveRunner(deps) {
       if (!appName) {
         return { synced: false, appName: '', mode, reason: 'missing_app_name' };
       }
+      if (!isNetworkOnlineForLaunch(options)) {
+        return { synced: false, appName, mode, offlineSkipped: true, reason: 'offline_skipped' };
+      }
 
       const canRunSync =
         (!isTestEnvironment(options) && !options.skipCloudSaveSync) ||
@@ -2512,14 +2608,19 @@ function createCloudSaveRunner(deps) {
         typeof options.execFileFn === 'function' ||
         options.allowCloudSaveSyncInTest === true;
 
+      let resolvedLegAuth =
+        options.prefetchedLegAuth && typeof options.prefetchedLegAuth === 'object'
+          ? options.prefetchedLegAuth
+          : null;
       if (
+        !resolvedLegAuth &&
         canRunSync &&
         !options.skipAuthRefresh &&
         !options.legendaryConfigDir &&
         !options.legendaryConfigPath
       ) {
         try {
-          await ensureLegendaryConfigAndAuth(options);
+          resolvedLegAuth = await ensureLegendaryConfigAndAuth(options);
         } catch (authErr) {
           diagLog.warn('cloudSave.epicEnsureAuth', authErr, { appName });
         }
@@ -2631,7 +2732,9 @@ function createCloudSaveRunner(deps) {
         };
       }
 
-      let epicAccountId = String(options.epicAccountId || payload.epicAccountId || '').trim();
+      let epicAccountId = String(
+        options.epicAccountId || payload.epicAccountId || resolvedLegAuth?.accountId || ''
+      ).trim();
       if (!epicAccountId && legCfgDir) {
         const userJsonCandidates = [
           path.join(legCfgDir, 'user.json'),
@@ -2906,6 +3009,12 @@ function createCloudSaveRunner(deps) {
     if (isTestEnvironment(options) && options.enableTwoStageSteamColdStart !== true) {
       return { ready: true, waitedMs: 0, reason: 'skipped_in_test' };
     }
+    if (!isNetworkOnlineForLaunch(options)) {
+      return { ready: true, waitedMs: 0, offlineSkipped: true, reason: 'offline_skipped' };
+    }
+    if (options.signal?.aborted) {
+      return { ready: false, aborted: true, waitedMs: 0, reason: 'aborted' };
+    }
 
     const cleanAppId = String(appId || '')
       .replace(/^steam[-_]/i, '')
@@ -3142,7 +3251,28 @@ function createCloudSaveRunner(deps) {
       return { ready: true };
     };
 
-    const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const sleepMs = (ms) => {
+      if (ms <= 0 || options.signal?.aborted) return Promise.resolve();
+      return new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          if (options.signal && typeof options.signal.removeEventListener === 'function') {
+            try {
+              options.signal.removeEventListener('abort', finish);
+            } catch {}
+          }
+          resolve(undefined);
+        };
+        const timer = setTimeout(finish, ms);
+        if (typeof timer.unref === 'function') timer.unref();
+        if (options.signal && typeof options.signal.addEventListener === 'function') {
+          options.signal.addEventListener('abort', finish, { once: true });
+        }
+      });
+    };
 
     const startedWait = Date.now();
     let readySinceMs = 0;
@@ -3177,6 +3307,14 @@ function createCloudSaveRunner(deps) {
     }
 
     while (Date.now() - startedWait < maxStartupCloudWaitMs) {
+      if (options.signal?.aborted) {
+        return {
+          ready: false,
+          aborted: true,
+          waitedMs: Date.now() - startedWait,
+          reason: 'aborted',
+        };
+      }
       const remainingBudget = maxStartupCloudWaitMs - (Date.now() - startedWait);
       if (remainingBudget <= 0) break;
 
@@ -4092,6 +4230,16 @@ async function syncXboxCloudSaves(payload = {}, mode = 'pre_launch', options = {
   }
 
   // 2. Direct Title Storage REST Sync (macOS Bottle / Compat Layer OR Windows Clientless `xbox-msixvc-win`)
+  if (!isNetworkOnlineForLaunch(options)) {
+    return {
+      synced: false,
+      provider: 'xbox_connected_storage',
+      mode,
+      offlineSkipped: true,
+      reason: 'offline_skipped',
+      backupPath: null,
+    };
+  }
   const directSyncCompatLayer = Boolean(
     winePrefix || options.useCompatLayer || payload.useCompatLayer
   );
@@ -4217,6 +4365,13 @@ async function syncXboxCloudSaves(payload = {}, mode = 'pre_launch', options = {
       titleStorageOrigin: options.titleStorageOrigin || payload.titleStorageOrigin,
       fetchImpl: options.fetchImpl,
       signal: options.signal,
+      ...(typeof options.pendingUploadLastSyncedAt === 'number' &&
+      options.pendingUploadLastSyncedAt > 0
+        ? { pendingUploadLastSyncedAt: options.pendingUploadLastSyncedAt }
+        : {}),
+      ...(typeof options.blobConcurrency === 'number'
+        ? { blobConcurrency: options.blobConcurrency }
+        : {}),
     });
 
     const resolvedScid = String(syncRes?.resolvedScid || locs.scid || '').trim().toLowerCase();
@@ -4257,6 +4412,14 @@ async function syncXboxCloudSaves(payload = {}, mode = 'pre_launch', options = {
       uploadedContainers: Number(syncRes?.uploadedContainers || 0),
       deletedRemoteContainers: Number(syncRes?.deletedRemoteContainers || 0),
       backupPath,
+      ...(syncRes?.conflictDetected
+        ? {
+            conflictDetected: true,
+            conflictContainerNames: Array.isArray(syncRes.conflictContainerNames)
+              ? syncRes.conflictContainerNames
+              : [],
+          }
+        : {}),
       ...(syncRes?.lockHeld ? { reason: 'xbox_cloud_lock_conflict' } : {}),
     };
   } catch (err) {
@@ -4289,6 +4452,409 @@ async function syncXboxCloudSaves(payload = {}, mode = 'pre_launch', options = {
   }
 }
 
+const PENDING_CLOUD_UPLOADS_FILENAME = 'pending_cloud_uploads.json';
+const MAX_PENDING_CLOUD_UPLOADS = 100;
+
+/**
+ * @param {Record<string, any> | string} [options]
+ * @returns {string}
+ */
+function getPendingCloudUploadsFilePath(options = {}) {
+  const customDir =
+    options && typeof options === 'object'
+      ? options.userDataDir || options.baseDir
+      : typeof options === 'string'
+        ? options
+        : undefined;
+  return path.join(getUserDataDir(customDir), PENDING_CLOUD_UPLOADS_FILENAME);
+}
+
+/**
+ * Compute deterministic `(localMaxMtimeMs, localFilesDigest, fileCount)` across one or more
+ * local save paths, skipping OS metadata junk and symlinks.
+ *
+ * @param {string[]} savePaths
+ * @returns {{ localMaxMtimeMs: number, localFilesDigest: string, fileCount: number }}
+ */
+function computeSavePathsStateSnapshot(savePaths = []) {
+  const pathsList = Array.isArray(savePaths)
+    ? savePaths.map((p) => String(p || '').trim()).filter(Boolean)
+    : [];
+  /** @type {string[]} */
+  const digestLines = [];
+  let maxMtimeMs = 0;
+  let fileCount = 0;
+
+  const walk = (rootDir, currentDir, depth) => {
+    if (depth > 12) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry || entry.isSymbolicLink() || OS_METADATA_JUNK_REGEX.test(entry.name)) continue;
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        walk(rootDir, fullPath, depth + 1);
+      } else if (entry.isFile()) {
+        try {
+          const st = fs.statSync(fullPath);
+          const mtime = Math.trunc(st.mtimeMs || 0);
+          if (mtime > maxMtimeMs) maxMtimeMs = mtime;
+          const rel = path.relative(rootDir, fullPath).replace(/\\/g, '/');
+          digestLines.push(`${rel}|${st.size}|${mtime}`);
+          fileCount += 1;
+        } catch {}
+      }
+    }
+  };
+
+  for (const rawPath of pathsList) {
+    const hostPath = toHostFilesystemPath(rawPath);
+    if (!hostPath || !fs.existsSync(hostPath)) continue;
+    try {
+      const st = fs.statSync(hostPath);
+      if (st.isFile()) {
+        const mtime = Math.trunc(st.mtimeMs || 0);
+        if (mtime > maxMtimeMs) maxMtimeMs = mtime;
+        digestLines.push(`${path.basename(hostPath)}|${st.size}|${mtime}`);
+        fileCount += 1;
+      } else if (st.isDirectory()) {
+        walk(hostPath, hostPath, 0);
+      }
+    } catch {}
+  }
+
+  digestLines.sort();
+  const digest =
+    digestLines.length > 0
+      ? crypto.createHash('sha256').update(digestLines.join('\n')).digest('hex')
+      : '';
+  return {
+    localMaxMtimeMs: maxMtimeMs,
+    localFilesDigest: digest,
+    fileCount,
+  };
+}
+
+/**
+ * Load durable interrupted post-exit cloud uploads from `pending_cloud_uploads.json`.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {Array<Record<string, any>>}
+ */
+function loadPendingCloudUploads(options = {}) {
+  const filePath = getPendingCloudUploadsFilePath(options);
+  try {
+    if (!fs.existsSync(filePath)) return [];
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item) => item && typeof item === 'object' && item.gameId && item.platformId);
+    }
+  } catch (err) {
+    diagLog.warn('cloudSave.loadPendingUploadsFailed', err, { filePath });
+  }
+  return [];
+}
+
+/**
+ * Atomically persist an interrupted or offline post-exit cloud upload into `pending_cloud_uploads.json`
+ * with full timestamp & digest provenance so replay never clobbers newer remote saves.
+ *
+ * @param {Record<string, any>} record
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<Array<Record<string, any>>>}
+ */
+async function enqueuePendingCloudUpload(record, options = {}) {
+  if (!record || typeof record !== 'object') return loadPendingCloudUploads(options);
+  const gameId = String(record.gameId || '').trim();
+  const platformId = String(record.platformId || '').trim().toLowerCase();
+  if (!gameId || !['gog', 'epic', 'xbox'].includes(platformId)) {
+    return loadPendingCloudUploads(options);
+  }
+  const filePath = getPendingCloudUploadsFilePath(options);
+  const savePaths = Array.from(
+    new Set(
+      (Array.isArray(record.savePaths) ? record.savePaths : [])
+        .map((p) => String(p || '').trim())
+        .filter(Boolean)
+    )
+  );
+  const snap =
+    record.localMaxMtimeMs !== undefined && record.localFilesDigest !== undefined
+      ? {
+          localMaxMtimeMs: Number(record.localMaxMtimeMs) || 0,
+          localFilesDigest: String(record.localFilesDigest || ''),
+        }
+      : computeSavePathsStateSnapshot(savePaths);
+
+  const normalizedEntry = {
+    gameId,
+    platformId,
+    platformGameId: String(record.platformGameId || gameId),
+    queuedAt: record.queuedAt || new Date().toISOString(),
+    lastSyncedAt: Number(record.lastSyncedAt || 0) || 0,
+    localMaxMtimeMs: snap.localMaxMtimeMs,
+    localFilesDigest: snap.localFilesDigest,
+    savePaths,
+    ...(record.title ? { title: String(record.title) } : {}),
+    ...(record.installPath ? { installPath: String(record.installPath) } : {}),
+    ...(record.winePrefix ? { winePrefix: String(record.winePrefix) } : {}),
+    ...(typeof record.useCompatLayer === 'boolean' ? { useCompatLayer: record.useCompatLayer } : {}),
+    ...(record.packageFamilyName ? { packageFamilyName: String(record.packageFamilyName) } : {}),
+    ...(record.scid ? { scid: String(record.scid) } : {}),
+    ...(record.fallbackScid ? { fallbackScid: String(record.fallbackScid) } : {}),
+    ...(record.msaAppId ? { msaAppId: String(record.msaAppId) } : {}),
+    ...(record.xboxTitleId ? { xboxTitleId: String(record.xboxTitleId) } : {}),
+    ...(record.xboxProductId ? { xboxProductId: String(record.xboxProductId) } : {}),
+    ...(record.appUserModelId ? { appUserModelId: String(record.appUserModelId) } : {}),
+    ...(record.gogClientId ? { gogClientId: String(record.gogClientId) } : {}),
+    ...(record.appName ? { appName: String(record.appName) } : {}),
+  };
+
+  return await withCloudManifestFileLock(filePath, async () => {
+    let queue = loadPendingCloudUploads(options);
+    const idx = queue.findIndex(
+      (item) => item.gameId === gameId && String(item.platformId).toLowerCase() === platformId
+    );
+    if (idx >= 0) {
+      queue[idx] = {
+        ...queue[idx],
+        ...normalizedEntry,
+        savePaths: normalizedEntry.savePaths.length > 0 ? normalizedEntry.savePaths : queue[idx].savePaths || [],
+      };
+    } else {
+      queue.push(normalizedEntry);
+      if (queue.length > MAX_PENDING_CLOUD_UPLOADS) {
+        queue = queue.slice(-MAX_PENDING_CLOUD_UPLOADS);
+      }
+    }
+    atomicWriteFileSync(filePath, JSON.stringify(queue, null, 2));
+    return queue;
+  });
+}
+
+/**
+ * Remove a resolved entry from `pending_cloud_uploads.json`.
+ *
+ * @param {string} gameId
+ * @param {string} platformId
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<Array<Record<string, any>>>}
+ */
+async function removePendingCloudUpload(gameId, platformId, options = {}) {
+  const cleanGameId = String(gameId || '').trim();
+  const cleanPlatform = String(platformId || '').trim().toLowerCase();
+  const filePath = getPendingCloudUploadsFilePath(options);
+  return await withCloudManifestFileLock(filePath, async () => {
+    const queue = loadPendingCloudUploads(options);
+    const next = queue.filter(
+      (item) => !(item.gameId === cleanGameId && String(item.platformId).toLowerCase() === cleanPlatform)
+    );
+    if (next.length !== queue.length) {
+      atomicWriteFileSync(filePath, JSON.stringify(next, null, 2));
+    }
+    return next;
+  });
+}
+
+/**
+ * Conflict-safe replay of a single queued pending cloud upload:
+ * 1. Fast-skips when offline (retaining queue entry).
+ * 2. Snapshots a rolling local backup of every `savePaths` directory FIRST.
+ * 3. Replays strictly in conflict-aware / bidirectional timestamp mode (NEVER `--force-upload`),
+ *    comparing remote timestamps against `lastSyncedAt` so newer remote progress from another device
+ *    is NEVER silently overwritten.
+ *
+ * @param {Record<string, any>} entry
+ * @param {Record<string, any>} runnerOrHandlers
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<Record<string, any>>}
+ */
+async function replayPendingCloudUpload(entry, runnerOrHandlers = {}, options = {}) {
+  if (!entry || typeof entry !== 'object' || !entry.gameId || !entry.platformId) {
+    return { replayed: false, synced: false, reason: 'invalid_entry' };
+  }
+  if (!isNetworkOnlineForLaunch(options)) {
+    return {
+      replayed: false,
+      synced: false,
+      offlineSkipped: true,
+      reason: 'offline_skipped',
+      gameId: entry.gameId,
+      platformId: entry.platformId,
+    };
+  }
+
+  const userDataDir = getUserDataDir(options.userDataDir);
+  const platformId = String(entry.platformId).toLowerCase();
+  const safeId = String(entry.gameId).replace(/[^A-Za-z0-9._-]/g, '_');
+  const backupQuotaOpts = {
+    maxTotalBackupBytes: options.maxTotalBackupBytes,
+    maxSnapshotsPerGame: options.maxSnapshotsPerGame,
+    userDataDir,
+    backupsRootDir: options.backupsRootDir,
+    platform: options.platform || process.platform,
+  };
+  const maxBackupBytes =
+    Number(options.maxBackupBytes) > 0
+      ? Number(options.maxBackupBytes)
+      : resolveDefaultPerSnapshotMaxBackupBytes(options);
+
+  // Step 1: Mandatory rolling local backup BEFORE any bidirectional cloud sync
+  /** @type {string[]} */
+  const backupPaths = [];
+  const savePaths = Array.isArray(entry.savePaths) ? entry.savePaths : [];
+  for (let i = 0; i < savePaths.length; i += 1) {
+    const hostPath = toHostFilesystemPath(savePaths[i]);
+    if (!hostPath || !fs.existsSync(hostPath)) continue;
+    const backupRoot = path.join(
+      userDataDir,
+      'cloud_save_backups',
+      platformId,
+      safeId,
+      `pending_replay_${i}`
+    );
+    try {
+      const bRes = await createCloudSaveRollingBackupAsync(
+        hostPath,
+        backupRoot,
+        maxBackupBytes,
+        backupQuotaOpts
+      );
+      if (bRes?.backupPath) {
+        backupPaths.push(bRes.backupPath);
+      }
+    } catch (backupErr) {
+      diagLog.warn('cloudSave.pendingReplayBackupFailed', backupErr, {
+        gameId: entry.gameId,
+        platformId,
+        hostPath,
+      });
+    }
+  }
+
+  const payload = {
+    gameId: entry.gameId,
+    platformId,
+    platformGameId: entry.platformGameId || entry.gameId,
+    title: entry.title || entry.gameId,
+    installPath: entry.installPath || options.installPath,
+    useCompatLayer: Boolean(entry.useCompatLayer ?? options.useCompatLayer),
+    winePrefix: entry.winePrefix || options.winePrefix,
+    ...(entry.gogClientId ? { gogClientId: entry.gogClientId } : {}),
+    ...(entry.appName ? { appName: entry.appName } : {}),
+    ...(entry.packageFamilyName ? { packageFamilyName: entry.packageFamilyName } : {}),
+    ...(entry.scid ? { scid: entry.scid } : {}),
+    ...(entry.fallbackScid ? { fallbackScid: entry.fallbackScid } : {}),
+    ...(entry.msaAppId ? { msaAppId: entry.msaAppId } : {}),
+    ...(entry.xboxTitleId ? { xboxTitleId: entry.xboxTitleId } : {}),
+    ...(entry.xboxProductId ? { xboxProductId: entry.xboxProductId } : {}),
+    ...(entry.appUserModelId ? { appUserModelId: entry.appUserModelId } : {}),
+  };
+
+  /** @type {any} */
+  let syncRes = { synced: false, reason: 'unsupported_platform' };
+  const replayOpts = {
+    ...options,
+    userDataDir,
+    useCompatLayer: payload.useCompatLayer,
+    winePrefix: payload.winePrefix,
+    installPath: payload.installPath,
+    ...(Number(entry.lastSyncedAt) > 0
+      ? {
+          pendingUploadLastSyncedAt: Number(entry.lastSyncedAt),
+          fallbackLastSyncTsSec: Math.floor(Number(entry.lastSyncedAt) / 1000),
+        }
+      : {}),
+  };
+
+  if (platformId === 'gog' && typeof runnerOrHandlers.syncGogCloudSaves === 'function') {
+    // Strictly bidirectional (`mode = 'both'`) — NEVER `--force-upload`!
+    syncRes = await runnerOrHandlers.syncGogCloudSaves(payload, 'both', replayOpts);
+  } else if (platformId === 'epic' && typeof runnerOrHandlers.syncEpicCloudSaves === 'function') {
+    // Strictly bidirectional (`mode = 'both'`) — NEVER `--force-upload`!
+    syncRes = await runnerOrHandlers.syncEpicCloudSaves(payload, 'both', replayOpts);
+  } else if (platformId === 'xbox') {
+    const xboxSyncHandler =
+      typeof runnerOrHandlers.syncXboxCloudSaves === 'function'
+        ? runnerOrHandlers.syncXboxCloudSaves
+        : syncXboxCloudSaves;
+    // `pre_launch` mode performs bidirectional timestamp comparison (pulling newer remote before uploading dirty local)
+    syncRes = await xboxSyncHandler(payload, 'pre_launch', replayOpts);
+  }
+
+  const conflictInReason = /conflict/i.test(String(syncRes?.reason || ''));
+  const conflict = Boolean(syncRes?.conflictDetected || conflictInReason);
+
+  if (syncRes?.synced) {
+    await removePendingCloudUpload(entry.gameId, platformId, options);
+    return {
+      replayed: true,
+      synced: true,
+      conflict,
+      backupPaths,
+      gameId: entry.gameId,
+      platformId,
+      syncRes,
+    };
+  }
+
+  return {
+    replayed: false,
+    synced: false,
+    conflict,
+    backupPaths,
+    gameId: entry.gameId,
+    platformId,
+    reason: syncRes?.reason || 'replay_failed',
+    syncRes,
+  };
+}
+
+/**
+ * Replay all (or filtered) queued entries from `pending_cloud_uploads.json` in conflict-safe mode.
+ *
+ * @param {Record<string, any>} runnerOrHandlers
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ attempted: number, replayed: number, conflicts: number, offlineSkipped?: boolean, results: Array<Record<string, any>> }>}
+ */
+async function replayPendingCloudUploads(runnerOrHandlers = {}, options = {}) {
+  if (!isNetworkOnlineForLaunch(options)) {
+    return { attempted: 0, replayed: 0, conflicts: 0, offlineSkipped: true, results: [] };
+  }
+  const allQueued = loadPendingCloudUploads(options);
+  const filtered = allQueued.filter((entry) => {
+    if (options.gameId && entry.gameId !== String(options.gameId)) return false;
+    if (
+      options.platformId &&
+      String(entry.platformId).toLowerCase() !== String(options.platformId).toLowerCase()
+    ) {
+      return false;
+    }
+    return true;
+  });
+
+  /** @type {Array<Record<string, any>>} */
+  const results = [];
+  let replayed = 0;
+  let conflicts = 0;
+  for (const entry of filtered) {
+    const res = await replayPendingCloudUpload(entry, runnerOrHandlers, options);
+    results.push(res);
+    if (res.replayed) replayed += 1;
+    if (res.conflict) conflicts += 1;
+  }
+  return {
+    attempted: filtered.length,
+    replayed,
+    conflicts,
+    results,
+  };
+}
+
 module.exports = {
   GOG_GALAXY_LAUNCHER_CLIENT_ID,
   MAX_GOG_CLOUD_CONFIG_CACHE_ENTRIES,
@@ -4299,6 +4865,7 @@ module.exports = {
   FILE_ATTRIBUTE_OFFLINE,
   FILE_ATTRIBUTE_RECALL_ON_OPEN,
   FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+  PENDING_CLOUD_UPLOADS_FILENAME,
   hasWin32CloudPlaceholderAttributes,
   isOneDrivePath,
   isBroadOneDriveKnownFolderRoot,
@@ -4324,5 +4891,11 @@ module.exports = {
   pruneCloudSaveStateForGame,
   pruneCloudSaveStateForGameAsync,
   buildCloudSyncTelemetryPayload,
+  computeSavePathsStateSnapshot,
+  loadPendingCloudUploads,
+  enqueuePendingCloudUpload,
+  removePendingCloudUpload,
+  replayPendingCloudUpload,
+  replayPendingCloudUploads,
   createCloudSaveRunner,
 };

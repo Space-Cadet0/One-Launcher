@@ -35,6 +35,7 @@ import {
 } from '../../services/scraper/reviewCandidateService';
 import { CriticScoreData, CriticSource } from '../../contracts/critic';
 import { calculateTier } from '../../services/critic/criticUtils';
+import { sanitizeAllowedStoreUri } from '../../services/common/htmlSanitizer';
 import { syncJobManager } from '../../services/network/syncJobManager';
 import { useSafeId } from '../../utils/useSafeId';
 import {
@@ -675,11 +676,12 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
       const parsedReviews =
         typeof numReviews === 'string' ? parseInt(numReviews.trim(), 10) : numReviews;
       const count = !isNaN(parsedReviews) && parsedReviews > 0 ? parsedReviews : undefined;
+      const safeCustomUrl = url.trim() ? sanitizeAllowedStoreUri(url.trim()) : '';
       setSelectedReviewData({
         source: src,
         score: parsedScore,
         tier,
-        url: url.trim(),
+        url: safeCustomUrl,
         summary: summary.trim() || undefined,
         numReviews: count,
         isVerified: src === 'metacritic' || src === 'opencritic',
@@ -688,7 +690,8 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     } else {
       setSelectedReviewData(null);
     }
-    setSelectedReviewRoute({ mode: 'static', source: src, url: url.trim() });
+    const safeRouteUrl = url.trim() ? sanitizeAllowedStoreUri(url.trim()) : '';
+    setSelectedReviewRoute({ mode: 'static', source: src, url: safeRouteUrl || undefined });
   };
 
   const handleSelectCustomCard = () => {
@@ -777,7 +780,14 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     if (!game || !scrapedBundle) return;
 
     const activeMetaOpt = metadataSources.find((s) => s.id === selectedMetadataSourceId);
-    const isXboxMatchedBundle = isXboxStoreCandidateId(scrapedBundle.matchedId);
+    const isXboxSelectedCandidate = Boolean(
+      selectedCandidate &&
+        (selectedCandidate.source === 'xbox' ||
+          isXboxStoreCandidateId(selectedCandidate.id, selectedCandidate.storeUrl))
+    );
+    const isXboxMatchedBundle =
+      isXboxStoreCandidateId(scrapedBundle.matchedId) ||
+      (isXboxSelectedCandidate && String(scrapedBundle.matchedId) === String(selectedCandidate?.id));
     const isXboxMetaOpt = activeMetaOpt
       ? isXboxStoreCandidateId(activeMetaOpt.id, activeMetaOpt.storeUrl)
       : isXboxMatchedBundle;
@@ -790,21 +800,35 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
         !hasValidMetaSteamId &&
         typeof scrapedBundle.steamAppId !== 'number');
 
-    const reviewRoute: ReviewScoreRoute =
-      !selectedReviewData || selectedReviewOptionId === 'unrated'
+    const safeSelectedReviewData: CriticScoreData | null = selectedReviewData
+      ? {
+          ...selectedReviewData,
+          url: selectedReviewData.url ? sanitizeAllowedStoreUri(selectedReviewData.url) : '',
+        }
+      : null;
+
+    const rawReviewRoute: ReviewScoreRoute =
+      !safeSelectedReviewData || selectedReviewOptionId === 'unrated'
         ? { mode: 'unrated' }
-        : selectedReviewOptionId === 'custom' || selectedReviewData.source === 'custom'
+        : selectedReviewOptionId === 'custom' || safeSelectedReviewData.source === 'custom'
           ? {
               mode: 'static',
-              source: selectedReviewData.source,
-              url: selectedReviewData.url,
+              source: safeSelectedReviewData.source,
+              url: safeSelectedReviewData.url || undefined,
             }
           : selectedReviewRoute || {
               mode: 'routed',
-              source: selectedReviewData.source,
-              url: selectedReviewData.url,
+              source: safeSelectedReviewData.source,
+              url: safeSelectedReviewData.url || undefined,
               targetTitle: customTitle.trim() || scrapedBundle.title,
             };
+
+    const reviewRoute: ReviewScoreRoute = rawReviewRoute.url
+      ? {
+          ...rawReviewRoute,
+          url: sanitizeAllowedStoreUri(rawReviewRoute.url) || undefined,
+        }
+      : rawReviewRoute;
 
     const activeSource = activeMetaOpt?.source || scrapedBundle.matchedStore;
     const routeSource = resolveWizardMetadataRouteSource(activeMetaOpt, scrapedBundle);
@@ -854,6 +878,19 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
 
     const isSplittingFromMerged = isGameSplittingFromMerged(game, existingOverride);
 
+    const safeCapsuleImage =
+      sanitizeAllowedStoreUri(selectedCoverUrl) ||
+      sanitizeAllowedStoreUri(scrapedBundle.capsuleImage) ||
+      undefined;
+    const safeHeaderImage =
+      sanitizeAllowedStoreUri(activeHeaderImage) ||
+      sanitizeAllowedStoreUri(scrapedBundle.headerImage) ||
+      undefined;
+    const safeIconUrl =
+      sanitizeAllowedStoreUri(selectedCoverUrl) ||
+      sanitizeAllowedStoreUri(scrapedBundle.iconUrl) ||
+      undefined;
+
     const override: UserGameOverride = {
       gameId: game.id,
       platformId: game.platforms?.[0]?.platformId,
@@ -870,9 +907,9 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
         : scrapedBundle.steamAppId ?? activeMetaOpt?.steamAppId ?? null,
       isExplicitNonSteam,
       igdbId: activeMetaOpt?.igdbId ?? scrapedBundle.igdbId,
-      capsuleImage: selectedCoverUrl || scrapedBundle.capsuleImage,
-      headerImage: activeHeaderImage || scrapedBundle.headerImage,
-      iconUrl: selectedCoverUrl || scrapedBundle.iconUrl,
+      capsuleImage: safeCapsuleImage,
+      headerImage: safeHeaderImage,
+      iconUrl: safeIconUrl,
       shortDescription: selectedBlurb || scrapedBundle.shortDescription,
       detailedDescription:
         activeMetaOpt?.detailedDescription || scrapedBundle.detailedDescription,
@@ -882,7 +919,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
       tags: activeTags.length ? activeTags : scrapedBundle.tags,
       releaseDate: activeReleaseDate || scrapedBundle.releaseDate,
       storefrontAnchor: scrapedBundle.storefrontAnchor,
-      reviewScoreOverride: selectedReviewData,
+      reviewScoreOverride: safeSelectedReviewData,
       reviewRoute,
       metadataRoute,
       updatedAt: new Date().toISOString(),

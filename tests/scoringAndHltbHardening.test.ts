@@ -982,8 +982,8 @@ describe('Phase 3B & 4.1: Review Scoring Engine Hardening, HLTB Guard, and Reque
         expect(searchHltbMock).toHaveBeenCalledTimes(1);
         expect(searchHltbMock).toHaveBeenCalledWith('BioShock™');
 
-        // Flush the 150ms persistence debounce so both localStorage and IndexedDB vault are updated
-        await vi.advanceTimersByTimeAsync(200);
+        // Flush the 2000ms persistence debounce so both localStorage and IndexedDB vault are updated
+        await vi.advanceTimersByTimeAsync(2100);
 
         const persistedLocal = JSON.parse(
           mockStorage.getItem('one_launcher_hltb_lru_v3') || '{}'

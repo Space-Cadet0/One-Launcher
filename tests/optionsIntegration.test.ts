@@ -273,6 +273,7 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
         localStorage.setItem(`antigravity_critic_v8_${oldIdKey}`, JSON.stringify(oldScoreData));
         localStorage.setItem(`antigravity_critic_v8_${oldTitleKey}`, JSON.stringify(oldScoreData));
 
+        const evictHarvesterSpy = vi.spyOn(storefrontReviewHarvester, 'evictForGame');
         const clearHarvesterSpy = vi.spyOn(storefrontReviewHarvester, 'clearCache');
         const resolveSpy = vi.spyOn(criticScoreService, 'resolveDynamicScore').mockResolvedValue(null);
 
@@ -307,8 +308,9 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
         expect(localStorage.getItem(`antigravity_critic_v8_${oldIdKey}`)).toBeNull();
         expect(localStorage.getItem(`antigravity_critic_v8_${oldTitleKey}`)).toBeNull();
 
-        // Verify storefront review cache was cleared
-        expect(clearHarvesterSpy).toHaveBeenCalled();
+        // Verify targeted storefront review cache eviction occurred without nuclear clearCache()
+        expect(evictHarvesterSpy).toHaveBeenCalled();
+        expect(clearHarvesterSpy).not.toHaveBeenCalled();
 
         // Verify resolveDynamicScore was initiated with new title and storefront anchor
         expect(resolveSpy).toHaveBeenCalledWith('Fresh Title Beta', 22222, undefined, newAnchor);
@@ -389,7 +391,8 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
         expect(handleOverrideSpy).toHaveBeenCalledWith(override, undefined);
       });
 
-      it('criticScoreService receives window event antigravity:user-override-removed and clears cache', () => {
+      it('criticScoreService receives window event antigravity:user-override-removed and evicts only targeted game cache (H4)', () => {
+        const evictSpy = vi.spyOn(criticScoreService, 'evictCriticCacheForGame');
         const clearCacheSpy = vi.spyOn(criticScoreService, 'clearCache');
 
         window.dispatchEvent(
@@ -398,7 +401,8 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
           })
         );
 
-        expect(clearCacheSpy).toHaveBeenCalled();
+        expect(evictSpy).toHaveBeenCalled();
+        expect(clearCacheSpy).not.toHaveBeenCalled();
       });
     });
   });

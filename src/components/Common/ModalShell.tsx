@@ -1,5 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
+import { isImeComposing } from '../../utils/keyboardUtils';
 import { acquireModalOverlayLock, canPortalModalToBody } from '../../utils/modalOverlayLock';
 import { useIsRealClientRenderer } from '../../utils/useSafeId';
 
@@ -7,6 +8,7 @@ export interface ModalShellProps {
   isOpen: boolean;
   onClose: () => void;
   preventClose?: boolean;
+  onCloseAttemptWhilePrevented?: () => void;
   ariaLabelledBy?: string;
   ariaLabel?: string;
   className?: string;
@@ -61,6 +63,7 @@ export const ModalShell: React.FC<ModalShellProps> = ({
   isOpen,
   onClose,
   preventClose = false,
+  onCloseAttemptWhilePrevented,
   ariaLabelledBy,
   ariaLabel,
   className = '',
@@ -75,6 +78,8 @@ export const ModalShell: React.FC<ModalShellProps> = ({
   onCloseRef.current = onClose;
   const preventCloseRef = useRef(preventClose);
   preventCloseRef.current = preventClose;
+  const onCloseAttemptWhilePreventedRef = useRef(onCloseAttemptWhilePrevented);
+  onCloseAttemptWhilePreventedRef.current = onCloseAttemptWhilePrevented;
   const pointerStartedOnBackdropRef = useRef<boolean | null>(null);
 
   const isRealClientRenderer = useIsRealClientRenderer();
@@ -110,7 +115,10 @@ export const ModalShell: React.FC<ModalShellProps> = ({
     const handleCancel = (event: Event) => {
       if (event && event.target && event.target !== dialog) return;
       event.preventDefault();
-      if (preventCloseRef.current) return;
+      if (preventCloseRef.current) {
+        onCloseAttemptWhilePreventedRef.current?.();
+        return;
+      }
       onCloseRef.current();
     };
 
@@ -137,20 +145,35 @@ export const ModalShell: React.FC<ModalShellProps> = ({
   if (!isOpen) return null;
 
   const handleDialogPointerDown = (event: React.PointerEvent<HTMLDialogElement>) => {
-    const dialog = dialogRef.current;
+    const dialog = dialogRef.current || (event.currentTarget as HTMLDialogElement | null);
     if (!dialog) return;
     pointerStartedOnBackdropRef.current = isBackdropPoint(dialog, event);
+  };
+
+  const handleDialogKeyDown = (event: React.KeyboardEvent<HTMLDialogElement>) => {
+    if (event.defaultPrevented || isImeComposing(event)) return;
+    if (event.key === 'Escape' && preventCloseRef.current) {
+      event.preventDefault();
+      event.stopPropagation();
+      onCloseAttemptWhilePreventedRef.current?.();
+    }
   };
 
   const handleDialogClick = (event: React.MouseEvent<HTMLDialogElement>) => {
     const startedOnBackdrop = pointerStartedOnBackdropRef.current;
     pointerStartedOnBackdropRef.current = null;
 
-    if (preventClose || !closeOnBackdrop) return;
+    const dialog = dialogRef.current || (event.currentTarget as HTMLDialogElement | null);
+    if (!dialog || event.target !== dialog) return;
     if (startedOnBackdrop === false) return;
 
-    const dialog = dialogRef.current;
-    if (!dialog || event.target !== dialog) return;
+    if (preventClose) {
+      if (closeOnBackdrop && isBackdropPoint(dialog, event)) {
+        onCloseAttemptWhilePreventedRef.current?.();
+      }
+      return;
+    }
+    if (!closeOnBackdrop) return;
     if (
       typeof HTMLDialogElement !== 'undefined' &&
       'closedBy' in HTMLDialogElement.prototype
@@ -179,6 +202,7 @@ export const ModalShell: React.FC<ModalShellProps> = ({
       aria-label={!ariaLabelledBy ? ariaLabel : undefined}
       data-testid={testId}
       onPointerDown={handleDialogPointerDown}
+      onKeyDown={handleDialogKeyDown}
       onClick={handleDialogClick}
       style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
       className={`ol-modal-dialog modal-shell app-no-drag ${className}`.trim()}

@@ -473,6 +473,7 @@ function resolveStructuralExternalLauncherHandoff(params = {}) {
 }
 
 const DISPLAY_CATALOG_CACHE_TTL_MS = 7 * 24 * 3600_000; // 7 days (prevents post-rotation licensing staleness)
+const LAYER3_REJECTED_TTL_MS = 24 * 3600_000; // 24 hours (prevents per-startup bypassCache re-fetch of console-only/ineligible SKUs)
 const SIGL_FRESH_SKIP_NETWORK_MS = 5 * 60_000; // 5 minutes ultra-fast skip
 
 // ============================================================================
@@ -1107,7 +1108,8 @@ function openXboxCatalogCacheStore(userDataDirOrOptions) {
           big_id TEXT NOT NULL,
           market TEXT NOT NULL,
           product_json BLOB NOT NULL,
-          updated_at INTEGER NOT NULL
+          updated_at INTEGER NOT NULL,
+          layer3_rejected_at INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS sync_metadata (
           key TEXT PRIMARY KEY,
@@ -1115,6 +1117,19 @@ function openXboxCatalogCacheStore(userDataDirOrOptions) {
           updated_at INTEGER NOT NULL
         );
       `);
+
+      // Guarded schema migration for existing v1 SQLite caches lacking `layer3_rejected_at`
+      try {
+        const productCols = db.prepare('PRAGMA table_info(display_catalog_products)').all();
+        const hasLayer3RejectedCol =
+          Array.isArray(productCols) &&
+          productCols.some((col) => col && col.name === 'layer3_rejected_at');
+        if (!hasLayer3RejectedCol) {
+          db.exec(
+            'ALTER TABLE display_catalog_products ADD COLUMN layer3_rejected_at INTEGER NOT NULL DEFAULT 0'
+          );
+        }
+      } catch {}
 
       // Evict expired rows & migrate oversized legacy uncompressed caches down to <= 3.5 MB
       try {
@@ -1188,11 +1203,18 @@ function openXboxCatalogCacheStore(userDataDirOrOptions) {
         'DELETE FROM display_catalog_products WHERE cache_key = ?'
       );
       const upsertProductStmt = db.prepare(
-        `INSERT INTO display_catalog_products (cache_key, big_id, market, product_json, updated_at)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO display_catalog_products (cache_key, big_id, market, product_json, updated_at, layer3_rejected_at)
+         VALUES (?, ?, ?, ?, ?, 0)
          ON CONFLICT(cache_key) DO UPDATE SET
            product_json = excluded.product_json,
-           updated_at = excluded.updated_at`
+           updated_at = excluded.updated_at,
+           layer3_rejected_at = 0`
+      );
+      const getLayer3RejectedStmt = db.prepare(
+        'SELECT layer3_rejected_at FROM display_catalog_products WHERE cache_key = ?'
+      );
+      const setLayer3RejectedStmt = db.prepare(
+        'UPDATE display_catalog_products SET layer3_rejected_at = ? WHERE cache_key = ?'
       );
       const getMetaStmt = db.prepare('SELECT value FROM sync_metadata WHERE key = ?');
       const setMetaStmt = db.prepare(
@@ -1307,6 +1329,58 @@ function openXboxCatalogCacheStore(userDataDirOrOptions) {
             throw err;
           }
         },
+        getLayer3RejectedMap(bigIds, market = 'US') {
+          const out = new Map();
+          if (!Array.isArray(bigIds) || bigIds.length === 0) return out;
+          const mkt = String(market || 'US').toUpperCase();
+          for (const rawId of bigIds) {
+            const id = String(rawId || '').trim().toUpperCase();
+            if (!id) continue;
+            try {
+              const row = getLayer3RejectedStmt.get(`${mkt}:${id}`);
+              const ts = Number(row?.layer3_rejected_at || 0);
+              if (Number.isFinite(ts) && ts > 0) {
+                out.set(id, ts);
+              }
+            } catch {}
+          }
+          return out;
+        },
+        markLayer3Rejected(bigIds, market = 'US', rejectedAtMs = Date.now()) {
+          if (!Array.isArray(bigIds) || bigIds.length === 0) return;
+          const mkt = String(market || 'US').toUpperCase();
+          const ts = Number.isFinite(rejectedAtMs) && rejectedAtMs > 0 ? Math.floor(rejectedAtMs) : Date.now();
+          db.exec('BEGIN');
+          try {
+            for (const rawId of bigIds) {
+              const id = String(rawId || '').trim().toUpperCase();
+              if (!id) continue;
+              setLayer3RejectedStmt.run(ts, `${mkt}:${id}`);
+            }
+            db.exec('COMMIT');
+          } catch {
+            try {
+              db.exec('ROLLBACK');
+            } catch {}
+          }
+        },
+        clearLayer3Rejected(bigIds, market = 'US') {
+          if (!Array.isArray(bigIds) || bigIds.length === 0) return;
+          const mkt = String(market || 'US').toUpperCase();
+          db.exec('BEGIN');
+          try {
+            for (const rawId of bigIds) {
+              const id = String(rawId || '').trim().toUpperCase();
+              if (!id) continue;
+              setLayer3RejectedStmt.run(0, `${mkt}:${id}`);
+            }
+            db.exec('COMMIT');
+          } catch {
+            try {
+              db.exec('ROLLBACK');
+            } catch {}
+          }
+        },
         pruneExpired(nowMs = Date.now()) {
           const cutoff = nowMs - DISPLAY_CATALOG_CACHE_TTL_MS;
           const info = db
@@ -1413,9 +1487,52 @@ function openXboxCatalogCacheStore(userDataDirOrOptions) {
         state.products[`${mkt}:${String(id).toUpperCase()}`] = {
           product: projectCompactDisplayCatalogProduct(product),
           updatedAt: now,
+          layer3RejectedAt: 0,
         };
       }
       flushJson();
+    },
+    getLayer3RejectedMap(bigIds, market = 'US') {
+      const out = new Map();
+      const mkt = String(market || 'US').toUpperCase();
+      for (const rawId of bigIds || []) {
+        const id = String(rawId || '').trim().toUpperCase();
+        const entry = state.products?.[`${mkt}:${id}`];
+        const ts = Number(entry?.layer3RejectedAt || 0);
+        if (Number.isFinite(ts) && ts > 0) {
+          out.set(id, ts);
+        }
+      }
+      return out;
+    },
+    markLayer3Rejected(bigIds, market = 'US', rejectedAtMs = Date.now()) {
+      if (!Array.isArray(bigIds) || bigIds.length === 0) return;
+      const mkt = String(market || 'US').toUpperCase();
+      const ts = Number.isFinite(rejectedAtMs) && rejectedAtMs > 0 ? Math.floor(rejectedAtMs) : Date.now();
+      let dirty = false;
+      for (const rawId of bigIds) {
+        const id = String(rawId || '').trim().toUpperCase();
+        const entry = state.products?.[`${mkt}:${id}`];
+        if (entry) {
+          entry.layer3RejectedAt = ts;
+          dirty = true;
+        }
+      }
+      if (dirty) flushJson();
+    },
+    clearLayer3Rejected(bigIds, market = 'US') {
+      if (!Array.isArray(bigIds) || bigIds.length === 0) return;
+      const mkt = String(market || 'US').toUpperCase();
+      let dirty = false;
+      for (const rawId of bigIds) {
+        const id = String(rawId || '').trim().toUpperCase();
+        const entry = state.products?.[`${mkt}:${id}`];
+        if (entry && entry.layer3RejectedAt) {
+          entry.layer3RejectedAt = 0;
+          dirty = true;
+        }
+      }
+      if (dirty) flushJson();
     },
     pruneExpired() {
       flushJson();
@@ -5634,11 +5751,19 @@ async function syncXboxCatalog(options = {}) {
 
     // Re-fetch any active SIGL candidate that came from DisplayCatalog cache and failed Layer-3
     // desktop licensing (e.g., newly added Game Pass title or rolled-over availability window)
-    // before rejecting it, keeping forceRefresh fast while guaranteeing 0% false rejections.
-    if (cachedSourceIds.size > 0 && typeof fetchImpl === 'function' && syncMode !== 'owned_only') {
+    // before rejecting it — EXCEPT SKUs already marked `layer3_rejected_at` within the 24h TTL
+    // (unless `forceRefresh` or `subscriptionChanged`), avoiding per-startup `bypassCache: true` churn.
+    if (syncMode !== 'owned_only') {
       const prelimLineageIds = Array.from(bundleLineage.keys());
       const prelimIds = Array.from(new Set([...candidateSeedIds, ...prelimLineageIds]));
+      const rejectedAtMap =
+        cacheStore && typeof cacheStore.getLayer3RejectedMap === 'function'
+          ? cacheStore.getLayer3RejectedMap(prelimIds, market)
+          : new Map();
       const staleLayer3RefreshIds = new Set();
+      const newlyRejectedLayer3Ids = new Set();
+      const clearedLayer3Ids = new Set();
+
       for (const pid of prelimIds) {
         const prod = hydratedProducts.get(pid);
         if (!prod) continue;
@@ -5653,20 +5778,35 @@ async function syncXboxCatalog(options = {}) {
           nowMs
         );
         if (!preLayer3.allowed) {
+          const prevRejectedAt = Number(rejectedAtMap.get(pid) || 0);
+          const isWithinRejectionTtl =
+            !forceRefresh &&
+            !subscriptionChanged &&
+            prevRejectedAt > 0 &&
+            nowMs - prevRejectedAt < LAYER3_REJECTED_TTL_MS;
+
           if (cachedSourceIds.has(pid)) {
-            staleLayer3RefreshIds.add(pid);
-          }
-          if (Array.isArray(lin?.parentKeys)) {
-            for (const pk of lin.parentKeys) {
-              const pBigId = String(pk || '').split(':')[0];
-              if (pBigId && cachedSourceIds.has(pBigId)) {
-                staleLayer3RefreshIds.add(pBigId);
+            if (!isWithinRejectionTtl && typeof fetchImpl === 'function') {
+              staleLayer3RefreshIds.add(pid);
+              if (Array.isArray(lin?.parentKeys)) {
+                for (const pk of lin.parentKeys) {
+                  const pBigId = String(pk || '').split(':')[0];
+                  if (pBigId && cachedSourceIds.has(pBigId)) {
+                    staleLayer3RefreshIds.add(pBigId);
+                  }
+                }
               }
             }
+          } else if (!hydrationStats.failedProductIds.has(pid)) {
+            // Freshly fetched during this sync and failed Layer-3: stamp 24h rejection TTL immediately
+            newlyRejectedLayer3Ids.add(pid);
           }
+        } else if (rejectedAtMap.has(pid)) {
+          clearedLayer3Ids.add(pid);
         }
       }
-      if (staleLayer3RefreshIds.size > 0) {
+
+      if (staleLayer3RefreshIds.size > 0 && typeof fetchImpl === 'function') {
         const refreshedLayer3Map = await hydrateDisplayCatalogProducts(
           Array.from(staleLayer3RefreshIds),
           {
@@ -5686,6 +5826,37 @@ async function syncXboxCatalog(options = {}) {
           hydratedProducts.set(rid, rprod);
           cachedSourceIds.delete(rid);
         }
+        const failedRefreshIds =
+          /** @type {any} */ (refreshedLayer3Map)?.failedProductIds instanceof Set
+            ? /** @type {Set<string>} */ (/** @type {any} */ (refreshedLayer3Map).failedProductIds)
+            : new Set();
+        for (const rid of staleLayer3RefreshIds) {
+          if (failedRefreshIds.has(rid)) continue;
+          const rprod = hydratedProducts.get(rid);
+          if (!rprod) continue;
+          const rlin = bundleLineage.get(rid);
+          const rawInSigl = activePcSiglSet.has(rid) || Boolean(rlin?.inSiglFromParent);
+          if (!rawInSigl) continue;
+          const postLayer3 = evaluateLayer3DesktopLicenseGate(
+            rprod,
+            rlin,
+            hydratedProducts,
+            expandedCapabilityPassSet,
+            nowMs
+          );
+          if (!postLayer3.allowed) {
+            newlyRejectedLayer3Ids.add(rid);
+          } else {
+            clearedLayer3Ids.add(rid);
+          }
+        }
+      }
+
+      if (newlyRejectedLayer3Ids.size > 0 && cacheStore && typeof cacheStore.markLayer3Rejected === 'function') {
+        cacheStore.markLayer3Rejected(Array.from(newlyRejectedLayer3Ids), market, nowMs);
+      }
+      if (clearedLayer3Ids.size > 0 && cacheStore && typeof cacheStore.clearLayer3Rejected === 'function') {
+        cacheStore.clearLayer3Rejected(Array.from(clearedLayer3Ids), market);
       }
     }
 
@@ -6856,6 +7027,7 @@ module.exports = {
   hasStaleCachedDesktopPassGrants,
   openXboxCatalogCacheStore,
   closeXboxCatalogCacheStore,
+  LAYER3_REJECTED_TTL_MS,
   normalizeXboxSyncMode,
   evaluateXboxActiveAccessGate,
   evaluateLayer3DesktopLicenseGate,

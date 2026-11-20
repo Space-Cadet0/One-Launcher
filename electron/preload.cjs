@@ -221,6 +221,11 @@ if (isTrustedMainRendererOrigin()) {
   getAppVersion: () => ipcRenderer.invoke('app:get-version'),
   getAppInfo: () => ipcRenderer.invoke('app:get-info'),
   checkForAppUpdates: () => ipcRenderer.invoke('app:check-for-updates'),
+  onOpenSettings: (cb) => {
+    const handler = (_e, section) => cb(section);
+    ipcRenderer.on('app:open-settings', handler);
+    return () => ipcRenderer.removeListener('app:open-settings', handler);
+  },
   getUserOverrides: () => ipcRenderer.invoke('offlineVault:get-user-overrides'),
   saveUserOverride: (arg1, arg2) => ipcRenderer.invoke('offlineVault:save-user-override', arg1, arg2),
   removeUserOverride: (gameId) => ipcRenderer.invoke('offlineVault:remove-user-override', gameId),

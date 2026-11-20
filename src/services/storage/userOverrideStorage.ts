@@ -8,6 +8,7 @@ import type {
   NativeGameBaselineSnapshot,
 } from '../../contracts/override';
 import type { UserMetadataOverride } from '../../types/electron';
+import { sanitizeAllowedStoreUri } from '../common/htmlSanitizer';
 import { stripHtmlToPlainSynopsis } from '../common/synopsisTextUtils';
 
 export const STORAGE_KEY_USER_OVERRIDES = 'universal_game_library_user_overrides';
@@ -125,6 +126,189 @@ const VALID_MATCHED_STORES: ReadonlySet<UserGameOverride['matchedStore']> = new 
   'custom',
 ]);
 
+type UserOverrideWithOptionalArtUrls = Partial<UserGameOverride> & {
+  heroImage?: string;
+  logoImage?: string;
+};
+
+interface DeduplicatedUserOverridesEnvelopeV2 {
+  __v: 2;
+  records: Record<string, UserGameOverride>;
+  aliases: Record<string, string>;
+}
+
+/**
+ * Validates override URL fields (`capsuleImage`, `headerImage`, `heroImage`, `logoImage`,
+ * `iconUrl`, `reviewScoreOverride.url`, `reviewRoute.url`) through `sanitizeAllowedStoreUri`
+ * (`https:` and `ol-media:` only), returning a clean immutable copy.
+ */
+function sanitizeUserOverrideUrls<T extends UserOverrideWithOptionalArtUrls>(raw: T): T {
+  const copy: T = { ...raw };
+  const artKeys: ReadonlyArray<'capsuleImage' | 'headerImage' | 'heroImage' | 'logoImage' | 'iconUrl'> = [
+    'capsuleImage',
+    'headerImage',
+    'heroImage',
+    'logoImage',
+    'iconUrl',
+  ];
+
+  for (const field of artKeys) {
+    const val = copy[field];
+    if (typeof val === 'string') {
+      const trimmed = val.trim();
+      if (!trimmed) {
+        delete copy[field];
+      } else {
+        const safe = sanitizeAllowedStoreUri(trimmed);
+        if (safe) {
+          copy[field] = safe;
+        } else {
+          delete copy[field];
+        }
+      }
+    }
+  }
+
+  if (copy.reviewScoreOverride && typeof copy.reviewScoreOverride === 'object') {
+    const rawUrl = copy.reviewScoreOverride.url;
+    const safeReviewUrl =
+      typeof rawUrl === 'string' && rawUrl.trim().length > 0
+        ? sanitizeAllowedStoreUri(rawUrl)
+        : '';
+    if (safeReviewUrl !== copy.reviewScoreOverride.url) {
+      copy.reviewScoreOverride = {
+        ...copy.reviewScoreOverride,
+        url: safeReviewUrl,
+      };
+    }
+  }
+
+  if (copy.reviewRoute && typeof copy.reviewRoute === 'object' && typeof copy.reviewRoute.url === 'string') {
+    const trimmedRouteUrl = copy.reviewRoute.url.trim();
+    const safeRouteUrl = trimmedRouteUrl ? sanitizeAllowedStoreUri(trimmedRouteUrl) : '';
+    if (safeRouteUrl !== copy.reviewRoute.url) {
+      copy.reviewRoute = {
+        ...copy.reviewRoute,
+        ...(safeRouteUrl ? { url: safeRouteUrl } : { url: undefined }),
+      };
+    }
+  }
+
+  return copy;
+}
+
+function serializeUserOverridesEnvelopeV2(map: UserGameOverridesMap): string {
+  const records: Record<string, UserGameOverride> = {};
+  const aliases: Record<string, string> = {};
+  const objectToCanonicalKey = new Map<UserGameOverride, string>();
+  const canonicalJsonCache = new Map<string, string>();
+
+  const getCanonicalJson = (canonicalKey: string): string => {
+    let cached = canonicalJsonCache.get(canonicalKey);
+    if (cached === undefined) {
+      cached = JSON.stringify(records[canonicalKey]);
+      canonicalJsonCache.set(canonicalKey, cached);
+    }
+    return cached;
+  };
+
+  // Pass 1: register canonical records whose storage key matches `ov.gameId`
+  for (const [key, ov] of Object.entries(map)) {
+    if (!ov || typeof ov !== 'object' || Array.isArray(ov)) continue;
+    if (ov.gameId && key === ov.gameId) {
+      records[key] = ov;
+      objectToCanonicalKey.set(ov, key);
+    }
+  }
+
+  // Pass 2: collapse alias keys referencing an already-registered record into string pointers
+  for (const [key, ov] of Object.entries(map)) {
+    if (!ov || typeof ov !== 'object' || Array.isArray(ov)) continue;
+    if (Object.prototype.hasOwnProperty.call(records, key)) continue;
+
+    const existingObjKey = objectToCanonicalKey.get(ov);
+    if (existingObjKey) {
+      aliases[key] = existingObjKey;
+      continue;
+    }
+
+    if (
+      ov.gameId &&
+      Object.prototype.hasOwnProperty.call(records, ov.gameId) &&
+      getCanonicalJson(ov.gameId) === JSON.stringify(ov)
+    ) {
+      aliases[key] = ov.gameId;
+      continue;
+    }
+
+    records[key] = ov;
+    objectToCanonicalKey.set(ov, key);
+  }
+
+  const envelope: DeduplicatedUserOverridesEnvelopeV2 = {
+    __v: 2,
+    records,
+    aliases,
+  };
+  return JSON.stringify(envelope);
+}
+
+function deserializeUserOverridesPayload(parsed: unknown): UserGameOverridesMap {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {};
+  }
+
+  const rawObj = parsed as Record<string, unknown>;
+  if (
+    rawObj.__v === 2 &&
+    rawObj.records &&
+    typeof rawObj.records === 'object' &&
+    !Array.isArray(rawObj.records)
+  ) {
+    const records = rawObj.records as Record<string, unknown>;
+    const aliases =
+      rawObj.aliases && typeof rawObj.aliases === 'object' && !Array.isArray(rawObj.aliases)
+        ? (rawObj.aliases as Record<string, unknown>)
+        : {};
+    const projected: UserGameOverridesMap = {};
+
+    for (const [k, rec] of Object.entries(records)) {
+      if (rec && typeof rec === 'object' && !Array.isArray(rec)) {
+        projected[k] = rec as UserGameOverride;
+      }
+    }
+
+    // Absorb any top-level override records spread onto a v2 envelope by external/legacy writers
+    for (const [k, val] of Object.entries(rawObj)) {
+      if (k === '__v' || k === 'records' || k === 'aliases') continue;
+      if (val && typeof val === 'object' && !Array.isArray(val)) {
+        projected[k] = val as UserGameOverride;
+      }
+    }
+
+    for (const [aliasKey, targetKey] of Object.entries(aliases)) {
+      if (
+        typeof targetKey === 'string' &&
+        Object.prototype.hasOwnProperty.call(projected, targetKey) &&
+        !Object.prototype.hasOwnProperty.call(projected, aliasKey)
+      ) {
+        projected[aliasKey] = projected[targetKey];
+      }
+    }
+
+    return projected;
+  }
+
+  // Legacy flat v1 map
+  const legacyMap: UserGameOverridesMap = {};
+  for (const [k, val] of Object.entries(rawObj)) {
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      legacyMap[k] = val as UserGameOverride;
+    }
+  }
+  return legacyMap;
+}
+
 function normalizeVaultUserOverride(
   key: string,
   rawOv: UserMetadataOverride
@@ -158,7 +342,7 @@ function normalizeVaultUserOverride(
       ? (rawMatchedStore as UserGameOverride['matchedStore'])
       : 'custom';
 
-  return {
+  return sanitizeUserOverrideUrls({
     ...rest,
     gameId: canonicalId,
     matchedStore,
@@ -168,7 +352,7 @@ function normalizeVaultUserOverride(
       : {}),
     ...(rawMatchedId !== undefined ? { matchedId: String(rawMatchedId) } : {}),
     updatedAt: rawUpdatedAt || new Date(0).toISOString(),
-  };
+  });
 }
 
 /**
@@ -398,8 +582,8 @@ export function loadUserOverrides(): UserGameOverridesMap {
       cachedOverridesRaw = raw;
       return cachedOverridesMap;
     }
-    const parsed = JSON.parse(raw);
-    const map = parsed && typeof parsed === 'object' ? (parsed as UserGameOverridesMap) : {};
+    const parsed: unknown = JSON.parse(raw);
+    const map = deserializeUserOverridesPayload(parsed);
     cachedStorageRef = storage;
     cachedOverridesRaw = raw;
     cachedOverridesMap = map;
@@ -1080,7 +1264,7 @@ function persistUserOverridesMapToStorage(current: UserGameOverridesMap): void {
   cachedOverridesMap = current;
   inMemoryOverridesHydrated = true;
   if (storage) {
-    const serialized = JSON.stringify(current);
+    const serialized = serializeUserOverridesEnvelopeV2(current);
     storage.setItem(STORAGE_KEY_USER_OVERRIDES, serialized);
     cachedStorageRef = storage;
     cachedOverridesRaw = isTestEnv() ? serialized : null;
@@ -1152,14 +1336,14 @@ export function saveUserOverride(override: UserGameOverride, oldGame?: Canonical
     priorCandidates.sort((a, b) => parseOverrideTimestamp(b) - parseOverrideTimestamp(a));
     const priorExisting = priorCandidates[0];
 
-    const updatedOverride: UserGameOverride = {
+    const updatedOverride: UserGameOverride = sanitizeUserOverrideUrls({
       ...override,
       ...(effPlatformId && !override.platformId ? { platformId: effPlatformId } : {}),
       ...(effPlatformGameId && !override.platformGameId
         ? { platformGameId: effPlatformGameId }
         : {}),
       updatedAt: override.updatedAt || new Date().toISOString(),
-    };
+    });
 
     if (!updatedOverride.nativeBaseline) {
       if (priorExisting?.nativeBaseline) {
@@ -1245,15 +1429,17 @@ export function saveUserOverride(override: UserGameOverride, oldGame?: Canonical
       }
     }
 
-    current[override.gameId] = updatedOverride;
+    const sanitizedUpdated = sanitizeUserOverrideUrls(updatedOverride);
+
+    current[override.gameId] = sanitizedUpdated;
 
     // Also index platform key if available (e.g., 'epic:boga' or 'gog:1837805079')
-    if (updatedOverride.platformId && updatedOverride.platformGameId) {
-      const platformKey = `${updatedOverride.platformId}:${updatedOverride.platformGameId}`;
-      current[platformKey] = updatedOverride;
-      if (updatedOverride.splitFromMerged) {
-        const dashKey = `${updatedOverride.platformId}-${updatedOverride.platformGameId}`;
-        current[dashKey] = updatedOverride;
+    if (sanitizedUpdated.platformId && sanitizedUpdated.platformGameId) {
+      const platformKey = `${sanitizedUpdated.platformId}:${sanitizedUpdated.platformGameId}`;
+      current[platformKey] = sanitizedUpdated;
+      if (sanitizedUpdated.splitFromMerged) {
+        const dashKey = `${sanitizedUpdated.platformId}-${sanitizedUpdated.platformGameId}`;
+        current[dashKey] = sanitizedUpdated;
       }
     }
 
@@ -1263,7 +1449,7 @@ export function saveUserOverride(override: UserGameOverride, oldGame?: Canonical
     if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
       try {
         window.dispatchEvent(
-          new CustomEvent('antigravity:user-override-updated', { detail: { override: updatedOverride, oldGame } })
+          new CustomEvent('antigravity:user-override-updated', { detail: { override: sanitizedUpdated, oldGame } })
         );
       } catch {}
     }
@@ -1271,7 +1457,7 @@ export function saveUserOverride(override: UserGameOverride, oldGame?: Canonical
     // Optional Electron IPC sync if available
     if (typeof window !== 'undefined' && typeof window.electronAPI?.saveUserOverride === 'function') {
       try {
-        void window.electronAPI.saveUserOverride(updatedOverride);
+        void window.electronAPI.saveUserOverride(sanitizedUpdated);
       } catch (ipcErr) {
         console.warn('Failed to sync user override to Electron:', ipcErr);
       }
@@ -1283,10 +1469,10 @@ export function saveUserOverride(override: UserGameOverride, oldGame?: Canonical
       try {
         const vaultPayload: object =
           staleKeysToDelete.length > 0
-            ? { ...updatedOverride, purgeKeys: staleKeysToDelete }
-            : updatedOverride;
+            ? { ...sanitizedUpdated, purgeKeys: staleKeysToDelete }
+            : sanitizedUpdated;
         void window.electronAPI.offlineVault
-          .saveUserOverride(updatedOverride.gameId, vaultPayload)
+          .saveUserOverride(sanitizedUpdated.gameId, vaultPayload)
           ?.catch?.(() => {});
       } catch (vaultErr) {
         console.warn('Failed to sync user override to offlineVault:', vaultErr);
@@ -1759,6 +1945,96 @@ function hasQaSandboxOrganization(values?: string[] | null): boolean {
 }
 
 /**
+ * Immutably updates `reviewScoreOverride` on an existing canonical user override record,
+ * sanitizes its URL via `sanitizeAllowedStoreUri`, monotonically bumps `updatedAt`, increments
+ * `userOverridesRevision`, persists deduplicated v2 storage, and syncs to `offlineVault` (`user_overrides.json`).
+ */
+export function patchUserOverrideReviewScore(
+  overrideKeyOrGameId: string,
+  refreshed: NonNullable<UserGameOverride['reviewScoreOverride']>
+): void {
+  const cleanTarget = (overrideKeyOrGameId || '').trim();
+  if (!cleanTarget || !refreshed || typeof refreshed !== 'object') return;
+  try {
+    const existingMap = loadUserOverrides();
+    let existing: UserGameOverride | undefined = existingMap[cleanTarget];
+    if (!existing) {
+      const lowerTarget = cleanTarget.toLowerCase();
+      for (const [k, ov] of Object.entries(existingMap)) {
+        if (!ov) continue;
+        if (
+          ov.gameId === cleanTarget ||
+          k.toLowerCase() === lowerTarget ||
+          (ov.platformId &&
+            ov.platformGameId &&
+            `${ov.platformId}:${ov.platformGameId}`.toLowerCase() === lowerTarget)
+        ) {
+          existing = ov;
+          break;
+        }
+      }
+    }
+    if (!existing) return;
+
+    const prevTs = parseOverrideTimestamp(existing);
+    const nowTs = Date.now();
+    const nextUpdatedAt = new Date(nowTs > prevTs ? nowTs : prevTs + 1).toISOString();
+
+    const sanitizedRefreshed: NonNullable<UserGameOverride['reviewScoreOverride']> = {
+      ...refreshed,
+      url:
+        typeof refreshed.url === 'string' && refreshed.url.trim().length > 0
+          ? sanitizeAllowedStoreUri(refreshed.url)
+          : '',
+    };
+
+    const canonicalId = (existing.gameId || cleanTarget).trim();
+    const next: UserGameOverride = sanitizeUserOverrideUrls({
+      ...existing,
+      gameId: canonicalId,
+      reviewScoreOverride: sanitizedRefreshed,
+      updatedAt: nextUpdatedAt,
+    });
+
+    const nextMap: UserGameOverridesMap = { ...existingMap };
+    // Rebind every key that previously referenced this override or belongs to its canonical entitlement
+    for (const [k, ov] of Object.entries(nextMap)) {
+      if (ov === existing || (ov && ov.gameId === canonicalId)) {
+        nextMap[k] = next;
+      }
+    }
+    nextMap[canonicalId] = next;
+    if (cleanTarget !== canonicalId && Object.prototype.hasOwnProperty.call(nextMap, cleanTarget)) {
+      nextMap[cleanTarget] = next;
+    }
+    if (next.platformId && next.platformGameId) {
+      nextMap[`${next.platformId}:${next.platformGameId}`] = next;
+      if (next.splitFromMerged) {
+        nextMap[`${next.platformId}-${next.platformGameId}`] = next;
+      }
+    }
+
+    persistUserOverridesMapToStorage(nextMap);
+
+    if (
+      canonicalId &&
+      typeof window !== 'undefined' &&
+      typeof window.electronAPI?.offlineVault?.saveUserOverride === 'function'
+    ) {
+      try {
+        void window.electronAPI.offlineVault
+          .saveUserOverride(canonicalId, next)
+          ?.catch?.(() => {});
+      } catch (vaultErr) {
+        console.warn('Failed to sync patched review score override to offlineVault:', vaultErr);
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to patch user override review score:', err);
+  }
+}
+
+/**
  * Updates the cached metadata snapshot on a routed UserGameOverride without overwriting
  * user-pinned custom fields (such as customTitleEdited, customSynopsisEdited, capsuleImage, or existing headerImage).
  */
@@ -1799,7 +2075,10 @@ export function updateRoutedMetadataSnapshot(
       refreshed.headerImage &&
       refreshed.headerImage.trim()
     ) {
-      next.headerImage = refreshed.headerImage.trim();
+      const safeHeader = sanitizeAllowedStoreUri(refreshed.headerImage.trim());
+      if (safeHeader) {
+        next.headerImage = safeHeader;
+      }
     }
     if (Array.isArray(refreshed.developers) && refreshed.developers.length > 0) {
       next.developers = [...refreshed.developers];
@@ -1817,20 +2096,22 @@ export function updateRoutedMetadataSnapshot(
       next.releaseDate = refreshed.releaseDate.trim();
     }
 
-    current[gameId] = next;
+    const sanitizedNext = sanitizeUserOverrideUrls(next);
+
+    current[gameId] = sanitizedNext;
     if (existing.gameId) {
-      current[existing.gameId] = next;
+      current[existing.gameId] = sanitizedNext;
     }
     if (existing.platformId && existing.platformGameId) {
-      current[`${existing.platformId}:${existing.platformGameId}`] = next;
+      current[`${existing.platformId}:${existing.platformGameId}`] = sanitizedNext;
       if (existing.splitFromMerged) {
-        current[`${existing.platformId}-${existing.platformGameId}`] = next;
+        current[`${existing.platformId}-${existing.platformGameId}`] = sanitizedNext;
       }
     }
 
     persistUserOverridesMapToStorage(current);
 
-    const canonicalId = (next.gameId || gameId).trim();
+    const canonicalId = (sanitizedNext.gameId || gameId).trim();
     if (
       canonicalId &&
       typeof window !== 'undefined' &&
@@ -1838,7 +2119,7 @@ export function updateRoutedMetadataSnapshot(
     ) {
       try {
         void window.electronAPI.offlineVault
-          .saveUserOverride(canonicalId, next)
+          .saveUserOverride(canonicalId, sanitizedNext)
           ?.catch?.(() => {});
       } catch {
         // Ignore non-fatal IPC errors during snapshot update
@@ -1922,13 +2203,22 @@ export function applyUserOverrideToGame(
   }
 
   if (override.capsuleImage !== undefined && override.capsuleImage.trim() !== '') {
-    updated.capsuleImage = override.capsuleImage.trim();
+    const safeCapsule = sanitizeAllowedStoreUri(override.capsuleImage.trim());
+    if (safeCapsule) {
+      updated.capsuleImage = safeCapsule;
+    }
   }
   if (override.headerImage !== undefined && override.headerImage.trim() !== '') {
-    updated.headerImage = override.headerImage.trim();
+    const safeHeader = sanitizeAllowedStoreUri(override.headerImage.trim());
+    if (safeHeader) {
+      updated.headerImage = safeHeader;
+    }
   }
   if (override.iconUrl !== undefined && override.iconUrl.trim() !== '') {
-    updated.iconUrl = override.iconUrl.trim();
+    const safeIcon = sanitizeAllowedStoreUri(override.iconUrl.trim());
+    if (safeIcon) {
+      updated.iconUrl = safeIcon;
+    }
   }
 
   const isPoisonedRoutedQaSnapshot =
@@ -1968,7 +2258,17 @@ export function applyUserOverrideToGame(
     updated.releaseDate = override.releaseDate;
   }
   if (override.reviewScoreOverride !== undefined) {
-    updated.reviewScoreOverride = override.reviewScoreOverride;
+    updated.reviewScoreOverride =
+      override.reviewScoreOverride && typeof override.reviewScoreOverride === 'object'
+        ? {
+            ...override.reviewScoreOverride,
+            url:
+              typeof override.reviewScoreOverride.url === 'string' &&
+              override.reviewScoreOverride.url.trim().length > 0
+                ? sanitizeAllowedStoreUri(override.reviewScoreOverride.url)
+                : '',
+          }
+        : override.reviewScoreOverride;
   }
 
   return updated;

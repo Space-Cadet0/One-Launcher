@@ -24,6 +24,35 @@ import {
   resolveEffectiveSteamAppId,
   type EffectiveSteamLookupInput,
 } from '../storage/userOverrideStorage';
+import {
+  reconcileCapsuleImage,
+  reconcileHeaderImage,
+  type ArtworkRecoveryContext,
+} from '../storage/metadataReconciliation';
+import { isKnownDeadSteamCover } from '../igdb/igdbCoverService';
+import { steamApi } from './steamApi';
+
+const STOREFRONT_DISTRIBUTION_SUFFIX_RE =
+  /(?:[:\-–—]\s*|\s+)(?:amazon\s+prime(?:\s+gaming)?|prime\s+gaming|ea\s+play(?:\s+pro)?|ubisoft\s+connect|xbox\s+game\s+pass)(?:\s+(?:edition|version))?\s*$/gi;
+const STOREFRONT_DISTRIBUTION_DETECTOR_RE =
+  /(?:[:\-–—]\s*|\s+)(?:amazon\s+prime(?:\s+gaming)?|prime\s+gaming|ea\s+play(?:\s+pro)?|ubisoft\s+connect|xbox\s+game\s+pass)(?:\s+(?:edition|version))?\s*$/i;
+
+function stripStorefrontMatchSuffixes(rawTitle: string): string {
+  if (!rawTitle || typeof rawTitle !== 'string') return '';
+  let cur = rawTitle.replace(/\s+/g, ' ').trim();
+  for (let pass = 0; pass < 3; pass++) {
+    const prev = cur;
+    cur = stripStorefrontPlatformDisambiguators(
+      cur.replace(STOREFRONT_DISTRIBUTION_SUFFIX_RE, '').replace(/\s+/g, ' ').trim()
+    );
+    if (cur === prev) break;
+  }
+  return cur || rawTitle.trim();
+}
+
+function hasStorefrontDistributionSuffix(rawTitle: string): boolean {
+  return STOREFRONT_DISTRIBUTION_DETECTOR_RE.test(rawTitle);
+}
 
 /**
  * Optional static Steam AppID mapping table (empty by default for universal dynamic resolution).
@@ -35,7 +64,7 @@ export const KNOWN_STORE_STEAM_MAPPINGS: Record<string, number> = {};
  */
 export function canonicalizeTitleKey(str: string): string {
   if (!str) return '';
-  return stripYearEditionPhrases(stripStorefrontPlatformDisambiguators(str))
+  return stripYearEditionPhrases(stripStorefrontMatchSuffixes(str))
     .toLowerCase()
     .replace(/['’‘"“”]/g, '')
     .replace(/[™®©℠•·𝄞★☆]/g, ' ')
@@ -51,7 +80,7 @@ export function canonicalizeTitleKey(str: string): string {
 export function normalizeGameTitle(rawTitle: string): string {
   if (!rawTitle) return '';
 
-  let title = stripYearEditionPhrases(stripStorefrontPlatformDisambiguators(rawTitle))
+  let title = stripYearEditionPhrases(stripStorefrontMatchSuffixes(rawTitle))
     .replace(/[™®©℠•·𝄞★☆]/g, ' ')
     .replace(/\s+:/g, ':')
     .replace(/\s*\((?:19|20)\d{2}\)/g, '')
@@ -68,8 +97,8 @@ export function normalizeGameTitle(rawTitle: string): string {
     title = title.replace(pattern, '').trim();
   }
 
-  // Strip any residual trailing MS Store platform disambiguators exposed after edition suffix removal
-  title = stripStorefrontPlatformDisambiguators(title);
+  // Strip any residual trailing storefront/platform disambiguators exposed after edition suffix removal
+  title = stripStorefrontMatchSuffixes(title);
 
   // Normalize quotes and spaces
   title = title
@@ -127,8 +156,8 @@ const DISJOINT_STOP_WORDS = new Set<string>([
 export function computeTitleSimilarity(source: string, candidate: string): number {
   const cleanSource = stripYearEditionPhrases(source);
   const cleanCandidate = stripYearEditionPhrases(candidate);
-  const s1 = stripStorefrontPlatformDisambiguators(cleanSource).toLowerCase().replace(/['’‘"“”]/g, '').replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-  const s2 = stripStorefrontPlatformDisambiguators(cleanCandidate).toLowerCase().replace(/['’‘"“”]/g, '').replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  const s1 = stripStorefrontMatchSuffixes(cleanSource).toLowerCase().replace(/['’‘"“”]/g, '').replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  const s2 = stripStorefrontMatchSuffixes(cleanCandidate).toLowerCase().replace(/['’‘"“”]/g, '').replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
 
   if (!s1 || !s2) return 0;
   if (s1 === s2) return 1.0;
@@ -231,8 +260,10 @@ export function computeTitleSimilarity(source: string, candidate: string): numbe
   return jaccard;
 }
 
-const STORAGE_KEY_MATCHED_APP_IDS = 'steam_app_id_match_cache_v4';
+const STORAGE_KEY_MATCHED_APP_IDS = 'steam_app_id_match_cache_v5';
+const LEGACY_STORAGE_KEY_MATCHED_APP_IDS_V4 = 'steam_app_id_match_cache_v4';
 const STORAGE_KEY_MATCHER_SCHEMA = 'antigravity_steam_matcher_schema_v5';
+const POSITIVE_MATCH_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const NEGATIVE_MATCH_TTL_MS = TIER_TTLS.negative; // 7 days = 604,800,000 ms
 const NON_GAME_SOURCE_REGEX =
   /\b(public testing|tech beta|playtest|test branch|official walkthrough|walkthrough|digital goodies|pre-game editor|resource archiver|bonus content|artbook|soundtrack|ost)\b|\bcontent$/i;
@@ -240,7 +271,7 @@ export const DISTINCT_EDITION_TOKEN_REGEX =
   /\b(remastered|remaster|remake|enhanced|definitive|redux|director'?s cut|anniversary)\b/i;
 
 function tokenizeSimilarityWords(text: string): string[] {
-  const cleaned = stripYearEditionPhrases(stripStorefrontPlatformDisambiguators(text))
+  const cleaned = stripYearEditionPhrases(stripStorefrontMatchSuffixes(text))
     .toLowerCase()
     .replace(/['’‘"“”]/g, '')
     .replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ')
@@ -262,6 +293,11 @@ interface EnrichedMatchEntry {
 
 const MAX_MATCH_CACHE_ENTRIES = 2000;
 
+interface PersistedPositiveMatchRecord {
+  appId: number;
+  cachedAt: number;
+}
+
 interface PersistedNegativeMatchRecord {
   appId?: null;
   id?: null;
@@ -269,8 +305,11 @@ interface PersistedNegativeMatchRecord {
   failureCount?: number;
 }
 
+type PersistedMatchRecord = number | PersistedPositiveMatchRecord | PersistedNegativeMatchRecord;
+
 export class SteamMatcherService {
   private cache = new Map<string, number | null>();
+  private positiveTimestamps = new Map<string, number>();
   private negativeTimestamps = new Map<string, number>();
   private negativeFailureCounts = new Map<string, number>();
   private instantMemo = new Map<string, number | null>();
@@ -306,18 +345,30 @@ export class SteamMatcherService {
     }
   }
 
-  private setCacheBounded(key: string, val: number | null): void {
+  private setCacheBounded(key: string, val: number | null, positiveCachedAt?: number): void {
     if (this.cache.has(key)) {
       this.cache.delete(key);
     }
     this.cache.set(key, val);
+    if (typeof val === 'number' && val > 0) {
+      this.positiveTimestamps.set(key, positiveCachedAt ?? Date.now());
+    } else {
+      this.positiveTimestamps.delete(key);
+    }
     while (this.cache.size > MAX_MATCH_CACHE_ENTRIES) {
       const oldest = this.cache.keys().next().value;
       if (oldest === undefined) break;
       this.cache.delete(oldest);
+      this.positiveTimestamps.delete(oldest);
       this.negativeTimestamps.delete(oldest);
       this.negativeFailureCounts.delete(oldest);
     }
+  }
+
+  private isPositiveEntryFresh(key: string): boolean {
+    const cachedAt = this.positiveTimestamps.get(key);
+    if (cachedAt === undefined) return true;
+    return Date.now() - cachedAt < POSITIVE_MATCH_TTL_MS;
   }
 
   private setNegativeTimestampBounded(key: string, ts: number): void {
@@ -397,67 +448,179 @@ export class SteamMatcherService {
       .map((idx) => entries[idx]);
   }
 
+  private ingestPersistedMatchEntries(
+    recordMap: Record<string, unknown>,
+    options: { isLegacyV4: boolean; allowNegativeRecords: boolean; skipExistingPositives?: boolean }
+  ): boolean {
+    let ingestedAny = false;
+    const now = Date.now();
+
+    for (const [rawKey, v] of Object.entries(recordMap)) {
+      const rawLower = rawKey.toLowerCase().trim();
+      if (!rawLower || NON_GAME_SOURCE_REGEX.test(rawLower)) {
+        continue;
+      }
+
+      // On legacy v4 migration, drop entries carrying storefront distribution suffixes
+      // (e.g. "- Amazon Prime") that caused Remastered -> Classic collisions.
+      if (options.isLegacyV4 && hasStorefrontDistributionSuffix(rawLower)) {
+        continue;
+      }
+
+      const lk = stripStorefrontMatchSuffixes(rawLower).toLowerCase().trim();
+      if (!lk || NON_GAME_SOURCE_REGEX.test(lk)) {
+        continue;
+      }
+
+      const existingVal = this.cache.get(lk);
+      if (options.skipExistingPositives && typeof existingVal === 'number' && existingVal > 0) {
+        continue;
+      }
+
+      // Positive match: either v5 `{ appId: number, cachedAt: number }` or legacy bare `number`
+      let positiveAppId: number | null = null;
+      let positiveCachedAt = now;
+      if (typeof v === 'number' && v > 0) {
+        positiveAppId = v;
+        positiveCachedAt = now;
+      } else if (
+        v &&
+        typeof v === 'object' &&
+        typeof (v as Partial<PersistedPositiveMatchRecord>).appId === 'number' &&
+        ((v as Partial<PersistedPositiveMatchRecord>).appId as number) > 0
+      ) {
+        const posRec = v as Partial<PersistedPositiveMatchRecord>;
+        positiveAppId = posRec.appId as number;
+        positiveCachedAt = typeof posRec.cachedAt === 'number' && posRec.cachedAt > 0 ? posRec.cachedAt : now;
+      }
+
+      if (positiveAppId !== null) {
+        if (now - positiveCachedAt >= POSITIVE_MATCH_TTL_MS) {
+          continue;
+        }
+        const enrichedName = (
+          steamEnrichedCache as Record<string, { name?: string } | undefined>
+        )[String(positiveAppId)]?.name;
+        if (
+          enrichedName &&
+          (computeTitleSimilarity(normalizeGameTitle(lk), enrichedName) < 0.85 ||
+            DISTINCT_EDITION_TOKEN_REGEX.test(lk) !==
+              DISTINCT_EDITION_TOKEN_REGEX.test(enrichedName))
+        ) {
+          continue;
+        }
+        this.setCacheBounded(lk, positiveAppId, positiveCachedAt);
+        this.negativeTimestamps.delete(lk);
+        this.negativeFailureCounts.delete(lk);
+        if (this.instantMemo.get(lk) === null) {
+          this.instantMemo.delete(lk);
+        }
+        ingestedAny = true;
+        continue;
+      }
+
+      if (v === null) {
+        // Legacy null without timestamp: treat as expired
+        continue;
+      }
+
+      if (typeof v === 'object' && v !== null && options.allowNegativeRecords) {
+        const negRec = v as Partial<PersistedNegativeMatchRecord>;
+        const cachedAt = typeof negRec.cachedAt === 'number' ? negRec.cachedAt : 0;
+        const existingNegTs = this.negativeTimestamps.get(lk) || 0;
+        if (options.skipExistingPositives && existingVal === null && existingNegTs >= cachedAt) {
+          continue;
+        }
+        const rawFailureCount = negRec.failureCount;
+        const failureCount =
+          typeof rawFailureCount === 'number' && rawFailureCount >= 1
+            ? Math.floor(rawFailureCount)
+            : undefined;
+        const effectiveTtlMs =
+          failureCount !== undefined
+            ? computeAdaptive404RetryDelayMs(failureCount)
+            : NEGATIVE_MATCH_TTL_MS;
+        const isExpired = now - cachedAt >= effectiveTtlMs;
+        if (negRec.appId === null || negRec.id === null) {
+          if (failureCount !== undefined) {
+            this.negativeFailureCounts.set(lk, failureCount);
+          }
+          if (!isExpired) {
+            this.setCacheBounded(lk, null);
+            this.setNegativeTimestampBounded(lk, cachedAt);
+            this.instantMemo.delete(lk);
+            ingestedAny = true;
+          }
+        }
+      }
+    }
+
+    return ingestedAny;
+  }
+
+  private buildPersistedCachePayload(): Record<string, PersistedMatchRecord> {
+    const now = Date.now();
+    const obj: Record<string, PersistedMatchRecord> = {};
+    for (const [k, v] of this.cache.entries()) {
+      if (typeof v === 'number' && v > 0) {
+        const cachedAt = this.positiveTimestamps.get(k) ?? now;
+        if (now - cachedAt < POSITIVE_MATCH_TTL_MS) {
+          obj[k] = { appId: v, cachedAt };
+        }
+      } else if (v === null) {
+        const cachedAt = this.negativeTimestamps.get(k) || now;
+        const failureCount = this.negativeFailureCounts.get(k);
+        obj[k] =
+          failureCount !== undefined
+            ? { appId: null, cachedAt, failureCount }
+            : { appId: null, cachedAt };
+      }
+    }
+    return obj;
+  }
+
   private loadPersistentCache() {
     if (typeof window === 'undefined') return;
     try {
       localStorage.removeItem('steam_app_id_match_cache_v3');
       localStorage.removeItem('antigravity_steam_matched_app_ids');
-      const raw = localStorage.getItem(STORAGE_KEY_MATCHED_APP_IDS);
-      if (raw) {
-        const parsed: unknown = JSON.parse(raw);
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
-        const entries = Object.entries(parsed as Record<string, unknown>);
-        const hasV5Schema = localStorage.getItem(STORAGE_KEY_MATCHER_SCHEMA) === '1';
 
-        for (const [k, v] of entries) {
-          const lk = k.toLowerCase();
-          if (NON_GAME_SOURCE_REGEX.test(lk)) {
-            continue;
-          }
+      const hasV5Schema = localStorage.getItem(STORAGE_KEY_MATCHER_SCHEMA) === '1';
+      let needsPersistV5 = false;
 
-          if (typeof v === 'number' && v > 0) {
-            const enrichedName = (
-              steamEnrichedCache as Record<string, { name?: string } | undefined>
-            )[String(v)]?.name;
-            if (
-              enrichedName &&
-              (computeTitleSimilarity(normalizeGameTitle(lk), enrichedName) < 0.85 ||
-                DISTINCT_EDITION_TOKEN_REGEX.test(lk) !== DISTINCT_EDITION_TOKEN_REGEX.test(enrichedName))
-            ) {
-              continue;
-            }
-            this.setCacheBounded(lk, v);
-          } else if (v === null) {
-            // Legacy null without timestamp: treat as expired
-          } else if (typeof v === 'object' && v !== null && hasV5Schema) {
-            const negRec = v as Partial<PersistedNegativeMatchRecord>;
-            const cachedAt = typeof negRec.cachedAt === 'number' ? negRec.cachedAt : 0;
-            const rawFailureCount = negRec.failureCount;
-            const failureCount =
-              typeof rawFailureCount === 'number' && rawFailureCount >= 1
-                ? Math.floor(rawFailureCount)
-                : undefined;
-            const effectiveTtlMs =
-              failureCount !== undefined
-                ? computeAdaptive404RetryDelayMs(failureCount)
-                : NEGATIVE_MATCH_TTL_MS;
-            const isExpired = Date.now() - cachedAt >= effectiveTtlMs;
-            if (negRec.appId === null || negRec.id === null) {
-              if (failureCount !== undefined) {
-                this.negativeFailureCounts.set(lk, failureCount);
-              }
-              if (!isExpired) {
-                this.setCacheBounded(lk, null);
-                this.setNegativeTimestampBounded(lk, cachedAt);
-              }
-            }
-          }
+      const rawV5 = localStorage.getItem(STORAGE_KEY_MATCHED_APP_IDS);
+      if (rawV5) {
+        const parsedV5: unknown = JSON.parse(rawV5);
+        if (parsedV5 && typeof parsedV5 === 'object' && !Array.isArray(parsedV5)) {
+          this.ingestPersistedMatchEntries(parsedV5 as Record<string, unknown>, {
+            isLegacyV4: false,
+            allowNegativeRecords: true,
+          });
         }
+      }
 
-        if (!hasV5Schema) {
-          localStorage.setItem(STORAGE_KEY_MATCHER_SCHEMA, '1');
-          this.savePersistentCache();
+      // One-time sanitized migration from legacy steam_app_id_match_cache_v4 -> v5
+      const rawV4 = localStorage.getItem(LEGACY_STORAGE_KEY_MATCHED_APP_IDS_V4);
+      if (rawV4) {
+        try {
+          const parsedV4: unknown = JSON.parse(rawV4);
+          if (parsedV4 && typeof parsedV4 === 'object' && !Array.isArray(parsedV4)) {
+            this.ingestPersistedMatchEntries(parsedV4 as Record<string, unknown>, {
+              isLegacyV4: true,
+              allowNegativeRecords: hasV5Schema,
+              skipExistingPositives: true,
+            });
+          }
+        } catch {
+          // Ignore malformed legacy v4 cache
         }
+        localStorage.removeItem(LEGACY_STORAGE_KEY_MATCHED_APP_IDS_V4);
+        needsPersistV5 = true;
+      }
+
+      if (needsPersistV5 || (rawV5 && !hasV5Schema)) {
+        localStorage.setItem(STORAGE_KEY_MATCHER_SCHEMA, '1');
+        this.savePersistentCache();
       }
     } catch {
       // Ignore read errors
@@ -468,93 +631,46 @@ export class SteamMatcherService {
     if (typeof window === 'undefined') return;
     const gen = this.cacheGeneration;
     try {
-      const vaultData = await vaultGet<Record<string, unknown>>(STORAGE_KEY_MATCHED_APP_IDS);
-      if (
-        gen !== this.cacheGeneration ||
-        !vaultData ||
-        typeof vaultData !== 'object' ||
-        Array.isArray(vaultData)
-      ) {
-        return;
-      }
+      const [vaultDataV5, vaultDataV4] = await Promise.all([
+        vaultGet<Record<string, unknown>>(STORAGE_KEY_MATCHED_APP_IDS),
+        vaultGet<Record<string, unknown>>(LEGACY_STORAGE_KEY_MATCHED_APP_IDS_V4),
+      ]);
+      if (gen !== this.cacheGeneration) return;
 
       let hydratedAny = false;
-      for (const [k, v] of Object.entries(vaultData)) {
-        const lk = k.toLowerCase();
-        if (NON_GAME_SOURCE_REGEX.test(lk)) {
-          continue;
-        }
-
-        const existingVal = this.cache.get(lk);
-        if (typeof existingVal === 'number' && existingVal > 0) {
-          continue;
-        }
-
-        if (typeof v === 'number' && v > 0) {
-          const enrichedName = (
-            steamEnrichedCache as Record<string, { name?: string } | undefined>
-          )[String(v)]?.name;
-          if (
-            enrichedName &&
-            (computeTitleSimilarity(normalizeGameTitle(lk), enrichedName) < 0.85 ||
-              DISTINCT_EDITION_TOKEN_REGEX.test(lk) !==
-                DISTINCT_EDITION_TOKEN_REGEX.test(enrichedName))
-          ) {
-            continue;
-          }
-          this.setCacheBounded(lk, v);
-          this.negativeTimestamps.delete(lk);
-          this.negativeFailureCounts.delete(lk);
-          if (this.instantMemo.get(lk) === null) {
-            this.instantMemo.delete(lk);
-          }
+      if (vaultDataV5 && typeof vaultDataV5 === 'object' && !Array.isArray(vaultDataV5)) {
+        if (
+          this.ingestPersistedMatchEntries(vaultDataV5, {
+            isLegacyV4: false,
+            allowNegativeRecords: true,
+            skipExistingPositives: true,
+          })
+        ) {
           hydratedAny = true;
-        } else if (typeof v === 'object' && v !== null) {
-          const negRec = v as Partial<PersistedNegativeMatchRecord>;
-          const cachedAt = typeof negRec.cachedAt === 'number' ? negRec.cachedAt : 0;
-          const existingNegTs = this.negativeTimestamps.get(lk) || 0;
-          if (existingVal === null && existingNegTs >= cachedAt) {
-            continue;
-          }
-          const rawFailureCount = negRec.failureCount;
-          const failureCount =
-            typeof rawFailureCount === 'number' && rawFailureCount >= 1
-              ? Math.floor(rawFailureCount)
-              : undefined;
-          const effectiveTtlMs =
-            failureCount !== undefined
-              ? computeAdaptive404RetryDelayMs(failureCount)
-              : NEGATIVE_MATCH_TTL_MS;
-          const isExpired = Date.now() - cachedAt >= effectiveTtlMs;
-          if (negRec.appId === null || negRec.id === null) {
-            if (failureCount !== undefined) {
-              this.negativeFailureCounts.set(lk, failureCount);
-            }
-            if (!isExpired) {
-              this.setCacheBounded(lk, null);
-              this.setNegativeTimestampBounded(lk, cachedAt);
-              this.instantMemo.delete(lk);
-              hydratedAny = true;
-            }
-          }
         }
       }
 
-      if (hydratedAny) {
+      let migratedLegacyV4 = false;
+      if (vaultDataV4 && typeof vaultDataV4 === 'object' && !Array.isArray(vaultDataV4)) {
+        if (
+          this.ingestPersistedMatchEntries(vaultDataV4, {
+            isLegacyV4: true,
+            allowNegativeRecords: true,
+            skipExistingPositives: true,
+          })
+        ) {
+          hydratedAny = true;
+        }
+        migratedLegacyV4 = true;
+        void vaultDelete(LEGACY_STORAGE_KEY_MATCHED_APP_IDS_V4);
+      }
+
+      if (hydratedAny || migratedLegacyV4) {
+        const obj = this.buildPersistedCachePayload();
+        if (migratedLegacyV4) {
+          void vaultSet(STORAGE_KEY_MATCHED_APP_IDS, obj);
+        }
         try {
-          const obj: Record<string, number | PersistedNegativeMatchRecord> = {};
-          for (const [k, v] of this.cache.entries()) {
-            if (typeof v === 'number' && v > 0) {
-              obj[k] = v;
-            } else if (v === null) {
-              const cachedAt = this.negativeTimestamps.get(k) || Date.now();
-              const failureCount = this.negativeFailureCounts.get(k);
-              obj[k] =
-                failureCount !== undefined
-                  ? { appId: null, cachedAt, failureCount }
-                  : { appId: null, cachedAt };
-            }
-          }
           localStorage.setItem(STORAGE_KEY_MATCHED_APP_IDS, JSON.stringify(obj));
           localStorage.setItem(STORAGE_KEY_MATCHER_SCHEMA, '1');
         } catch {
@@ -572,19 +688,7 @@ export class SteamMatcherService {
       clearTimeout(this.pendingSaveTimer);
       this.pendingSaveTimer = null;
     }
-    const obj: Record<string, number | PersistedNegativeMatchRecord> = {};
-    for (const [k, v] of this.cache.entries()) {
-      if (typeof v === 'number' && v > 0) {
-        obj[k] = v;
-      } else if (v === null) {
-        const cachedAt = this.negativeTimestamps.get(k) || Date.now();
-        const failureCount = this.negativeFailureCounts.get(k);
-        obj[k] =
-          failureCount !== undefined
-            ? { appId: null, cachedAt, failureCount }
-            : { appId: null, cachedAt };
-      }
-    }
+    const obj = this.buildPersistedCachePayload();
     void vaultSet(STORAGE_KEY_MATCHED_APP_IDS, obj);
     try {
       localStorage.setItem(STORAGE_KEY_MATCHED_APP_IDS, JSON.stringify(obj));
@@ -615,6 +719,7 @@ export class SteamMatcherService {
       this.pendingSaveTimer = null;
     }
     this.cache.clear();
+    this.positiveTimestamps.clear();
     this.negativeTimestamps.clear();
     this.negativeFailureCounts.clear();
     this.inFlightFailedKeys.clear();
@@ -622,9 +727,11 @@ export class SteamMatcherService {
     this.enrichedEntries = null;
     this.enrichedWordIndex = null;
     void vaultDelete(STORAGE_KEY_MATCHED_APP_IDS);
+    void vaultDelete(LEGACY_STORAGE_KEY_MATCHED_APP_IDS_V4);
     if (typeof window !== 'undefined') {
       try {
         localStorage.removeItem(STORAGE_KEY_MATCHED_APP_IDS);
+        localStorage.removeItem(LEGACY_STORAGE_KEY_MATCHED_APP_IDS_V4);
       } catch {}
     }
   }
@@ -648,7 +755,7 @@ export class SteamMatcherService {
    */
   public hasAttemptedMatch(title: string): boolean {
     if (!title || !title.trim()) return true;
-    const cleanRaw = title.trim();
+    const cleanRaw = stripStorefrontMatchSuffixes(title.trim());
     const lowerKey = cleanRaw.toLowerCase();
 
     if (this.matchGameToSteamInstant(cleanRaw)) {
@@ -657,6 +764,7 @@ export class SteamMatcherService {
 
     const normalized = normalizeGameTitle(cleanRaw).toLowerCase();
     if (
+      NON_GAME_SOURCE_REGEX.test(title) ||
       NON_GAME_SOURCE_REGEX.test(cleanRaw) ||
       KNOWN_NON_STEAM_TITLES.has(lowerKey) ||
       KNOWN_NON_STEAM_TITLES.has(normalized)
@@ -667,7 +775,11 @@ export class SteamMatcherService {
     if (this.cache.has(lowerKey)) {
       const val = this.cache.get(lowerKey);
       if (typeof val === 'number' && val > 0) {
-        return true;
+        if (this.isPositiveEntryFresh(lowerKey)) {
+          return true;
+        }
+        this.cache.delete(lowerKey);
+        this.positiveTimestamps.delete(lowerKey);
       }
       if (val === null) {
         const cachedAt = this.negativeTimestamps.get(lowerKey);
@@ -693,12 +805,16 @@ export class SteamMatcherService {
    */
   matchGameToSteamInstant(title: string): number | null {
     if (!title || !title.trim()) return null;
-    const cleanRaw = title.trim();
+    const cleanRaw = stripStorefrontMatchSuffixes(title.trim());
     const lowerKey = cleanRaw.toLowerCase();
     if (this.instantMemo.has(lowerKey)) {
-      return this.instantMemo.get(lowerKey) ?? null;
+      const memoVal = this.instantMemo.get(lowerKey) ?? null;
+      if (memoVal === null || !this.cache.has(lowerKey) || this.isPositiveEntryFresh(lowerKey)) {
+        return memoVal;
+      }
+      this.instantMemo.delete(lowerKey);
     }
-    if (NON_GAME_SOURCE_REGEX.test(cleanRaw)) {
+    if (NON_GAME_SOURCE_REGEX.test(title) || NON_GAME_SOURCE_REGEX.test(cleanRaw)) {
       this.instantMemo.set(lowerKey, null);
       return null;
     }
@@ -728,12 +844,16 @@ export class SteamMatcherService {
       return directMatch;
     }
 
-    // 2. Check in-memory / persistent cache
+    // 2. Check in-memory / persistent cache (enforcing 30-day positive TTL)
     if (this.cache.has(lowerKey)) {
       const val = this.cache.get(lowerKey);
       if (typeof val === 'number' && val > 0) {
-        this.instantMemo.set(lowerKey, val);
-        return val;
+        if (this.isPositiveEntryFresh(lowerKey)) {
+          this.instantMemo.set(lowerKey, val);
+          return val;
+        }
+        this.cache.delete(lowerKey);
+        this.positiveTimestamps.delete(lowerKey);
       }
       if (val === null) {
         const cachedAt = this.negativeTimestamps.get(lowerKey);
@@ -749,7 +869,7 @@ export class SteamMatcherService {
     const cleanHasDistinctEdition = DISTINCT_EDITION_TOKEN_REGEX.test(cleanRaw);
     if (!cleanHasDistinctEdition && normalized && this.cache.has(normalized)) {
       const normVal = this.cache.get(normalized);
-      if (typeof normVal === 'number' && normVal > 0) {
+      if (typeof normVal === 'number' && normVal > 0 && this.isPositiveEntryFresh(normalized)) {
         this.instantMemo.set(lowerKey, normVal);
         return normVal;
       }
@@ -878,8 +998,14 @@ export class SteamMatcherService {
         score = Math.min(100, score + 15);
       }
 
-      // Edition alignment: prefer exact edition matches (e.g. GOTY / Game of the Year, Unrated, Director's Cut)
-      // and penalize candidate remasters when the user's title is the original/GOTY edition
+      // Edition alignment: prefer exact edition matches (e.g. GOTY / Game of the Year, Unrated, Director's Cut),
+      // block explicit Remastered/Remake titles from matching non-remastered classic releases,
+      // and penalize candidate remasters when the user's title is the original/GOTY edition.
+      const rawHasStrictRemaster = /\b(remastered|remaster|remake)\b/i.test(cleanRaw);
+      const candHasStrictRemaster = /\b(remastered|remaster|remake)\b/i.test(candidateName);
+      if (rawHasStrictRemaster && !candHasStrictRemaster) {
+        continue;
+      }
       const rawHasGoty = /\b(goty|game of the year)\b/i.test(cleanRaw);
       const candHasGoty = /\b(goty|game of the year)\b/i.test(candidateName);
       if (rawHasGoty && candHasGoty) {
@@ -926,9 +1052,9 @@ export class SteamMatcherService {
     options?: { releaseYear?: number | string | null; developers?: string[]; priority?: number }
   ): Promise<number | null> {
     if (!title || !title.trim()) return null;
-    const cleanRaw = title.trim();
+    const cleanRaw = stripStorefrontMatchSuffixes(title.trim());
     const lowerKey = cleanRaw.toLowerCase();
-    if (NON_GAME_SOURCE_REGEX.test(cleanRaw)) {
+    if (NON_GAME_SOURCE_REGEX.test(title) || NON_GAME_SOURCE_REGEX.test(cleanRaw)) {
       this.recordNegativeMatch(lowerKey);
       return null;
     }
@@ -954,16 +1080,20 @@ export class SteamMatcherService {
       CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(strippedBase);
 
     if (directMatch) {
-      this.cache.set(lowerKey, directMatch);
+      this.setCacheBounded(lowerKey, directMatch);
       this.savePersistentCache();
       return directMatch;
     }
 
-    // 2. Check in-memory / persistent cache
+    // 2. Check in-memory / persistent cache (honoring 30-day positive TTL)
     if (this.cache.has(lowerKey)) {
       const val = this.cache.get(lowerKey);
       if (typeof val === 'number' && val > 0) {
-        return val;
+        if (this.isPositiveEntryFresh(lowerKey)) {
+          return val;
+        }
+        this.cache.delete(lowerKey);
+        this.positiveTimestamps.delete(lowerKey);
       }
       if (val === null) {
         const cachedAt = this.negativeTimestamps.get(lowerKey);
@@ -978,8 +1108,8 @@ export class SteamMatcherService {
     const cleanHasDistinctEdition = DISTINCT_EDITION_TOKEN_REGEX.test(cleanRaw);
     if (!cleanHasDistinctEdition && normalized && this.cache.has(normalized)) {
       const normVal = this.cache.get(normalized);
-      if (typeof normVal === 'number' && normVal > 0) {
-        this.cache.set(lowerKey, normVal);
+      if (typeof normVal === 'number' && normVal > 0 && this.isPositiveEntryFresh(normalized)) {
+        this.setCacheBounded(lowerKey, normVal);
         this.instantMemo.set(lowerKey, normVal);
         this.savePersistentCache();
         return normVal;
@@ -994,7 +1124,7 @@ export class SteamMatcherService {
         continue;
       }
       if (computeTitleSimilarity(normalized, entry.name) >= 0.85) {
-        this.cache.set(lowerKey, entry.appId);
+        this.setCacheBounded(lowerKey, entry.appId);
         this.negativeFailureCounts.delete(lowerKey);
         this.negativeTimestamps.delete(lowerKey);
         this.instantMemo.set(lowerKey, entry.appId);
@@ -1014,7 +1144,7 @@ export class SteamMatcherService {
     );
     const effectivePriority =
       options?.priority !== undefined ? options.priority : Priority.P2_BACKGROUND;
-    const camelSplit = splitCamelCaseTitle(stripStorefrontPlatformDisambiguators(cleanRaw)).toLowerCase();
+    const camelSplit = splitCamelCaseTitle(cleanRaw).toLowerCase();
     const bilingualParts = cleanRaw.includes(' / ')
       ? cleanRaw
           .split(' / ')
@@ -1023,10 +1153,11 @@ export class SteamMatcherService {
       : [];
 
     const searchStrategies = [
-      normalized,                                     // Strategy 1: Normalized clean title
-      cleanRaw,                                       // Strategy 2: Exact raw title
-      strippedBase,                                   // Strategy 3: Stripped base edition key
-      normBaseKey,                                    // Strategy 4: Normalized alphanumeric title key
+      ...(cleanHasDistinctEdition ? [cleanRaw] : []), // Preserve Remastered/Remake/Director's Cut on Pass 1
+      normalized,                                     // Normalized clean title
+      cleanRaw,                                       // Exact suffix-stripped title
+      strippedBase,                                   // Stripped base edition key
+      normBaseKey,                                    // Normalized alphanumeric title key
       ...(camelSplit && camelSplit !== normalized ? [camelSplit] : []),
       ...bilingualParts,
       ...(cleanRaw.includes('+')
@@ -1195,7 +1326,7 @@ export class SteamMatcherService {
   }
 
   /**
-   * Enriches a CanonicalGame with Steam App ID and official Steam assets if matched.
+   * Enriches a CanonicalGame with Steam App ID and monotonically reconciled Steam assets if matched.
    */
   async enrichGameWithSteamMatch(game: CanonicalGame): Promise<CanonicalGame> {
     if (game.steamAppId) return game;
@@ -1206,12 +1337,38 @@ export class SteamMatcherService {
     });
     if (!matchedId) return game;
 
+    const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
+    const browseAssets = steamApi.peekCachedBrowseAssets(matchedId);
+    const candidateHeader =
+      browseAssets?.headerImage ||
+      `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedId}/header.jpg`;
+    const candidateCapsule =
+      browseAssets?.capsuleImage ||
+      (!isKnownDeadSteamCover(matchedId)
+        ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedId}/library_600x900_2x.jpg`
+        : undefined);
+
+    const artworkCtx: ArtworkRecoveryContext = {
+      gameId: game.id,
+      title: game.title,
+      steamAppId: matchedId,
+      gogId: gogPlat?.platformGameId,
+    };
+    const nextHeader =
+      reconcileHeaderImage(game.headerImage, candidateHeader, artworkCtx) ||
+      game.headerImage ||
+      candidateHeader;
+    const nextCapsule = reconcileCapsuleImage(game.capsuleImage, candidateCapsule, {
+      ...artworkCtx,
+      headerUrl: nextHeader,
+    });
+
     return {
       ...game,
       steamAppId: matchedId,
       id: `steam-${matchedId}`,
-      headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedId}/header.jpg`,
-      capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedId}/library_600x900_2x.jpg`,
+      headerImage: nextHeader,
+      capsuleImage: nextCapsule,
     };
   }
 
