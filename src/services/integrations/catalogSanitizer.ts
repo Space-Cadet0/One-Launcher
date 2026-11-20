@@ -3218,8 +3218,9 @@ export function sanitizeGameCatalog(
       };
     }
 
-    // Purge any cached localization placeholder tokens, HTML tags in shortDescription, or regional non-English movies from enrichedMetadata
-    if (game.enrichedMetadata) {
+    // Purge any cached localization placeholder tokens, HTML tags in shortDescription, or regional non-English movies from enrichedMetadata.
+    // Skip __quotaSlimmed first-paint projections so stripped `undefined` descriptions are NEVER mutated into empty strings `""`.
+    if (game.enrichedMetadata && !game.enrichedMetadata.__quotaSlimmed) {
       const hasPlaceholderShort = isPlaceholderDesc(game.enrichedMetadata.shortDescription, game.title);
       const hasHtmlInShort = Boolean(
         game.enrichedMetadata.shortDescription &&
@@ -3266,7 +3267,11 @@ export function sanitizeGameCatalog(
       }
     }
 
-    if (!userOverride?.shortDescription && isPlaceholderDesc(game.shortDescription, game.title)) {
+    if (
+      !userOverride?.shortDescription &&
+      !(game.enrichedMetadata?.__quotaSlimmed === true && game.shortDescription === undefined) &&
+      isPlaceholderDesc(game.shortDescription, game.title)
+    ) {
       const blurb = matchedAppIdForBlurb
         ? (steamBlurbCache as Record<string, string>)[String(matchedAppIdForBlurb)]
         : null;

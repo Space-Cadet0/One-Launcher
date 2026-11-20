@@ -1060,9 +1060,145 @@ function collectDroppedAndSelfHealedCatalogDelta(
   };
 }
 
-function persistCatalogSnapshotToIdbAndLocalStorage(compacted: CanonicalGame[]): void {
-  // Primary rich persistence in IndexedDB vault (non-blocking, GB-scale quota)
-  void vaultSet(IDB_KEY_MAIN_CATALOG, compacted);
+function hasNonPlaceholderStrings(list: string[] | undefined, placeholder: string): boolean {
+  return Boolean(
+    Array.isArray(list) &&
+      list.some((s) => typeof s === 'string' && s.trim().length > 0 && s !== placeholder)
+  );
+}
+
+function recoverRichSummaryFieldsFromDonor(
+  target: CanonicalGame,
+  donor?: CanonicalGame | null,
+  donorMeta?: CanonicalGame['enrichedMetadata'] | null,
+  wasSlimmed = false
+): CanonicalGame {
+  const effectiveMeta =
+    donorMeta && !donorMeta.__quotaSlimmed
+      ? donorMeta
+      : donor?.enrichedMetadata && !donor.enrichedMetadata.__quotaSlimmed
+        ? donor.enrichedMetadata
+        : undefined;
+  const targetIsSlimmed = Boolean(wasSlimmed || target.enrichedMetadata?.__quotaSlimmed);
+
+  const nextShortDescription =
+    typeof target.shortDescription === 'string' && target.shortDescription.trim().length > 0
+      ? target.shortDescription
+      : typeof donor?.shortDescription === 'string' && donor.shortDescription.trim().length > 0
+        ? donor.shortDescription
+        : typeof effectiveMeta?.shortDescription === 'string' &&
+            effectiveMeta.shortDescription.trim().length > 0
+          ? effectiveMeta.shortDescription
+          : target.shortDescription;
+
+  const nextDetailedDescription =
+    typeof target.detailedDescription === 'string' && target.detailedDescription.trim().length > 0
+      ? target.detailedDescription
+      : typeof donor?.detailedDescription === 'string' &&
+          donor.detailedDescription.trim().length > 0
+        ? donor.detailedDescription
+        : typeof effectiveMeta?.detailedDescription === 'string' &&
+            effectiveMeta.detailedDescription.trim().length > 0
+          ? effectiveMeta.detailedDescription
+          : typeof effectiveMeta?.aboutTheGame === 'string' &&
+              effectiveMeta.aboutTheGame.trim().length > 0
+            ? effectiveMeta.aboutTheGame
+            : target.detailedDescription;
+
+  const nextDevelopers = hasNonPlaceholderStrings(target.developers, 'Unknown Developer')
+    ? target.developers
+    : hasNonPlaceholderStrings(donor?.developers, 'Unknown Developer')
+      ? donor!.developers
+      : hasNonPlaceholderStrings(effectiveMeta?.developers, 'Unknown Developer')
+        ? effectiveMeta!.developers
+        : target.developers;
+
+  const nextPublishers = hasNonPlaceholderStrings(target.publishers, 'Unknown Publisher')
+    ? target.publishers
+    : hasNonPlaceholderStrings(donor?.publishers, 'Unknown Publisher')
+      ? donor!.publishers
+      : hasNonPlaceholderStrings(effectiveMeta?.publishers, 'Unknown Publisher')
+        ? effectiveMeta!.publishers
+        : target.publishers;
+
+  const nextTags =
+    Array.isArray(target.tags) && target.tags.length > 0
+      ? target.tags
+      : Array.isArray(donor?.tags) && donor.tags.length > 0
+        ? donor.tags
+        : Array.isArray(effectiveMeta?.tags) && effectiveMeta.tags.length > 0
+          ? effectiveMeta.tags
+          : target.tags;
+
+  const donorGenres =
+    Array.isArray(donor?.genres) && donor.genres.length > 0
+      ? donor.genres
+      : Array.isArray(effectiveMeta?.genres) && effectiveMeta.genres.length > 0
+        ? effectiveMeta.genres
+        : undefined;
+  const nextGenres =
+    Array.isArray(target.genres) &&
+    target.genres.length > 0 &&
+    !(targetIsSlimmed && donorGenres && donorGenres.length > target.genres.length)
+      ? target.genres
+      : donorGenres ?? target.genres;
+
+  const targetHasReviews = Boolean(
+    target.reviewSummary &&
+      (target.reviewSummary.totalReviews > 0 || target.reviewSummary.positivePercent > 0)
+  );
+  const donorHasReviews = Boolean(
+    donor?.reviewSummary &&
+      (donor.reviewSummary.totalReviews > 0 || donor.reviewSummary.positivePercent > 0)
+  );
+  const metaHasReviews = Boolean(
+    effectiveMeta?.reviewSummary &&
+      (effectiveMeta.reviewSummary.totalReviews > 0 ||
+        effectiveMeta.reviewSummary.positivePercent > 0)
+  );
+  const nextReviewSummary = targetHasReviews
+    ? target.reviewSummary
+    : donorHasReviews
+      ? donor!.reviewSummary
+      : metaHasReviews
+        ? effectiveMeta!.reviewSummary
+        : target.reviewSummary;
+
+  if (
+    nextShortDescription === target.shortDescription &&
+    nextDetailedDescription === target.detailedDescription &&
+    nextDevelopers === target.developers &&
+    nextPublishers === target.publishers &&
+    nextTags === target.tags &&
+    nextGenres === target.genres &&
+    nextReviewSummary === target.reviewSummary
+  ) {
+    return target;
+  }
+
+  return {
+    ...target,
+    ...(nextShortDescription !== undefined ? { shortDescription: nextShortDescription } : {}),
+    ...(nextDetailedDescription !== undefined
+      ? { detailedDescription: nextDetailedDescription }
+      : {}),
+    ...(nextDevelopers !== undefined ? { developers: nextDevelopers } : {}),
+    ...(nextPublishers !== undefined ? { publishers: nextPublishers } : {}),
+    ...(nextTags !== undefined ? { tags: nextTags } : {}),
+    ...(nextGenres !== undefined ? { genres: nextGenres } : {}),
+    ...(nextReviewSummary !== undefined ? { reviewSummary: nextReviewSummary } : {}),
+  };
+}
+
+function persistCatalogSnapshotToIdbAndLocalStorage(
+  compacted: CanonicalGame[],
+  options?: { skipIdbOverwrite?: boolean }
+): void {
+  // Primary rich persistence in IndexedDB vault (non-blocking, GB-scale quota).
+  // Never overwrite IndexedDB with a pure __quotaSlimmed cold-boot projection.
+  if (!options?.skipIdbOverwrite) {
+    void vaultSet(IDB_KEY_MAIN_CATALOG, compacted);
+  }
 
   const storage = getSafeStorage();
   if (!storage) {
@@ -1188,55 +1324,91 @@ function writeCatalogToLocalStorage(
   writeOptions?: { deferSnapshotMirror?: boolean }
 ): void {
   const previousInMemory = inMemoryCatalogCache;
-  const compacted = cleaned.map(compactGameForStorage);
+  let compacted = cleaned.map(compactGameForStorage);
+
+  // Guard against slimmed projections overwriting non-slimmed in-memory / durable records
+  const hasIncomingSlimmed = compacted.some((g) => Boolean(g?.enrichedMetadata?.__quotaSlimmed));
+  if (hasIncomingSlimmed && Array.isArray(previousInMemory) && previousInMemory.length > 0) {
+    const prevById = new Map<string, CanonicalGame>();
+    for (const pg of previousInMemory) {
+      if (pg?.id && !pg.enrichedMetadata?.__quotaSlimmed) {
+        prevById.set(pg.id, pg);
+      }
+    }
+    if (prevById.size > 0) {
+      compacted = compacted.map((g) => {
+        if (!g?.id || !g.enrichedMetadata?.__quotaSlimmed) return g;
+        const prevRich = prevById.get(g.id);
+        if (!prevRich) return g;
+        const mergedMeta = pickBestEnrichedMetadata(prevRich.enrichedMetadata, g.enrichedMetadata);
+        const withRichMeta =
+          mergedMeta !== g.enrichedMetadata ? { ...g, enrichedMetadata: mergedMeta } : g;
+        return recoverRichSummaryFieldsFromDonor(withRichMeta, prevRich, mergedMeta, true);
+      });
+    }
+  }
+
+  const hasRemainingSlimmed = compacted.some((g) => Boolean(g?.enrichedMetadata?.__quotaSlimmed));
+  const hasAnyNonSlimmedEnriched = compacted.some((g) =>
+    Boolean(g?.enrichedMetadata && !g.enrichedMetadata.__quotaSlimmed)
+  );
+  const isPureSlimmedSnapshot = hasRemainingSlimmed && !hasAnyNonSlimmedEnriched;
+
   inMemoryCatalogCache = compacted;
 
   const isFullCatalogWrite = dirtyIds === null || dirtyIds === undefined;
-  if (isFullCatalogWrite) {
-    const nextIdSet = new Set<string>();
-    for (const g of compacted) {
-      if (g?.id) nextIdSet.add(g.id);
-    }
-    const removedIdSet = new Set<string>();
-    if (Array.isArray(previousInMemory) && previousInMemory.length > 0) {
-      for (const pg of previousInMemory) {
-        if (pg?.id && !nextIdSet.has(pg.id)) {
-          removedIdSet.add(pg.id);
+  if (!isPureSlimmedSnapshot) {
+    if (isFullCatalogWrite) {
+      const nextIdSet = new Set<string>();
+      for (const g of compacted) {
+        if (g?.id) nextIdSet.add(g.id);
+      }
+      const removedIdSet = new Set<string>();
+      if (Array.isArray(previousInMemory) && previousInMemory.length > 0) {
+        for (const pg of previousInMemory) {
+          if (pg?.id && !nextIdSet.has(pg.id)) {
+            removedIdSet.add(pg.id);
+          }
         }
       }
-    }
-    if (lastPersistedVaultCatalogIds && lastPersistedVaultCatalogIds.size > 0) {
-      for (const prevId of lastPersistedVaultCatalogIds) {
-        if (prevId && !nextIdSet.has(prevId)) {
-          removedIdSet.add(prevId);
+      if (lastPersistedVaultCatalogIds && lastPersistedVaultCatalogIds.size > 0) {
+        for (const prevId of lastPersistedVaultCatalogIds) {
+          if (prevId && !nextIdSet.has(prevId)) {
+            removedIdSet.add(prevId);
+          }
         }
       }
-    }
-    if (removedIdSet.size > 0) {
-      deleteOrphanedGamesFromOfflineVault(Array.from(removedIdSet));
-    }
-    lastPersistedVaultCatalogIds = nextIdSet;
-  } else if (removedIds && removedIds.size > 0) {
-    const nextIdSet = new Set<string>();
-    for (const g of compacted) {
-      if (g?.id) nextIdSet.add(g.id);
-    }
-    const confirmedRemoved: string[] = [];
-    for (const remId of removedIds) {
-      if (remId && !nextIdSet.has(remId)) {
-        confirmedRemoved.push(remId);
-        lastPersistedVaultCatalogIds?.delete(remId);
+      if (removedIdSet.size > 0) {
+        deleteOrphanedGamesFromOfflineVault(Array.from(removedIdSet));
       }
-    }
-    if (confirmedRemoved.length > 0) {
-      deleteOrphanedGamesFromOfflineVault(confirmedRemoved);
+      lastPersistedVaultCatalogIds = nextIdSet;
+    } else if (removedIds && removedIds.size > 0) {
+      const nextIdSet = new Set<string>();
+      for (const g of compacted) {
+        if (g?.id) nextIdSet.add(g.id);
+      }
+      const confirmedRemoved: string[] = [];
+      for (const remId of removedIds) {
+        if (remId && !nextIdSet.has(remId)) {
+          confirmedRemoved.push(remId);
+          lastPersistedVaultCatalogIds?.delete(remId);
+        }
+      }
+      if (confirmedRemoved.length > 0) {
+        deleteOrphanedGamesFromOfflineVault(confirmedRemoved);
+      }
     }
   }
 
   // Mirror catalog snapshot to Electron SQLite offlineVault when available (non-blocking).
+  // Never mirror a pure __quotaSlimmed cold-boot projection into SQLite!
   // For incremental updates where dirtyIds is known and smaller than the catalog, send ONLY
   // the compacted dirty slice across IPC instead of structured-cloning all unchanged games!
-  if (typeof window !== 'undefined' && window.electronAPI?.offlineVault?.upsertGames) {
+  if (
+    !isPureSlimmedSnapshot &&
+    typeof window !== 'undefined' &&
+    window.electronAPI?.offlineVault?.upsertGames
+  ) {
     try {
       const ipcPayload =
         dirtyIds !== null && dirtyIds !== undefined
@@ -1258,7 +1430,8 @@ function writeCatalogToLocalStorage(
   }
 
   const isSmallDeltaOnLargeCatalog = Boolean(
-    writeOptions?.deferSnapshotMirror === true &&
+    !isPureSlimmedSnapshot &&
+      writeOptions?.deferSnapshotMirror === true &&
       dirtyIds !== null &&
       dirtyIds !== undefined &&
       dirtyIds.size > 0 &&
@@ -1276,7 +1449,9 @@ function writeCatalogToLocalStorage(
     pendingSnapshotMirrorTimer = null;
   }
   pendingSnapshotGames = null;
-  persistCatalogSnapshotToIdbAndLocalStorage(compacted);
+  persistCatalogSnapshotToIdbAndLocalStorage(compacted, {
+    skipIdbOverwrite: isPureSlimmedSnapshot,
+  });
 }
 
 /**
@@ -1376,21 +1551,44 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
           });
           void vaultSet(IDB_KEY_MAIN_CATALOG, vaultCatalog);
         } else {
+          const snapGamesById = new Map<string, CanonicalGame>();
+          for (const sg of snap.games) {
+            if (sg?.id) snapGamesById.set(sg.id, sg);
+          }
           let upgradedAnyFromVaultDetails = false;
           vaultCatalog = vaultCatalog!.map((g) => {
+            const snapGame = g?.id ? snapGamesById.get(g.id) : undefined;
             const detailEntry = g?.id ? details[g.id] : undefined;
-            const rawDetailMeta = detailEntry?.enrichedMetadata ?? undefined;
-            if (!rawDetailMeta) return g;
+            const rawDetailMeta = detailEntry?.enrichedMetadata ?? snapGame?.enrichedMetadata ?? undefined;
             const detailMeta =
-              detailEntry?.enrichedAt && !rawDetailMeta.enrichedAt
+              rawDetailMeta && detailEntry?.enrichedAt && !rawDetailMeta.enrichedAt
                 ? { ...rawDetailMeta, enrichedAt: detailEntry.enrichedAt }
                 : rawDetailMeta;
-            const mergedMeta = pickBestEnrichedMetadata(g.enrichedMetadata, detailMeta);
-            if (mergedMeta !== g.enrichedMetadata) {
-              upgradedAnyFromVaultDetails = true;
-              return { ...g, enrichedMetadata: mergedMeta };
+            const mergedMeta = detailMeta
+              ? pickBestEnrichedMetadata(g.enrichedMetadata, detailMeta)
+              : g.enrichedMetadata;
+            let nextGame =
+              mergedMeta !== g.enrichedMetadata
+                ? { ...g, enrichedMetadata: mergedMeta }
+                : g;
+            // Recover rich SQLite summary_json fields (shortDescription, detailedDescription,
+            // developers, publishers, tags, genres, reviewSummary) whenever an IDB entry was
+            // previously slimmed or lost top-level summary fields.
+            if (snapGame || (mergedMeta && !mergedMeta.__quotaSlimmed)) {
+              const recovered = recoverRichSummaryFieldsFromDonor(
+                nextGame,
+                snapGame,
+                mergedMeta,
+                Boolean(g.enrichedMetadata?.__quotaSlimmed)
+              );
+              if (recovered !== nextGame) {
+                nextGame = recovered;
+              }
             }
-            return g;
+            if (nextGame !== g) {
+              upgradedAnyFromVaultDetails = true;
+            }
+            return nextGame;
           });
           if (upgradedAnyFromVaultDetails) {
             void vaultSet(IDB_KEY_MAIN_CATALOG, vaultCatalog);
@@ -1449,15 +1647,21 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
       return mergedCache;
     }
   } else if (inMemoryCatalogCache && inMemoryCatalogCache.length > 0) {
-    // One-time automatic migration from localStorage into IndexedDB & SQLite offlineVault
-    void vaultSet(IDB_KEY_MAIN_CATALOG, inMemoryCatalogCache);
-    lastPersistedVaultCatalogIds = new Set(
-      inMemoryCatalogCache.map((g) => g?.id).filter((id): id is string => Boolean(id))
+    // Never migrate a __quotaSlimmed first-paint projection into IndexedDB or SQLite
+    const inMemoryHasQuotaSlimmed = inMemoryCatalogCache.some((g) =>
+      Boolean(g?.enrichedMetadata?.__quotaSlimmed)
     );
-    if (window.electronAPI?.offlineVault?.upsertGames) {
-      try {
-        void window.electronAPI.offlineVault.upsertGames(inMemoryCatalogCache)?.catch?.(() => {});
-      } catch {}
+    if (!inMemoryHasQuotaSlimmed) {
+      // One-time automatic migration from localStorage into IndexedDB & SQLite offlineVault
+      void vaultSet(IDB_KEY_MAIN_CATALOG, inMemoryCatalogCache);
+      lastPersistedVaultCatalogIds = new Set(
+        inMemoryCatalogCache.map((g) => g?.id).filter((id): id is string => Boolean(id))
+      );
+      if (window.electronAPI?.offlineVault?.upsertGames) {
+        try {
+          void window.electronAPI.offlineVault.upsertGames(inMemoryCatalogCache)?.catch?.(() => {});
+        } catch {}
+      }
     }
   }
   return null;
@@ -1636,6 +1840,9 @@ export function loadCurrentCatalog(): CanonicalGame[] {
         return buildDefaultBaseCatalog(userOverrides);
       }
       if (Array.isArray(parsed) && parsed.length > 0) {
+        const isQuotaSlimmedSnapshot = parsed.some((g: CanonicalGame) =>
+          Boolean(g?.enrichedMetadata?.__quotaSlimmed)
+        );
         let compactedAny = parsed.some(
           (g: CanonicalGame) =>
             g?.platforms?.some(
@@ -1670,7 +1877,12 @@ export function loadCurrentCatalog(): CanonicalGame[] {
           }
         }
         inMemoryCatalogCache = cleaned;
-        if (cleaned.length !== parsed.length || compactedAny || platformOrVersionHealed) {
+        // Cold-Boot Write Barrier (C8): NEVER write back to localStorage / IDB / SQLite when
+        // parsed contains __quotaSlimmed projections — let hydrateCatalogFromIndexedDb() restore full rows.
+        if (
+          !isQuotaSlimmedSnapshot &&
+          (cleaned.length !== parsed.length || compactedAny || platformOrVersionHealed)
+        ) {
           writeCatalogToLocalStorage(cleaned);
         } else {
           inMemoryCatalogRawRef = fp;
@@ -3737,7 +3949,7 @@ export function mergeUpdatedGamePreservingLivePlatformState(
     }
   }
 
-  const candidateMerged =
+  let candidateMerged =
     !platformsChanged && !enrichedChanged
       ? incomingGame
       : {
@@ -3745,6 +3957,15 @@ export function mergeUpdatedGamePreservingLivePlatformState(
           ...(platformsChanged ? { platforms: mergedPlatforms } : {}),
           ...(enrichedChanged ? { enrichedMetadata: bestEnriched } : {}),
         };
+
+  if (incomingGame.enrichedMetadata?.__quotaSlimmed && !liveGame.enrichedMetadata?.__quotaSlimmed) {
+    candidateMerged = recoverRichSummaryFieldsFromDonor(
+      candidateMerged,
+      liveGame,
+      bestEnriched,
+      true
+    );
+  }
 
   return areCanonicalGamesShallowEqual(liveGame, candidateMerged) ? liveGame : candidateMerged;
 }

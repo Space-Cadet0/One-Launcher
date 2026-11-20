@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const { execFileSync } = require('node:child_process');
 const { app } = require('electron');
 
@@ -25,7 +26,12 @@ const EPIC_CLIENT_AUTH =
   String(process.env.ONE_LAUNCHER_EPIC_CLIENT_AUTH || '').trim() ||
   'MzRhMDJjZjhmNDQxNGUyOWIxNTkyMTg3NmRhMzZmOWE6ZGFhZmJjY2M3Mzc3NDUwMzlkZmZlNTNkOTRmYzc2Y2Y=';
 
-const { toHostFilesystemPath } = require('./launcher/securityAndPathUtils.cjs');
+const {
+  toHostFilesystemPath,
+  isAllowedHttpsHost,
+  assertSafePublicHttpsUrlSyntax,
+  assertSafePublicHttpsUrl,
+} = require('./launcher/securityAndPathUtils.cjs');
 
 const {
   getMachineIdentityKeyMaterial,
@@ -1011,6 +1017,559 @@ async function fetchGogAccount(accessToken, options = {}) {
   };
 }
 
+const MAX_GOG_CLIENT_ID_CACHE_ENTRIES = 2000;
+const MAX_GOG_MANIFEST_COMPRESSED_BYTES = 2 * 1024 * 1024; // 2 MB cap (C2)
+const MAX_GOG_MANIFEST_INFLATED_BYTES = 4 * 1024 * 1024; // 4 MB zlib inflate cap (C2)
+const GOG_MANIFEST_ALLOWED_HOSTS = Object.freeze(['gog.com', 'gog-statics.com']);
+const gogClientIdCache = new Map();
+
+function classifyAchievementRarityTier(percentage) {
+  if (typeof percentage !== 'number' || !Number.isFinite(percentage)) return 'common';
+  if (percentage < 10) return 'ultra_rare';
+  if (percentage < 25) return 'rare';
+  if (percentage < 50) return 'uncommon';
+  return 'common';
+}
+
+function setBoundedGogClientIdCache(productId, clientId) {
+  const key = String(productId || '').trim();
+  const val = String(clientId || '').trim();
+  if (!key || !val) return;
+  if (gogClientIdCache.has(key)) gogClientIdCache.delete(key);
+  gogClientIdCache.set(key, val);
+  while (gogClientIdCache.size > MAX_GOG_CLIENT_ID_CACHE_ENTRIES) {
+    const oldest = gogClientIdCache.keys().next().value;
+    if (oldest === undefined) break;
+    gogClientIdCache.delete(oldest);
+  }
+}
+
+/**
+ * Read a fetch Response body into a Buffer while enforcing a strict maximum byte limit (`C2`).
+ */
+async function readBoundedResponseBuffer(res, maxBytes) {
+  const rawCl = res?.headers?.get?.('content-length');
+  if (rawCl !== null && rawCl !== undefined) {
+    const clNum = Number(rawCl);
+    if (Number.isFinite(clNum) && clNum > maxBytes) {
+      throw new Error(`Response Content-Length exceeds limit (${clNum} > ${maxBytes})`);
+    }
+  }
+  if (res?.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const chunks = [];
+    let totalBytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        totalBytes += chunk.length;
+        if (totalBytes > maxBytes) {
+          try {
+            await reader.cancel();
+          } catch {}
+          throw new Error(`Response stream exceeds byte cap (${totalBytes} > ${maxBytes})`);
+        }
+        chunks.push(chunk);
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {}
+    }
+    return Buffer.concat(chunks, totalBytes);
+  }
+  const ab = await res.arrayBuffer();
+  if (ab.byteLength > maxBytes) {
+    throw new Error(`Response buffer exceeds byte cap (${ab.byteLength} > ${maxBytes})`);
+  }
+  return Buffer.from(ab);
+}
+
+/**
+ * Universal zero-auth GOG `productId -> clientId` resolution via `content-system.gog.com`
+ * v2 builds + zlib-inflated manifest, hardened with host allowlist, public HTTPS SSRF check,
+ * 2 MB compressed download cap, and 4 MB `zlib.inflateSync` output cap (`C2`).
+ */
+async function resolveGogClientId(productId, options = {}) {
+  const cleanProductId = String(productId || '')
+    .replace(/^gog[-_]/i, '')
+    .trim();
+  if (!cleanProductId || !/^\d+$/.test(cleanProductId)) {
+    return null;
+  }
+
+  if (!options.forceRefresh && gogClientIdCache.has(cleanProductId)) {
+    const cached = gogClientIdCache.get(cleanProductId);
+    gogClientIdCache.delete(cleanProductId);
+    gogClientIdCache.set(cleanProductId, cached);
+    return cached;
+  }
+
+  const hasCustomFetch = typeof options?.fetchFn === 'function';
+  const fetchImpl = hasCustomFetch ? options.fetchFn : fetch;
+  const headers = {
+    Accept: 'application/json',
+    'User-Agent': buildPlatformStoreUserAgent('GOGGalaxy/2.0'),
+  };
+
+  for (const osName of ['windows', 'osx', 'linux']) {
+    try {
+      const buildsUrl = `https://content-system.gog.com/products/${encodeURIComponent(
+        cleanProductId
+      )}/os/${osName}/builds?generation=2`;
+      const buildsRes = await fetchImpl(buildsUrl, {
+        headers,
+        signal: buildStoreFetchSignal(options?.signal),
+      });
+      if (!buildsRes.ok) continue;
+      const buildsData = await buildsRes.json();
+      const firstItem = Array.isArray(buildsData?.items) ? buildsData.items[0] : null;
+      const link = typeof firstItem?.link === 'string' ? firstItem.link.trim() : '';
+      if (!link) continue;
+
+      // SSRF defense (`C2`): enforce GOG host allowlist + public HTTPS URL validation
+      if (!isAllowedHttpsHost(link, GOG_MANIFEST_ALLOWED_HOSTS)) {
+        console.warn(`Blocked non-GOG manifest link host during clientId resolution`);
+        continue;
+      }
+      assertSafePublicHttpsUrlSyntax(link);
+      if (!hasCustomFetch || options.enforceDnsCheck === true) {
+        await assertSafePublicHttpsUrl(
+          link,
+          typeof options.dnsLookup === 'function' ? { dnsLookup: options.dnsLookup } : {}
+        );
+      }
+
+      const manifestRes = await fetchImpl(link, {
+        headers: { 'User-Agent': buildPlatformStoreUserAgent('GOGGalaxy/2.0') },
+        signal: buildStoreFetchSignal(options?.signal),
+      });
+      if (!manifestRes.ok) continue;
+
+      const compressedBuf = await readBoundedResponseBuffer(
+        manifestRes,
+        MAX_GOG_MANIFEST_COMPRESSED_BYTES
+      );
+      if (!compressedBuf || compressedBuf.length === 0) continue;
+
+      let manifestText = '';
+      if (compressedBuf[0] === 0x7b) {
+        // Plain JSON manifest (uncompressed)
+        manifestText = compressedBuf.toString('utf8');
+      } else {
+        const inflated = zlib.inflateSync(compressedBuf, {
+          maxOutputLength: MAX_GOG_MANIFEST_INFLATED_BYTES,
+        });
+        manifestText = inflated.toString('utf8');
+      }
+
+      const manifest = JSON.parse(manifestText);
+      const clientId = String(manifest?.clientId || '').trim();
+      if (clientId) {
+        setBoundedGogClientIdCache(cleanProductId, clientId);
+        return clientId;
+      }
+    } catch {
+      // Try next OS build or fall through cleanly on SSRF/zlib/network error
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extract a balanced JSON array literal `[ ... ]` starting at `bracketStartIndex`.
+ */
+function extractBalancedJsonArray(text, bracketStartIndex) {
+  if (text[bracketStartIndex] !== '[') return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = bracketStartIndex; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '[') {
+      depth++;
+    } else if (ch === ']') {
+      depth--;
+      if (depth === 0) {
+        return text.slice(bracketStartIndex, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Normalize GOG achievement image URLs (`//` or `http://` -> `https://`).
+ */
+function normalizeGogImageUrl(rawUrl) {
+  const clean = String(rawUrl || '').trim();
+  if (!clean) return '';
+  if (clean.startsWith('//')) return `https:${clean}`;
+  if (clean.startsWith('http://')) return `https://${clean.slice(7)}`;
+  return clean;
+}
+
+/**
+ * Parse `window.profilesData.achievements` from `www.gog.com/u/<username>/game/<productId>`,
+ * converting Unix seconds `unlockDate * 1000` into ISO timestamps.
+ */
+function parseGogProfileAchievementsHtml(html, cleanProductId, preferredUserId = '') {
+  if (typeof html !== 'string' || !html) return [];
+  const markerMatch = html.match(/window\.profilesData\.achievements\s*=\s*/);
+  if (!markerMatch || markerMatch.index === undefined) return [];
+  const arrStart = html.indexOf('[', markerMatch.index + markerMatch[0].length);
+  if (arrStart === -1) return [];
+  const rawJsonArr = extractBalancedJsonArray(html, arrStart);
+  if (!rawJsonArr) return [];
+
+  let list;
+  try {
+    list = JSON.parse(rawJsonArr);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(list) || list.length === 0) return [];
+
+  return list
+    .filter((entry) => entry && typeof entry === 'object' && entry.achievement)
+    .map((entry, idx) => {
+      const ach = entry.achievement;
+      if (ach.clientId && cleanProductId) {
+        setBoundedGogClientIdCache(cleanProductId, String(ach.clientId));
+      }
+      const statsObj = entry.stats && typeof entry.stats === 'object' ? entry.stats : {};
+      const userStat =
+        (preferredUserId && statsObj[preferredUserId]) ||
+        Object.values(statsObj).find((s) => s && typeof s === 'object') ||
+        null;
+      const isUnlocked = Boolean(userStat?.isUnlocked);
+      const rawDate = Number(userStat?.unlockDate ?? 0);
+      const unlockedAtMs =
+        isUnlocked && Number.isFinite(rawDate) && rawDate > 0
+          ? rawDate > 1e12
+            ? rawDate
+            : rawDate * 1000
+          : undefined;
+      const unlockedAtIso = unlockedAtMs ? new Date(unlockedAtMs).toISOString() : undefined;
+      const rawRarity = Number(ach.rarity);
+      const globalPercentage =
+        ach.rarity !== undefined && ach.rarity !== null && Number.isFinite(rawRarity)
+          ? Number(rawRarity.toFixed(1))
+          : undefined;
+      const iconUnlockedUrl = normalizeGogImageUrl(ach.imageUrlUnlocked || ach.image_url_unlocked);
+      const iconLockedUrl =
+        normalizeGogImageUrl(ach.imageUrlLocked || ach.image_url_locked) || iconUnlockedUrl;
+      const achId = String(ach.id || ach.achievement_id || `gog_ach_${idx + 1}`);
+      const achKey = String(ach.achievement_key || ach.key || achId);
+
+      return {
+        id: `gog:${cleanProductId}:${achId}`,
+        achievement_id: achId,
+        achievement_key: achKey,
+        apiName: achKey,
+        name: String(ach.name || `Achievement #${idx + 1}`),
+        description: String(ach.description || '').trim() || undefined,
+        unlocked: isUnlocked,
+        isUnlocked,
+        ...(unlockedAtIso ? { unlockedAt: unlockedAtIso, date_unlocked: unlockedAtIso } : {}),
+        iconUnlockedUrl,
+        iconLockedUrl,
+        image_url_unlocked: iconUnlockedUrl,
+        image_url_locked: iconLockedUrl,
+        ...(globalPercentage !== undefined
+          ? {
+              globalPercentage,
+              rarity: globalPercentage,
+              rarityTier: classifyAchievementRarityTier(globalPercentage),
+            }
+          : {}),
+        visible: ach.visible !== false,
+        isSecret: ach.visible === false,
+        storefrontId: 'gog',
+      };
+    });
+}
+
+/**
+ * Fetch full per-achievement unlocks, timestamps, rarity & icons for a single GOG game (`Task 10a`):
+ * - Proactively refreshes GOG token if `expires_at - Date.now() < 60_000` (and retries once on HTTP 401/403
+ *   with `{ preferVaultRefreshToken: true }`)
+ * - Resolves `productId -> clientId` via `resolveGogClientId` (`C2`)
+ * - Paginates `GET gameplay.gog.com/clients/<clientId>/users/<userId>/achievements`
+ * - Falls back to `GET www.gog.com/u/<username>/game/<productId>` (`window.profilesData.achievements`)
+ */
+async function fetchGogDetailedGameAchievements(payload = {}, options = {}) {
+  const fetchImpl = typeof options?.fetchFn === 'function' ? options.fetchFn : fetch;
+  const vaultOpts = resolveStoreVaultOptions(options?.userDataDir ? options : payload);
+  const cleanProductId = String(
+    payload.productId || payload.platformGameId || payload.gameId || ''
+  )
+    .replace(/^gog[-_]/i, '')
+    .trim();
+
+  if (!cleanProductId) return null;
+
+  const { locale } = resolveDefaultStoreLocaleAndCountry(options);
+  let savedGog = {};
+  if (!options.accessToken || !options.userId || !options.username) {
+    try {
+      const saved = await loadSavedTokensAsync(vaultOpts);
+      savedGog = saved?.gog || {};
+    } catch {}
+  }
+
+  let accessToken = String(options.accessToken || savedGog.access_token || '').trim();
+  let refreshToken = String(options.refreshToken || savedGog.refresh_token || '').trim();
+  let userId = String(options.userId || savedGog.user_id || '').trim();
+  let username = String(options.username || savedGog.username || '').trim();
+  const rawExpiresAt = options.expiresAt || savedGog.expires_at;
+  const expiresAtMs = rawExpiresAt ? Date.parse(String(rawExpiresAt)) : NaN;
+
+  // Proactive GOG token renewal when within 60s of expiry
+  if (
+    refreshToken &&
+    (!accessToken || (!Number.isNaN(expiresAtMs) && expiresAtMs - Date.now() < 60_000))
+  ) {
+    try {
+      const renewed = await renewGogTokens(refreshToken, {
+        ...options,
+        ...vaultOpts,
+        preferVaultRefreshToken: true,
+      });
+      accessToken = String(renewed?.access_token || accessToken).trim();
+      refreshToken = String(renewed?.refresh_token || refreshToken).trim();
+      userId = String(renewed?.user_id || userId).trim();
+    } catch {}
+  }
+
+  // Hydrate missing userId/username if token is present
+  if (accessToken && (!userId || !username || username === 'GOG User')) {
+    try {
+      const acc = await fetchGogAccount(accessToken, { ...options, ...vaultOpts });
+      if (acc?.userId) userId = String(acc.userId).trim();
+      if (acc?.username && acc.username !== 'GOG User') username = String(acc.username).trim();
+    } catch {
+      if (refreshToken) {
+        try {
+          const renewed = await renewGogTokens(refreshToken, {
+            ...options,
+            ...vaultOpts,
+            preferVaultRefreshToken: true,
+          });
+          accessToken = String(renewed?.access_token || accessToken).trim();
+          refreshToken = String(renewed?.refresh_token || refreshToken).trim();
+          const acc = await fetchGogAccount(accessToken, { ...options, ...vaultOpts });
+          if (acc?.userId) userId = String(acc.userId).trim();
+          if (acc?.username && acc.username !== 'GOG User') username = String(acc.username).trim();
+        } catch {}
+      }
+    }
+  }
+
+  const clientId =
+    String(payload.clientId || options.clientId || '').trim() ||
+    (await resolveGogClientId(cleanProductId, options));
+
+  const syncedAt = new Date().toISOString();
+
+  // 1. Primary: Paginated `gameplay.gog.com/clients/<clientId>/users/<userId>/achievements`
+  if (clientId && userId && accessToken) {
+    const fetchAllPages = async (tokenToUse) => {
+      const collected = [];
+      let totalCount = 0;
+      let pageToken = '';
+      const authHeader = tokenToUse.startsWith('Bearer ') ? tokenToUse : `Bearer ${tokenToUse}`;
+
+      for (let page = 0; page < 20; page++) {
+        const gpUrl = `https://gameplay.gog.com/clients/${encodeURIComponent(
+          clientId
+        )}/users/${encodeURIComponent(userId)}/achievements${
+          pageToken ? `?page_token=${encodeURIComponent(pageToken)}` : ''
+        }`;
+        const gpRes = await fetchImpl(gpUrl, {
+          headers: {
+            Authorization: authHeader,
+            'X-GOG-Lc': locale,
+            'User-Agent': buildPlatformStoreUserAgent('GOGGalaxy/2.0'),
+          },
+          signal: buildStoreFetchSignal(options?.signal),
+        });
+        if (gpRes.status === 401 || gpRes.status === 403) {
+          return { ok: false, authExpired: true, status: gpRes.status };
+        }
+        if (gpRes.status === 404) {
+          return { ok: false, notFound: true, status: 404 };
+        }
+        if (!gpRes.ok) {
+          return { ok: false, status: gpRes.status };
+        }
+        const gpData = await gpRes.json();
+        const pageItems = Array.isArray(gpData?.items) ? gpData.items : [];
+        if (typeof gpData?.total_count === 'number' && gpData.total_count > totalCount) {
+          totalCount = gpData.total_count;
+        }
+        collected.push(...pageItems);
+        const nextToken = typeof gpData?.page_token === 'string' ? gpData.page_token.trim() : '';
+        if (!nextToken || nextToken === pageToken || pageItems.length === 0) break;
+        pageToken = nextToken;
+      }
+
+      return { ok: true, items: collected, totalCount: totalCount || collected.length };
+    };
+
+    try {
+      let gpResult = await fetchAllPages(accessToken);
+      if (gpResult.authExpired && refreshToken) {
+        try {
+          const renewed = await renewGogTokens(refreshToken, {
+            ...options,
+            ...vaultOpts,
+            preferVaultRefreshToken: true,
+          });
+          if (renewed?.access_token) {
+            accessToken = String(renewed.access_token).trim();
+            gpResult = await fetchAllPages(accessToken);
+          }
+        } catch {}
+      }
+
+      if (gpResult.ok && Array.isArray(gpResult.items)) {
+        const mapped = gpResult.items.map((item, idx) => {
+          const achId = String(item?.achievement_id || item?.id || `gog_${idx + 1}`);
+          const achKey = String(item?.achievement_key || achId);
+          const rawUnlocked = item?.date_unlocked;
+          const isUnlocked = Boolean(rawUnlocked);
+          let unlockedAt = undefined;
+          if (isUnlocked) {
+            if (typeof rawUnlocked === 'number' && Number.isFinite(rawUnlocked) && rawUnlocked > 0) {
+              unlockedAt = new Date(rawUnlocked > 1e12 ? rawUnlocked : rawUnlocked * 1000).toISOString();
+            } else if (typeof rawUnlocked === 'string' && rawUnlocked.trim()) {
+              const parsed = Date.parse(rawUnlocked);
+              unlockedAt = !Number.isNaN(parsed) ? new Date(parsed).toISOString() : rawUnlocked.trim();
+            }
+          }
+          const rawRarity = Number(item?.rarity);
+          const globalPercentage =
+            item?.rarity !== undefined && item?.rarity !== null && Number.isFinite(rawRarity)
+              ? Number(rawRarity.toFixed(1))
+              : undefined;
+          const iconUnlockedUrl = normalizeGogImageUrl(
+            item?.image_url_unlocked || item?.imageUrlUnlocked
+          );
+          const iconLockedUrl =
+            normalizeGogImageUrl(item?.image_url_locked || item?.imageUrlLocked) ||
+            iconUnlockedUrl;
+
+          return {
+            id: `gog:${cleanProductId}:${achId}`,
+            achievement_id: achId,
+            achievement_key: achKey,
+            apiName: achKey,
+            name: String(item?.name || `Achievement #${idx + 1}`),
+            description: String(item?.description || '').trim() || undefined,
+            unlocked: isUnlocked,
+            isUnlocked,
+            ...(unlockedAt ? { unlockedAt, date_unlocked: unlockedAt } : {}),
+            iconUnlockedUrl,
+            iconLockedUrl,
+            image_url_unlocked: iconUnlockedUrl,
+            image_url_locked: iconLockedUrl,
+            ...(globalPercentage !== undefined
+              ? {
+                  globalPercentage,
+                  rarity: globalPercentage,
+                  rarityTier: classifyAchievementRarityTier(globalPercentage),
+                }
+              : {}),
+            visible: item?.visible !== false,
+            isSecret: item?.visible === false,
+            storefrontId: 'gog',
+          };
+        });
+
+        const total = Math.max(mapped.length, gpResult.totalCount || 0);
+        const unlocked = mapped.filter((a) => a.unlocked).length;
+        const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
+        return {
+          storefrontId: 'gog',
+          storefrontName: 'GOG GALAXY',
+          total,
+          totalCount: total,
+          unlocked,
+          percentage,
+          isMastered: total > 0 && unlocked >= total,
+          achievements: mapped,
+          items: mapped,
+          syncedAt,
+          source: 'live_cloud',
+          unlockPrecision: 'exact',
+          supportsAchievements: total > 0,
+          cacheVersion: 2,
+        };
+      }
+    } catch {}
+  }
+
+  // 2. Secondary Fallback: `GET www.gog.com/u/<username>/game/<productId>` (`window.profilesData.achievements`)
+  if (username && username !== 'GOG User') {
+    try {
+      const pageUrl = `https://www.gog.com/u/${encodeURIComponent(username)}/game/${encodeURIComponent(
+        cleanProductId
+      )}`;
+      const headers = {
+        'User-Agent': buildPlatformStoreUserAgent('GOGGalaxy/2.0'),
+      };
+      if (accessToken) {
+        headers['Authorization'] = accessToken.startsWith('Bearer ')
+          ? accessToken
+          : `Bearer ${accessToken}`;
+      }
+      const pageRes = await fetchImpl(pageUrl, {
+        headers,
+        signal: buildStoreFetchSignal(options?.signal),
+      });
+      if (pageRes.ok) {
+        const html = await pageRes.text();
+        const mapped = parseGogProfileAchievementsHtml(html, cleanProductId, userId);
+        if (mapped.length > 0) {
+          const total = mapped.length;
+          const unlocked = mapped.filter((a) => a.unlocked).length;
+          const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
+          return {
+            storefrontId: 'gog',
+            storefrontName: 'GOG GALAXY',
+            total,
+            totalCount: total,
+            unlocked,
+            percentage,
+            isMastered: total > 0 && unlocked >= total,
+            achievements: mapped,
+            items: mapped,
+            syncedAt,
+            source: 'live_cloud',
+            unlockPrecision: 'exact',
+            supportsAchievements: true,
+            cacheVersion: 2,
+          };
+        }
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
 /**
  * Fetch exact achievements for a single GOG game using Galaxy gameplay API or user profile page.
  *
@@ -1043,8 +1602,10 @@ async function fetchGogGameAchievementDetail(
 
   // 1. Try GOG Galaxy official gameplay achievements API if userId & accessToken are available
   if (userId && accessToken) {
-    try {
-      const gpUrl = `https://gameplay.gog.com/clients/${encodeURIComponent(cleanId)}/users/${encodeURIComponent(userId)}/achievements`;
+    const queryGameplaySummary = async (clientIdCandidate) => {
+      const gpUrl = `https://gameplay.gog.com/clients/${encodeURIComponent(
+        clientIdCandidate
+      )}/users/${encodeURIComponent(userId)}/achievements`;
       const gpRes = await fetchImpl(gpUrl, {
         headers: {
           ...headers,
@@ -1060,17 +1621,42 @@ async function fetchGogGameAchievementDetail(
           const unlocked = items.filter((a) => Boolean(a.date_unlocked)).length;
           const percentage = Math.round((unlocked / total) * 100);
           return {
-            unlocked,
-            total,
-            percentage,
-            isMastered: unlocked >= total,
-            source: 'live_cloud_api',
-            syncedAt: new Date().toISOString(),
+            hit: {
+              unlocked,
+              total,
+              percentage,
+              isMastered: unlocked >= total,
+              source: 'live_cloud_api',
+              syncedAt: new Date().toISOString(),
+            },
           };
         }
-      } else if (gpRes.status === 401 || gpRes.status === 403) {
+        return { empty: true };
+      }
+      if (gpRes.status === 401 || gpRes.status === 403) {
         if (options && typeof options === 'object' && options._authState) {
           options._authState.authExpired = true;
+        }
+        return { authExpired: true };
+      }
+      return { notFound: true };
+    };
+
+    try {
+      const cachedClientId = gogClientIdCache.get(cleanId);
+      const firstResult = await queryGameplaySummary(cachedClientId || cleanId);
+      if (firstResult.hit) {
+        return firstResult.hit;
+      }
+      // If `cleanId` was a catalog productId (404 or empty) and not yet resolved to a Galaxy clientId,
+      // resolve `clientId` dynamically via `content-system.gog.com` and query `gameplay.gog.com`.
+      if (!cachedClientId && !firstResult.authExpired) {
+        const resolvedClientId = await resolveGogClientId(cleanId, options);
+        if (resolvedClientId && resolvedClientId !== cleanId) {
+          const secondResult = await queryGameplaySummary(resolvedClientId);
+          if (secondResult.hit) {
+            return secondResult.hit;
+          }
         }
       }
     } catch {}
@@ -1086,27 +1672,19 @@ async function fetchGogGameAchievementDetail(
       });
       if (pageRes.ok) {
         const html = await pageRes.text();
-        const match = html.match(
-          /window\.profilesData\.achievements\s*=\s*(\[[\s\S]*?\]);\s*window\.profilesData\.matchedGame/
-        );
-        if (match) {
-          const list = JSON.parse(match[1]);
-          if (Array.isArray(list) && list.length > 0) {
-            const total = list.length;
-            const unlocked = list.filter((a) => {
-              if (!a.stats) return false;
-              return Object.values(a.stats).some((s) => s && s.isUnlocked);
-            }).length;
-            const percentage = Math.round((unlocked / total) * 100);
-            return {
-              unlocked,
-              total,
-              percentage,
-              isMastered: unlocked >= total,
-              source: 'live_cloud_xml',
-              syncedAt: new Date().toISOString(),
-            };
-          }
+        const parsedList = parseGogProfileAchievementsHtml(html, cleanId, userId);
+        if (parsedList.length > 0) {
+          const total = parsedList.length;
+          const unlocked = parsedList.filter((a) => a.unlocked).length;
+          const percentage = Math.round((unlocked / total) * 100);
+          return {
+            unlocked,
+            total,
+            percentage,
+            isMastered: unlocked >= total,
+            source: 'live_cloud_xml',
+            syncedAt: new Date().toISOString(),
+          };
         }
       }
     } catch {}
@@ -2160,8 +2738,83 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
     }
     const fetchImpl = options.fetchFn || fetch;
 
-    // Targeted single-sandbox GraphQL query when scoped to one game
+    // Targeted single-game GraphQL query when scoped to one game
     if (isSingleGameScoped && targetSandboxId) {
+      const cachedProdId =
+        String(options.productId || '').trim() ||
+        epicSandboxProductIdCache.get(targetSandboxId.toLowerCase()) ||
+        '';
+
+      const tryQueryByProductId = async (resolvedProductId, fallbackTotals = null) => {
+        if (!resolvedProductId) return false;
+        const prodQuery = `query playerProductAchievements($epicAccountId: String!, $productId: String!) {
+          PlayerProfile {
+            playerProfile(epicAccountId: $epicAccountId) {
+              productAchievements(productId: $productId) {
+                __typename
+                ... on PlayerProductAchievementsResponseSuccess {
+                  data {
+                    sandboxId
+                    epicAccountId
+                    totalUnlocked
+                    totalXP
+                    playerAchievements {
+                      playerAchievement {
+                        achievementName
+                        unlocked
+                        unlockDate
+                        progress
+                        XP
+                        achievementSetId
+                        isBase
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }`;
+        const prodRes = await fetchImpl('https://launcher.store.epicgames.com/graphql', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            query: prodQuery,
+            variables: {
+              epicAccountId: accountId,
+              productId: resolvedProductId,
+            },
+          }),
+          signal: buildStoreFetchSignal(options.signal),
+        });
+        if (!prodRes.ok) return false;
+        const prodJson = await prodRes.json();
+        const paNode = prodJson?.data?.PlayerProfile?.playerProfile?.productAchievements;
+        const paData = paNode?.data;
+        if (!paData || paNode?.__typename === 'ServiceError') return false;
+        const totals = fallbackTotals || (await fetchEpicPublicAchievementSchema(targetSandboxId, options));
+        indexEpicAchievementItems([
+          {
+            sandboxId: paData.sandboxId || targetSandboxId,
+            totalUnlocked: Number(paData.totalUnlocked || 0),
+            totalXP: Number(paData.totalXP || 0),
+            product: options.title ? { name: String(options.title) } : undefined,
+            productAchievements: {
+              totalAchievements: Number(totals?.totalAchievements || 0),
+              totalProductXP: Number(totals?.totalProductXP || 0),
+            },
+          },
+        ]);
+        return true;
+      };
+
+      if (cachedProdId) {
+        try {
+          const hit = await tryQueryByProductId(cachedProdId);
+          if (hit) return achievementsMap;
+        } catch {}
+      }
+
       const singleQuery = `query playerProfileProductAchievements($epicAccountId: String!, $sandboxId: String!, $locale: String!) {
         PlayerProfile {
           playerProfile(epicAccountId: $epicAccountId) {
@@ -2202,30 +2855,39 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
         signal: buildStoreFetchSignal(options.signal),
       });
 
-      if (!singleRes.ok) {
+      if (singleRes.ok) {
+        const singleJson = await singleRes.json();
+        const profileNode = singleJson?.data?.PlayerProfile?.playerProfile;
+        const targetedRaw = profileNode?.productAchievements?.data;
+        const summaryFallbackRaw = profileNode?.achievementsSummaries?.data;
+        const hasSchemaError = Array.isArray(singleJson?.errors) && singleJson.errors.length > 0;
+
+        if (targetedRaw) {
+          const list = Array.isArray(targetedRaw) ? targetedRaw : [targetedRaw];
+          indexEpicAchievementItems(list);
+          return achievementsMap;
+        }
+        if (Array.isArray(summaryFallbackRaw)) {
+          indexEpicAchievementItems(summaryFallbackRaw);
+          return achievementsMap;
+        }
+        if (!hasSchemaError) {
+          return achievementsMap;
+        }
+      } else if (singleRes.status === 401 || singleRes.status === 403) {
         console.warn(`Epic single-game achievements query returned status ${singleRes.status}`);
         return achievementsMap;
       }
 
-      const singleJson = await singleRes.json();
-      const profileNode = singleJson?.data?.PlayerProfile?.playerProfile;
-      const targetedRaw = profileNode?.productAchievements?.data;
-      const summaryFallbackRaw = profileNode?.achievementsSummaries?.data;
-      const hasSchemaError = Array.isArray(singleJson?.errors) && singleJson.errors.length > 0;
-
-      if (targetedRaw) {
-        const list = Array.isArray(targetedRaw) ? targetedRaw : [targetedRaw];
-        indexEpicAchievementItems(list);
-        return achievementsMap;
-      }
-      if (Array.isArray(summaryFallbackRaw)) {
-        indexEpicAchievementItems(summaryFallbackRaw);
-        return achievementsMap;
-      }
-      if (!hasSchemaError) {
-        return achievementsMap;
-      }
-      // Only fall back to full query filtered to target if Epic rejected the single-game GraphQL field
+      // Live Epic GraphQL rejects `productAchievements(sandboxId:)` with HTTP 400 / schema error;
+      // resolve `productId` via public `api.epicgames.dev` and query `productAchievements(productId:)`.
+      try {
+        const publicSchema = await fetchEpicPublicAchievementSchema(targetSandboxId, options);
+        if (publicSchema?.productId) {
+          const hit = await tryQueryByProductId(publicSchema.productId, publicSchema);
+          if (hit) return achievementsMap;
+        }
+      } catch {}
     }
 
     const query = `query playerProfile($epicAccountId: String!, $locale: String!) {
@@ -5243,9 +5905,629 @@ function trimStoreSyncMemory() {
   }
 }
 
+const MAX_EPIC_PRODUCT_ID_CACHE_ENTRIES = 2000;
+const epicSandboxProductIdCache = new Map();
+
+function setBoundedEpicSandboxProductId(sandboxId, productId) {
+  const key = String(sandboxId || '').trim().toLowerCase();
+  const val = String(productId || '').trim();
+  if (!key || !val) return;
+  if (epicSandboxProductIdCache.has(key)) epicSandboxProductIdCache.delete(key);
+  epicSandboxProductIdCache.set(key, val);
+  while (epicSandboxProductIdCache.size > MAX_EPIC_PRODUCT_ID_CACHE_ENTRIES) {
+    const oldest = epicSandboxProductIdCache.keys().next().value;
+    if (oldest === undefined) break;
+    epicSandboxProductIdCache.delete(oldest);
+  }
+}
+
+/**
+ * Detect Epic GraphQL authentication failure across BOTH HTTP 401/403 AND HTTP 200 GraphQL
+ * `errors` (`UNAUTHENTICATED`, `token_verification_failed`, etc.) or `{ __typename: 'ServiceError' }` (`C7`).
+ */
+function isEpicGraphqlAuthFailure(status, json) {
+  if (status === 401 || status === 403) return true;
+  if (!json || typeof json !== 'object') return false;
+  if (Array.isArray(json.errors)) {
+    for (const err of json.errors) {
+      if (!err || typeof err !== 'object') continue;
+      const code = String(err.extensions?.code || err.errorCode || '').toUpperCase();
+      const msg = String(err.message || '');
+      const svcResp = String(err.serviceResponse || '');
+      const numCode = Number(err.numericErrorCode || 0);
+      if (
+        code === 'UNAUTHENTICATED' ||
+        code === 'UNAUTHORIZED' ||
+        numCode === 1011 ||
+        numCode === 1012 ||
+        /unauthenticated|unauthorized|token_verification_failed|invalid_token|expired|authentication|401/i.test(
+          `${code} ${msg} ${svcResp}`
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  const paNode = json?.data?.PlayerProfile?.playerProfile?.productAchievements;
+  if (paNode && typeof paNode === 'object') {
+    if (paNode.__typename === 'ServiceError') return true;
+    const paStatus = Number(paNode.status || 0);
+    if (paStatus === 401 || paStatus === 403) return true;
+  }
+  return false;
+}
+
+/**
+ * Compute partial achievement progress for a locked Epic achievement (`progress` in `(0, 1)`):
+ * - Single-stat `statThresholds` (`threshold > 1`) -> exact `current = Math.min(max - 1, Math.round(progress * max))` / `max`
+ * - Multi-stat or opaque -> `{ current: pct, max: 100, percentage: pct, unit: '%' }`
+ */
+function computeEpicPartialProgress(rawProgress, statThresholds) {
+  const progress = Number(rawProgress);
+  if (!Number.isFinite(progress) || progress <= 0 || progress >= 1) {
+    return undefined;
+  }
+
+  const thresholdEntries = [];
+  if (Array.isArray(statThresholds)) {
+    for (const item of statThresholds) {
+      const val = Number(item?.threshold ?? item?.value ?? item);
+      if (Number.isFinite(val) && val > 1) {
+        thresholdEntries.push([String(item?.name || 'stat'), val]);
+      }
+    }
+  } else if (statThresholds && typeof statThresholds === 'object') {
+    for (const [k, rawVal] of Object.entries(statThresholds)) {
+      const val = Number(rawVal);
+      if (Number.isFinite(val) && val > 1) {
+        thresholdEntries.push([k, val]);
+      }
+    }
+  }
+
+  const percentage = Math.min(99, Math.max(1, Math.round(progress * 100)));
+  if (thresholdEntries.length === 1) {
+    const max = Math.round(Number(thresholdEntries[0][1]));
+    const current = Math.max(1, Math.min(max - 1, Math.round(progress * max)));
+    return {
+      current,
+      max,
+      percentage,
+    };
+  }
+
+  return {
+    current: percentage,
+    max: 100,
+    percentage,
+    unit: '%',
+  };
+}
+
+/**
+ * Step 1 of universal Epic cloud achievements (`Task 10a + 10b`):
+ * Public zero-auth `GET api.epicgames.dev/epic/achievements/v1/public/achievements/product/<sandboxId>/locale/<locale>`
+ * with backup GraphQL `Achievement.productAchievementsRecordBySandbox`.
+ */
+async function fetchEpicPublicAchievementSchema(sandboxId, options = {}) {
+  const cleanSandbox = String(sandboxId || '').trim();
+  if (!cleanSandbox) return null;
+  const fetchImpl = typeof options?.fetchFn === 'function' ? options.fetchFn : fetch;
+  const { locale } = resolveDefaultStoreLocaleAndCountry(options);
+  const effectiveLocale = String(locale || 'en-US').trim() || 'en-US';
+
+  let saw404 = false;
+
+  // 1a. Primary zero-auth REST endpoint
+  try {
+    const restUrl = `https://api.epicgames.dev/epic/achievements/v1/public/achievements/product/${encodeURIComponent(
+      cleanSandbox
+    )}/locale/${encodeURIComponent(effectiveLocale)}`;
+    const res = await fetchImpl(restUrl, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
+      },
+      signal: buildStoreFetchSignal(options?.signal),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const rawAchievements = Array.isArray(data?.achievements) ? data.achievements : [];
+      const productId = String(data?.productId || '').trim();
+      if (productId) {
+        setBoundedEpicSandboxProductId(cleanSandbox, productId);
+      }
+      if (rawAchievements.length > 0 || productId) {
+        return {
+          productId,
+          sandboxId: String(data?.sandboxId || cleanSandbox),
+          totalAchievements: Number(data?.totalAchievements || rawAchievements.length) || 0,
+          totalProductXP: Number(data?.totalProductXP || 0) || 0,
+          achievementSets: data?.achievementSets || null,
+          rawAchievements,
+          definitiveNotFound: rawAchievements.length === 0,
+        };
+      }
+    } else if (res.status === 404) {
+      saw404 = true;
+    }
+  } catch {}
+
+  // 1b. Backup zero-auth GraphQL `Achievement.productAchievementsRecordBySandbox`
+  try {
+    const gqlQuery = `query Achievement($sandboxId: String!, $locale: String!) {
+      Achievement {
+        productAchievementsRecordBySandbox(sandboxId: $sandboxId, locale: $locale) {
+          productId
+          sandboxId
+          totalAchievements
+          totalProductXP
+          achievementSets {
+            achievementSetId
+            isBase
+            totalAchievements
+            totalXP
+          }
+          achievements {
+            achievement {
+              sandboxId
+              name
+              hidden
+              isBase
+              achievementSetId
+              unlockedDisplayName
+              lockedDisplayName
+              unlockedDescription
+              lockedDescription
+              flavorText
+              XP
+              unlockedIconLink
+              lockedIconLink
+              statThresholds
+              tier {
+                name
+                hexColor
+                min
+                max
+              }
+              rarity {
+                percent
+              }
+            }
+          }
+        }
+      }
+    }`;
+    const gqlRes = await fetchImpl('https://launcher.store.epicgames.com/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
+      },
+      body: JSON.stringify({
+        query: gqlQuery,
+        variables: { sandboxId: cleanSandbox, locale: effectiveLocale },
+      }),
+      signal: buildStoreFetchSignal(options?.signal),
+    });
+    if (gqlRes.ok) {
+      const gqlJson = await gqlRes.json();
+      const rec = gqlJson?.data?.Achievement?.productAchievementsRecordBySandbox;
+      if (rec && typeof rec === 'object') {
+        const rawAchievements = Array.isArray(rec.achievements) ? rec.achievements : [];
+        const productId = String(rec.productId || '').trim();
+        if (productId) {
+          setBoundedEpicSandboxProductId(cleanSandbox, productId);
+        }
+        if (rawAchievements.length > 0 || productId) {
+          return {
+            productId,
+            sandboxId: String(rec.sandboxId || cleanSandbox),
+            totalAchievements: Number(rec.totalAchievements || rawAchievements.length) || 0,
+            totalProductXP: Number(rec.totalProductXP || 0) || 0,
+            achievementSets: rec.achievementSets || null,
+            rawAchievements,
+            definitiveNotFound: rawAchievements.length === 0,
+          };
+        }
+      }
+    }
+  } catch {}
+
+  if (saw404) {
+    return {
+      productId: '',
+      sandboxId: cleanSandbox,
+      totalAchievements: 0,
+      totalProductXP: 0,
+      achievementSets: null,
+      rawAchievements: [],
+      definitiveNotFound: true,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Universal 2-step cloud Epic per-achievement unlocks, ISO timestamps & partial progress (`Task 10a + 10b`):
+ * 1. Public schema + `productId` via `api.epicgames.dev` (fallback GraphQL `productAchievementsRecordBySandbox`)
+ * 2. Authenticated `POST launcher.store.epicgames.com/graphql` (`PlayerProfile.playerProfile.productAchievements(productId)`)
+ *    with single `renewEpicTokens(refreshToken, { preferVaultRefreshToken: true })` retry on BOTH
+ *    HTTP `401/403` AND HTTP `200` GraphQL auth `errors` / `ServiceError` (`C7`).
+ */
+async function fetchEpicDetailedGameAchievements(payload = {}, options = {}) {
+  const fetchImpl = typeof options?.fetchFn === 'function' ? options.fetchFn : fetch;
+  const vaultOpts = resolveStoreVaultOptions(options?.userDataDir ? options : payload);
+  const syncedAt = new Date().toISOString();
+
+  let sandboxId = String(payload.sandboxId || payload.namespace || '').trim();
+  if (!sandboxId) {
+    try {
+      const resolved = await resolveEpicNamespaceAndIds(payload, { ...options, ...vaultOpts });
+      if (resolved?.namespace) {
+        sandboxId = String(resolved.namespace).trim();
+      }
+    } catch {}
+  }
+
+  if (!sandboxId) {
+    const localFallback = await getEpicGameAchievementSchema(payload, {
+      ...options,
+      localOnly: true,
+    });
+    if (localFallback.length > 0) {
+      return {
+        storefrontId: 'epic',
+        storefrontName: 'Epic Games',
+        total: localFallback.length,
+        unlocked: 0,
+        percentage: 0,
+        isMastered: false,
+        achievements: localFallback,
+        syncedAt,
+        source: 'local_cache',
+        supportsAchievements: true,
+        cacheVersion: 2,
+      };
+    }
+    return null;
+  }
+
+  // Step 1: Public schema & `productId`
+  const publicSchema = await fetchEpicPublicAchievementSchema(sandboxId, options);
+  if (publicSchema?.definitiveNotFound && publicSchema.rawAchievements.length === 0) {
+    return {
+      storefrontId: 'epic',
+      storefrontName: 'Epic Games',
+      total: 0,
+      unlocked: 0,
+      percentage: 0,
+      isMastered: false,
+      achievements: [],
+      syncedAt,
+      source: 'live_cloud',
+      unlockPrecision: 'exact',
+      supportsAchievements: false,
+      cacheVersion: 2,
+    };
+  }
+
+  if (!publicSchema || publicSchema.rawAchievements.length === 0) {
+    const localFallback = await getEpicGameAchievementSchema(payload, {
+      ...options,
+      localOnly: true,
+    });
+    if (localFallback.length > 0) {
+      return {
+        storefrontId: 'epic',
+        storefrontName: 'Epic Games',
+        total: localFallback.length,
+        unlocked: 0,
+        percentage: 0,
+        isMastered: false,
+        achievements: localFallback,
+        syncedAt,
+        source: 'local_cache',
+        supportsAchievements: true,
+        cacheVersion: 2,
+      };
+    }
+    return null;
+  }
+
+  // Step 2: Authenticated per-achievement unlocks, timestamps & progress
+  let savedEpic = {};
+  if (!options.accessToken || !options.accountId) {
+    try {
+      const saved = await loadSavedTokensAsync(vaultOpts);
+      savedEpic = saved?.epic || {};
+    } catch {}
+  }
+
+  let accessToken = String(options.accessToken || savedEpic.access_token || '').trim();
+  let refreshToken = String(options.refreshToken || savedEpic.refresh_token || '').trim();
+  let accountId = String(options.accountId || savedEpic.account_id || '').trim();
+
+  if ((!accessToken || !accountId) && typeof options.ensureLegendaryAuth === 'function') {
+    try {
+      const legAuth = await options.ensureLegendaryAuth();
+      accessToken = accessToken || String(legAuth?.accessToken || '').trim();
+      accountId = accountId || String(legAuth?.accountId || '').trim();
+    } catch {}
+  }
+
+  /** @type {Map<string, Record<string, any>>} */
+  const playerMap = new Map();
+  let hasAuthoritativePlayerResponse = false;
+  let playerTotalXP = undefined;
+
+  if (publicSchema.productId && accountId && (accessToken || refreshToken)) {
+    const playerQuery = `query playerProductAchievements($epicAccountId: String!, $productId: String!) {
+      PlayerProfile {
+        playerProfile(epicAccountId: $epicAccountId) {
+          productAchievements(productId: $productId) {
+            __typename
+            ... on PlayerProductAchievementsResponseSuccess {
+              data {
+                sandboxId
+                epicAccountId
+                totalUnlocked
+                totalXP
+                playerAchievements {
+                  playerAchievement {
+                    achievementName
+                    unlocked
+                    unlockDate
+                    progress
+                    XP
+                    achievementSetId
+                    isBase
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }`;
+
+    const executePlayerQuery = async (tokenToUse) => {
+      const authHeader = /^bearer\s+/i.test(tokenToUse) ? tokenToUse : `Bearer ${tokenToUse}`;
+      const res = await fetchImpl('https://launcher.store.epicgames.com/graphql', {
+        method: 'POST',
+        headers: {
+          Authorization: authHeader,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
+        },
+        body: JSON.stringify({
+          query: playerQuery,
+          variables: {
+            epicAccountId: accountId,
+            productId: publicSchema.productId,
+          },
+        }),
+        signal: buildStoreFetchSignal(options?.signal),
+      });
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {}
+      return { status: res.status, ok: res.ok, json };
+    };
+
+    try {
+      if (!accessToken && refreshToken) {
+        const renewed = await renewEpicTokens(refreshToken, {
+          ...options,
+          ...vaultOpts,
+          preferVaultRefreshToken: true,
+        });
+        accessToken = String(renewed?.access_token || '').trim();
+        accountId = String(renewed?.account_id || accountId).trim();
+      }
+
+      if (accessToken) {
+        let gqlAttempt = await executePlayerQuery(accessToken);
+        // Retry AT MOST ONCE on HTTP 401/403 OR HTTP 200 GraphQL auth `errors` / `ServiceError` (`C7`)
+        if (isEpicGraphqlAuthFailure(gqlAttempt.status, gqlAttempt.json) && refreshToken) {
+          try {
+            const renewed = await renewEpicTokens(refreshToken, {
+              ...options,
+              ...vaultOpts,
+              preferVaultRefreshToken: true,
+            });
+            if (renewed?.access_token) {
+              accessToken = String(renewed.access_token).trim();
+              accountId = String(renewed.account_id || accountId).trim();
+              gqlAttempt = await executePlayerQuery(accessToken);
+            }
+          } catch {}
+        }
+
+        const paNode = gqlAttempt.json?.data?.PlayerProfile?.playerProfile?.productAchievements;
+        const paData = paNode?.data;
+        if (
+          gqlAttempt.ok &&
+          paNode &&
+          paNode.__typename !== 'ServiceError' &&
+          paData &&
+          typeof paData === 'object'
+        ) {
+          hasAuthoritativePlayerResponse = true;
+          if (typeof paData.totalXP === 'number' && Number.isFinite(paData.totalXP)) {
+            playerTotalXP = paData.totalXP;
+          }
+          const rawPlayerItems = Array.isArray(paData.playerAchievements)
+            ? paData.playerAchievements
+            : [];
+          for (const entry of rawPlayerItems) {
+            const pa = entry?.playerAchievement || entry;
+            if (!pa || typeof pa !== 'object' || !pa.achievementName) continue;
+            playerMap.set(String(pa.achievementName).trim().toLowerCase(), pa);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // Build achievementSets base-vs-DLC lookup (supports both object map and array)
+  const setIsBaseMap = new Map();
+  if (Array.isArray(publicSchema.achievementSets)) {
+    for (const s of publicSchema.achievementSets) {
+      if (s?.achievementSetId) {
+        setIsBaseMap.set(String(s.achievementSetId), s.isBase !== false);
+      }
+    }
+  } else if (publicSchema.achievementSets && typeof publicSchema.achievementSets === 'object') {
+    for (const [setId, s] of Object.entries(publicSchema.achievementSets)) {
+      if (s && typeof s === 'object') {
+        setIsBaseMap.set(String(setId), s.isBase !== false);
+      }
+    }
+  }
+
+  let sumXp = 0;
+  let sumEarnedXp = 0;
+
+  const achievements = publicSchema.rawAchievements.map((rawItem, idx) => {
+    const ach =
+      rawItem?.achievement && typeof rawItem.achievement === 'object'
+        ? rawItem.achievement
+        : rawItem;
+    const apiName = String(ach?.name || ach?.achievement_id || `EPIC_ACH_${idx + 1}`).trim();
+    const playerEntry = playerMap.get(apiName.toLowerCase());
+
+    const unlocked = Boolean(playerEntry?.unlocked === true);
+    const rawUnlockDate =
+      typeof playerEntry?.unlockDate === 'string' ? playerEntry.unlockDate.trim() : '';
+    // Guard `unlockDate !== 'N/A'` (`Task 10a/10b`)
+    const unlockedAt =
+      unlocked &&
+      rawUnlockDate &&
+      rawUnlockDate.toUpperCase() !== 'N/A' &&
+      !Number.isNaN(Date.parse(rawUnlockDate))
+        ? new Date(Date.parse(rawUnlockDate)).toISOString()
+        : undefined;
+
+    const progress = !unlocked
+      ? computeEpicPartialProgress(playerEntry?.progress, ach?.statThresholds)
+      : undefined;
+
+    const xpVal = Number(ach?.XP ?? ach?.xp ?? playerEntry?.XP ?? 0) || 0;
+    sumXp += xpVal;
+    if (unlocked) sumEarnedXp += xpVal;
+
+    const rawRarityPct =
+      typeof ach?.rarity?.percent === 'number'
+        ? ach.rarity.percent
+        : typeof ach?.completed_percent === 'number'
+          ? ach.completed_percent
+          : undefined;
+    const globalPercentage =
+      rawRarityPct !== undefined && Number.isFinite(rawRarityPct)
+        ? Number(Number(rawRarityPct).toFixed(1))
+        : undefined;
+
+    const setId =
+      ach?.achievementSetId || playerEntry?.achievementSetId
+        ? String(ach?.achievementSetId || playerEntry?.achievementSetId)
+        : undefined;
+    const isBaseGame =
+      typeof ach?.isBase === 'boolean'
+        ? ach.isBase
+        : typeof playerEntry?.isBase === 'boolean'
+          ? playerEntry.isBase
+          : setId && setIsBaseMap.has(setId)
+            ? setIsBaseMap.get(setId)
+            : true;
+
+    const iconUnlockedUrl = String(
+      ach?.unlockedIconLink || ach?.unlocked_icon_url || ''
+    ).trim();
+    const iconLockedUrl =
+      String(ach?.lockedIconLink || ach?.locked_icon_url || '').trim() || iconUnlockedUrl;
+
+    const name = String(
+      ach?.unlockedDisplayName ||
+        ach?.unlocked_display_name ||
+        ach?.lockedDisplayName ||
+        ach?.locked_display_name ||
+        apiName
+    ).trim();
+    const description = String(
+      ach?.unlockedDescription ||
+        ach?.unlocked_description ||
+        ach?.lockedDescription ||
+        ach?.locked_description ||
+        ach?.flavorText ||
+        ''
+    ).trim();
+
+    return {
+      id: `epic:${sandboxId}:${apiName}`,
+      apiName,
+      name,
+      description: description || undefined,
+      unlocked,
+      ...(unlockedAt ? { unlockedAt } : {}),
+      iconUnlockedUrl,
+      iconLockedUrl,
+      ...(globalPercentage !== undefined
+        ? {
+            globalPercentage,
+            rarityTier: classifyAchievementRarityTier(globalPercentage),
+          }
+        : {}),
+      ...(progress ? { progress } : {}),
+      isSecret: Boolean(ach?.hidden),
+      hidden: Boolean(ach?.hidden),
+      xp: xpVal,
+      ...(ach?.tier?.name ? { tierName: String(ach.tier.name) } : {}),
+      isBaseGame,
+      ...(setId ? { achievementSetId: setId } : {}),
+      storefrontId: 'epic',
+    };
+  });
+
+  const total = achievements.length;
+  const unlocked = achievements.filter((a) => a.unlocked).length;
+  const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
+  const totalXp = publicSchema.totalProductXP > 0 ? publicSchema.totalProductXP : sumXp;
+  const earnedXp = hasAuthoritativePlayerResponse
+    ? playerTotalXP !== undefined
+      ? playerTotalXP
+      : sumEarnedXp
+    : undefined;
+
+  return {
+    storefrontId: 'epic',
+    storefrontName: 'Epic Games',
+    total,
+    unlocked,
+    percentage,
+    isMastered: total > 0 && unlocked >= total,
+    ...(totalXp > 0 ? { totalXp } : {}),
+    ...(earnedXp !== undefined ? { earnedXp } : {}),
+    ...(totalXp > 0 || earnedXp !== undefined
+      ? { xp: { earned: earnedXp ?? 0, total: totalXp } }
+      : {}),
+    achievements,
+    syncedAt,
+    source: 'live_cloud',
+    ...(hasAuthoritativePlayerResponse ? { unlockPrecision: 'exact' } : {}),
+    supportsAchievements: total > 0,
+    cacheVersion: 2,
+  };
+}
+
 /**
  * Retrieve per-achievement schema definitions (names, descriptions, icons, XP, global rarity)
- * for an Epic Games Store title from local Legendary metadata/*.json via non-blocking async I/O.
+ * for an Epic Games Store title via public Epic Cloud API (`api.epicgames.dev`) first,
+ * falling back to local Legendary `metadata/*.json` via non-blocking async I/O.
  */
 async function getEpicGameAchievementSchema(payload = {}, options = {}) {
   const rawAppName = String(
@@ -5295,6 +6577,8 @@ async function getEpicGameAchievementSchema(payload = {}, options = {}) {
           ''
       ),
       hidden: Boolean(ach?.hidden),
+      isBaseGame: typeof ach?.isBase === 'boolean' ? ach.isBase : true,
+      ...(ach?.achievementSetId ? { achievementSetId: String(ach.achievementSetId) } : {}),
       xp: xpVal,
       tierName: ach?.tier?.name ? String(ach.tier.name) : undefined,
       globalPercentage: rawPct !== undefined ? Number(rawPct) : undefined,
@@ -5302,6 +6586,23 @@ async function getEpicGameAchievementSchema(payload = {}, options = {}) {
       iconLockedUrl: ach?.locked_icon_url || ach?.lockedIconLink || undefined,
     };
   };
+
+  // Cloud-first public schema lookup (`api.epicgames.dev`) unless explicitly local-only
+  if (!options.localOnly && !options.skipNetwork) {
+    try {
+      let sandboxId = rawNamespace;
+      if (!sandboxId) {
+        const resolved = await resolveEpicNamespaceAndIds(payload, options);
+        if (resolved?.namespace) sandboxId = String(resolved.namespace).trim();
+      }
+      if (sandboxId) {
+        const cloudSchema = await fetchEpicPublicAchievementSchema(sandboxId, options);
+        if (cloudSchema && cloudSchema.rawAchievements.length > 0) {
+          return cloudSchema.rawAchievements.map(mapRawEpicAchievement);
+        }
+      }
+    } catch {}
+  }
 
   const readParsedEpicSchemaMetaAsync = async (filePath, fallbackFileName = '') => {
     const st = await fs.promises.stat(filePath);
@@ -5991,11 +7292,18 @@ module.exports = {
   parseGogOsFlags,
   bulkLoadLocalGalaxyMetadataMap,
   fetchGogOwnedGames,
+  resolveGogClientId,
+  parseGogProfileAchievementsHtml,
+  fetchGogDetailedGameAchievements,
   fetchGogAchievements,
   exchangeEpicCode,
   renewEpicTokens,
   fetchEpicOwnedGames,
   fetchEpicAchievements,
+  fetchEpicPublicAchievementSchema,
+  fetchEpicDetailedGameAchievements,
+  computeEpicPartialProgress,
+  isEpicGraphqlAuthFailure,
   getEpicGameAchievementSchema,
   fetchEpicProductOfferMetadata,
   extractEpicCustomAttributesMap,

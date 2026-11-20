@@ -1,4 +1,5 @@
 import { CanonicalGame } from '../../contracts/game';
+import { SteamSystemRequirements } from '../../contracts/steam';
 import { FULL_USER_STEAM_GAMES } from './fullUserSteamGames';
 import { USER_SCANNED_STEAM_GAMES } from './userScannedLibrary';
 import { reconcileAchievementSummaries } from './achievementReconciliation';
@@ -12,10 +13,54 @@ import { sanitizeStoreReleaseDate } from '../common/titleUtils';
 
 const RICH_MEDIA_HTML_RE = /<(?:video|img)\b/i;
 
+function hasRequirementContent(req?: SteamSystemRequirements | null): boolean {
+  return Boolean(
+    req &&
+      ((typeof req.minimum === 'string' && req.minimum.trim().length > 0) ||
+        (typeof req.recommended === 'string' && req.recommended.trim().length > 0))
+  );
+}
+
+function mergeSystemRequirementsField(
+  winnerReq?: SteamSystemRequirements,
+  otherReq?: SteamSystemRequirements
+): SteamSystemRequirements | undefined {
+  if (!hasRequirementContent(otherReq)) return winnerReq;
+  if (!hasRequirementContent(winnerReq)) return otherReq;
+  const nextMin =
+    typeof winnerReq?.minimum === 'string' && winnerReq.minimum.trim().length > 0
+      ? winnerReq.minimum
+      : otherReq?.minimum;
+  const nextRec =
+    typeof winnerReq?.recommended === 'string' && winnerReq.recommended.trim().length > 0
+      ? winnerReq.recommended
+      : otherReq?.recommended;
+  if (nextMin === winnerReq?.minimum && nextRec === winnerReq?.recommended) {
+    return winnerReq;
+  }
+  return {
+    ...(nextMin !== undefined ? { minimum: nextMin } : {}),
+    ...(nextRec !== undefined ? { recommended: nextRec } : {}),
+  };
+}
+
+function hasValidStudioList(list?: string[], placeholder?: string): boolean {
+  return Boolean(
+    Array.isArray(list) &&
+      list.some((item) => typeof item === 'string' && item.trim().length > 0 && item !== placeholder)
+  );
+}
+
 export function getEnrichedMetadataQualityRank(
   meta?: CanonicalGame['enrichedMetadata'] | null
 ): number {
   if (!meta || typeof meta !== 'object') return -1;
+
+  // Universal C8 Lattice Invariant: __quotaSlimmed projections are ALWAYS Rank 0 (skeleton_fallback)
+  // so they can never outrank or overwrite any non-slimmed durable record.
+  if (meta.__quotaSlimmed === true) {
+    return 0;
+  }
 
   if (
     meta.enrichedSource === 'xbox' &&
@@ -56,6 +101,24 @@ export function pickBestEnrichedMetadata(
     winner: NonNullable<CanonicalGame['enrichedMetadata']>,
     other: NonNullable<CanonicalGame['enrichedMetadata']>
   ): NonNullable<CanonicalGame['enrichedMetadata']> => {
+    const samePositiveAppId =
+      Number(winner.appId) > 0 &&
+      Number(other.appId) > 0 &&
+      Number(winner.appId) === Number(other.appId);
+    const sameEnrichedSource =
+      Boolean(winner.enrichedSource) && winner.enrichedSource === other.enrichedSource;
+    const canInheritMacReqs =
+      samePositiveAppId ||
+      sameEnrichedSource ||
+      (winner.enrichedSource !== 'xbox' &&
+        (winner.platforms?.mac === true || (!winner.platforms && other.platforms?.mac === true)));
+    const canInheritLinuxReqs =
+      samePositiveAppId ||
+      sameEnrichedSource ||
+      (winner.enrichedSource !== 'xbox' &&
+        (winner.platforms?.linux === true ||
+          (!winner.platforms && other.platforms?.linux === true)));
+
     const nextXboxHints = winner.xboxDeliveryHints || other.xboxDeliveryHints;
     const nextMovies =
       winner.movies && winner.movies.length > 0
@@ -80,6 +143,142 @@ export function pickBestEnrichedMetadata(
       winner.detailedDescription,
       other.detailedDescription
     );
+    const nextAboutTheGame = pickPreferredDetailedDescription(
+      winner.aboutTheGame,
+      other.aboutTheGame
+    );
+
+    const nextSystemRequirements =
+      mergeSystemRequirementsField(winner.systemRequirements, other.systemRequirements) ??
+      winner.systemRequirements;
+    const nextMacRequirements = canInheritMacReqs
+      ? mergeSystemRequirementsField(winner.macRequirements, other.macRequirements)
+      : winner.macRequirements;
+    const nextLinuxRequirements = canInheritLinuxReqs
+      ? mergeSystemRequirementsField(winner.linuxRequirements, other.linuxRequirements)
+      : winner.linuxRequirements;
+    const nextPcRequirementsHtml = winner.pcRequirementsHtml || other.pcRequirementsHtml;
+
+    const nextSupportedLanguages =
+      typeof winner.supportedLanguages === 'string' && winner.supportedLanguages.trim().length > 0
+        ? winner.supportedLanguages
+        : typeof other.supportedLanguages === 'string' && other.supportedLanguages.trim().length > 0
+        ? other.supportedLanguages
+        : winner.supportedLanguages;
+    const nextLanguageOptions =
+      winner.languageOptions && winner.languageOptions.length > 0
+        ? winner.languageOptions
+        : other.languageOptions && other.languageOptions.length > 0
+        ? other.languageOptions
+        : winner.languageOptions;
+    const nextLanguageTableSchema = winner.languageTableSchema || other.languageTableSchema;
+
+    const nextDevelopers = hasValidStudioList(winner.developers, 'Unknown Developer')
+      ? winner.developers
+      : hasValidStudioList(other.developers, 'Unknown Developer')
+      ? other.developers
+      : winner.developers;
+    const nextPublishers = hasValidStudioList(winner.publishers, 'Unknown Publisher')
+      ? winner.publishers
+      : hasValidStudioList(other.publishers, 'Unknown Publisher')
+      ? other.publishers
+      : winner.publishers;
+    const nextGenres =
+      winner.genres && winner.genres.length > 0
+        ? winner.genres
+        : other.genres && other.genres.length > 0
+        ? other.genres
+        : winner.genres;
+    const nextTags =
+      winner.tags && winner.tags.length > 0
+        ? winner.tags
+        : other.tags && other.tags.length > 0
+        ? other.tags
+        : winner.tags;
+
+    const winnerHasReviews = Boolean(
+      winner.reviewSummary &&
+        (winner.reviewSummary.totalReviews > 0 || winner.reviewSummary.positivePercent > 0)
+    );
+    const otherHasReviews = Boolean(
+      other.reviewSummary &&
+        (other.reviewSummary.totalReviews > 0 || other.reviewSummary.positivePercent > 0)
+    );
+    const nextReviewSummary = winnerHasReviews
+      ? winner.reviewSummary
+      : otherHasReviews
+      ? other.reviewSummary
+      : winner.reviewSummary;
+    const nextMetacritic = winner.metacritic || other.metacritic;
+
+    let nextPlatforms = winner.platforms;
+    if (!winner.platforms && other.platforms && winner.enrichedSource !== 'xbox') {
+      nextPlatforms = other.platforms;
+    } else if (
+      winner.platforms &&
+      other.platforms &&
+      (samePositiveAppId || sameEnrichedSource)
+    ) {
+      const mergedWin = winner.platforms.windows ?? other.platforms.windows;
+      const mergedMac = winner.platforms.mac ?? other.platforms.mac;
+      const mergedLinux = winner.platforms.linux ?? other.platforms.linux;
+      if (
+        mergedWin !== winner.platforms.windows ||
+        mergedMac !== winner.platforms.mac ||
+        mergedLinux !== winner.platforms.linux
+      ) {
+        nextPlatforms = {
+          ...(mergedWin !== undefined ? { windows: mergedWin } : {}),
+          ...(mergedMac !== undefined ? { mac: mergedMac } : {}),
+          ...(mergedLinux !== undefined ? { linux: mergedLinux } : {}),
+        };
+      }
+    }
+
+    let nextAchievements = winner.achievements;
+    if (
+      winner.achievements &&
+      winner.achievements.total > 0 &&
+      !(winner.achievements.highlighted && winner.achievements.highlighted.length > 0) &&
+      other.achievements?.highlighted &&
+      other.achievements.highlighted.length > 0 &&
+      other.achievements.total >= winner.achievements.total
+    ) {
+      nextAchievements = {
+        ...winner.achievements,
+        highlighted: other.achievements.highlighted,
+      };
+    } else if (
+      (!winner.achievements || !(winner.achievements.total > 0)) &&
+      other.achievements &&
+      other.achievements.total > 0
+    ) {
+      nextAchievements = other.achievements;
+    }
+
+    const nextLegalNotice = winner.legalNotice || other.legalNotice;
+    const nextDrmNotice = winner.drmNotice || other.drmNotice;
+    const nextExtUserAccountNotice = winner.extUserAccountNotice || other.extUserAccountNotice;
+    const nextWebsite = winner.website || other.website;
+    const nextControllerSupport = winner.controllerSupport || other.controllerSupport;
+    const nextDeckCompatibility =
+      winner.deckCompatibility && winner.deckCompatibility !== 'unknown'
+        ? winner.deckCompatibility
+        : other.deckCompatibility || winner.deckCompatibility;
+
+    const winnerFetchedAt =
+      typeof winner.fetchedAt === 'number' && winner.fetchedAt > 0 ? winner.fetchedAt : undefined;
+    const otherFetchedAt =
+      typeof other.fetchedAt === 'number' &&
+      other.fetchedAt > 0 &&
+      !other.__quotaSlimmed &&
+      (samePositiveAppId || sameEnrichedSource)
+        ? other.fetchedAt
+        : undefined;
+    const nextFetchedAt =
+      winnerFetchedAt !== undefined && otherFetchedAt !== undefined
+        ? Math.max(winnerFetchedAt, otherFetchedAt)
+        : winnerFetchedAt ?? otherFetchedAt;
 
     const nextEnrichedAt =
       typeof winner.enrichedAt === 'number' || typeof other.enrichedAt === 'number'
@@ -99,14 +298,26 @@ export function pickBestEnrichedMetadata(
         ? other.mediaSyncFailureCount ?? winner.mediaSyncFailureCount
         : winner.mediaSyncFailureCount ?? other.mediaSyncFailureCount;
 
-    const hasRestoredRichMedia =
-      Boolean(!winner.__quotaSlimmed || !other.__quotaSlimmed) &&
-      ((nextScreenshots && nextScreenshots.length > 0) ||
-        (nextMovies && nextMovies.length > 0) ||
-        !winner.__quotaSlimmed);
-    const nextQuotaSlimmed = hasRestoredRichMedia
+    // Never clear __quotaSlimmed on a slimmed winner unless `other` provides non-slimmed
+    // authoritative specs/descriptions (prevents Frankenstein Rank-4 stubs lacking specs).
+    const otherProvidesAuthoritativeRestore = Boolean(
+      !other.__quotaSlimmed &&
+        other.metadataQuality !== 'skeleton_fallback' &&
+        (hasRequirementContent(other.systemRequirements) ||
+          hasRequirementContent(other.macRequirements) ||
+          (typeof other.fetchedAt === 'number' && other.fetchedAt > 0) ||
+          (other.metadataQuality === 'authoritative' &&
+            Boolean(
+              other.shortDescription?.trim() ||
+                other.detailedDescription?.trim() ||
+                other.aboutTheGame?.trim()
+            )))
+    );
+    const nextQuotaSlimmed = !winner.__quotaSlimmed
       ? undefined
-      : winner.__quotaSlimmed || other.__quotaSlimmed || undefined;
+      : otherProvidesAuthoritativeRestore
+      ? undefined
+      : true;
     const nextHasScreenshotsCount = nextQuotaSlimmed
       ? Math.max(winner.hasScreenshotsCount || 0, other.hasScreenshotsCount || 0) || undefined
       : undefined;
@@ -121,6 +332,29 @@ export function pickBestEnrichedMetadata(
       nextScreenshots === winner.screenshots &&
       nextShortDesc === winner.shortDescription &&
       nextDetailedDesc === winner.detailedDescription &&
+      nextAboutTheGame === winner.aboutTheGame &&
+      nextSystemRequirements === winner.systemRequirements &&
+      nextMacRequirements === winner.macRequirements &&
+      nextLinuxRequirements === winner.linuxRequirements &&
+      nextPcRequirementsHtml === winner.pcRequirementsHtml &&
+      nextSupportedLanguages === winner.supportedLanguages &&
+      nextLanguageOptions === winner.languageOptions &&
+      nextLanguageTableSchema === winner.languageTableSchema &&
+      nextDevelopers === winner.developers &&
+      nextPublishers === winner.publishers &&
+      nextGenres === winner.genres &&
+      nextTags === winner.tags &&
+      nextReviewSummary === winner.reviewSummary &&
+      nextMetacritic === winner.metacritic &&
+      nextPlatforms === winner.platforms &&
+      nextAchievements === winner.achievements &&
+      nextLegalNotice === winner.legalNotice &&
+      nextDrmNotice === winner.drmNotice &&
+      nextExtUserAccountNotice === winner.extUserAccountNotice &&
+      nextWebsite === winner.website &&
+      nextControllerSupport === winner.controllerSupport &&
+      nextDeckCompatibility === winner.deckCompatibility &&
+      nextFetchedAt === winner.fetchedAt &&
       nextEnrichedAt === winner.enrichedAt &&
       nextLastMediaSyncAttemptAt === winner.lastMediaSyncAttemptAt &&
       nextMediaSyncOutcome === winner.mediaSyncOutcome &&
@@ -140,6 +374,43 @@ export function pickBestEnrichedMetadata(
       ...(nextScreenshots ? { screenshots: nextScreenshots } : {}),
       ...(nextShortDesc !== undefined ? { shortDescription: nextShortDesc } : {}),
       ...(nextDetailedDesc !== undefined ? { detailedDescription: nextDetailedDesc } : {}),
+      ...(nextAboutTheGame !== undefined ? { aboutTheGame: nextAboutTheGame } : {}),
+      ...(nextSystemRequirements !== undefined
+        ? { systemRequirements: nextSystemRequirements }
+        : {}),
+      ...(nextMacRequirements !== undefined ? { macRequirements: nextMacRequirements } : {}),
+      ...(nextLinuxRequirements !== undefined ? { linuxRequirements: nextLinuxRequirements } : {}),
+      ...(nextPcRequirementsHtml !== undefined
+        ? { pcRequirementsHtml: nextPcRequirementsHtml }
+        : {}),
+      ...(nextSupportedLanguages !== undefined
+        ? { supportedLanguages: nextSupportedLanguages }
+        : {}),
+      ...(nextLanguageOptions !== undefined ? { languageOptions: nextLanguageOptions } : {}),
+      ...(nextLanguageTableSchema !== undefined
+        ? { languageTableSchema: nextLanguageTableSchema }
+        : {}),
+      ...(nextDevelopers !== undefined ? { developers: nextDevelopers } : {}),
+      ...(nextPublishers !== undefined ? { publishers: nextPublishers } : {}),
+      ...(nextGenres !== undefined ? { genres: nextGenres } : {}),
+      ...(nextTags !== undefined ? { tags: nextTags } : {}),
+      ...(nextReviewSummary !== undefined ? { reviewSummary: nextReviewSummary } : {}),
+      ...(nextMetacritic !== undefined ? { metacritic: nextMetacritic } : {}),
+      ...(nextPlatforms !== undefined ? { platforms: nextPlatforms } : {}),
+      ...(nextAchievements !== undefined ? { achievements: nextAchievements } : {}),
+      ...(nextLegalNotice !== undefined ? { legalNotice: nextLegalNotice } : {}),
+      ...(nextDrmNotice !== undefined ? { drmNotice: nextDrmNotice } : {}),
+      ...(nextExtUserAccountNotice !== undefined
+        ? { extUserAccountNotice: nextExtUserAccountNotice }
+        : {}),
+      ...(nextWebsite !== undefined ? { website: nextWebsite } : {}),
+      ...(nextControllerSupport !== undefined
+        ? { controllerSupport: nextControllerSupport }
+        : {}),
+      ...(nextDeckCompatibility !== undefined
+        ? { deckCompatibility: nextDeckCompatibility }
+        : {}),
+      ...(nextFetchedAt !== undefined ? { fetchedAt: nextFetchedAt } : {}),
       ...(nextEnrichedAt !== undefined ? { enrichedAt: nextEnrichedAt } : {}),
       ...(nextLastMediaSyncAttemptAt !== undefined
         ? { lastMediaSyncAttemptAt: nextLastMediaSyncAttemptAt }
@@ -168,6 +439,18 @@ export function pickBestEnrichedMetadata(
     return mergeWinnerWithFallbackFields(existing, incoming);
   }
   if (incomingRank > existingRank) {
+    return mergeWinnerWithFallbackFields(incoming, existing);
+  }
+
+  // Rank 0 tiebreak: preserve __quotaSlimmed stub over bare empty skeleton_fallback
+  const existingIsSkeleton =
+    existing.metadataQuality === 'skeleton_fallback' && !existing.__quotaSlimmed;
+  const incomingIsSkeleton =
+    incoming.metadataQuality === 'skeleton_fallback' && !incoming.__quotaSlimmed;
+  if (existing.__quotaSlimmed && incomingIsSkeleton) {
+    return mergeWinnerWithFallbackFields(existing, incoming);
+  }
+  if (incoming.__quotaSlimmed && existingIsSkeleton) {
     return mergeWinnerWithFallbackFields(incoming, existing);
   }
 

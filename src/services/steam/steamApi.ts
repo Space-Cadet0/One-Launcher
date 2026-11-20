@@ -763,6 +763,7 @@ export class SteamApiService {
     detailQuality?: string
   ): meta is SteamEnrichedMetadata {
     if (!meta || typeof meta !== 'object') return false;
+    if (meta.__quotaSlimmed === true) return false;
     if (!(meta.name || meta.shortDescription || meta.aboutTheGame || meta.detailedDescription)) {
       return false;
     }
@@ -849,6 +850,21 @@ export class SteamApiService {
     }
   }
 
+  private needsOnlineUpgrade(meta: SteamEnrichedMetadata | null | undefined): boolean {
+    if (!meta) return false;
+    if (meta.__quotaSlimmed === true) return true;
+    if (typeof meta.fetchedAt === 'number' && meta.fetchedAt > 0) return false;
+    const hasSysReq = Boolean(
+      meta.systemRequirements?.minimum?.trim() || meta.systemRequirements?.recommended?.trim()
+    );
+    if (!hasSysReq) return true;
+    const hasMacReq = Boolean(
+      meta.macRequirements?.minimum?.trim() || meta.macRequirements?.recommended?.trim()
+    );
+    if (meta.platforms?.mac === true && !hasMacReq) return true;
+    return false;
+  }
+
   async fetchGameMetadata(
     appId: number,
     priority: number = RequestPriority.P1_VIEWPORT,
@@ -856,9 +872,12 @@ export class SteamApiService {
   ): Promise<SteamEnrichedMetadata | null> {
     const forceRefresh = Boolean(options?.forceRefresh);
     const isOnline = onlineLifecycleManager.isOnline();
+    const canFetchLive = isOnline && !this.isStoreRateLimited();
     const inMemoryCached = this.metadataCache.get(appId) || null;
+    const inMemoryNeedsOnlineUpgrade =
+      Boolean(inMemoryCached) && canFetchLive && this.needsOnlineUpgrade(inMemoryCached);
 
-    if (inMemoryCached && (!forceRefresh || !isOnline || this.isStoreRateLimited())) {
+    if (inMemoryCached && !inMemoryNeedsOnlineUpgrade && (!forceRefresh || !canFetchLive)) {
       this.setCacheEntry(appId, inMemoryCached);
       return inMemoryCached;
     }
@@ -934,7 +953,9 @@ export class SteamApiService {
     }
 
     const persisted = await this.loadPersistedMetadata(appId);
-    if (persisted && (!isOnline || this.isStoreRateLimited() || !forceRefresh)) {
+    const persistedNeedsOnlineUpgrade =
+      Boolean(persisted) && canFetchLive && this.needsOnlineUpgrade(persisted);
+    if (persisted && !persistedNeedsOnlineUpgrade && (!canFetchLive || !forceRefresh)) {
       this.setCacheEntry(appId, persisted);
       return persisted;
     }

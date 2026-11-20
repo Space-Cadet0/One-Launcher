@@ -189,6 +189,22 @@ export function handleEpicAndLutrisEndpoints(req: FixtureRequest): FixtureRespon
     };
   }
 
+  if (host === 'api.epicgames.dev') {
+    if (/^\/epic\/achievements\/v1\/public\/achievements\/product\/[^/]+\/locale\/[^/]+\/?$/i.test(req.url.pathname)) {
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        body: {
+          productId: '',
+          sandboxId: '',
+          totalAchievements: 0,
+          totalProductXP: 0,
+          achievements: [],
+        },
+      };
+    }
+  }
+
   if (host === 'lutris.net' && req.url.pathname === '/api/games') {
     const q = norm(req.url.searchParams.get('search') || '');
     const results = !q

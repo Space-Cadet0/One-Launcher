@@ -58,6 +58,15 @@ export interface DetailedAchievement {
   /** Optional Epic XP value (e.g., 20, 50, 100 XP) */
   xp?: number;
 
+  /** Optional raw storefront tier label (metadata only; UI uses PC rarity tiers) */
+  tierName?: string;
+
+  /** True when part of the base game achievement set; false for DLC/expansion achievements */
+  isBaseGame?: boolean;
+
+  /** Optional storefront achievement set identifier (e.g., Epic achievementSetId / Steam groupid) */
+  achievementSetId?: string;
+
   /** Optional Xbox/Windows Gamerscore (e.g., 10G, 25G) */
   gamerscore?: number;
 
@@ -85,6 +94,7 @@ export interface StorefrontAchievementsData {
   unlockPrecision?: 'exact' | 'summary_count_only';
   supportsAchievements?: boolean;
   schemaUnavailableOffline?: boolean;
+  cacheVersion?: number;
 }
 
 export type AchievementLoadResult = StorefrontAchievementsData;

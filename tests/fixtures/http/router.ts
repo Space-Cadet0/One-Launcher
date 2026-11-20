@@ -25,13 +25,15 @@ export function resolveOfflineFixture(req: FixtureRequest): FixtureResponse {
     host === 'api.gog.com' ||
     host === 'www.gog.com' ||
     host === 'auth.gog.com' ||
-    host === 'gameplay.gog.com'
+    host === 'gameplay.gog.com' ||
+    host === 'content-system.gog.com'
   ) {
     matched = handleGogEndpoints(req);
   } else if (
     host === 'launcher.store.epicgames.com' ||
     host === 'store-content.ak.epicgames.com' ||
     host === 'account-public-service-prod03.ol.epicgames.com' ||
+    host === 'api.epicgames.dev' ||
     host === 'lutris.net'
   ) {
     matched = handleEpicAndLutrisEndpoints(req);

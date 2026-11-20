@@ -40,6 +40,7 @@ export type OfflineAssetRole =
   | 'cover'
   | 'header'
   | 'icon'
+  | 'achievement_icon'
   | 'screenshot_thumb'
   | 'screenshot_full'
   | 'inline_img'

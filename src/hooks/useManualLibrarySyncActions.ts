@@ -1118,25 +1118,39 @@ export function useManualLibrarySyncActions({
       }
     };
 
+    const updatedGameIds = new Set<string>();
     try {
       const { syncJobManager } = await import('../services/network/syncJobManager');
-      await syncJobManager.startStoreMediaSync(games, (updatedGame) => {
-        pendingMediaUpdates.set(updatedGame.id, updatedGame);
-        if (isVitest) {
-          flushMediaBatch();
-        } else if (!mediaFlushTimer) {
-          mediaFlushTimer = setTimeout(flushMediaBatch, 350);
-        }
-      });
+      await syncJobManager.startStoreMediaSync(
+        gamesRef.current,
+        (updatedGame) => {
+          updatedGameIds.add(updatedGame.id);
+          pendingMediaUpdates.set(updatedGame.id, updatedGame);
+          if (isVitest) {
+            flushMediaBatch();
+          } else if (!mediaFlushTimer) {
+            mediaFlushTimer = setTimeout(flushMediaBatch, 350);
+          }
+        },
+        { isManualSync: true }
+      );
       if (mediaFlushTimer) {
         clearTimeout(mediaFlushTimer);
         mediaFlushTimer = null;
       }
       flushMediaBatch();
-      showSyncNotice(
-        'Store media sync complete! Refreshed trailers, screenshots & descriptions.',
-        5000
-      );
+      const updatedCount = updatedGameIds.size;
+      if (updatedCount > 0) {
+        showSyncNotice(
+          `Store media sync complete! Updated ${updatedCount} ${updatedCount === 1 ? 'title' : 'titles'} (trailers, screenshots, descriptions & specs).`,
+          5000
+        );
+      } else {
+        showSyncNotice(
+          'All library store media & descriptions are already up to date.',
+          5000
+        );
+      }
     } catch (err: unknown) {
       if (mediaFlushTimer) {
         clearTimeout(mediaFlushTimer);
@@ -1157,7 +1171,7 @@ export function useManualLibrarySyncActions({
         window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
       }
     }
-  }, [games, gamesRef, isSyncingAllMedia, setGames, setIsSyncingAllMedia, showSyncNotice]);
+  }, [gamesRef, isSyncingAllMedia, setGames, setIsSyncingAllMedia, showSyncNotice]);
 
   const handleRefreshScores = useCallback(async () => {
     if (isSyncingScores) return;

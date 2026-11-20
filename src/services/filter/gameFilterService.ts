@@ -10,6 +10,11 @@ import {
   getEffectiveTags,
 } from '../steam/steamFeatureNormalizer';
 import {
+  normalizeTagKey,
+  resolveEffectiveGameTags,
+} from '../tags/gameTagResolver';
+import { getUserTagOverrideForGame } from '../storage/userTagStorage';
+import {
   isNativelyAvailableOnMac,
   isNativelyAvailableOnWindows,
 } from '../platform/nativeOsService';
@@ -177,14 +182,26 @@ export function matchesGameFilter(game: CanonicalGame, filter: ActiveGameFilter)
   }
 
   if (filter.type === 'tag') {
+    const resolved = resolveEffectiveGameTags(game);
+    const effectiveTags = resolved.tags;
+    if (
+      effectiveTags.some((t) => t.toLowerCase() === target || t.toLowerCase().includes(target))
+    ) {
+      return true;
+    }
+
     const isOwnedOnSteam = isGameOwnedOnSteam(game.platforms);
     if (isSteamExclusiveFeature(target) && !isOwnedOnSteam) {
       return false;
     }
-    const effectiveTags = getEffectiveTags(game.tags, isOwnedOnSteam);
-    return (
-      effectiveTags.some((t) => t.toLowerCase() === target || t.toLowerCase().includes(target)) ||
-      game.genres.some((g) => g.toLowerCase() === target || g.toLowerCase().includes(target))
+
+    const tagOverride = getUserTagOverrideForGame(game);
+    if (tagOverride?.removedTags.some((rt) => normalizeTagKey(rt) === target)) {
+      return false;
+    }
+
+    return (game.genres || []).some(
+      (g) => g.toLowerCase() === target || g.toLowerCase().includes(target)
     );
   }
 

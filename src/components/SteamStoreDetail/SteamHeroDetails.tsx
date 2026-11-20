@@ -1,10 +1,22 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { SteamReviewSummary } from '../../contracts/steam';
 import { toOlMediaUrl } from '../../contracts/network';
 import { OpenCriticData, getTierColor } from '../../services/opencritic/openCritic';
 import { ActiveGameFilter } from '../../contracts/filter';
+import type { ResolvedGameTag, TagFacetCount } from '../../contracts/tags';
 import { stripHtmlToPlainSynopsis } from '../../services/steam/fallbackMetadataProvider';
 import { onlineLifecycleManager } from '../../services/network/onlineLifecycleManager';
+import { resolveEffectiveGameTags, type ResolvableTagGame } from '../../services/tags/gameTagResolver';
+import {
+  USER_TAG_OVERRIDES_UPDATED_EVENT,
+  addUserTagForGame,
+  normalizeTagKey,
+  removeUserTagForGame,
+  resetUserTagsForGame,
+  sanitizeTagLabel,
+  type TagOverrideGameIdentity,
+} from '../../services/storage/userTagStorage';
+import { TagManagerPopover } from './TagManagerPopover';
 import { HelpCircle, ExternalLink } from 'lucide-react';
 
 function isSentinelReleaseDateValue(raw?: string | null): boolean {
@@ -37,6 +49,13 @@ interface SteamHeroDetailsProps {
   xboxTitleId?: string | null;
   headerOverrideToken?: string;
   coverOverrideToken?: string;
+  tagEntries?: ResolvedGameTag[];
+  availableLibraryTags?: TagFacetCount[];
+  hasUserTagEdits?: boolean;
+  onAddTag?: (tag: string) => void;
+  onRemoveTag?: (tag: string) => void;
+  onResetTags?: () => void;
+  platforms?: Array<{ platformId: string; platformGameId: string }>;
 }
 
 export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
@@ -60,9 +79,17 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
   xboxTitleId,
   headerOverrideToken,
   coverOverrideToken,
+  tagEntries,
+  availableLibraryTags,
+  hasUserTagEdits,
+  onAddTag,
+  onRemoveTag,
+  onResetTags,
+  platforms,
 }) => {
   const [primaryFailed, setPrimaryFailed] = useState(false);
   const [fallbackFailed, setFallbackFailed] = useState(false);
+  const [localTagRevision, setLocalTagRevision] = useState(0);
 
   const resolvedHeaderImage = headerImage
     ? toOlMediaUrl({
@@ -111,6 +138,158 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
     });
   }, []);
 
+  useEffect(() => {
+    if (tagEntries !== undefined) return;
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    const handleTagUpdate = (event: Event) => {
+      const detail = (event as CustomEvent<{ gameId?: string }>).detail;
+      if (!detail?.gameId || !gameId || detail.gameId === gameId) {
+        setLocalTagRevision((rev) => rev + 1);
+      }
+    };
+    window.addEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagUpdate);
+    return () => {
+      window.removeEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagUpdate);
+    };
+  }, [tagEntries, gameId]);
+
+  const fallbackGameIdentity = useMemo<TagOverrideGameIdentity | null>(() => {
+    if (!gameId) return null;
+    const resolvedPlatforms: Array<{ platformId: string; platformGameId: string }> =
+      Array.isArray(platforms) && platforms.length > 0 ? [...platforms] : [];
+    if (resolvedPlatforms.length === 0) {
+      if (gogId) resolvedPlatforms.push({ platformId: 'gog', platformGameId: gogId });
+      if (epicAppName) resolvedPlatforms.push({ platformId: 'epic', platformGameId: epicAppName });
+      if (xboxProductId) {
+        resolvedPlatforms.push({ platformId: 'xbox', platformGameId: xboxProductId });
+      }
+      const parsedSteam =
+        typeof steamAppId === 'number'
+          ? steamAppId
+          : typeof steamAppId === 'string' && /^\d+$/.test(steamAppId.trim())
+            ? Number(steamAppId.trim())
+            : undefined;
+      if (
+        parsedSteam &&
+        parsedSteam > 0 &&
+        (resolvedPlatforms.length === 0 || /^steam[:_-]/i.test(gameId))
+      ) {
+        resolvedPlatforms.push({ platformId: 'steam', platformGameId: String(parsedSteam) });
+      }
+    }
+    const parsedSteamId =
+      typeof steamAppId === 'number' && Number.isInteger(steamAppId) && steamAppId > 0
+        ? steamAppId
+        : typeof steamAppId === 'string' && /^\d+$/.test(steamAppId.trim())
+          ? Number(steamAppId.trim())
+          : undefined;
+    return {
+      id: gameId,
+      ...(parsedSteamId ? { steamAppId: parsedSteamId } : {}),
+      platforms: resolvedPlatforms,
+    };
+  }, [gameId, steamAppId, gogId, epicAppName, xboxProductId, platforms]);
+
+  const fallbackResolvedTags = useMemo(() => {
+    if (tagEntries !== undefined) return null;
+    if (!fallbackGameIdentity?.id) {
+      const entries: ResolvedGameTag[] = [];
+      const seen = new Set<string>();
+      for (const raw of tags) {
+        const label = sanitizeTagLabel(raw);
+        const key = normalizeTagKey(label);
+        if (!label || !key || seen.has(key)) continue;
+        seen.add(key);
+        entries.push({ label, key, source: 'synced' });
+      }
+      return {
+        entries,
+        syncedTags: entries.map((e) => e.label),
+        hasUserEdits: false,
+      };
+    }
+
+    const resolvableGame: ResolvableTagGame = {
+      id: fallbackGameIdentity.id,
+      steamAppId:
+        typeof fallbackGameIdentity.steamAppId === 'number'
+          ? fallbackGameIdentity.steamAppId
+          : undefined,
+      platforms: (fallbackGameIdentity.platforms || []).map((p) => ({
+        platformId: String(p.platformId || ''),
+        platformGameId: p.platformGameId ? String(p.platformGameId) : undefined,
+      })),
+      tags,
+    };
+    const resolved = resolveEffectiveGameTags(resolvableGame);
+    return {
+      entries: resolved.entries,
+      syncedTags: resolved.syncedTags,
+      hasUserEdits: resolved.hasUserEdits,
+    };
+  }, [tagEntries, fallbackGameIdentity, tags, localTagRevision]);
+
+  const effectiveEntries = useMemo<ResolvedGameTag[]>(() => {
+    if (tagEntries !== undefined) {
+      return tagEntries;
+    }
+    return fallbackResolvedTags?.entries ?? [];
+  }, [tagEntries, fallbackResolvedTags]);
+
+  const effectiveHasUserEdits = useMemo<boolean>(() => {
+    if (typeof hasUserTagEdits === 'boolean') {
+      return hasUserTagEdits;
+    }
+    return Boolean(fallbackResolvedTags?.hasUserEdits);
+  }, [hasUserTagEdits, fallbackResolvedTags]);
+
+  const handleAddTag = useCallback(
+    (tag: string) => {
+      if (onAddTag) {
+        onAddTag(tag);
+        return;
+      }
+      if (fallbackGameIdentity) {
+        addUserTagForGame(
+          fallbackGameIdentity,
+          tag,
+          fallbackResolvedTags?.syncedTags ?? tags
+        );
+        setLocalTagRevision((rev) => rev + 1);
+      }
+    },
+    [onAddTag, fallbackGameIdentity, fallbackResolvedTags, tags]
+  );
+
+  const handleRemoveTag = useCallback(
+    (tag: string) => {
+      if (onRemoveTag) {
+        onRemoveTag(tag);
+        return;
+      }
+      if (fallbackGameIdentity) {
+        removeUserTagForGame(
+          fallbackGameIdentity,
+          tag,
+          fallbackResolvedTags?.syncedTags ?? tags
+        );
+        setLocalTagRevision((rev) => rev + 1);
+      }
+    },
+    [onRemoveTag, fallbackGameIdentity, fallbackResolvedTags, tags]
+  );
+
+  const handleResetTags = useCallback(() => {
+    if (onResetTags) {
+      onResetTags();
+      return;
+    }
+    if (fallbackGameIdentity) {
+      resetUserTagsForGame(fallbackGameIdentity);
+      setLocalTagRevision((rev) => rev + 1);
+    }
+  }, [onResetTags, fallbackGameIdentity]);
+
   // Determine Steam review text & color
   const getReviewColor = (desc?: string) => {
     if (!desc) return 'text-[#94a3b8]';
@@ -121,7 +300,13 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
     return 'text-[#94a3b8]';
   };
 
-  const displayTags = tags.length > 0 ? tags.slice(0, 7) : [];
+  // Prioritize ALL user-added tags first before slicing synced tags
+  const displayEntries = useMemo<ResolvedGameTag[]>(() => {
+    const userEntries = effectiveEntries.filter((e) => e.source === 'user');
+    const syncedEntries = effectiveEntries.filter((e) => e.source === 'synced');
+    const syncedLimit = userEntries.length > 0 ? Math.max(7 - userEntries.length, 3) : 7;
+    return [...userEntries, ...syncedEntries.slice(0, syncedLimit)];
+  }, [effectiveEntries]);
 
   const hasRealUserReviews = Boolean(
     reviewSummary &&
@@ -378,36 +563,41 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
         <div className="text-[11px] text-[#94a3b8] mb-1.5">
           Popular user-defined tags for this product:
         </div>
-        {displayTags.length > 0 ? (
-          <div className="flex flex-wrap gap-1 items-center">
-            {displayTags.map((tag, i) => (
+        <div className="flex flex-wrap gap-1 items-center">
+          {displayEntries.length > 0 ? (
+            displayEntries.map((entry) => (
               <button
-                key={i}
+                key={entry.key}
                 type="button"
-                onClick={() => onApplyFilter?.({ type: 'tag', label: 'Tag', value: tag })}
-                className="inline-flex items-center px-2 min-h-6 text-[11px] bg-[rgba(103,193,245,0.2)] hover:bg-[rgba(103,193,245,0.4)] text-[#67c1f5] hover:text-white rounded-[2px] transition-colors cursor-pointer"
-                title={`Filter library by tag "${tag}"`}
+                data-tag-source={entry.source}
+                onClick={() =>
+                  onApplyFilter?.({ type: 'tag', label: 'Tag', value: entry.label })
+                }
+                className={
+                  entry.source === 'user'
+                    ? 'inline-flex items-center px-2 min-h-6 text-[11px] border border-[#67c1f5]/50 bg-[rgba(103,193,245,0.28)] hover:bg-[rgba(103,193,245,0.45)] text-[#a8dcfa] hover:text-white rounded-[2px] transition-colors cursor-pointer'
+                    : 'inline-flex items-center px-2 min-h-6 text-[11px] bg-[rgba(103,193,245,0.2)] hover:bg-[rgba(103,193,245,0.4)] text-[#67c1f5] hover:text-white rounded-[2px] transition-colors cursor-pointer'
+                }
+                title={`Filter library by tag "${entry.label}"`}
               >
-                {tag}
+                {entry.label}
               </button>
-            ))}
-            {/* Steam Plus Tag Button */}
-            <button
-              type="button"
-              aria-label="View more tags"
-              onClick={() =>
-                displayTags[0] &&
-                onApplyFilter?.({ type: 'tag', label: 'Tag', value: displayTags[0] })
-              }
-              className="inline-flex items-center justify-center min-w-6 min-h-6 bg-[rgba(103,193,245,0.2)] hover:bg-[rgba(103,193,245,0.4)] text-[#67c1f5] hover:text-white rounded-[2px] cursor-pointer text-xs transition-colors"
-              title="Browse tags"
-            >
-              +
-            </button>
-          </div>
-        ) : (
-          <div className="text-[11px] text-[#94a3b8] italic">Tags pending online sync</div>
-        )}
+            ))
+          ) : (
+            <span className="text-[11px] text-[#94a3b8] italic mr-1">No tags yet</span>
+          )}
+          <TagManagerPopover
+            gameTitle={title}
+            entries={effectiveEntries}
+            availableLibraryTags={availableLibraryTags}
+            hasUserEdits={effectiveHasUserEdits}
+            onAddTag={handleAddTag}
+            onRemoveTag={handleRemoveTag}
+            onResetTags={
+              onResetTags || fallbackGameIdentity ? handleResetTags : undefined
+            }
+          />
+        </div>
       </div>
     </div>
   );
