@@ -111,6 +111,11 @@ const loadSystemSetupWizardModal = () =>
     default: m.SystemSetupWizardModal,
   }));
 const SystemSetupWizardModal = lazyWithRetry(loadSystemSetupWizardModal);
+const SettingsModal = lazyWithRetry(() =>
+  import('./components/Settings/SettingsModal').then((m) => ({
+    default: m.SettingsModal,
+  }))
+);
 
 function areShallowValuesEqual(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
@@ -205,22 +210,32 @@ function isCanonicalGameMateriallyUnchanged(prev: CanonicalGame, next: Canonical
 
 export function App() {
   const [games, setGames] = useState<CanonicalGame[]>(() => {
-    const saved = localStorage.getItem('universal_game_library_catalog');
-    if (saved) {
-      try {
-        const loaded = loadCurrentCatalog();
-        if (Array.isArray(loaded) && loaded.length > 0) {
-          return loaded.map((g: CanonicalGame) => ({
-            ...g,
-            platforms: g.platforms.map((p) => ({
-              ...p,
-              installed: Boolean(p.installed || launcherService.isGameInstalled(g, p.platformId)),
-            })),
-          }));
-        }
-      } catch (e) {
-        console.error('Failed to parse cached games:', e);
+    try {
+      const loaded = loadCurrentCatalog();
+      if (Array.isArray(loaded) && loaded.length > 0) {
+        let anyInstallOverlay = false;
+        const overlaid = loaded.map((g: CanonicalGame) => {
+          let platChanged = false;
+          const nextPlatforms = g.platforms.map((p) => {
+            const nextInstalled = Boolean(
+              p.installed || launcherService.isGameInstalled(g, p.platformId)
+            );
+            if (nextInstalled !== Boolean(p.installed)) {
+              platChanged = true;
+              return { ...p, installed: nextInstalled };
+            }
+            return p;
+          });
+          if (platChanged) {
+            anyInstallOverlay = true;
+            return { ...g, platforms: nextPlatforms };
+          }
+          return g;
+        });
+        return anyInstallOverlay ? overlaid : loaded;
       }
+    } catch (e) {
+      console.error('Failed to parse cached games:', e);
     }
     return [];
   });
@@ -477,6 +492,10 @@ export function App() {
     StorefrontId | undefined
   >(undefined);
   const [isDownloadDrawerOpen, setIsDownloadDrawerOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [settingsInitialSection, setSettingsInitialSection] = useState<'general' | 'macos_bottle'>(
+    'general'
+  );
   const [isSystemSetupOpen, setIsSystemSetupOpen] = useState(false);
   const [systemSetupMode, setSystemSetupMode] = useState<SetupWizardOpenMode>('health_check');
   const [systemSetupInitialStep, setSystemSetupInitialStep] = useState<
@@ -491,11 +510,21 @@ export function App() {
   const hasCheckedStartupWizardRef = useRef(false);
   const setupSessionBaselineSigRef = useRef<string>('');
 
-  const lastExplicitlySavedCatalogRef = useRef<CanonicalGame[] | null>(null);
+  const lastExplicitlySavedCatalogRef = useRef<CanonicalGame[] | null>(games);
   const prevCommittedCatalogRef = useRef<CanonicalGame[]>(games);
 
-  // Persist catalog state in commit phase (never inside pure setGames updaters)
+  const handleExternalCatalogPersisted = useCallback((catalog: CanonicalGame[]) => {
+    lastExplicitlySavedCatalogRef.current = catalog;
+    prevCommittedCatalogRef.current = catalog;
+  }, []);
+
+  // Persist catalog state in commit phase (never inside pure setGames updaters),
+  // strictly gated behind isCatalogVaultHydrated to eliminate cold-boot slim-overwrites-rich races.
   useEffect(() => {
+    if (!isCatalogVaultHydrated) {
+      return;
+    }
+
     const prev = prevCommittedCatalogRef.current;
     prevCommittedCatalogRef.current = games;
 
@@ -518,8 +547,12 @@ export function App() {
           }
         }
         if (orderPreserved) {
-          if (dirtyIds.length === 0) return;
+          if (dirtyIds.length === 0) {
+            lastExplicitlySavedCatalogRef.current = games;
+            return;
+          }
           if (dirtyIds.length < games.length) {
+            lastExplicitlySavedCatalogRef.current = games;
             saveCurrentCatalog(games, { skipSanitize: true, dirtyGameIds: dirtyIds });
             return;
           }
@@ -546,6 +579,7 @@ export function App() {
         }
         const removedIds = Array.from(prevById.keys());
         if (dirtyIds.length + removedIds.length <= 20 && dirtyIds.length < games.length) {
+          lastExplicitlySavedCatalogRef.current = games;
           saveCurrentCatalog(games, {
             skipSanitize: true,
             dirtyGameIds: dirtyIds,
@@ -555,9 +589,10 @@ export function App() {
         }
       }
 
+      lastExplicitlySavedCatalogRef.current = games;
       saveCurrentCatalog(games, { skipSanitize: true });
     } catch {}
-  }, [games]);
+  }, [games, isCatalogVaultHydrated]);
 
   const overlayLauncherInstalledState = useCallback((catalog: CanonicalGame[]): CanonicalGame[] => {
     const records = launcherService.getInstalledRecords();
@@ -583,7 +618,42 @@ export function App() {
           if (!shouldUpgradeFromVault) return;
           const merged = mergeHydratedCatalogPreservingLiveState(prev, hydrated);
           const next = overlayLauncherInstalledState(merged);
+
+          const hydratedById = new Map<string, CanonicalGame>();
+          for (let i = 0; i < hydrated.length; i++) {
+            const hg = hydrated[i];
+            if (hg?.id) hydratedById.set(hg.id, hg);
+          }
+          const mutatedIds: string[] = [];
+          for (let i = 0; i < next.length; i++) {
+            const ng = next[i];
+            if (!ng?.id) continue;
+            const hg = hydratedById.get(ng.id);
+            if (!hg) {
+              mutatedIds.push(ng.id);
+            } else {
+              hydratedById.delete(ng.id);
+              if (!isCanonicalGameMateriallyUnchanged(hg, ng)) {
+                mutatedIds.push(ng.id);
+              }
+            }
+          }
+          const removedIds = Array.from(hydratedById.keys());
+
           gamesLatestRef.current = next;
+          lastExplicitlySavedCatalogRef.current = next;
+          prevCommittedCatalogRef.current = next;
+
+          if (mutatedIds.length > 0 || removedIds.length > 0) {
+            try {
+              saveCurrentCatalog(next, {
+                skipSanitize: true,
+                dirtyGameIds: mutatedIds,
+                ...(removedIds.length > 0 ? { removedGameIds: removedIds } : {}),
+              });
+            } catch {}
+          }
+
           setGames(next);
         }
       })
@@ -662,7 +732,11 @@ export function App() {
   }, []);
 
   const isInteractiveModalBusy =
-    isMatchManagerOpen || isFixMatchModalOpen || isIntegrationsModalOpen || isSystemSetupOpen;
+    isMatchManagerOpen ||
+    isFixMatchModalOpen ||
+    isIntegrationsModalOpen ||
+    isSystemSetupOpen ||
+    isSettingsOpen;
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.electronAPI?.offlineVault) return;
@@ -691,6 +765,8 @@ export function App() {
     overlayLauncherInstalledState,
     showSyncNotice,
     isModalOpen: isInteractiveModalBusy,
+    isCatalogVaultHydrated,
+    onCatalogPersisted: handleExternalCatalogPersisted,
   });
 
   useCriticScoreWarmup(
@@ -1024,6 +1100,63 @@ export function App() {
     handleOpenSystemSetup('health_check');
   }, [handleOpenSystemSetup]);
 
+  const openGlobalSettings = useCallback((section?: string) => {
+    const normalizedSection: 'general' | 'macos_bottle' =
+      section === 'macos_bottle' ? 'macos_bottle' : 'general';
+    setSettingsInitialSection(normalizedSection);
+    setIsSettingsOpen(true);
+  }, []);
+
+  const handleTopNavOpenSettings = useCallback(() => {
+    openGlobalSettings('general');
+  }, [openGlobalSettings]);
+
+  const handleCloseSettingsModal = useCallback(() => {
+    setIsSettingsOpen(false);
+  }, []);
+
+  const handleOpenRunnerSetupFromSettings = useCallback(() => {
+    setIsSettingsOpen(false);
+    handleOpenSystemSetup('health_check', 'compatibility');
+  }, [handleOpenSystemSetup]);
+
+  const handleOpenIntegrationsFromSettings = useCallback(() => {
+    setIsSettingsOpen(false);
+    setIsIntegrationsModalOpen(true);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+
+    const handleOpenSettingsEvent = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{ section?: 'general' | 'macos_bottle' | string } | undefined>
+      ).detail;
+      openGlobalSettings(detail?.section);
+    };
+
+    const handleSettingsKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key === ',') {
+        event.preventDefault();
+        openGlobalSettings('general');
+      }
+    };
+
+    window.addEventListener('antigravity:open-settings', handleOpenSettingsEvent);
+    window.addEventListener('keydown', handleSettingsKeyDown);
+
+    const unsubscribeIpcOpenSettings = window.electronAPI?.onOpenSettings?.((section) => {
+      openGlobalSettings(section);
+    });
+
+    return () => {
+      window.removeEventListener('antigravity:open-settings', handleOpenSettingsEvent);
+      window.removeEventListener('keydown', handleSettingsKeyDown);
+      unsubscribeIpcOpenSettings?.();
+    };
+  }, [openGlobalSettings]);
+
   useEffect(() => {
     const syncAlertCount = () => {
       const snap = environmentSetupService.getLastSnapshot();
@@ -1040,17 +1173,52 @@ export function App() {
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    const normalizeWizardStep = (step?: string): SetupWizardStepId | undefined => {
+      if (!step) return undefined;
+      if (step === 'compatibility_and_bottle' || step === 'compatibility') {
+        return 'compatibility';
+      }
+      if (
+        step === 'prerequisites' ||
+        step === 'accounts' ||
+        step === 'clients' ||
+        step === 'client_logins' ||
+        step === 'summary'
+      ) {
+        return step;
+      }
+      return undefined;
+    };
     const handleOpenEvent = (event: Event) => {
       const detail = (event as CustomEvent<OpenSystemSetupEventDetail | undefined>).detail;
       handleOpenSystemSetup(
         detail?.mode || 'health_check',
-        detail?.initialStep,
+        normalizeWizardStep(detail?.initialStep),
+        detail?.focusComponentId
+      );
+    };
+    const handleOpenSetupWizardEvent = (event: Event) => {
+      const detail = (
+        event as CustomEvent<
+          | {
+              mode?: SetupWizardOpenMode;
+              initialStep?: SetupWizardStepId | 'compatibility_and_bottle' | string;
+              focusComponentId?: EnvironmentComponentId;
+            }
+          | undefined
+        >
+      ).detail;
+      handleOpenSystemSetup(
+        detail?.mode || 'health_check',
+        normalizeWizardStep(detail?.initialStep) || 'compatibility',
         detail?.focusComponentId
       );
     };
     window.addEventListener(OPEN_SYSTEM_SETUP_EVENT, handleOpenEvent);
+    window.addEventListener('antigravity:open-setup-wizard', handleOpenSetupWizardEvent);
     return () => {
       window.removeEventListener(OPEN_SYSTEM_SETUP_EVENT, handleOpenEvent);
+      window.removeEventListener('antigravity:open-setup-wizard', handleOpenSetupWizardEvent);
     };
   }, [handleOpenSystemSetup]);
 
@@ -1283,6 +1451,7 @@ export function App() {
         onOpenFixMatch={handleTopNavOpenFixMatch}
         onOpenLibraryMatchManager={handleOpenMatchManager}
         onOpenSystemSetup={handleTopNavOpenSystemSetup}
+        onOpenSettings={handleTopNavOpenSettings}
         systemSetupAlertCount={systemSetupAlertCount}
         onOpenAchievements={handleTopNavOpenAchievements}
         onOpenDownloads={handleOpenDownloadDrawer}
@@ -1543,6 +1712,25 @@ export function App() {
               onClose={handleCloseSystemSetup}
               onOpenIntegrationsModal={handleOpenIntegrationsModal}
               onLibraryUpdated={handleIntegrationsLibraryUpdated}
+            />
+          </Suspense>
+        </ModalErrorBoundary>
+      )}
+
+      {/* Modal: Global Launcher & Gameplay Settings */}
+      {isSettingsOpen && (
+        <ModalErrorBoundary
+          modalName="Global Settings"
+          isOpen={isSettingsOpen}
+          onClose={handleCloseSettingsModal}
+        >
+          <Suspense fallback={null}>
+            <SettingsModal
+              isOpen={isSettingsOpen}
+              initialSection={settingsInitialSection}
+              onClose={handleCloseSettingsModal}
+              onOpenRunnerSetup={handleOpenRunnerSetupFromSettings}
+              onOpenIntegrations={handleOpenIntegrationsFromSettings}
             />
           </Suspense>
         </ModalErrorBoundary>

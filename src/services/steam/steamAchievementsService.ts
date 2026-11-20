@@ -1,10 +1,15 @@
 import axios from 'axios';
 import { CanonicalGame, StoreAchievementSummary } from '../../contracts/game';
 import { loadIntegrations } from '../integrations/integrationStorage';
-import { KNOWN_USER_STEAM_ACHIEVEMENTS } from '../storage/knownGameAchievements';
+import {
+  KNOWN_USER_STEAM_ACHIEVEMENTS,
+  cacheUserSteamAchievements,
+  type CachedAchievementEntry,
+} from '../storage/knownGameAchievements';
 import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
 import { vaultGet, vaultSet } from '../storage/indexedDbVault';
 import { requestScheduler, Priority } from '../network/requestScheduler';
+import { scanLocalSteamAchievements } from '../system/localSystemScanner';
 
 const STORAGE_KEY_ACHIEVEMENTS_SUMMARY = 'antigravity_steam_achievements';
 const IDB_KEY_ACHIEVEMENTS_SUMMARY = 'idb_steam_achievements_summary_v1';
@@ -13,11 +18,16 @@ const DEFAULT_ACHIEVEMENTS_SYNC_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours
 const ACHIEVEMENTS_SAVE_DEBOUNCE_MS = 250;
 
 export class SteamAchievementsService {
+  private static readonly LOCAL_SCAN_STARTUP_WINDOW_MS = 30_000;
   private inMemoryCache = new Map<number, StoreAchievementSummary>();
   private persistedDictCache: Record<string, StoreAchievementSummary> | null = null;
   private lastRawStorageRef: string | null = null;
   private isDictDirty = false;
   private pendingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private inFlightLibrarySyncPromise: Promise<Record<number, StoreAchievementSummary>> | null = null;
+  private inFlightLocalScanPromise: Promise<Record<number, CachedAchievementEntry>> | null = null;
+  private lastLocalScanAt = 0;
+  private lastLocalScanResults: Record<number, CachedAchievementEntry> = {};
 
   constructor() {
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
@@ -145,6 +155,116 @@ export class SteamAchievementsService {
     try {
       localStorage.setItem(STORAGE_KEY_ACHIEVEMENTS_LAST_SYNC, String(timestamp));
     } catch {}
+  }
+
+  /**
+   * Single-flight local Steam achievement scan per startup window so cold boot and React StrictMode
+   * invoke `scanLocalSteamAchievements()` at most once instead of redundantly scanning disk twice.
+   */
+  async scanLocalAchievementsSingleFlight(
+    force = false
+  ): Promise<Record<number, CachedAchievementEntry>> {
+    if (!force && this.inFlightLocalScanPromise) {
+      return this.inFlightLocalScanPromise;
+    }
+    if (
+      !force &&
+      this.lastLocalScanAt > 0 &&
+      Date.now() - this.lastLocalScanAt < SteamAchievementsService.LOCAL_SCAN_STARTUP_WINDOW_MS
+    ) {
+      return { ...this.lastLocalScanResults };
+    }
+
+    const flight = (async (): Promise<Record<number, CachedAchievementEntry>> => {
+      try {
+        const scanned = await scanLocalSteamAchievements();
+        const normalized: Record<number, CachedAchievementEntry> =
+          scanned && typeof scanned === 'object' ? scanned : {};
+        this.lastLocalScanResults = normalized;
+        this.lastLocalScanAt = Date.now();
+        if (Object.keys(normalized).length > 0) {
+          cacheUserSteamAchievements(normalized);
+        }
+        return { ...normalized };
+      } catch {
+        return {};
+      }
+    })();
+
+    this.inFlightLocalScanPromise = flight;
+    try {
+      return await flight;
+    } finally {
+      if (this.inFlightLocalScanPromise === flight) {
+        this.inFlightLocalScanPromise = null;
+      }
+    }
+  }
+
+  /**
+   * Ingests batch achievements already obtained during Steam storefront sync (`syncStore('steam')`)
+   * and updates `antigravity_steam_achievements_last_sync_ts` so cold boot does not re-run a duplicate
+   * `fetchSteamBatchAchievements` Web API pass immediately afterwards.
+   */
+  ingestBatchAchievements(
+    rawAchievements: Record<string | number, CachedAchievementEntry>,
+    options?: { markFullSyncComplete?: boolean }
+  ): Record<number, StoreAchievementSummary> {
+    const ingested: Record<number, StoreAchievementSummary> = {};
+    if (!rawAchievements || typeof rawAchievements !== 'object') {
+      return ingested;
+    }
+    const nowIso = new Date().toISOString();
+    for (const [rawId, data] of Object.entries(rawAchievements)) {
+      const appId = Number(rawId);
+      if (
+        !appId ||
+        !Number.isFinite(appId) ||
+        !data ||
+        typeof data.unlocked !== 'number' ||
+        typeof data.total !== 'number'
+      ) {
+        continue;
+      }
+      if (data.total <= 0 && data.unlocked <= 0) continue;
+      const existing = this.getCachedAchievements(appId) || undefined;
+      const incoming: StoreAchievementSummary = {
+        unlocked: data.unlocked,
+        total: data.total,
+        percentage:
+          data.percentage ?? (data.total > 0 ? Math.round((data.unlocked / data.total) * 100) : 0),
+        isMastered: Boolean(data.isMastered) || (data.total > 0 && data.unlocked >= data.total),
+        source: data.source || 'live_cloud_api',
+        syncedAt: data.syncedAt || nowIso,
+      };
+      const reconciled =
+        reconcileAchievementSummaries(existing, incoming, {
+          appId,
+          store: 'steam',
+        }) || incoming;
+      ingested[appId] = reconciled;
+      this.setCachedAchievement(appId, reconciled);
+    }
+
+    if (options?.markFullSyncComplete !== false && Object.keys(ingested).length > 0) {
+      this.recordFullSyncCompleted();
+    }
+    return ingested;
+  }
+
+  public resetForTests(): void {
+    if (this.pendingFlushTimer !== null) {
+      clearTimeout(this.pendingFlushTimer);
+      this.pendingFlushTimer = null;
+    }
+    this.inMemoryCache.clear();
+    this.persistedDictCache = null;
+    this.lastRawStorageRef = null;
+    this.isDictDirty = false;
+    this.inFlightLibrarySyncPromise = null;
+    this.inFlightLocalScanPromise = null;
+    this.lastLocalScanAt = 0;
+    this.lastLocalScanResults = {};
   }
 
   /**
@@ -515,6 +635,7 @@ export class SteamAchievementsService {
   /**
    * Performs an automated live synchronization of player achievements directly from Steam
    * across owned games, prioritizing played titles with playtime > 0.
+   * Single-flight guarded per startup window so concurrent callers share one batch Web API pass.
    */
   async syncUserLibraryAchievements(
     games: CanonicalGame[],
@@ -526,16 +647,54 @@ export class SteamAchievementsService {
       onBatchUpdated?: (partialResults: Record<number, StoreAchievementSummary>) => void;
     }
   ): Promise<Record<number, StoreAchievementSummary>> {
-    const creds = this.getActiveSteamCredentials();
-    let activeSteamId = creds.steamId;
-    const results: Record<number, StoreAchievementSummary> = {};
+    if (!options?.forceRefresh && this.inFlightLibrarySyncPromise) {
+      return this.inFlightLibrarySyncPromise;
+    }
 
-    // Filter games that belong to Steam and have steamAppId
     const steamGames = games.filter((g) =>
       Boolean(g.steamAppId && g.platforms.some((p) => p.platformId === 'steam'))
     );
+    if (steamGames.length === 0) return {};
 
-    if (steamGames.length === 0) return results;
+    if (!options?.forceRefresh && this.hasRecentFullSync()) {
+      const cachedMap: Record<number, StoreAchievementSummary> = {};
+      for (const game of steamGames) {
+        if (!game.steamAppId) continue;
+        const cached = this.getCachedAchievements(game.steamAppId);
+        if (cached) {
+          cachedMap[game.steamAppId] = cached;
+        }
+      }
+      onProgress?.(steamGames.length, steamGames.length);
+      return cachedMap;
+    }
+
+    const flight = this.runSyncUserLibraryAchievementsInternal(steamGames, onProgress, options);
+    if (!options?.forceRefresh) {
+      this.inFlightLibrarySyncPromise = flight;
+    }
+    try {
+      return await flight;
+    } finally {
+      if (this.inFlightLibrarySyncPromise === flight) {
+        this.inFlightLibrarySyncPromise = null;
+      }
+    }
+  }
+
+  private async runSyncUserLibraryAchievementsInternal(
+    steamGames: CanonicalGame[],
+    onProgress?: (completed: number, total: number, currentTitle?: string) => void,
+    options?: {
+      forceRefresh?: boolean;
+      includeUnplayed?: boolean;
+      priority?: number;
+      onBatchUpdated?: (partialResults: Record<number, StoreAchievementSummary>) => void;
+    }
+  ): Promise<Record<number, StoreAchievementSummary>> {
+    const creds = this.getActiveSteamCredentials();
+    let activeSteamId = creds.steamId;
+    const results: Record<number, StoreAchievementSummary> = {};
 
     // 1. Fast Native Batch Sync via Electron (IPlayerService/GetAchievementsProgress/v1 + local Steam librarycache)
     const batchSolvedAppIds = new Set<number>();
@@ -573,6 +732,8 @@ export class SteamAchievementsService {
           if (Object.keys(results).length > 0) {
             options?.onBatchUpdated?.({ ...results });
           }
+          // Immediately mark batch Web API sync completed so concurrent/subsequent cold-boot passes skip duplicate calls
+          this.recordFullSyncCompleted();
         }
       } catch {}
     }

@@ -659,7 +659,7 @@ function auditWcag22AA(tree: any): string[] {
       }
       const cls = String(props.className || '');
       if (
-        !/\b(min-h-(?:[6-9]|\d{2,})|h-(?:[6-9]|\d{2,})|p-(?:[2-9]|\d{2,})|py-(?:[2-9]|1\.5|\d{2,})|underline)\b/.test(
+        !/(?:^|\s)(min-h-(?:[6-9]|\d{2,}|\[(?:2[4-9]|[3-9]\d|\d{3,})px\])|h-(?:[6-9]|\d{2,})|p-(?:[2-9]|\d{2,})|py-(?:[2-9]|1\.5|\d{2,})|underline)(?:\s|$)/.test(
           cls
         )
       ) {
@@ -1333,11 +1333,11 @@ describe('Wave 3A — Pass-2 Dual-OS Launch Engine, Clean-Room & 32-Bit Bottled 
       expect(String(bgWakeSpawns[0].env.CX_ENV || '')).not.toContain('MTL_HUD_ENABLED');
       expect(String(bgWakeSpawns[0].env.CX_ENV || '')).not.toContain('DXVK_HUD');
 
-      // Foreground <game.exe> retains its full 32-bit DXMT routing and HUD flags
+      // Foreground <game.exe> retains its full 32-bit DXMT routing and single unified Metal HUD (zero double overlays!)
       expect(fgGameSpawns[0].args.some((a) => /synthgalaxy32\.exe$/i.test(a))).toBe(true);
       expect(fgGameSpawns[0].env.CX_GRAPHICS_BACKEND).toBe('dxmt');
       expect(fgGameSpawns[0].env.MTL_HUD_ENABLED).toBe('1');
-      expect(fgGameSpawns[0].env.DXVK_HUD).toBe('devinfo,fps,frametimes');
+      expect(fgGameSpawns[0].env.DXVK_HUD).toBeUndefined();
 
       await supervisor.finalizeGameSession('gog:19990001', { skipPostSessionCloudSync: true });
     });
@@ -2807,26 +2807,29 @@ int main(void) {
         tree = renderer.render();
         expect(auditWcag22AA(tree)).toEqual([]);
 
-        // Uncheck both HUD switches ('Apple Metal HUD' and 'DXVK / DXMT HUD')
-        const metalToggle = findVNodes(
+        // Select unified Performance HUD -> 'off' radio (migrated from legacy metalHud: true / dxvkHud: true -> 'on')
+        const perfHudOnLabel = findVNodes(
           tree,
-          (el) => el.type === 'button' && el.props?.['data-testid'] === 'toggle-metal-hud'
+          (el) => el.props?.['data-testid'] === 'performance-hud-on'
         )[0];
-        expect(metalToggle).toBeTruthy();
-        expect(metalToggle.props.role).toBe('switch');
-        expect(metalToggle.props['aria-checked']).toBe(true);
-        metalToggle.props.onClick();
-
-        tree = renderer.render();
-
-        const dxvkToggle = findVNodes(
+        const perfHudOffLabel = findVNodes(
           tree,
-          (el) => el.type === 'button' && el.props?.['data-testid'] === 'toggle-dxvk-hud'
+          (el) => el.props?.['data-testid'] === 'performance-hud-off'
         )[0];
-        expect(dxvkToggle).toBeTruthy();
-        expect(dxvkToggle.props.role).toBe('switch');
-        expect(dxvkToggle.props['aria-checked']).toBe(true);
-        dxvkToggle.props.onClick();
+        expect(perfHudOnLabel).toBeTruthy();
+        expect(perfHudOffLabel).toBeTruthy();
+        const perfHudOnRadio = findVNodes(perfHudOnLabel, (el) => el.type === 'input')[0];
+        const perfHudOffRadio = findVNodes(perfHudOffLabel, (el) => el.type === 'input')[0];
+        expect(perfHudOnRadio).toBeTruthy();
+        expect(perfHudOnRadio.props.checked).toBe(true);
+        expect(perfHudOffRadio).toBeTruthy();
+        expect(
+          findVNodes(tree, (el) => el.props?.['data-testid'] === 'toggle-metal-hud')
+        ).toHaveLength(0);
+        expect(
+          findVNodes(tree, (el) => el.props?.['data-testid'] === 'toggle-dxvk-hud')
+        ).toHaveLength(0);
+        perfHudOffRadio.props.onChange();
 
         tree = renderer.render();
 
@@ -2839,8 +2842,9 @@ int main(void) {
 
         expect(savedModalConfig).toBeTruthy();
         const reloaded = getLaunchConfigFromStorage('syn-modal-pe32', 'gog');
-        expect(reloaded?.metalHud).toBe(false);
-        expect(reloaded?.dxvkHud).toBe(false);
+        expect(reloaded?.performanceHud).toBe('off');
+        expect(reloaded?.metalHud).toBeUndefined();
+        expect(reloaded?.dxvkHud).toBeUndefined();
         expect(reloaded?.metalfxSpatialUpscaleFactor).toBe(1.5);
         expect(reloaded?.preferredMaxFrameRate).toBe(90);
         expect(reloaded?.emulateModeset).toBe(true);

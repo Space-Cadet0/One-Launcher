@@ -352,7 +352,8 @@ describe('UI/UX Game Page, Launch & Compatibility Settings, and Storefront Funct
     expect(renderToString(perfSection)).toContain('storefront-launch-policy-card');
     expect(renderToString(perfSection)).toContain('Bottle Steam Launch Policy');
     expect(renderToString(perfSection)).toContain('Fast Bottle Launch');
-    expect(renderToString(perfSection)).toContain('toggle-auto-shutdown-wine');
+    expect(renderToString(perfSection)).toContain('edit-global-defaults-btn');
+    expect(renderToString(perfSection)).not.toContain('global-gameplay-performance-card');
 
     // Task 3: Initial badge is Low-RAM / Zero-GPU Overhead Mode
     const getBadgeText = () => {
@@ -601,9 +602,9 @@ describe('UI/UX Game Page, Launch & Compatibility Settings, and Storefront Funct
 
     expect(idxLaunchMode).toBeGreaterThan(-1);
     expect(idxCompat).toBeGreaterThan(idxLaunchMode);
-    expect(idxFootprint).toBeGreaterThan(idxCompat);
-    expect(idxExeArgs).toBeGreaterThan(idxFootprint);
+    expect(idxExeArgs).toBeGreaterThan(idxCompat);
     expect(idxEnvHooks).toBeGreaterThan(idxExeArgs);
+    expect(idxFootprint).toBeGreaterThan(idxEnvHooks);
     installedModal.unmount();
 
     // Uninstalled game: Locate Existing Local Executable appears above In-Game Footprint & Performance
@@ -876,7 +877,8 @@ describe('UI/UX Game Page, Launch & Compatibility Settings, and Storefront Funct
     expect(modal.html).not.toContain('contain:layout style paint');
     expect(modal.html).not.toContain('Checking for updates...');
     expect(modal.html).toContain('v26.0.0');
-    expect(modal.html).toContain('Up to Date');
+    expect(modal.html).toContain('data-testid="runner-status-banner"');
+    expect(modal.html).not.toContain('data-testid="runner-update-available-badge"');
     modal.unmount();
 
     // Verify GameInstallModal also uses flat sibling scrim without backdrop-blur or contain:layout style paint
@@ -1062,18 +1064,18 @@ describe('UI/UX Game Page, Launch & Compatibility Settings, and Storefront Funct
     expect(activeModeAfter).toBe('storefront_uri');
     expect(getLifecycleSelect().props.value).toBe('minimal_and_close_if_started');
 
-    // Selecting keep_open hides contradictory 'stay_minimized' option in post-game-launcher-behavior-select
+    // Selecting keep_open updates the per-game behavior select cleanly; global post-game behavior lives in SettingsModal
     steamModal
       .findElements((el) => el.props?.['data-testid'] === 'in-game-launcher-behavior-select')[0]
       .props.onChange({ target: { value: 'keep_open' } });
     steamModal.rerender();
-    const postExitSelectHtml = renderToString(
+    expect(
       steamModal.findElements(
-        (el) => el.props?.['data-testid'] === 'post-game-launcher-behavior-select'
-      )[0]
-    );
-    expect(postExitSelectHtml).toContain('Keep One Launcher Window Open');
-    expect(postExitSelectHtml).not.toContain('value="stay_minimized"');
+        (el) => el.props?.['data-testid'] === 'in-game-launcher-behavior-select'
+      )[0].props.value
+    ).toBe('keep_open');
+    expect(steamModal.html).toContain('data-testid="edit-global-defaults-btn"');
+    expect(steamModal.html).not.toContain('data-testid="global-gameplay-performance-card"');
 
     steamModal.unmount();
     hostSpy.mockRestore();
@@ -1129,28 +1131,21 @@ describe('UI/UX Game Page, Launch & Compatibility Settings, and Storefront Funct
       },
     }));
 
-    // 1. CrossOver + Auto backend: Target Bottle Name is shown, DXVK HUD is enabled
+    // 1. CrossOver + Auto backend: Target Bottle Name is shown, unified Performance HUD radio group replaces split toggles
     expect(
       modal.findElements((el) => el.props?.['aria-label'] === 'Target Bottle Name').length
     ).toBe(1);
-    const getDxvkBtn = () =>
-      modal.findElements((el) => el.props?.['data-testid'] === 'toggle-dxvk-hud')[0];
-    expect(getDxvkBtn().props.disabled).toBe(false);
+    expect(modal.findElements((el) => el.props?.['data-testid'] === 'toggle-metal-hud').length).toBe(0);
+    expect(modal.findElements((el) => el.props?.['data-testid'] === 'toggle-dxvk-hud').length).toBe(0);
+    expect(modal.html).toContain('data-testid="performance-hud-group"');
+    expect(modal.html).toContain('data-testid="performance-hud-on"');
 
-    // Enable DXVK HUD, then switch Graphics Backend to D3DMetal -> DXVK HUD disables ("Unavailable") and is omitted on save!
-    getDxvkBtn().props.onClick();
-    modal.rerender();
-    expect(getDxvkBtn().props['aria-checked']).toBe(true);
-
+    // Switch Graphics Backend to D3DMetal, then switch runner to GPTK (with 0 bottles) -> hides no-op Target Bottle Name input & updates WinePrefix placeholder
     modal
       .findElements((el) => el.props?.['aria-label'] === 'Graphics Backend')[0]
       .props.onChange({ target: { value: 'd3dmetal' } });
     modal.rerender();
-    expect(getDxvkBtn().props.disabled).toBe(true);
-    expect(getDxvkBtn().props['aria-checked']).toBe(false);
-    expect(modal.html).toContain('Unavailable');
 
-    // Switch runner to GPTK (with 0 bottles) -> hides no-op Target Bottle Name input & updates WinePrefix placeholder
     modal
       .findElements((el) => el.props?.['data-testid'] === 'compat-runner-select')[0]
       .props.onChange({ target: { value: 'gptk' } });
@@ -1159,7 +1154,6 @@ describe('UI/UX Game Page, Launch & Compatibility Settings, and Storefront Funct
       modal.findElements((el) => el.props?.['aria-label'] === 'Target Bottle Name').length
     ).toBe(0);
     expect(modal.html).toContain('~/Games/OneLauncher/Prefixes/default');
-    expect(getDxvkBtn().props.disabled).toBe(true);
 
     // Verify technical text/textarea inputs disable spellCheck & autoCorrect, and macOS env placeholder omits Linux MANGOHUD
     expect(modal.html).not.toContain('MANGOHUD=1');
@@ -1176,13 +1170,14 @@ describe('UI/UX Game Page, Launch & Compatibility Settings, and Storefront Funct
       expect(inp.props.autoCorrect).toBe('off');
     }
 
-    // Save while on GPTK (where DXVK HUD is unsupported) -> dxvkHud must NOT leak into saved config
+    // Save while on GPTK -> legacy dxvkHud & metalHud must NOT leak into saved config
     const saveBtn = modal.findElements(
       (el) => el.type === 'button' && renderToString(el).includes('Save Configuration')
     )[0];
     await saveBtn.props.onClick();
     expect(savedCfg?.compatibilityLayer).toBe('gptk');
     expect(savedCfg?.dxvkHud).toBeUndefined();
+    expect(savedCfg?.metalHud).toBeUndefined();
     modal.unmount();
 
     // Native macOS .app build: switch to Direct mode to inspect Launch Arguments placeholder (omits Windows '-dx11')

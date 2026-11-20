@@ -733,7 +733,7 @@ describe("Universal Game Launcher QA — Progressive Disclosure & Dual Builds (3
         directBtn.props.onClick();
 
         const rDirect = render();
-        expect(rDirect.html).toContain('data-section="native-mac-settings"');
+        expect(rDirect.html).toContain('data-testid="performance-hud-group"');
         expect(rDirect.html).not.toContain('data-section="compatibility-layer-settings"');
       } finally {
         hostSpy.mockRestore();
@@ -795,12 +795,12 @@ describe("Universal Game Launcher QA — Progressive Disclosure & Dual Builds (3
 
         // Steam native defaults to 'storefront_uri' (Recommended): storefront-uri-notice shown, direct-only sections hidden
         expect(rInitial.html).toContain('data-section="storefront-uri-notice"');
-        expect(rInitial.html).not.toContain('data-section="native-mac-settings"');
+        expect(rInitial.html).toContain('data-testid="performance-hud-group"');
         expect(rInitial.html).not.toContain('data-section="executable-and-args"');
         expect(rInitial.html).not.toContain('data-section="environment-variables"');
         expect(rInitial.html).not.toContain('data-section="shell-hooks"');
 
-        // Click 'Direct macOS Application' mode button -> reveals native-mac-settings, executable-and-args, environment-variables, shell-hooks
+        // Click 'Direct macOS Application' mode button -> reveals unified performance-hud-group, executable-and-args, environment-variables, shell-hooks
         const directBtn = findElements(
           rInitial.vnode,
           (el) => el.type === 'button' && el.props?.['data-launch-mode'] === 'direct'
@@ -809,7 +809,7 @@ describe("Universal Game Launcher QA — Progressive Disclosure & Dual Builds (3
         directBtn.props.onClick();
 
         const rDirect = render();
-        expect(rDirect.html).toContain('data-section="native-mac-settings"');
+        expect(rDirect.html).toContain('data-testid="performance-hud-group"');
         expect(rDirect.html).toContain('data-section="executable-and-args"');
         expect(rDirect.html).toContain('data-section="environment-variables"');
         expect(rDirect.html).toContain('data-section="shell-hooks"');
@@ -826,7 +826,7 @@ describe("Universal Game Launcher QA — Progressive Disclosure & Dual Builds (3
 
         const rStoreUri = render();
         expect(rStoreUri.html).toContain('data-section="storefront-uri-notice"');
-        expect(rStoreUri.html).not.toContain('data-section="native-mac-settings"');
+        expect(rStoreUri.html).toContain('data-testid="performance-hud-group"');
         expect(rStoreUri.html).not.toContain('data-section="executable-and-args"');
         expect(rStoreUri.html).not.toContain('data-section="environment-variables"');
         expect(rStoreUri.html).not.toContain('data-section="shell-hooks"');
@@ -935,7 +935,7 @@ describe("Universal Game Launcher QA — Progressive Disclosure & Dual Builds (3
         expect(rAuto.html).toContain('Locate Existing Local Executable');
         expect(rAuto.html).toContain('Browse Executable...');
         expect(rAuto.html).not.toContain('Working Directory');
-        expect(rAuto.html).not.toContain('Launch Arguments');
+        expect(rAuto.html).toContain('data-testid="disclosure-execution-hooks"');
         expect(rAuto.html).toContain('Pre-Configure Compatibility Runner &amp; Bottle');
 
         // Clicking 'Pre-Configure Compatibility Runner & Bottle' reveals compatibility-layer-settings for pre-configuration

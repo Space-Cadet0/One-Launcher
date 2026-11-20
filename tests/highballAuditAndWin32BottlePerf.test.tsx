@@ -315,7 +315,7 @@ function auditWcag22AA(tree: any): string[] {
       }
       const cls = String(props.className || '');
       if (
-        !/\b(min-h-(?:[6-9]|\d{2,})|h-(?:[6-9]|\d{2,})|p-(?:[2-9]|\d{2,})|py-(?:[2-9]|1\.5|\d{2,})|underline)\b/.test(
+        !/(?:^|\s)(min-h-(?:[6-9]|\d{2,}|\[(?:2[4-9]|[3-9]\d|\d{3,})px\])|h-(?:[6-9]|\d{2,})|p-(?:[2-9]|\d{2,})|py-(?:[2-9]|1\.5|\d{2,})|underline)(?:\s|$)/.test(
           cls
         )
       ) {
@@ -2126,7 +2126,8 @@ describe('Clean-Room Launch Engine Hardening & 32-Bit PE32 Bottled Performance R
             n.props?.role === 'switch' &&
             typeof n.props?.['aria-checked'] === 'boolean'
         );
-        expect(switchButtons.length).toBeGreaterThanOrEqual(4);
+        // Unified Performance HUD moved to GameLaunchConfigModal radio group; CompatibilityLayerSection keeps DLSS, Legacy 96 DPI & 4GB LAA switches
+        expect(switchButtons.length).toBeGreaterThanOrEqual(3);
         const syncRadios = findVNodes(
           tree,
           (n) => n.type === 'input' && n.props?.type === 'radio'

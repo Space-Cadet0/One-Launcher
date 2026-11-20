@@ -264,6 +264,7 @@ function auditWcag22AA(tree: any): string[] {
       const cls = String(props.className || '');
       const hasMinTarget =
         /\bmin-h-(?:6|7|8|9|10|11|12)\b/.test(cls) ||
+        /(?:^|\s)min-h-\[(?:2[4-9]|[3-9]\d|\d{3,})px\](?:\s|$)/.test(cls) ||
         /\bh-(?:6|7|8|9|10|11|12)\b/.test(cls) ||
         /\bp-(?:1\.5|2|2\.5|3|3\.5|4)\b/.test(cls) ||
         /\bpy-(?:1|1\.5|2|2\.5|3)\b/.test(cls);
@@ -761,15 +762,19 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
       expect(findVNodeByTestId(tree, 'preferred-max-fps-select')?.type).toBe('select');
       expect(findVNodeByTestId(tree, 'emulate-modeset-select')?.type).toBe('select');
 
-      // <SwitchControl> role="switch" + boolean aria-checked
+      // <SwitchControl> role="switch" + boolean aria-checked + unified Performance HUD radio group
       const dlssSwitch = findVNodeByTestId(tree, 'toggle-crossover-dlss');
-      const metalHudSwitch = findVNodeByTestId(tree, 'toggle-metal-hud');
-      const dxvkHudSwitch = findVNodeByTestId(tree, 'toggle-dxvk-hud');
-      for (const sw of [dlssSwitch, metalHudSwitch, dxvkHudSwitch]) {
+      const legacy96DpiSwitch = findVNodeByTestId(tree, 'toggle-legacy-96dpi-mode');
+      for (const sw of [dlssSwitch, legacy96DpiSwitch]) {
         expect(sw?.type).toBe('button');
         expect(sw?.props?.role).toBe('switch');
         expect(typeof sw?.props?.['aria-checked']).toBe('boolean');
       }
+      expect(findVNodeByTestId(tree, 'toggle-metal-hud')).toBeUndefined();
+      expect(findVNodeByTestId(tree, 'toggle-dxvk-hud')).toBeUndefined();
+      expect(findVNodeByTestId(tree, 'performance-hud-group')).toBeDefined();
+      expect(findVNodeByTestId(tree, 'performance-hud-on')).toBeDefined();
+      expect(findVNodeByTestId(tree, 'performance-hud-off')).toBeDefined();
 
       // Wine Synchronization Mode radio group mutual exclusivity (MSync / ESync / Default)
       const getSyncRadios = (rootTree: any) => {
@@ -1057,7 +1062,7 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
       treeA = modalA.render();
       expect(ipcProgressListener).toBeTypeOf('function');
 
-      // 1. Emit determinate downloading event -> <progress max=100 value=45>
+      // 1. Emit determinate downloading event -> launcherService tracks live operation & modal stays clean/WCAG-compliant
       ipcProgressListener!({
         runnerType: 'crossover',
         operation: 'update',
@@ -1070,11 +1075,8 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
       });
       treeA = modalA.render();
 
-      const detProgress = findVNodeByTestId(treeA, 'runner-operation-progress');
-      expect(detProgress).toBeDefined();
-      expect(detProgress.props.max).toBe(100);
-      expect(detProgress.props.value).toBe(45);
-      expect(extractVNodeText(findVNodeByTestId(treeA, 'runner-operation-status'))).toContain('45%');
+      expect(launcherService.getActiveRunnerOperation('crossover')?.progressPercent).toBe(45);
+      expect(findVNodeByTestId(treeA, 'runner-status-banner')).toBeDefined();
       expect(auditWcag22AA(treeA)).toEqual([]);
 
       // 2. Unmount modal while update continues in background (`verifying_signature`), then remount!
@@ -1099,15 +1101,13 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
       await Promise.resolve();
       treeB = modalB.render();
 
-      const indetVerifyProgress = findVNodeByTestId(treeB, 'runner-operation-progress');
-      expect(indetVerifyProgress).toBeDefined();
-      expect(indetVerifyProgress.props.value).toBeUndefined();
-      expect(extractVNodeText(findVNodeByTestId(treeB, 'runner-operation-status'))).toContain(
-        'Verifying'
+      expect(launcherService.getActiveRunnerOperation('crossover')?.phase).toBe(
+        'verifying_signature'
       );
+      expect(launcherService.getActiveRunnerOperation('crossover')?.progressPercent).toBeNull();
       expect(auditWcag22AA(treeB)).toEqual([]);
 
-      // 3. Advance to indeterminate `installing` phase -> value remains undefined
+      // 3. Advance to indeterminate `installing` phase
       ipcProgressListener!({
         runnerType: 'crossover',
         operation: 'update',
@@ -1117,18 +1117,13 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
         updatedAt: '2026-06-15T12:01:30.000Z',
       });
       treeB = modalB.render();
-      const indetInstallProgress = findVNodeByTestId(treeB, 'runner-operation-progress');
-      expect(indetInstallProgress.props.value).toBeUndefined();
+      expect(launcherService.getActiveRunnerOperation('crossover')?.phase).toBe('installing');
       expect(auditWcag22AA(treeB)).toEqual([]);
 
-      // 4. Click Cancel button -> invokes cancelCompatibilityLayerOperation('crossover') and clears panel
-      const cancelBtn = findVNodeByTestId(treeB, 'cancel-runner-operation-btn');
-      expect(cancelBtn).toBeDefined();
-      await cancelBtn.props.onClick();
+      // 4. Cancel operation via launcherService -> invokes cancelCompatibilityLayerOperation('crossover') and clears active operation
+      await launcherService.cancelCompatibilityLayerOperation('crossover');
       expect(cancelIpcSpy).toHaveBeenCalledWith('crossover');
-
-      treeB = modalB.render();
-      expect(findVNodeByTestId(treeB, 'runner-live-progress-panel')).toBeUndefined();
+      expect(launcherService.getActiveRunnerOperation('crossover')).toBeUndefined();
       modalB.unmount();
     });
 
@@ -2530,17 +2525,14 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
 
       runnerSelectNoPreview.props.onChange({ target: { value: 'crossover_preview' } });
       treeNoPreview = modalNoPreview.render();
-      const previewInstallBtn = findVNodeByTestId(treeNoPreview, 'install-runner-brew-btn');
-      expect(previewInstallBtn).toBeDefined();
-      expect(extractVNodeText(previewInstallBtn).trim()).toBe(
-        'Sign In & Install CrossOver Preview (~480 MB)'
-      );
+      expect(findVNodeByTestId(treeNoPreview, 'runner-not-installed-callout')).toBeDefined();
+      expect(findVNodeByTestId(treeNoPreview, 'manage-runners-bottles-btn')).toBeDefined();
       expect(findVNodeByTestId(treeNoPreview, 'download-runner-btn')).toBeUndefined();
       expect(findVNodeByTestId(treeNoPreview, 'install-runner-archive-btn')).toBeUndefined();
       expect(auditWcag22AA(treeNoPreview)).toEqual([]);
       modalNoPreview.unmount();
 
-      // Part B: Verify 1-button "Update" UX + masked Heroic paths across all 4 runners
+      // Part B: Verify streamlined runner status banner + update badge & zero embedded clutter across all 4 runners
       const allFourLayers = [crossoverLayer, previewLayer, heroicGptkLayer, heroicWineLayer];
       vi.spyOn(launcherService, 'getCompatibilityLayers').mockReturnValue(allFourLayers);
       vi.spyOn(launcherService, 'detectCompatibilityLayers').mockResolvedValue(allFourLayers);
@@ -2561,49 +2553,28 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
       ).map((o) => o.props.value);
       expect(optionValuesWithPreview).toEqual(expectedRunnerOptions);
 
-      const expectedButtons: Array<{
+      const expectedRunners: Array<{
         runner: 'crossover' | 'gptk' | 'wine' | 'crossover_preview';
-        expectedAriaLabel: string;
-        expectedRenderedBinaryPath: string;
+        expectedVersion: string;
       }> = [
-        {
-          runner: 'crossover',
-          expectedAriaLabel: 'Update CrossOver to v26.4.0',
-          expectedRenderedBinaryPath:
-            '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine',
-        },
-        {
-          runner: 'gptk',
-          expectedAriaLabel: 'Update Apple GPTK to v3.0-3',
-          expectedRenderedBinaryPath:
-            '~/Library/Application Support/heroic/tools/game-porting-toolkit/Game-Porting-Toolkit-3.0b3/bin/wine64',
-        },
-        {
-          runner: 'wine',
-          expectedAriaLabel: 'Update Open-Source Wine to v11.21',
-          expectedRenderedBinaryPath:
-            '~/Library/Application Support/heroic/tools/wine/Wine-Staging-macOS-11.18/bin/wine64',
-        },
-        {
-          runner: 'crossover_preview',
-          expectedAriaLabel: 'Update CrossOver Preview to v27.0.1',
-          expectedRenderedBinaryPath:
-            '/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/bin/wine',
-        },
+        { runner: 'crossover', expectedVersion: '26.4.0' },
+        { runner: 'gptk', expectedVersion: '3.0-3' },
+        { runner: 'wine', expectedVersion: '11.21' },
+        { runner: 'crossover_preview', expectedVersion: '27.0.1' },
       ];
 
-      for (const item of expectedButtons) {
+      for (const item of expectedRunners) {
         findVNodeByTestId(treeAll, 'compat-runner-select').props.onChange({
           target: { value: item.runner },
         });
         treeAll = modalAll.render();
 
-        const updateBtn = findVNodeByTestId(treeAll, 'update-runner-btn');
-        expect(updateBtn).toBeDefined();
-        expect(extractVNodeText(updateBtn).trim()).toBe('Update');
-        expect(updateBtn.props['aria-label']).toBe(item.expectedAriaLabel);
+        const updateBadge = findVNodeByTestId(treeAll, 'runner-update-available-badge');
+        expect(updateBadge).toBeDefined();
+        expect(extractVNodeText(updateBadge)).toContain(item.expectedVersion);
+        expect(findVNodeByTestId(treeAll, 'manage-runners-bottles-btn')).toBeDefined();
 
-        // Zero secondary/clutter runner buttons may appear
+        // Zero secondary/clutter embedded runner buttons may appear inside per-game modal
         expect(findVNodeByTestId(treeAll, 'download-runner-btn')).toBeUndefined();
         expect(findVNodeByTestId(treeAll, 'install-runner-archive-btn')).toBeUndefined();
         expect(findVNodeByTestId(treeAll, 'switch-to-stable-crossover-btn')).toBeUndefined();
@@ -2613,14 +2584,13 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
           (n) => n.props?.['data-section'] === 'compatibility-layer-settings'
         )[0];
         const sectionText = extractVNodeText(compatSection);
-        expect(sectionText).toContain(item.expectedRenderedBinaryPath);
         expect(sectionText).not.toContain('/Users/player1/');
         expect(auditWcag22AA(treeAll)).toEqual([]);
       }
       modalAll.unmount();
 
-      // Part C: When crossover_preview has stableSurpassesPreview: true, clicking the single "Update"
-      // button updates via switchToStableCrossOver and promotes compatibilityLayer to 'crossover'
+      // Part C: When crossover_preview has stableSurpassesPreview: true, calling form.handleUpdateRunner()
+      // updates via switchToStableCrossOver and promotes compatibilityLayer to 'crossover'
       const surpassedPreviewLayer: CompatibilityLayerInfo = {
         ...previewLayer,
         version: '26.2.0',
@@ -2661,33 +2631,39 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
           message: 'Updated to CrossOver 26.4.0.',
         } as any);
 
-      const modalPromote = createDomain12DeepRenderer(GameLaunchConfigModal, {
-        isOpen: true,
-        game: synthGame,
-        initialPlatformId: 'steam',
-        onClose: vi.fn(),
-      });
+      const { useGameLaunchConfigForm } = await import(
+        '../src/components/Launcher/LaunchConfig/useGameLaunchConfigForm'
+      );
+      let promoteForm: ReturnType<typeof useGameLaunchConfigForm> | null = null;
+      const PromoteHarness = () => {
+        promoteForm = useGameLaunchConfigForm({
+          isOpen: true,
+          game: synthGame,
+          initialPlatformId: 'steam',
+          onClose: vi.fn(),
+        });
+        return React.createElement('div', {
+          'data-testid': 'promote-harness',
+          'data-compat-layer': promoteForm.compatibilityLayer,
+        });
+      };
+      const modalPromote = createDomain12DeepRenderer(PromoteHarness, {});
       let treePromote = modalPromote.render();
       await Promise.resolve();
       treePromote = modalPromote.render();
 
-      findVNodeByTestId(treePromote, 'compat-runner-select').props.onChange({
-        target: { value: 'crossover_preview' },
-      });
+      promoteForm!.handleSelectCompatibilityLayer('crossover_preview');
       treePromote = modalPromote.render();
 
-      expect(findVNodeByTestId(treePromote, 'switch-to-stable-crossover-btn')).toBeUndefined();
-      const singlePromoteUpdateBtn = findVNodeByTestId(treePromote, 'update-runner-btn');
-      expect(singlePromoteUpdateBtn).toBeDefined();
-      expect(extractVNodeText(singlePromoteUpdateBtn).trim()).toBe('Update');
-
-      await singlePromoteUpdateBtn.props.onClick();
+      await promoteForm!.handleUpdateRunner();
       treePromote = modalPromote.render();
 
       expect(updateSpy).toHaveBeenCalledWith('crossover_preview', {
         switchToStableCrossOver: true,
       });
-      expect(findVNodeByTestId(treePromote, 'compat-runner-select').props.value).toBe('crossover');
+      expect(findVNodeByTestId(treePromote, 'promote-harness').props['data-compat-layer']).toBe(
+        'crossover'
+      );
       modalPromote.unmount();
     });
 

@@ -36,6 +36,11 @@ import {
   reconcileCatalogTrophiesRecords,
   runIntelligentNonSteamMatchPass,
 } from '../utils/catalogMergeUtils';
+import {
+  reconcileCapsuleImage,
+  reconcileHeaderImage,
+} from '../services/storage/metadataReconciliation';
+import { getUserOverrideForGame } from '../services/storage/userOverrideStorage';
 import { clearFailedCoverUrls } from '../components/Library/LibraryGridView';
 import { clearFailedSidebarIconUrls } from '../components/Library/LibrarySidebar';
 import { SyncNoticeTone } from './useSyncNotice';
@@ -829,6 +834,11 @@ export function useManualLibrarySyncActions({
           import('../services/steam/steamAchievementsService'),
         ]);
 
+        const preEvictGogCover =
+          igdbCoverService.getGogVerticalCoverInstant(gogId, target.title) || undefined;
+        const preEvictIgdbCover =
+          igdbCoverService.getIgdbCoverInstant(target.title, targetAppId, target.id) || undefined;
+
         if (onlineLifecycleManager.isOnline()) {
           igdbCoverService.evictCacheForGame(target.title, gogId, targetAppId);
           if (targetAppId) {
@@ -863,18 +873,17 @@ export function useManualLibrarySyncActions({
               (refreshed?.capsuleImage && !isUnsuitableCoverUrl(refreshed.capsuleImage)
                 ? refreshed.capsuleImage
                 : undefined) ||
-              igdbCover;
+              igdbCover ||
+              preEvictGogCover ||
+              preEvictIgdbCover;
 
             if (refreshed || validRefreshedCapsule) {
               const updated = gamesRef.current.map((g) => {
                 if (g.id === target.id) {
+                  const userOv = getUserOverrideForGame(g);
                   const cleanDevelopers = refreshed?.developers?.filter(
                     (d) => d && d !== 'Unknown Developer'
                   );
-                  const existingValidCapsule =
-                    g.capsuleImage && !isUnsuitableCoverUrl(g.capsuleImage)
-                      ? g.capsuleImage
-                      : undefined;
                   const safeRefreshed =
                     refreshed &&
                     refreshed.metadataQuality === 'skeleton_fallback' &&
@@ -882,11 +891,25 @@ export function useManualLibrarySyncActions({
                     g.enrichedMetadata.metadataQuality !== 'skeleton_fallback'
                       ? undefined
                       : refreshed;
+                  const nextHeader =
+                    reconcileHeaderImage(g.headerImage, safeRefreshed?.headerImage, {
+                      gameId: g.id,
+                      title: g.title,
+                      gogId,
+                      userOverrideHeader: userOv?.headerImage,
+                    }) || g.headerImage;
+                  const nextCapsule = reconcileCapsuleImage(g.capsuleImage, validRefreshedCapsule, {
+                    gameId: g.id,
+                    title: g.title,
+                    gogId,
+                    userOverrideCapsule: userOv?.capsuleImage,
+                    headerUrl: nextHeader,
+                  });
                   return {
                     ...g,
                     enrichedMetadata: safeRefreshed || g.enrichedMetadata,
-                    headerImage: safeRefreshed?.headerImage || g.headerImage,
-                    capsuleImage: validRefreshedCapsule || existingValidCapsule,
+                    headerImage: nextHeader,
+                    capsuleImage: nextCapsule,
                     shortDescription:
                       safeRefreshed?.shortDescription &&
                       !isGenericPlaceholderSynopsis(safeRefreshed.shortDescription, target.title)
@@ -947,6 +970,24 @@ export function useManualLibrarySyncActions({
               ? browseAssets.capsuleImage
               : undefined);
 
+          if (!resolvedVerticalCover && gogId) {
+            const instantGogCover =
+              igdbCoverService.getGogVerticalCoverInstant(gogId, target.title) || undefined;
+            if (instantGogCover && !isUnsuitableCoverUrl(instantGogCover)) {
+              resolvedVerticalCover = instantGogCover;
+            } else {
+              const fetchedGogCover =
+                (await igdbCoverService
+                  .fetchGogVerticalCover(gogId, target.title, RequestPriority.P0_INTERACTIVE)
+                  .catch(() => null)) || undefined;
+              if (fetchedGogCover && !isUnsuitableCoverUrl(fetchedGogCover)) {
+                resolvedVerticalCover = fetchedGogCover;
+              } else if (preEvictGogCover && !isUnsuitableCoverUrl(preEvictGogCover)) {
+                resolvedVerticalCover = preEvictGogCover;
+              }
+            }
+          }
+
           if (!resolvedVerticalCover) {
             resolvedVerticalCover =
               (await igdbCoverService
@@ -955,12 +996,16 @@ export function useManualLibrarySyncActions({
                   refreshed?.releaseDate || target.releaseDate,
                   RequestPriority.P0_INTERACTIVE
                 )
-                .catch(() => null)) || undefined;
+                .catch(() => null)) ||
+              preEvictGogCover ||
+              preEvictIgdbCover ||
+              undefined;
           }
 
           if (refreshed || browseAssets || resolvedVerticalCover || liveAchs) {
             const updated = gamesRef.current.map((g) => {
               if (g.id === target.id) {
+                const userOv = getUserOverrideForGame(g);
                 const updatedPlatforms = g.platforms.map((p) => {
                   if (p.platformId === 'steam' && liveAchs) {
                     return {
@@ -971,10 +1016,6 @@ export function useManualLibrarySyncActions({
                   return p;
                 });
 
-                const existingValidCapsule =
-                  g.capsuleImage && !isUnsuitableCoverUrl(g.capsuleImage)
-                    ? g.capsuleImage
-                    : undefined;
                 const safeRefreshed =
                   refreshed &&
                   refreshed.metadataQuality === 'skeleton_fallback' &&
@@ -982,15 +1023,38 @@ export function useManualLibrarySyncActions({
                   g.enrichedMetadata.metadataQuality !== 'skeleton_fallback'
                     ? undefined
                     : refreshed;
+                const nextHeader =
+                  reconcileHeaderImage(
+                    g.headerImage,
+                    safeRefreshed?.headerImage || browseAssets?.headerImage,
+                    {
+                      gameId: g.id,
+                      title: g.title,
+                      steamAppId: targetAppId,
+                      gogId,
+                      userOverrideHeader: userOv?.headerImage,
+                    }
+                  ) || g.headerImage;
+                const nextCapsule = reconcileCapsuleImage(
+                  g.capsuleImage,
+                  resolvedVerticalCover || preEvictGogCover || preEvictIgdbCover,
+                  {
+                    gameId: g.id,
+                    title: g.title,
+                    steamAppId: targetAppId,
+                    gogId,
+                    userOverrideCapsule: userOv?.capsuleImage,
+                    headerUrl: nextHeader,
+                  }
+                );
 
                 return {
                   ...g,
                   steamAppId: targetAppId,
                   platforms: updatedPlatforms,
                   enrichedMetadata: safeRefreshed || g.enrichedMetadata,
-                  headerImage:
-                    safeRefreshed?.headerImage || browseAssets?.headerImage || g.headerImage,
-                  capsuleImage: resolvedVerticalCover || existingValidCapsule,
+                  headerImage: nextHeader,
+                  capsuleImage: nextCapsule,
                   iconUrl: browseAssets?.iconUrl || g.iconUrl,
                   shortDescription: safeRefreshed?.shortDescription || g.shortDescription,
                   developers: safeRefreshed?.developers?.length

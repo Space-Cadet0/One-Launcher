@@ -119,7 +119,8 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
       expect(env1.WINEMSYNC).toBe('1');
       expect(env1.WINEESYNC).toBe('0');
       expect(env1.MTL_HUD_ENABLED).toBe('1');
-      expect(env1.DXVK_HUD).toBe('devinfo,fps,frametimes');
+      // Unified Performance HUD: when Apple Metal HUD is active on D3DMetal, DXVK_HUD is stripped to prevent double overlays
+      expect(env1.DXVK_HUD).toBeUndefined();
 
       const conf1 = fs.readFileSync(cxbottleConfPath, 'utf8');
       expect(conf1).toContain('"CUSTOM_VAR" = "keep_me"');
@@ -512,7 +513,10 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         if (predicate(node)) acc.push(node);
         if (
           typeof node.type === 'function' &&
-          (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+          (node.type.name === 'LaunchSelect' ||
+            node.type.name === 'SwitchControl' ||
+            node.type.name === 'SegmentedRadioGroup' ||
+            node.type.name === 'LaunchDisclosure')
         ) {
           findElements(node.type(node.props || {}), predicate, acc);
         } else if (node.props && node.props.children) {
@@ -586,13 +590,10 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         expect(r1.html).toContain('Windows Build (.exe) on macOS');
         expect(r1.html).toContain('Custom Runner &amp; Bottle');
         expect(r1.html).not.toContain('Storefront Client Protocol');
-        expect(r1.html).toContain('CrossOver 26 Rendering &amp; Display Settings');
         expect(r1.html).toContain('aria-label="Graphics Backend"');
-        expect(r1.html).toContain('aria-label="High Resolution Mode"');
-        expect(r1.html).toContain('DLSS (MetalFX Upscaling)');
-        expect(r1.html).toContain(
-          'Exposes NVIDIA DLSS to the game (powered by Apple MetalFX) for D3DMetal &amp; DXMT — select Quality / Balanced / Performance inside the game’s graphics settings.'
-        );
+        expect(r1.html).toContain('data-testid="toggle-legacy-96dpi-mode"');
+        expect(r1.html).toContain('data-testid="toggle-crossover-dlss"');
+        expect(r1.html).toContain('data-testid="performance-hud-group"');
 
         // Verify default MSync/ESync mutual exclusion state (MSync: checked, ESync: unchecked)
         const getMsyncRadio = (vnode: any) =>
@@ -648,18 +649,19 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         expect(r3.html).toContain('Not available with DXVK or WineD3D');
         expect(r3.html).toContain('Unavailable');
 
-        // Select Graphics Backend = 'd3dmetal', enable High Resolution Mode and DLSS, and Save
+        // Select Graphics Backend = 'd3dmetal', enable Legacy 96 DPI Mode and DLSS, and Save
         const backendSelect3 = findElements(
           r3.vnode,
           (el) => el.type === 'select' && el.props?.['aria-label'] === 'Graphics Backend'
         )[0];
         backendSelect3.props.onChange({ target: { value: 'd3dmetal' } });
 
-        const retinaSelect = findElements(
+        const legacy96DpiBtn = findElements(
           r3.vnode,
-          (el) => el.type === 'select' && el.props?.['aria-label'] === 'High Resolution Mode'
+          (el) => el.type === 'button' && el.props?.['data-testid'] === 'toggle-legacy-96dpi-mode'
         )[0];
-        retinaSelect.props.onChange({ target: { value: 'true' } });
+        expect(legacy96DpiBtn).toBeDefined();
+        legacy96DpiBtn.props.onClick();
 
         const r4 = renderConfigModal();
         const dlssBtn = findElements(
@@ -681,7 +683,7 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         expect(saveSpy.mock.calls[0][0]).toMatchObject({
           gameId: 'steam-2320',
           crossoverGraphicsBackend: 'd3dmetal',
-          crossoverHighResolutionMode: true,
+          crossoverHighResolutionMode: false,
           crossoverDlss: true,
           wineMsync: true,
           wineEsync: false,
@@ -893,7 +895,10 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
           if (predicate(node)) acc.push(node);
           if (
             typeof node.type === 'function' &&
-            (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+            (node.type.name === 'LaunchSelect' ||
+              node.type.name === 'SwitchControl' ||
+              node.type.name === 'SegmentedRadioGroup' ||
+              node.type.name === 'LaunchDisclosure')
           ) {
             findElements(node.type(node.props || {}), predicate, acc);
           } else if (node.props && node.props.children) {
@@ -994,11 +999,13 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         )[0];
         expect(backendSelectGog.props.value).toBe('d3dmetal');
 
-        const retinaSelectGog = findElements(
+        const legacy96DpiSwitchGog = findElements(
           modalGogRender.vnode,
-          (el) => el.type === 'select' && el.props?.['aria-label'] === 'High Resolution Mode'
+          (el) => el.type === 'button' && el.props?.['data-testid'] === 'toggle-legacy-96dpi-mode'
         )[0];
-        expect(retinaSelectGog.props.value).toBe('true');
+        expect(legacy96DpiSwitchGog).toBeDefined();
+        // Legacy crossoverHighResolutionMode: true normalizes cleanly to Retina default (Legacy 96 DPI off)
+        expect(legacy96DpiSwitchGog.props['aria-checked']).toBe(false);
 
         const bottleSelectGog = findElements(
           modalGogRender.vnode,
@@ -1052,11 +1059,12 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         )[0];
         expect(backendSelectSteam.props.value).toBe('dxmt');
 
-        const retinaSelectSteam = findElements(
+        const legacy96DpiSwitchSteam = findElements(
           modalSteamCompatRender.vnode,
-          (el) => el.type === 'select' && el.props?.['aria-label'] === 'High Resolution Mode'
+          (el) => el.type === 'button' && el.props?.['data-testid'] === 'toggle-legacy-96dpi-mode'
         )[0];
-        expect(retinaSelectSteam.props.value).toBe('false');
+        expect(legacy96DpiSwitchSteam).toBeDefined();
+        expect(legacy96DpiSwitchSteam.props['aria-checked']).toBe(true);
 
         const bottleSelectSteam = findElements(
           modalSteamCompatRender.vnode,
@@ -1078,9 +1086,9 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
           launchMethod: 'compatibility_layer',
           wineBottleName: 'GOGBottle',
           crossoverGraphicsBackend: 'd3dmetal',
-          crossoverHighResolutionMode: true,
           customExecutablePath: tempGogExe,
         });
+        expect(savedModalConfig.platformConfigs?.gog?.crossoverHighResolutionMode).toBeUndefined();
         expect(savedModalConfig.platformConfigs?.steam).toMatchObject({
           launchMethod: 'compatibility_layer',
           wineBottleName: 'SteamBottle',
@@ -1246,7 +1254,10 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
           if (predicate(node)) acc.push(node);
           if (
             typeof node.type === 'function' &&
-            (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+            (node.type.name === 'LaunchSelect' ||
+              node.type.name === 'SwitchControl' ||
+              node.type.name === 'SegmentedRadioGroup' ||
+              node.type.name === 'LaunchDisclosure')
           ) {
             findElements(node.type(node.props || {}), predicate, acc);
           } else if (node.props && node.props.children) {
@@ -1332,9 +1343,11 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         expect(gogRender.html).not.toContain('ESync');
         expect(gogRender.html).not.toContain('DXVK HUD');
 
-        // Verify GOG native macOS .app DOES render native macOS Metal HUD section and exactly 2 native launch modes
-        expect(gogRender.html).toContain('data-section="native-mac-settings"');
-        expect(gogRender.html).toContain('Apple Metal Performance HUD (MTL_HUD_ENABLED=1)');
+        // Verify GOG native macOS .app DOES render unified Performance HUD radio group and exactly 2 native launch modes
+        expect(gogRender.html).toContain('data-testid="performance-hud-group"');
+        expect(gogRender.html).toContain('data-testid="performance-hud-on"');
+        expect(gogRender.html).not.toContain('data-testid="toggle-metal-hud"');
+        expect(gogRender.html).not.toContain('data-testid="toggle-dxvk-hud"');
         expect(gogRender.html).toContain('Direct macOS Application (Recommended)');
         expect(gogRender.html).toContain('Storefront Client Protocol');
         expect(gogRender.html).not.toContain('Auto-Detect Native macOS Launch');
@@ -1352,38 +1365,31 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
 
         const steamRender = renderHybridModal();
         expect(steamRender.html).toContain('Launch &amp; Compatibility Settings');
-        expect(steamRender.html).not.toContain('data-section="native-mac-settings"');
         expect(steamRender.html).toContain('data-section="compatibility-layer-settings"');
-        expect(steamRender.html).toContain(
-          'macOS Compatibility Layer (CrossOver / Apple GPTK / Wine)'
-        );
-        expect(steamRender.html).toContain('CrossOver 26 Rendering &amp; Display Settings');
         expect(steamRender.html).toContain('aria-label="Graphics Backend"');
-        expect(steamRender.html).toContain('aria-label="High Resolution Mode"');
-        expect(steamRender.html).toContain('DLSS (MetalFX Upscaling)');
+        expect(steamRender.html).toContain('data-testid="toggle-legacy-96dpi-mode"');
+        expect(steamRender.html).toContain('data-testid="toggle-crossover-dlss"');
         expect(steamRender.html).toContain('MSync');
         expect(steamRender.html).toContain('ESync');
-        expect(steamRender.html).toContain('DXVK / DXMT HUD');
+        expect(steamRender.html).toContain('data-testid="performance-hud-group"');
 
         // 5. Switch Compatibility Runner on the Steam storefront to 'gptk'
         const runnerSelect = findElements(
           steamRender.vnode,
-          (el) => el.type === 'select' && el.props?.['aria-label'] === 'Compatibility Runner'
+          (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
         )[0];
         expect(runnerSelect).toBeDefined();
         runnerSelect.props.onChange({ target: { value: 'gptk' } });
 
         const gptkRender = renderHybridModal();
         // Verify CrossOver-only Graphics Backend and DLSS hide while Wine/GPTK Display & Sync settings remain visible
-        expect(gptkRender.html).not.toContain('CrossOver 26 Rendering &amp; Display Settings');
         expect(gptkRender.html).not.toContain('aria-label="Graphics Backend"');
         expect(gptkRender.html).not.toContain('DLSS (MetalFX Upscaling)');
-        expect(gptkRender.html).toContain('Wine / GPTK Display &amp; Synchronization Settings');
-        expect(gptkRender.html).toContain('aria-label="High Resolution Mode"');
+        expect(gptkRender.html).toContain('data-testid="toggle-legacy-96dpi-mode"');
         expect(gptkRender.html).toContain('MSync');
         expect(gptkRender.html).toContain('ESync');
 
-        // 6. Switch back to GOG (mac_native_app), toggle native Metal HUD on, and click Save Configuration
+        // 6. Switch back to GOG (mac_native_app), select unified Performance HUD 'on', and click Save Configuration
         const gogPillBtn2 = findElements(
           gptkRender.vnode,
           (el) => el.type === 'button' && el.props?.['data-storefront-pill'] === 'gog'
@@ -1392,17 +1398,17 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         gogPillBtn2.props.onClick();
 
         const gogRender2 = renderHybridModal();
-        const nativeSection = findElements(
+        const perfHudOnLabel = findElements(
           gogRender2.vnode,
-          (el) => el.props?.['data-section'] === 'native-mac-settings'
+          (el) => el.props?.['data-testid'] === 'performance-hud-on'
         )[0];
-        expect(nativeSection).toBeDefined();
-        const metalHudToggleBtn = findElements(
-          nativeSection,
-          (el) => el.type === 'button'
+        expect(perfHudOnLabel).toBeDefined();
+        const perfHudOnRadio = findElements(
+          perfHudOnLabel,
+          (el) => el.type === 'input' && el.props?.type === 'radio'
         )[0];
-        expect(metalHudToggleBtn).toBeDefined();
-        metalHudToggleBtn.props.onClick();
+        expect(perfHudOnRadio).toBeDefined();
+        perfHudOnRadio.props.onChange();
 
         const gogRender3 = renderHybridModal();
         const saveBtn = findElements(
@@ -1415,9 +1421,11 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         expect(onSavedMock).toHaveBeenCalledTimes(1);
         const savedConfig = onSavedMock.mock.calls[0][0];
 
-        // Verify platformConfigs.gog has metalHud: true and no Wine/CrossOver pollution
+        // Verify platformConfigs.gog has unified performanceHud: 'on' and no Wine/CrossOver pollution
         expect(savedConfig.platformConfigs?.gog).toBeDefined();
-        expect(savedConfig.platformConfigs?.gog?.metalHud).toBe(true);
+        expect(savedConfig.platformConfigs?.gog?.performanceHud).toBe('on');
+        expect(savedConfig.platformConfigs?.gog?.metalHud).toBeUndefined();
+        expect(savedConfig.platformConfigs?.gog?.dxvkHud).toBeUndefined();
         expect(savedConfig.platformConfigs?.gog?.compatibilityLayer).toBeUndefined();
         expect(savedConfig.platformConfigs?.gog?.wineBottleName).toBeUndefined();
         expect(savedConfig.platformConfigs?.gog?.crossoverGraphicsBackend).toBeUndefined();
@@ -2214,7 +2222,10 @@ setTimeout(() => process.exit(0), 1000);
         if (predicate(node)) acc.push(node);
         if (
           typeof node.type === 'function' &&
-          (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+          (node.type.name === 'LaunchSelect' ||
+            node.type.name === 'SwitchControl' ||
+            node.type.name === 'SegmentedRadioGroup' ||
+            node.type.name === 'LaunchDisclosure')
         ) {
           findElements(node.type(node.props || {}), predicate, acc);
         } else if (node.props && node.props.children) {
@@ -2301,46 +2312,40 @@ setTimeout(() => process.exit(0), 1000);
         expect(optionValues).not.toContain('native');
         expect(optionValues).not.toContain('whisky');
 
-        // 2. When 'crossover' (installed) is selected, runner-details-card shows Up to Date
-        expect(r1.html).toContain('data-testid="runner-details-card"');
-        expect(r1.html).toContain('Up to Date');
+        // 2. When 'crossover' (installed) is selected, streamlined runner-status-banner renders with Manage Runners link (embedded installer removed)
+        expect(r1.html).toContain('data-testid="runner-status-banner"');
+        expect(r1.html).toContain('data-testid="manage-runners-bottles-btn"');
         expect(r1.html).not.toContain('data-testid="runner-not-installed-callout"');
 
-        // 2b. Switch runner to uninstalled 'crossover_preview' -> renders in-app Sign In & Install button
+        // 2b. Switch runner to uninstalled 'crossover_preview' -> renders compact not-installed callout linking to Setup Wizard
         runnerSelect.props.onChange({ target: { value: 'crossover_preview' } });
         const rPreview = renderModal();
         expect(rPreview.html).toContain('data-testid="runner-not-installed-callout"');
-        expect(rPreview.html).toContain('data-testid="install-runner-brew-btn"');
-        expect(rPreview.html).toContain('Sign In &amp; Install CrossOver Preview (~480 MB)');
+        expect(rPreview.html).toContain('data-testid="manage-runners-bottles-btn"');
         expect(rPreview.html).not.toContain('data-testid="download-runner-btn"');
         expect(rPreview.html).not.toContain('data-testid="install-runner-archive-btn"');
 
-        // 3. Switch runner to uninstalled 'wine' -> renders runner-not-installed-callout + 1-click Install button
+        // 3. Switch runner to uninstalled 'wine' -> renders runner-not-installed-callout + Manage Runners CTA
         const runnerSelectFromPreview = findElements(
           rPreview.vnode,
           (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
         )[0];
         runnerSelectFromPreview.props.onChange({ target: { value: 'wine' } });
         const rWine = renderModal();
-        expect(rWine.html).toContain('data-testid="runner-details-card"');
         expect(rWine.html).toContain('data-testid="runner-not-installed-callout"');
-        expect(rWine.html).toContain('Runner Not Installed on This Mac');
-        expect(rWine.html).toContain('Install Open-Source Wine (~240 MB)');
-        expect(rWine.html).toContain('Re-Scan Installed Runners');
+        expect(rWine.html).toContain('data-testid="manage-runners-bottles-btn"');
         expect(rWine.html).not.toContain('data-testid="download-runner-btn"');
         expect(rWine.html).not.toContain('data-testid="install-runner-archive-btn"');
 
-        // 4. Switch runner to uninstalled 'gptk' -> renders runner-not-installed-callout + 1-click Install button
+        // 4. Switch runner to uninstalled 'gptk' -> renders runner-not-installed-callout + Manage Runners CTA
         const runnerSelect2 = findElements(
           rWine.vnode,
           (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
         )[0];
         runnerSelect2.props.onChange({ target: { value: 'gptk' } });
         const rGptk = renderModal();
-        expect(rGptk.html).toContain('data-testid="runner-details-card"');
         expect(rGptk.html).toContain('data-testid="runner-not-installed-callout"');
-        expect(rGptk.html).toContain('Install Apple GPTK (~228 MB)');
-        expect(rGptk.html).toContain('Re-Scan Installed Runners');
+        expect(rGptk.html).toContain('data-testid="manage-runners-bottles-btn"');
         expect(rGptk.html).not.toContain('data-testid="download-runner-btn"');
 
         // 5. Verify launcherEngine.installCompatibilityLayer & launcherService.installCompatibilityLayer
@@ -2737,7 +2742,10 @@ setTimeout(() => process.exit(0), 1000);
         if (predicate(node)) acc.push(node);
         if (
           typeof node.type === 'function' &&
-          (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+          (node.type.name === 'LaunchSelect' ||
+            node.type.name === 'SwitchControl' ||
+            node.type.name === 'SegmentedRadioGroup' ||
+            node.type.name === 'LaunchDisclosure')
         ) {
           findElements(node.type(node.props || {}), predicate, acc);
         } else if (node.props && node.props.children) {
@@ -2821,27 +2829,22 @@ setTimeout(() => process.exit(0), 1000);
         );
         expect(optionTexts).toContain('CrossOver Preview — v27.0.0 Installed');
 
-        // 2. Verify runner-version-update-row and runner-installed-version show deduplicated v26.3.0 · Build 39832
-        expect(r1.html).toContain('data-testid="runner-version-update-row"');
+        // 2. Verify streamlined runner-status-banner & runner-installed-version show deduplicated v26.3.0 · Build 39832
+        expect(r1.html).toContain('data-testid="runner-status-banner"');
         expect(r1.html).toContain('data-testid="runner-installed-version"');
         expect(r1.html).toContain('v26.3.0 · Build 39832');
 
-        // 3. Verify runner-update-available-badge and update-runner-btn render and trigger updateCompatibilityLayer('crossover')
+        // 3. Verify runner-update-available-badge renders and Manage Runners CTA routes runner updates to Setup Wizard
         expect(r1.html).toContain('data-testid="runner-update-available-badge"');
-        expect(r1.html).toContain('Update Available: v26.4.0');
-        expect(r1.html).toContain('data-testid="update-runner-btn"');
-        expect(r1.html).toContain('aria-label="Update CrossOver to v26.4.0"');
-        expect(r1.html).toContain('>Update<');
+        expect(r1.html).toContain('Update v26.4.0');
+        expect(r1.html).toContain('data-testid="manage-runners-bottles-btn"');
+        expect(r1.html).not.toContain('data-testid="update-runner-btn"');
 
-        const updateBtn = findElements(
-          r1.vnode,
-          (el) => el.type === 'button' && el.props?.['data-testid'] === 'update-runner-btn'
-        )[0];
-        expect(updateBtn).toBeDefined();
-        await updateBtn.props.onClick();
+        // Service-level updateCompatibilityLayer remains wired cleanly
+        await launcherService.updateCompatibilityLayer('crossover');
         expect(updateRunnerSpy).toHaveBeenCalledWith('crossover');
 
-        // 4. Switch to crossover_preview -> shows deduplicated v27.0.0 · Preview 20261006, runner-up-to-date-badge ("Up to Date"), and check-runner-updates-btn
+        // 4. Switch to crossover_preview -> shows deduplicated v27.0.0 · Preview 20261006 and omits update badge when up to date
         const runnerSelectAfter = findElements(
           r1.vnode,
           (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
@@ -2850,9 +2853,8 @@ setTimeout(() => process.exit(0), 1000);
 
         const rPreview = renderModal();
         expect(rPreview.html).toContain('v27.0.0 · Preview 20261006');
-        expect(rPreview.html).toContain('data-testid="runner-up-to-date-badge"');
-        expect(rPreview.html).toContain('Up to Date');
-        expect(rPreview.html).toContain('data-testid="check-runner-updates-btn"');
+        expect(rPreview.html).toContain('data-testid="runner-status-banner"');
+        expect(rPreview.html).not.toContain('data-testid="runner-update-available-badge"');
       } finally {
         detectSpy.mockRestore();
         getLayersSpy.mockRestore();
@@ -3194,7 +3196,10 @@ setTimeout(() => process.exit(0), 1000);
           if (predicate(node)) acc.push(node);
           if (
             typeof node.type === 'function' &&
-            (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+            (node.type.name === 'LaunchSelect' ||
+              node.type.name === 'SwitchControl' ||
+              node.type.name === 'SegmentedRadioGroup' ||
+              node.type.name === 'LaunchDisclosure')
           ) {
             findElements(node.type(node.props || {}), predicate, acc);
           } else if (node.props && node.props.children) {

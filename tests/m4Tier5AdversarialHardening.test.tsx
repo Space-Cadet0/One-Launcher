@@ -1540,21 +1540,13 @@ describe('M4 Tier 5 Adversarial Hardening Suite', () => {
       });
       const switchRenderer = createDomain12DeepRenderer(() => sectionWithSwitch, {});
       const switchTree = switchRenderer.render();
-      const switchBtn = findByTestId(switchTree, 'switch-to-stable-crossover-btn');
-      expect(switchBtn).toBeDefined();
-      switchBtn!.props.onClick();
-      expect(switchSpy).toHaveBeenCalledTimes(1);
-
-      const updFeedback = findByTestId(switchTree, 'runner-update-feedback');
-      expect(updFeedback?.props.role).toBe('alert');
-      expect(updFeedback?.props['aria-live']).toBe('assertive');
-
-      const actFeedback = findByTestId(switchTree, 'runner-action-feedback');
-      expect(actFeedback?.props.role).toBe('alert');
-      expect(actFeedback?.props['aria-live']).toBe('assertive');
+      // Streamlined CompatibilityLayerSection removes embedded switch/archive buttons and routes runner management to Setup Wizard
+      expect(findByTestId(switchTree, 'runner-status-banner')).toBeDefined();
+      expect(findByTestId(switchTree, 'manage-runners-bottles-btn')).toBeDefined();
+      expect(findByTestId(switchTree, 'switch-to-stable-crossover-btn')).toBeUndefined();
       switchRenderer.unmount();
 
-      // Archive button renders & fires when !canAutoInstallRunner and runner not installed
+      // Uninstalled runner renders compact not-installed callout linking to Manage Runners & Bottles
       const archiveSection = React.createElement(CompatibilityLayerSection, {
         isWindowsHost: false,
         preview: basePreview,
@@ -1610,14 +1602,9 @@ describe('M4 Tier 5 Adversarial Hardening Suite', () => {
       });
       const archiveRenderer = createDomain12DeepRenderer(() => archiveSection, {});
       const archiveTree = archiveRenderer.render();
-      const archiveBtn = findByTestId(archiveTree, 'install-runner-archive-btn');
-      expect(archiveBtn).toBeDefined();
-      archiveBtn!.props.onClick();
-      expect(archiveSpy).toHaveBeenCalledTimes(1);
-
-      const statusFeedback = findByTestId(archiveTree, 'runner-action-feedback');
-      expect(statusFeedback?.props.role).toBe('status');
-      expect(statusFeedback?.props['aria-live']).toBe('polite');
+      expect(findByTestId(archiveTree, 'runner-not-installed-callout')).toBeDefined();
+      expect(findByTestId(archiveTree, 'manage-runners-bottles-btn')).toBeDefined();
+      expect(findByTestId(archiveTree, 'install-runner-archive-btn')).toBeUndefined();
       archiveRenderer.unmount();
     } finally {
       fs.rmSync(sandbox, { recursive: true, force: true });
@@ -2280,19 +2267,23 @@ describe('M4 Tier 5 Adversarial Hardening Suite', () => {
 
       const updatePromise = latestForm!.handleUpdateRunner();
       tree = renderer.render();
-      expect(findByTestId(tree, 'runner-live-progress-panel')).toBeDefined();
+      expect(latestForm!.isUpdatingRunner).toBe(true);
+      expect(latestForm!.isAnotherRunnerOperationActive).toBe(false);
+      expect(findByTestId(tree, 'runner-status-banner')).toBeDefined();
 
-      // Switch dropdown to unrelated 'crossover'
+      // Switch dropdown to unrelated 'crossover' -> isAnotherRunnerOperationActive becomes true while isUpdatingRunner stays false for crossover
       latestForm!.handleSelectCompatibilityLayer('crossover');
       tree = renderer.render();
-      expect(findByTestId(tree, 'runner-live-progress-panel')).toBeUndefined();
-      const crossoverUpdateBtn = findByTestId(tree, 'update-runner-btn');
-      expect(crossoverUpdateBtn?.props.disabled).toBe(true);
+      expect(latestForm!.compatibilityLayer).toBe('crossover');
+      expect(latestForm!.isUpdatingRunner).toBe(false);
+      expect(latestForm!.isAnotherRunnerOperationActive).toBe(true);
 
-      // Switch back to 'crossover_preview_arm64' -> progress panel visible again
+      // Switch back to 'crossover_preview_arm64' -> isUpdatingRunner restores to true
       latestForm!.handleSelectCompatibilityLayer('crossover_preview_arm64');
       tree = renderer.render();
-      expect(findByTestId(tree, 'runner-live-progress-panel')).toBeDefined();
+      expect(latestForm!.compatibilityLayer).toBe('crossover_preview_arm64');
+      expect(latestForm!.isUpdatingRunner).toBe(true);
+      expect(latestForm!.isAnotherRunnerOperationActive).toBe(false);
 
       resolveHolder.fn?.({
         success: true,

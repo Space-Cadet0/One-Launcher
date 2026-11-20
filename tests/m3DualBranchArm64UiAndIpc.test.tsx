@@ -1394,7 +1394,7 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
       );
       expect(optionVals).toContain(selectEl!.props.value);
       expect(selectEl!.props.value).toBe('crossover');
-      expect(getTextContent(xTree)).toContain('1 Detected on System');
+      expect(findByTestId(xTree, 'runner-status-banner')).toBeDefined();
       x64Modal.unmount();
 
       // Uninstalled preview placeholder check in CompatibilityLayerSection
@@ -2414,9 +2414,9 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
       expect(bottleControl.props.value).toBe('');
       expect(bottleOpts).toEqual(['', 'OneLauncher']);
       expect(findByTestId(tree, 'compat-bottle-arch-mismatch-warning')).toBeUndefined();
-      const installedVerText = getTextContent(findByTestId(tree, 'runner-installed-version')!);
-      expect(installedVerText).toContain('CrossOver');
-      expect(installedVerText).not.toContain('arm64 / FEX');
+      const statusBannerText = getTextContent(findByTestId(tree, 'runner-status-banner')!);
+      expect(statusBannerText).toContain('CrossOver');
+      expect(statusBannerText).not.toContain('arm64 / FEX');
       section.unmount();
     });
   });
@@ -4362,21 +4362,27 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         crossover_preview: updateAvailableSurpassInfo,
       });
 
-      const modal = createDomain12DeepRenderer(GameLaunchConfigModal, {
-        isOpen: true,
-        game,
-        initialPlatformId: 'steam',
-        onClose: vi.fn(),
-      });
-      modal.render();
+      let formSessionA: ReturnType<typeof useGameLaunchConfigForm> | null = null;
+      const ModalFormHarness = ({ isOpen }: { isOpen: boolean }) => {
+        formSessionA = useGameLaunchConfigForm({
+          isOpen,
+          game,
+          initialPlatformId: 'steam',
+          onClose: vi.fn(),
+        });
+        return React.createElement('div', {
+          'data-testid': 'compat-runner-state',
+          'data-value': formSessionA.compatibilityLayer,
+        });
+      };
+      const modal = createDomain12DeepRenderer(ModalFormHarness, { isOpen: true });
+      modal.render({ isOpen: true });
       await Promise.resolve();
       await Promise.resolve();
-      let tree = modal.render();
+      modal.render({ isOpen: true });
 
-      expect(findByTestId(tree, 'compat-runner-select')!.props.value).toBe('crossover_preview');
-      const updateBtn = findByTestId(tree, 'update-runner-btn');
-      expect(updateBtn).toBeDefined();
-      const pendingClick = updateBtn!.props.onClick();
+      expect(formSessionA!.compatibilityLayer).toBe('crossover_preview');
+      const pendingClick = formSessionA!.handleUpdateRunner();
 
       // Close modal, change saved config to 'wine', and reopen modal while stale updateCompatibilityLayer is pending
       modal.render({ isOpen: false });
@@ -4384,11 +4390,11 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         launchMethod: 'compatibility_layer',
         compatibilityLayer: 'wine',
       };
-      tree = modal.render({ isOpen: true });
+      modal.render({ isOpen: true });
       await Promise.resolve();
       await Promise.resolve();
-      tree = modal.render({ isOpen: true });
-      expect(findByTestId(tree, 'compat-runner-select')!.props.value).toBe('wine');
+      modal.render({ isOpen: true });
+      expect(formSessionA!.compatibilityLayer).toBe('wine');
 
       // Resolve the stale in-flight update from the closed session
       resolveStaleUpdate({
@@ -4400,9 +4406,9 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
       await pendingClick;
       await Promise.resolve();
       await Promise.resolve();
-      tree = modal.render({ isOpen: true });
+      modal.render({ isOpen: true });
 
-      expect(findByTestId(tree, 'compat-runner-select')!.props.value).toBe('wine');
+      expect(formSessionA!.compatibilityLayer).toBe('wine');
       modal.unmount();
 
       // Part B: handleSwitchToStableCrossOver directly across isOpen: true -> false -> true
@@ -4567,45 +4573,36 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
           })
       );
 
-      const modal = createDomain12DeepRenderer(GameLaunchConfigModal, {
-        isOpen: true,
-        game,
-        initialPlatformId: 'epic',
-        onClose: vi.fn(),
-      });
+      let modalForm: ReturnType<typeof useGameLaunchConfigForm> | null = null;
+      const SwitchTabHarness = () => {
+        modalForm = useGameLaunchConfigForm({
+          isOpen: true,
+          game,
+          initialPlatformId: 'epic',
+          onClose: vi.fn(),
+        });
+        return React.createElement('div', { 'data-testid': 'switch-tab-harness' });
+      };
+      const modal = createDomain12DeepRenderer(SwitchTabHarness, {});
       modal.render();
       await Promise.resolve();
       await Promise.resolve();
-      let tree = modal.render();
+      modal.render();
 
-      const getSaveButton = (root: unknown) =>
-        findElements(
-          root,
-          (el) => el.type === 'button' && getTextContent(el).includes('Save Configuration')
-        )[0]!;
-
-      expect(findByTestId(tree, 'compat-runner-select')!.props.value).toBe('wine');
-      expect(getSaveButton(tree).props['data-has-unsaved-changes']).toBe('false');
+      expect(modalForm!.compatibilityLayer).toBe('wine');
+      expect(modalForm!.hasUnsavedChanges).toBe(false);
 
       // Switch epic -> steam
-      const steamTab = findElements(
-        tree,
-        (el) => el.type === 'button' && getTextContent(el).includes('Steam')
-      )[0]!;
-      steamTab.props.onClick();
-      tree = modal.render();
-      expect(findByTestId(tree, 'compat-runner-select')!.props.value).toBe('crossover_preview');
+      modalForm!.handleSelectStorefront('steam');
+      modal.render();
+      expect(modalForm!.compatibilityLayer).toBe('crossover_preview');
 
-      // Start switch on steam via update-runner-btn, then switch back to epic while pending
-      const switchPromise = findByTestId(tree, 'update-runner-btn')!.props.onClick();
-      const epicTab = findElements(
-        tree,
-        (el) => el.type === 'button' && getTextContent(el).includes('Epic')
-      )[0]!;
-      epicTab.props.onClick();
-      tree = modal.render();
-      expect(findByTestId(tree, 'compat-runner-select')!.props.value).toBe('wine');
-      expect(getSaveButton(tree).props['data-has-unsaved-changes']).toBe('false');
+      // Start switch on steam via handleUpdateRunner, then switch back to epic while pending
+      const switchPromise = modalForm!.handleUpdateRunner();
+      modalForm!.handleSelectStorefront('epic');
+      modal.render();
+      expect(modalForm!.compatibilityLayer).toBe('wine');
+      expect(modalForm!.hasUnsavedChanges).toBe(false);
 
       // Resolve switch while active tab is epic
       resolveSwitch({
@@ -4616,19 +4613,16 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
       });
       await switchPromise;
       await Promise.resolve();
-      tree = modal.render();
+      modal.render();
 
-      expect(findByTestId(tree, 'compat-runner-select')!.props.value).toBe('wine');
-      expect(getSaveButton(tree).props['data-has-unsaved-changes']).toBe('true');
+      expect(modalForm!.compatibilityLayer).toBe('wine');
+      expect(modalForm!.hasUnsavedChanges).toBe(true);
 
       // Switching back to steam remains dirty and reflects crossover
-      findElements(
-        tree,
-        (el) => el.type === 'button' && getTextContent(el).includes('Steam')
-      )[0]!.props.onClick();
-      tree = modal.render();
-      expect(findByTestId(tree, 'compat-runner-select')!.props.value).toBe('crossover');
-      expect(getSaveButton(tree).props['data-has-unsaved-changes']).toBe('true');
+      modalForm!.handleSelectStorefront('steam');
+      modal.render();
+      expect(modalForm!.compatibilityLayer).toBe('crossover');
+      expect(modalForm!.hasUnsavedChanges).toBe(true);
       modal.unmount();
 
       // Also verify direct handleSwitchToStableCrossOver updates hasUnsavedChanges when on epic

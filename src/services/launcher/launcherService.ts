@@ -39,7 +39,6 @@ import {
 import type { StorefrontId } from '../../contracts/platform';
 import { normalizeTitleKey } from '../common/titleUtils';
 import { requestScheduler } from '../network/requestScheduler';
-import { syncJobManager } from '../network/syncJobManager';
 import {
   getStorefrontNativeOsFlags,
   saveCachedGogOsSupport,
@@ -157,6 +156,9 @@ interface InstalledLookupIndex {
   byPlatNormTitle: Map<string, InstalledGameRecord>;
 }
 
+const FOCUS_RESCAN_COOLDOWN_MS = 5 * 60 * 1000;
+const INIT_CONFIG_FRESH_WINDOW_MS = 10_000;
+
 export class LauncherService {
   public static readonly MAX_INSTALL_INFO_CACHE_SIZE = 150;
   private installedRecords: InstalledGameRecord[] = [];
@@ -179,6 +181,7 @@ export class LauncherService {
     ...DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
   };
   private inGameHibernating = false;
+  private inGamePriorityScopeActive = false;
   private inGamePriorityScopeRelease: (() => void) | null = null;
   private downloadsPausedByInGame: Set<string> = new Set();
   private compatibilityLayers: CompatibilityLayerInfo[] = [];
@@ -187,6 +190,13 @@ export class LauncherService {
   private installInfoCache: Map<string, GameInstallInfo> = new Map();
   private listeners: Set<() => void> = new Set();
   private initialized = false;
+  private initPromise: Promise<void> | null = null;
+  private initializedElectronApiRef: unknown = undefined;
+  private cachedAppInfo: AppInfoResult | null = null;
+  private cachedAppInfoPromise: Promise<AppInfoResult | null> | null = null;
+  private cachedAppInfoApiRef: unknown = undefined;
+  private lastConfigsFetchedAt = 0;
+  private inFlightLaunchesByGameId: Map<string, Promise<LauncherActionResult>> = new Map();
   private unsubscribeDownload?: () => void;
   private unsubscribeSession?: () => void;
   private unsubscribeHibernate?: () => void;
@@ -368,7 +378,7 @@ export class LauncherService {
   private syncInGameResourceThrottle(): void {
     if (this.activeSessions.size > 0) {
       if (typeof document !== 'undefined') {
-        document.body?.classList.add('is-in-game');
+        document.body?.classList?.add('is-in-game');
       }
 
       const activeSession = Array.from(this.activeSessions.values())[0];
@@ -384,22 +394,37 @@ export class LauncherService {
 
       if (this.performanceSettings.pauseBackgroundSyncInGame !== false) {
         requestScheduler.setInGameThrottle(true);
-        if (!this.inGamePriorityScopeRelease) {
+        if (!this.inGamePriorityScopeActive && !this.inGamePriorityScopeRelease) {
+          this.inGamePriorityScopeActive = true;
           const activeTitle = activeSession?.title || 'Active Game';
-          const scopeHandle = syncJobManager.beginPriorityScope(
-            'In-Game Performance Mode',
-            activeTitle
-          ) as unknown;
-          this.inGamePriorityScopeRelease = () => {
-            if (typeof scopeHandle === 'function') {
-              scopeHandle();
-            } else if (typeof scopeHandle === 'string') {
-              syncJobManager.endPriorityScope(scopeHandle);
-            }
-          };
+          void import('../network/syncJobManager')
+            .then(({ syncJobManager }) => {
+              const scopeHandle = syncJobManager.beginPriorityScope(
+                'In-Game Performance Mode',
+                activeTitle
+              ) as unknown;
+              const release = () => {
+                if (typeof scopeHandle === 'function') {
+                  scopeHandle();
+                } else if (typeof scopeHandle === 'string') {
+                  syncJobManager.endPriorityScope(scopeHandle);
+                }
+              };
+              if (!this.inGamePriorityScopeActive || this.activeSessions.size === 0) {
+                try {
+                  release();
+                } catch {}
+                return;
+              }
+              this.inGamePriorityScopeRelease = release;
+            })
+            .catch(() => {
+              this.inGamePriorityScopeActive = false;
+            });
         }
       } else {
         requestScheduler.setInGameThrottle(false);
+        this.inGamePriorityScopeActive = false;
         if (this.inGamePriorityScopeRelease) {
           try {
             this.inGamePriorityScopeRelease();
@@ -424,11 +449,12 @@ export class LauncherService {
       }
     } else {
       if (typeof document !== 'undefined') {
-        document.body?.classList.remove('is-in-game');
+        document.body?.classList?.remove('is-in-game');
       }
       const wasHibernating = this.inGameHibernating;
       this.inGameHibernating = false;
       requestScheduler.setInGameThrottle(false);
+      this.inGamePriorityScopeActive = false;
 
       if (this.inGamePriorityScopeRelease) {
         try {
@@ -503,13 +529,103 @@ export class LauncherService {
     this.activeDownloadPollTimer = timer;
   }
 
-  public async initialize(): Promise<void> {
+  public async getAppInfo(): Promise<AppInfoResult | null> {
+    const currentApi = typeof window !== 'undefined' ? window.electronAPI : undefined;
+    if (!currentApi?.getAppInfo) {
+      return null;
+    }
+    if (this.cachedAppInfoApiRef !== currentApi) {
+      this.cachedAppInfoApiRef = currentApi;
+      this.cachedAppInfo = null;
+      this.cachedAppInfoPromise = null;
+    }
+    if (this.cachedAppInfo) {
+      return this.cachedAppInfo;
+    }
+    if (this.cachedAppInfoPromise) {
+      return this.cachedAppInfoPromise;
+    }
+    const flight = currentApi
+      .getAppInfo()
+      .then((info) => {
+        if (this.cachedAppInfoApiRef === currentApi) {
+          this.cachedAppInfo = info ?? null;
+          if (info && typeof (info as AppInfoResult).arch === 'string') {
+            const prevArch = this.detectedHostArch;
+            this.detectedHostArch = (info as AppInfoResult).arch;
+            if (prevArch !== this.detectedHostArch) {
+              this.notifyStateChanged();
+            }
+          }
+        }
+        return info ?? null;
+      })
+      .catch(() => null)
+      .finally(() => {
+        if (this.cachedAppInfoPromise === flight) {
+          this.cachedAppInfoPromise = null;
+        }
+      });
+    this.cachedAppInfoPromise = flight;
+    return flight;
+  }
+
+  public resetForTests(): void {
+    this.initialized = false;
+    this.initPromise = null;
+    this.initializedElectronApiRef = undefined;
+    this.cachedAppInfo = null;
+    this.cachedAppInfoPromise = null;
+    this.cachedAppInfoApiRef = undefined;
+    this.lastConfigsFetchedAt = 0;
+    this.inFlightLaunchesByGameId.clear();
+    this.inFlightScanPromise = null;
+    this.lastScanTimestamp = 0;
+    this.lastScanSucceeded = false;
+    this.activeSessions.clear();
+    this.inGamePriorityScopeActive = false;
+    if (this.inGamePriorityScopeRelease) {
+      try {
+        this.inGamePriorityScopeRelease();
+      } catch {}
+      this.inGamePriorityScopeRelease = null;
+    }
+  }
+
+  public initialize(): Promise<void> {
+    const currentApi = typeof window !== 'undefined' ? window.electronAPI : undefined;
+    if (this.initPromise && this.initializedElectronApiRef === currentApi) {
+      return this.initPromise;
+    }
+    if (this.initialized && this.initializedElectronApiRef === currentApi) {
+      return Promise.resolve();
+    }
+    if (this.initializedElectronApiRef !== currentApi) {
+      this.initialized = false;
+      this.initPromise = null;
+      this.cachedAppInfo = null;
+      this.cachedAppInfoPromise = null;
+      this.cachedAppInfoApiRef = undefined;
+      this.lastConfigsFetchedAt = 0;
+    }
+    this.initializedElectronApiRef = currentApi;
+
+    const flight = this.runInitializeInternal().finally(() => {
+      if (this.initPromise === flight) {
+        this.initPromise = null;
+      }
+    });
+    this.initPromise = flight;
+    return flight;
+  }
+
+  private async runInitializeInternal(): Promise<void> {
     this.loadLocalConfigs();
 
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function' && !this.focusListener) {
       this.focusListener = () => {
         if (this.activeSessions.size > 0) return;
-        if (!this.inFlightScanPromise && Date.now() - this.lastScanTimestamp > 30000) {
+        if (!this.inFlightScanPromise && Date.now() - this.lastScanTimestamp > FOCUS_RESCAN_COOLDOWN_MS) {
           this.scanAllInstalledGames().catch(() => {});
         }
       };
@@ -599,9 +715,7 @@ export class LauncherService {
           window.electronAPI.detectInstalledStorefrontClients
             ? window.electronAPI.detectInstalledStorefrontClients().catch(() => null)
             : Promise.resolve(null),
-          window.electronAPI.getAppInfo
-            ? window.electronAPI.getAppInfo().catch(() => null)
-            : Promise.resolve(null),
+          this.getAppInfo(),
         ]);
 
         if (appInfo && typeof (appInfo as AppInfoResult).arch === 'string') {
@@ -634,6 +748,7 @@ export class LauncherService {
               diskConfigs,
               true
             ).configs;
+            this.lastConfigsFetchedAt = Date.now();
           } else {
             this.launchConfigs = {
               ...this.launchConfigs,
@@ -745,7 +860,7 @@ export class LauncherService {
       this.syncInGameResourceThrottle();
       this.lastScanTimestamp = 0;
       if (this.activeSessions.size === 0) {
-        await this.scanAllInstalledGames(true);
+        await this.scanAllInstalledGames(true, { silentInitialBoot: true });
       }
       this.ensureActiveDownloadPolling();
     }
@@ -1034,6 +1149,8 @@ export class LauncherService {
         window.dispatchEvent(
           new CustomEvent('antigravity:game-session-ended', {
             detail: {
+              ...(session.sessionId ? { sessionId: session.sessionId } : {}),
+              sessionEvent: 'playtime_synced',
               gameId: session.gameId,
               platformId: session.platformId,
               platformGameId: session.platformGameId,
@@ -1074,6 +1191,8 @@ export class LauncherService {
           window.dispatchEvent(
             new CustomEvent('antigravity:game-session-ended', {
               detail: {
+                ...(session.sessionId ? { sessionId: session.sessionId } : {}),
+                sessionEvent: 'stopped',
                 gameId: session.gameId,
                 platformId: session.platformId,
                 platformGameId: session.platformGameId,
@@ -1194,7 +1313,12 @@ export class LauncherService {
                 (c?.platformConfigs &&
                   Object.values(c.platformConfigs).some((p) => Boolean(p?.customExecutablePath)))
             );
+            const configsFreshFromInit =
+              Boolean(options?.silentInitialBoot) ||
+              (this.lastConfigsFetchedAt > 0 &&
+                Date.now() - this.lastConfigsFetchedAt < INIT_CONFIG_FRESH_WINDOW_MS);
             if (
+              !configsFreshFromInit &&
               typeof window !== 'undefined' &&
               typeof window.electronAPI?.getGameLaunchConfigs === 'function' &&
               hasAnyCustomExe
@@ -1204,6 +1328,7 @@ export class LauncherService {
                   string,
                   GameLaunchConfig
                 >;
+                this.lastConfigsFetchedAt = Date.now();
                 if (freshConfigs && typeof freshConfigs === 'object') {
                   const reconciled = reconcileLaunchConfigsWithDisk(
                     this.launchConfigs,
@@ -2584,21 +2709,40 @@ export class LauncherService {
     return undefined;
   }
 
-  public async launchGame(
+  public launchGame(
     game: CanonicalGame,
     platformId?: StorefrontId
   ): Promise<LauncherActionResult> {
     if (!game) {
-      return { success: false, error: 'No game specified to launch.' };
+      return Promise.resolve({ success: false, error: 'No game specified to launch.' });
     }
 
     if (this.activeSessions.has(game.id)) {
-      return {
+      return Promise.resolve({
         success: true,
         message: `${game.title} is already running.`,
         session: this.activeSessions.get(game.id),
-      };
+      });
     }
+
+    const existingFlight = this.inFlightLaunchesByGameId.get(game.id);
+    if (existingFlight) {
+      return existingFlight;
+    }
+
+    const launchFlight = this.executeLaunchGameInternal(game, platformId).finally(() => {
+      if (this.inFlightLaunchesByGameId.get(game.id) === launchFlight) {
+        this.inFlightLaunchesByGameId.delete(game.id);
+      }
+    });
+    this.inFlightLaunchesByGameId.set(game.id, launchFlight);
+    return launchFlight;
+  }
+
+  private async executeLaunchGameInternal(
+    game: CanonicalGame,
+    platformId?: StorefrontId
+  ): Promise<LauncherActionResult> {
 
     const effPlatform = this.getEffectivePlatformForGame(game, platformId);
     const resolvedPlatformId: StorefrontId =

@@ -429,7 +429,9 @@ describe("Universal Game Launcher QA — Windows x64 Host & CrossOver Steam (10,
         const modalHtml = renderToString(vnode);
 
         // Verify header title is 'Launch Settings' (not 'Launch & Compatibility Settings')
-        expect(modalHtml).toContain('<h2 class="text-base font-bold text-white truncate">Launch Settings</h2>');
+        expect(modalHtml).toMatch(
+          /<h2[^>]*class="text-base font-bold text-white truncate"[^>]*>Launch Settings<\/h2>/
+        );
         expect(modalHtml).not.toContain('Launch &amp; Compatibility Settings');
         expect(modalHtml).not.toContain('Launch & Compatibility Settings');
 

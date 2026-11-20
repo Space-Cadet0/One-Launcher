@@ -31,6 +31,7 @@ import { launcherService } from '../src/services/launcher/launcherService';
 import { CompatibilityLayerSection } from '../src/components/Launcher/LaunchConfig/CompatibilityLayerSection';
 import { VIRTUAL_DESKTOP_RESOLUTION_OPTIONS } from '../src/components/Launcher/LaunchConfig/launchConfigHelpers';
 import { StorefrontLifecycleSection } from '../src/components/Launcher/LaunchConfig/StorefrontLifecycleSection';
+import { SettingsModal } from '../src/components/Settings/SettingsModal';
 import { SteamLibraryActionBar } from '../src/components/SteamStoreDetail/SteamLibraryActionBar';
 import { createDomain12DeepRenderer } from './helpers/xboxTestHarness';
 
@@ -478,7 +479,7 @@ function auditWcag22AA(tree: any): string[] {
       }
       const cls = String(props.className || '');
       if (
-        !/\b(min-h-(?:[6-9]|\d{2,}|\[(?:2[4-9]|[3-9]\d|\d{3,})px\])|h-(?:[6-9]|\d{2,})|p-(?:[2-9]|\d{2,})|py-(?:[2-9]|1\.5|\d{2,})|underline)\b/.test(
+        !/(?:^|\s)(min-h-(?:[6-9]|\d{2,}|\[(?:2[4-9]|[3-9]\d|\d{3,})px\])|h-(?:[6-9]|\d{2,})|p-(?:[2-9]|\d{2,})|py-(?:[2-9]|1\.5|\d{2,})|underline)(?:\s|$)/.test(
           cls
         )
       ) {
@@ -669,6 +670,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
         wineDebug: '-all',
         metalHud: false,
         dxvkHud: true,
+        performanceHud: 'on',
         preLaunchCommand: 'echo pre',
         postExitCommand: 'echo post',
         inGameLauncherBehavior: 'hide_tray_hibernate',
@@ -727,7 +729,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
       expect(resolvedGog.virtualDesktopResolution).toBe('1024x768');
     });
 
-    it('preserves all 10 LauncherPerformanceSettings keys through IPC sanitizeLauncherSettingsPayload and disk persistence', () => {
+    it('preserves all 11 LauncherPerformanceSettings keys through IPC sanitizeLauncherSettingsPayload and disk persistence', () => {
       const userDataDir = makeTempDir('userdata-perf-ipc');
       const incomingIpcPayload: LauncherPerformanceSettings & Record<string, unknown> = {
         inGameLauncherBehavior: 'zero_renderer_daemon',
@@ -740,6 +742,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
         defaultBottleDisplayScalingMode: 'force_fullscreen',
         defaultDisplayAspectRatio: 'integer',
         enableFullscreenHotkey: false,
+        defaultPerformanceHud: true,
         __proto_pollution_attempt__: 'blocked',
       };
 
@@ -748,6 +751,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
       expect(ipcCleaned.defaultBottleDisplayScalingMode).toBe('force_fullscreen');
       expect(ipcCleaned.defaultDisplayAspectRatio).toBe('integer');
       expect(ipcCleaned.enableFullscreenHotkey).toBe(false);
+      expect(ipcCleaned.defaultPerformanceHud).toBe(true);
       expect(ipcCleaned.storefrontClientLifecycle).toBe('fast_direct_bypass');
       expect(ipcCleaned.autoShutdownWinePrefixOnExit).toBe(false);
       expect(ipcCleaned.suppressWineDebugLogging).toBe(false);
@@ -767,6 +771,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
         defaultBottleDisplayScalingMode: 'force_fullscreen',
         defaultDisplayAspectRatio: 'integer',
         enableFullscreenHotkey: false,
+        defaultPerformanceHud: true,
       });
       expect(tsSanitized).toEqual(reloaded);
 
@@ -778,6 +783,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
       expect(afterReset.defaultBottleDisplayScalingMode).toBe('auto_fullscreen');
       expect(afterReset.defaultDisplayAspectRatio).toBe('preserve_aspect');
       expect(afterReset.enableFullscreenHotkey).toBe(true);
+      expect(afterReset.defaultPerformanceHud).toBe(false);
     });
   });
 
@@ -1560,21 +1566,26 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
 
       const renderer = createDomain12DeepRenderer(CompatibilityLayerSection, buildProps(false));
 
-      // Default (`auto_fullscreen` inherited): shows aspect select, hides virtual desktop resolution select
+      // Default (`auto_fullscreen` inherited): shows primary display scaling select + Display Overrides disclosure with aspect select, hides virtual desktop resolution select
       const treeAuto = renderer.render(buildProps(false));
       expect(
-        findVNodes(treeAuto, (n) => n.props?.['data-testid'] === 'display-fullscreen-scaling-panel')
+        findVNodes(treeAuto, (n) => n.props?.['data-testid'] === 'disclosure-display-overrides')
           .length
       ).toBe(1);
       const scalingSelect = findVNodes(
         treeAuto,
         (n) => n.props?.['data-testid'] === 'display-scaling-mode-select'
       )[0];
+      const advancedScalingSelect = findVNodes(
+        treeAuto,
+        (n) => n.props?.['data-testid'] === 'advanced-display-scaling-select'
+      )[0];
       const aspectSelect = findVNodes(
         treeAuto,
         (n) => n.props?.['data-testid'] === 'display-aspect-ratio-select'
       )[0];
       expect(scalingSelect).toBeDefined();
+      expect(advancedScalingSelect).toBeDefined();
       expect(aspectSelect).toBeDefined();
       expect(
         findVNodes(treeAuto, (n) => n.props?.['data-testid'] === 'virtual-desktop-resolution-select')
@@ -1582,16 +1593,13 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
       ).toBe(0);
       expect(auditWcag22AA(treeAuto)).toEqual([]);
 
-      // Change scaling mode to `virtual_desktop` and aspect to `integer`
+      // Change scaling mode to `virtual_desktop` via advanced override select and aspect to `integer`
       aspectSelect.props.onChange({ target: { value: 'integer' } });
       expect(currentAspect).toBe('integer');
-      scalingSelect.props.onChange({ target: { value: 'virtual_desktop' } });
+      advancedScalingSelect.props.onChange({ target: { value: 'virtual_desktop' } });
       expect(currentScaling).toBe('virtual_desktop');
 
       const treeVd = renderer.render(buildProps(false));
-      expect(
-        findVNodes(treeVd, (n) => n.props?.['data-testid'] === 'display-aspect-ratio-select').length
-      ).toBe(0);
       const vdResSelect = findVNodes(
         treeVd,
         (n) => n.props?.['data-testid'] === 'virtual-desktop-resolution-select'
@@ -1606,90 +1614,110 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
       expect(treeWin).toBeNull();
     });
 
-    it('renders StorefrontLifecycleSection global bottle display defaults & hotkey switch and passes WCAG 2.2 AA', () => {
-      let globalMode: GlobalBottleDisplayScalingMode = 'auto_fullscreen';
-      let globalAspect: GlobalDisplayAspectRatioMode = 'preserve_aspect';
-      let hotkeyEnabled = true;
-
-      const buildProps = (isWindowsHost: boolean) => {
-        const perf: LauncherPerformanceSettings = {
-          ...DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
-          defaultBottleDisplayScalingMode: globalMode,
-          defaultDisplayAspectRatio: globalAspect,
-          enableFullscreenHotkey: hotkeyEnabled,
-        };
-        return {
-          idPrefix: 'qa-lifecycle',
-          isWindowsHost,
-          preview: basePreview,
-          activeDisplayMethod: 'compatibility_layer' as const,
-          preferredPlatformId: 'gog' as const,
-          inGameLauncherBehavior: 'default' as const,
-          onChangeInGameLauncherBehavior: () => {},
-          storefrontClientLifecycle: 'default' as const,
-          onChangeStorefrontClientLifecycle: () => {},
-          perfSettings: perf,
-          onChangePostGameBehavior: () => {},
-          onTogglePauseSyncInGame: () => {},
-          onTogglePauseDownloadsInGame: () => {},
-          onToggleAutoShutdownWine: () => {},
-          onChangeDefaultBottleDisplayScalingMode: (v: GlobalBottleDisplayScalingMode) => {
-            globalMode = v;
-          },
-          onChangeDefaultDisplayAspectRatio: (v: GlobalDisplayAspectRatioMode) => {
-            globalAspect = v;
-          },
-          onToggleFullscreenHotkey: () => {
-            hotkeyEnabled = !hotkeyEnabled;
-          },
-        };
+    it('delegates global bottle display defaults & hotkey switch from StorefrontLifecycleSection to SettingsModal and passes WCAG 2.2 AA', () => {
+      const perf: LauncherPerformanceSettings = {
+        ...DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
+        defaultBottleDisplayScalingMode: 'auto_fullscreen',
+        defaultDisplayAspectRatio: 'preserve_aspect',
+        enableFullscreenHotkey: true,
       };
+      const buildLifecycleProps = (isWindowsHost: boolean) => ({
+        idPrefix: 'qa-lifecycle',
+        isWindowsHost,
+        preview: basePreview,
+        activeDisplayMethod: 'compatibility_layer' as const,
+        preferredPlatformId: 'gog' as const,
+        inGameLauncherBehavior: 'default' as const,
+        onChangeInGameLauncherBehavior: () => {},
+        storefrontClientLifecycle: 'default' as const,
+        onChangeStorefrontClientLifecycle: () => {},
+        perfSettings: perf,
+      });
 
-      const renderer = createDomain12DeepRenderer(StorefrontLifecycleSection, buildProps(false));
-      const treeMac = renderer.render(buildProps(false));
-      const modeSel = findVNodes(
+      // StorefrontLifecycleSection no longer embeds global defaults; it links to Global Settings
+      const lifecycleRenderer = createDomain12DeepRenderer(
+        StorefrontLifecycleSection,
+        buildLifecycleProps(false)
+      );
+      const treeLifecycle = lifecycleRenderer.render(buildLifecycleProps(false));
+      expect(
+        findVNodes(treeLifecycle, (n) => n.props?.['data-testid'] === 'edit-global-defaults-btn')
+          .length
+      ).toBe(1);
+      expect(
+        findVNodes(
+          treeLifecycle,
+          (n) => n.props?.['data-testid'] === 'global-gameplay-performance-card'
+        ).length
+      ).toBe(0);
+      expect(auditWcag22AA(treeLifecycle)).toEqual([]);
+
+      // SettingsModal owns global macOS bottle display defaults, aspect ratio & hotkey switch
+      const settingsRenderer = createDomain12DeepRenderer(SettingsModal, {
+        isOpen: true,
+        onClose: () => {},
+        hostPlatform: 'darwin',
+      });
+      const treeMac = settingsRenderer.render({
+        isOpen: true,
+        onClose: () => {},
+        hostPlatform: 'darwin',
+      });
+      const modeGroup = findVNodes(
         treeMac,
-        (n) => n.props?.['data-testid'] === 'global-bottle-display-mode-select'
+        (n) => n.props?.['data-testid'] === 'settings-default-display-mode'
       )[0];
-      const aspectSel = findVNodes(
+      const aspectGroup = findVNodes(
         treeMac,
-        (n) => n.props?.['data-testid'] === 'global-display-aspect-select'
+        (n) => n.props?.['data-testid'] === 'settings-default-aspect-ratio'
       )[0];
       const hotkeySwitch = findVNodes(
         treeMac,
-        (n) => n.props?.['data-testid'] === 'toggle-fullscreen-hotkey'
+        (n) => n.props?.['data-testid'] === 'settings-toggle-fullscreen-hotkey'
       )[0];
 
-      expect(modeSel).toBeDefined();
-      expect(aspectSel).toBeDefined();
+      expect(modeGroup).toBeDefined();
+      expect(aspectGroup).toBeDefined();
       expect(hotkeySwitch).toBeDefined();
       expect(hotkeySwitch.props.role).toBe('switch');
       expect(hotkeySwitch.props['aria-checked']).toBe(true);
       expect(auditWcag22AA(treeMac)).toEqual([]);
 
-      modeSel.props.onChange({ target: { value: 'force_fullscreen' } });
-      aspectSel.props.onChange({ target: { value: 'integer' } });
+      const forceFsLabel = findVNodes(
+        treeMac,
+        (n) => n.props?.['data-testid'] === 'settings-display-force-fullscreen'
+      )[0];
+      const integerLabel = findVNodes(
+        treeMac,
+        (n) => n.props?.['data-testid'] === 'settings-aspect-integer'
+      )[0];
+      const forceFsRadio = findVNodes(forceFsLabel, (n) => n.type === 'input')[0];
+      const integerRadio = findVNodes(integerLabel, (n) => n.type === 'input')[0];
+      forceFsRadio.props.onChange();
+      integerRadio.props.onChange();
       hotkeySwitch.props.onClick();
 
-      expect(globalMode).toBe('force_fullscreen');
-      expect(globalAspect).toBe('integer');
-      expect(hotkeyEnabled).toBe(false);
-
-      const treeMacUpdated = renderer.render(buildProps(false));
+      const treeMacUpdated = settingsRenderer.render({
+        isOpen: true,
+        onClose: () => {},
+        hostPlatform: 'darwin',
+      });
       const updatedSwitch = findVNodes(
         treeMacUpdated,
-        (n) => n.props?.['data-testid'] === 'toggle-fullscreen-hotkey'
+        (n) => n.props?.['data-testid'] === 'settings-toggle-fullscreen-hotkey'
       )[0];
       expect(updatedSwitch.props['aria-checked']).toBe(false);
       expect(auditWcag22AA(treeMacUpdated)).toEqual([]);
 
       // Windows host omits macOS bottle display defaults while remaining 100% WCAG compliant
-      const treeWin = renderer.render(buildProps(true));
+      const treeWin = settingsRenderer.render({
+        isOpen: true,
+        onClose: () => {},
+        hostPlatform: 'win32',
+      });
       expect(
-        findVNodes(
-          treeWin,
-          (n) => n.props?.['data-testid'] === 'global-bottle-display-mode-select'
-        ).length
+        findVNodes(treeWin, (n) => n.props?.['data-testid'] === 'settings-default-display-mode')
+          .length
       ).toBe(0);
       expect(auditWcag22AA(treeWin)).toEqual([]);
     });
