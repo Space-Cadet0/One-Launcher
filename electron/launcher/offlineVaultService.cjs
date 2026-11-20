@@ -92,6 +92,7 @@ const ROLE_MAX_WIDTHS = {
   cover: 600,
   capsule: 460,
   icon: 128,
+  achievement_icon: 128,
   logo: 640,
   header: 800,
   hero: 1920,
@@ -287,6 +288,7 @@ function normalizeComparableMediaUrl(url) {
 }
 
 const ASSET_IDENTITY_QUERY_KEYS = new Set([
+  'url',
   'w',
   'h',
   'width',
@@ -642,6 +644,7 @@ function buildAssetUrlKey(gameId, role, ordinal, sourceUrl) {
     cleanUrl &&
     (cleanRole === 'inline_img' ||
       cleanRole === 'inline_poster' ||
+      cleanRole === 'achievement_icon' ||
       (cleanRole === 'icon' && cleanOrd > 0));
   if (isUrlKeyedRole) {
     const urlHash = crypto.createHash('sha256').update(cleanUrl).digest('hex').slice(0, 32);
@@ -1144,6 +1147,11 @@ function sanitizeVaultPlatformEntriesOsFlags(platforms, hasEnrichedJson = false,
  */
 function isFederatedAssetRowCompatible(sourceUrl, federatedPath, params = null) {
   if (isExplicitOverrideParam(params?.ov)) {
+    return false;
+  }
+  const paramRole = params?.role != null ? String(params.role).trim().toLowerCase() : '';
+  const paramOrdinal = Math.max(0, Math.floor(Number(params?.ordinal ?? params?.ord ?? 0) || 0));
+  if (paramRole === 'achievement_icon' || (paramRole === 'icon' && paramOrdinal > 0)) {
     return false;
   }
   const cleanFedPath = typeof federatedPath === 'string' ? federatedPath.trim() : '';
@@ -1853,7 +1861,7 @@ class OfflineVaultService {
       // Self-heal poisoned cross-storefront, third-party CDN, or mismatched-hash federated asset rows
       const federatedRows = db
         .prepare(
-          "SELECT url_key, game_id, source_url, federated_path FROM game_media_assets WHERE storage_kind = 'federated'"
+          "SELECT url_key, game_id, asset_role, ordinal, source_url, federated_path FROM game_media_assets WHERE storage_kind = 'federated'"
         )
         .all();
       if (Array.isArray(federatedRows) && federatedRows.length > 0) {
@@ -1865,7 +1873,12 @@ class OfflineVaultService {
         );
         for (const fedRow of federatedRows) {
           if (!fedRow || !fedRow.url_key) continue;
-          if (!isFederatedAssetRowCompatible(fedRow.source_url, fedRow.federated_path, null)) {
+          if (
+            !isFederatedAssetRowCompatible(fedRow.source_url, fedRow.federated_path, {
+              role: fedRow.asset_role,
+              ordinal: fedRow.ordinal,
+            })
+          ) {
             resetFederatedStmt.run(fedRow.url_key);
             if (fedRow.game_id) {
               resetHydratedStmt.run(String(fedRow.game_id));
@@ -4277,13 +4290,17 @@ class OfflineVaultService {
       };
     }
 
-    const isAlphaSensitiveRole = assetRole === 'icon' || assetRole === 'logo';
+    const normalizedAssetRole = assetRole.toLowerCase();
+    const isAlphaSensitiveRole =
+      normalizedAssetRole === 'icon' ||
+      normalizedAssetRole === 'logo' ||
+      normalizedAssetRole === 'achievement_icon';
     const effectivePassThroughBytes =
       isAlphaSensitiveRole && ext === 'png'
         ? TRANSPARENT_PNG_PASS_THROUGH_MAX_BYTES
         : PASS_THROUGH_MAX_BYTES;
 
-    // Fast 0%-CPU pass-through for webp, avif, ico, <=45KB jpg/png (<=256KB for icon/logo png), and <=128KB static gif
+    // Fast 0%-CPU pass-through for webp, avif, ico, <=45KB jpg/png (<=256KB for icon/logo/achievement_icon png), and <=128KB static gif
     if (
       ext === 'webp' ||
       ext === 'avif' ||
@@ -4306,7 +4323,7 @@ class OfflineVaultService {
       try {
         let img = nativeImageImpl.createFromBuffer(rawBuffer);
         if (img && typeof img.isEmpty === 'function' && !img.isEmpty()) {
-          const maxWidth = ROLE_MAX_WIDTHS[assetRole] || 800;
+          const maxWidth = ROLE_MAX_WIDTHS[normalizedAssetRole] || 800;
           const sz = typeof img.getSize === 'function' ? img.getSize() : null;
           const needsResize = Boolean(
             sz &&
@@ -4341,21 +4358,23 @@ class OfflineVaultService {
               targetHeight ? { width: maxWidth, height: targetHeight } : { width: maxWidth }
             );
           }
-          if (isAlphaSensitiveRole && ext === 'png' && typeof img.toPNG === 'function') {
-            const pngBuf = img.toPNG();
-            if (
-              Buffer.isBuffer(pngBuf) &&
-              pngBuf.length >= 33 &&
-              pngBuf.length < rawBuffer.length &&
-              detectImageMagicBytes(pngBuf).valid
-            ) {
-              return {
-                valid: true,
-                buffer: pngBuf,
-                ext: 'png',
-                mimeType: 'image/png',
-                normalized: true,
-              };
+          if (isAlphaSensitiveRole && ext === 'png') {
+            if (typeof img.toPNG === 'function') {
+              const pngBuf = img.toPNG();
+              if (
+                Buffer.isBuffer(pngBuf) &&
+                pngBuf.length >= 33 &&
+                pngBuf.length < rawBuffer.length &&
+                detectImageMagicBytes(pngBuf).valid
+              ) {
+                return {
+                  valid: true,
+                  buffer: pngBuf,
+                  ext: 'png',
+                  mimeType: 'image/png',
+                  normalized: true,
+                };
+              }
             }
           } else if (typeof img.toJPEG === 'function') {
             const jpegBuf = img.toJPEG(82);
@@ -4926,9 +4945,11 @@ class OfflineVaultService {
     // Retention priority rank:
     // 100 = PINNED (installed game cover/capsule/header/hero/logo/icon)
     //  65 = installed game screenshots / inline images
-    //  55 = active library cover / capsule / icon
+    //  55 = active library cover / capsule
+    //  50 = active library icon
     //  40 = uninstalled header / hero / logo
     //  30 = screenshot_thumb / screenshot
+    //  25 = achievement_icon (deliberately unpinned even for installed games so 100+ trophies never starve covers)
     //  20 = inline_img / inline_poster
     //  10 = screenshot_full
     //   0 = orphaned blob
@@ -4943,11 +4964,12 @@ class OfflineVaultService {
           COALESCE(MAX(
             CASE
               WHEN vg.is_installed = 1 AND gma.asset_role IN ('cover', 'capsule', 'header', 'hero', 'logo', 'icon') THEN 100
-              WHEN vg.is_installed = 1 AND gma.url_key IS NOT NULL THEN 65
+              WHEN vg.is_installed = 1 AND COALESCE(gma.asset_role, '') != 'achievement_icon' AND gma.url_key IS NOT NULL THEN 65
               WHEN gma.asset_role IN ('cover', 'capsule') THEN 55
               WHEN gma.asset_role = 'icon' THEN 50
               WHEN gma.asset_role IN ('header', 'hero', 'logo') THEN 40
               WHEN gma.asset_role IN ('screenshot_thumb', 'screenshot') THEN 30
+              WHEN gma.asset_role = 'achievement_icon' THEN 25
               WHEN gma.asset_role IN ('inline_img', 'inline_poster') THEN 20
               WHEN gma.asset_role = 'screenshot_full' THEN 10
               WHEN gma.url_key IS NOT NULL THEN 15
@@ -5292,9 +5314,21 @@ class OfflineVaultService {
     }
     const db = this.ensureOpen();
     const federatedPath = String(assetRow.federated_path);
+    const effectiveRole = String(assetRow.asset_role || params?.role || '').trim().toLowerCase();
+    const effectiveOrdinal = Math.max(
+      0,
+      Math.floor(Number(assetRow.ordinal ?? params?.ordinal ?? params?.ord ?? 0) || 0)
+    );
+    const isDisallowedFederationRole =
+      effectiveRole === 'achievement_icon' || (effectiveRole === 'icon' && effectiveOrdinal > 0);
     if (
       isExplicitOverride ||
-      !isFederatedAssetRowCompatible(rawUrl || assetRow.source_url, federatedPath, params)
+      isDisallowedFederationRole ||
+      !isFederatedAssetRowCompatible(rawUrl || assetRow.source_url, federatedPath, {
+        ...(params && typeof params === 'object' ? params : {}),
+        role: effectiveRole || params?.role,
+        ordinal: effectiveOrdinal,
+      })
     ) {
       if (opts.selfHealMissing) {
         db.prepare(
@@ -5747,8 +5781,14 @@ class OfflineVaultService {
     }
 
     // Tier 2: Zero-Copy First-Party Local Cache Federation (Steam, GOG Galaxy, Heroic, Xbox)
-    // Skip Tier 2 completely when `ov` is set so explicit user media overrides always persist into `media_blobs`.
-    if (!isExplicitOverride) {
+    // Skip Tier 2 completely when `ov` is set so explicit user media overrides always persist into `media_blobs`,
+    // and skip for `achievement_icon` or `(icon && ordinal > 0)` so game-level app icons never hijack individual achievement icons.
+    const normalizedRoleForFederation = role.toLowerCase();
+    const skipTier2Federation =
+      isExplicitOverride ||
+      normalizedRoleForFederation === 'achievement_icon' ||
+      (normalizedRoleForFederation === 'icon' && ordinal > 0);
+    if (!skipTier2Federation) {
       let resolvedXboxProductId = params.xboxProductId || params.xid || '';
       let resolvedPfn = params.packageFamilyName || params.pfn || params.xpfn || '';
       let resolvedXboxTitleId = params.xboxTitleId || params.xtid || '';
@@ -6504,6 +6544,7 @@ module.exports = {
   parseVaultJson,
   isAnimatedGifBuffer,
   normalizeAssetIdentityUrl,
+  buildAssetUrlKey,
   inferVaultMetadataQuality,
   computeAdaptive404DelayMs,
   isWafOrChallengeResponse,

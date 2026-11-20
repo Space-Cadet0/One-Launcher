@@ -4910,6 +4910,80 @@ async function saveEpicOfferDiskCacheEntryAsync(cachePath, cacheKey, record, now
   } catch {}
 }
 
+/**
+ * Extracts multi-OS system requirements (`systemRequirements`, `macRequirements`, `linuxRequirements`)
+ * from Epic Content API `requirements.systems`, formatting and HTML-escaping untrusted fields.
+ *
+ * @param {Array<{ systemType?: string, details?: Array<{ title?: string, minimum?: string, recommended?: string }> }> | null | undefined} systems
+ * @returns {{ systemRequirements?: { minimum?: string, recommended?: string }, macRequirements?: { minimum?: string, recommended?: string }, linuxRequirements?: { minimum?: string, recommended?: string } }}
+ */
+function extractEpicRequirementsByOs(systems) {
+  if (!Array.isArray(systems) || systems.length === 0) {
+    return {};
+  }
+
+  let systemRequirements = undefined;
+  let macRequirements = undefined;
+  let linuxRequirements = undefined;
+  let fallbackRequirements = undefined;
+
+  for (const sys of systems) {
+    const details = Array.isArray(sys?.details) ? sys.details : [];
+    if (details.length === 0) continue;
+
+    const minReq = details
+      .map((r) => {
+        const rawTitle =
+          typeof r?.title === 'string' ? r.title.trim().replace(/:$/, '').trim() : '';
+        const rawMin = typeof r?.minimum === 'string' ? r.minimum.trim() : '';
+        return rawTitle && rawMin
+          ? `<strong>${escapeHtmlEntities(rawTitle)}:</strong> ${escapeHtmlEntities(rawMin)}`
+          : '';
+      })
+      .filter(Boolean)
+      .join('<br>');
+
+    const recReq = details
+      .map((r) => {
+        const rawTitle =
+          typeof r?.title === 'string' ? r.title.trim().replace(/:$/, '').trim() : '';
+        const rawRec = typeof r?.recommended === 'string' ? r.recommended.trim() : '';
+        return rawTitle && rawRec
+          ? `<strong>${escapeHtmlEntities(rawTitle)}:</strong> ${escapeHtmlEntities(rawRec)}`
+          : '';
+      })
+      .filter(Boolean)
+      .join('<br>');
+
+    if (!minReq && !recReq) continue;
+    const parsed = {
+      ...(minReq ? { minimum: minReq } : {}),
+      ...(recReq ? { recommended: recReq } : {}),
+    };
+
+    const sysType = String(sys?.systemType || '').trim();
+    if (/mac|os\s*x|darwin/i.test(sysType)) {
+      if (!macRequirements) macRequirements = parsed;
+    } else if (/linux|ubuntu|steam\s*os/i.test(sysType)) {
+      if (!linuxRequirements) linuxRequirements = parsed;
+    } else if (/win/i.test(sysType)) {
+      if (!systemRequirements) systemRequirements = parsed;
+    } else if (!fallbackRequirements) {
+      fallbackRequirements = parsed;
+    }
+  }
+
+  if (!systemRequirements && fallbackRequirements) {
+    systemRequirements = fallbackRequirements;
+  }
+
+  return {
+    ...(systemRequirements ? { systemRequirements } : {}),
+    ...(macRequirements ? { macRequirements } : {}),
+    ...(linuxRequirements ? { linuxRequirements } : {}),
+  };
+}
+
 async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
   const fetchImpl = typeof options?.fetchFn === 'function' ? options.fetchFn : fetch;
   const nowMs =
@@ -5145,6 +5219,8 @@ async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
 
     const movies = [];
     let systemRequirements = undefined;
+    let macRequirements = undefined;
+    let linuxRequirements = undefined;
     let languages = undefined;
 
     // Resolve candidate product slugs from offer mappings, attributes, and title to fetch video trailers from Epic Content API
@@ -5280,29 +5356,15 @@ async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
           }
         }
 
-        const reqs = Array.isArray(d.requirements?.systems?.[0]?.details)
-          ? d.requirements.systems[0].details
-          : [];
-        if (reqs.length > 0) {
-          const minReq = reqs
-            .map((r) =>
-              r?.title && r?.minimum
-                ? `<strong>${escapeHtmlEntities(r.title)}:</strong> ${escapeHtmlEntities(r.minimum)}`
-                : ''
-            )
-            .filter(Boolean)
-            .join('<br>');
-          const recReq = reqs
-            .map((r) =>
-              r?.title && r?.recommended
-                ? `<strong>${escapeHtmlEntities(r.title)}:</strong> ${escapeHtmlEntities(r.recommended)}`
-                : ''
-            )
-            .filter(Boolean)
-            .join('<br>');
-          if (minReq || recReq) {
-            systemRequirements = { minimum: minReq, recommended: recReq };
-          }
+        const parsedEpicReqs = extractEpicRequirementsByOs(d.requirements?.systems);
+        if (parsedEpicReqs.systemRequirements) {
+          systemRequirements = parsedEpicReqs.systemRequirements;
+        }
+        if (parsedEpicReqs.macRequirements) {
+          macRequirements = parsedEpicReqs.macRequirements;
+        }
+        if (parsedEpicReqs.linuxRequirements) {
+          linuxRequirements = parsedEpicReqs.linuxRequirements;
         }
 
         if (Array.isArray(d.requirements?.languages) && d.requirements.languages.length > 0) {
@@ -5360,6 +5422,8 @@ async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
       screenshots,
       movies: movies.length > 0 ? movies : undefined,
       systemRequirements,
+      ...(macRequirements ? { macRequirements } : {}),
+      ...(linuxRequirements ? { linuxRequirements } : {}),
       languages,
       supportedLanguages:
         Array.isArray(languages) && languages.length > 0 ? languages.join(' | ') : undefined,
@@ -7305,6 +7369,7 @@ module.exports = {
   computeEpicPartialProgress,
   isEpicGraphqlAuthFailure,
   getEpicGameAchievementSchema,
+  extractEpicRequirementsByOs,
   fetchEpicProductOfferMetadata,
   extractEpicCustomAttributesMap,
   resolveEpicPartnerChainedHandoff,
