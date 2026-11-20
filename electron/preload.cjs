@@ -250,6 +250,11 @@ if (isTrustedMainRendererOrigin()) {
       ipcRenderer.invoke('offlineVault:save-user-override', arg1, arg2),
     removeUserOverride: (gameId) =>
       ipcRenderer.invoke('offlineVault:remove-user-override', gameId),
+    getUserTagOverrides: () => ipcRenderer.invoke('offlineVault:get-user-tag-overrides'),
+    saveUserTagOverride: (arg1, arg2) =>
+      ipcRenderer.invoke('offlineVault:save-user-tag-override', arg1, arg2),
+    removeUserTagOverride: (gameId) =>
+      ipcRenderer.invoke('offlineVault:remove-user-tag-override', gameId),
     onHealthChanged: (cb) => {
       const handler = (_e, data) => cb(data);
       ipcRenderer.on('offlineVault:health-changed', handler);

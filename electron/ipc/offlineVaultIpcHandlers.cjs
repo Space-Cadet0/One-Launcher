@@ -698,6 +698,352 @@ function writeUserOverridesToDiskAsync(filePath, nextOverrides, updatedAt) {
   );
 }
 
+const MAX_USER_TAG_LENGTH = 64;
+const MAX_USER_TAGS_PER_ARRAY = 100;
+const MAX_USER_TAG_PLATFORM_ALIASES = 50;
+const MAX_USER_TAG_OVERRIDES_PAYLOAD_BYTES = 2 * 1024 * 1024;
+
+/**
+ * @typedef {{
+ *   gameId: string,
+ *   platformAliases?: string[],
+ *   addedTags: string[],
+ *   removedTags: string[],
+ *   updatedAt: string,
+ * }} SanitizedUserTagOverrideRecord
+ */
+
+/** @type {Map<string, { mtimeMs: number, overrides: Record<string, SanitizedUserTagOverrideRecord> }>} */
+const userTagOverridesMemoryCache = new Map();
+/** @type {Map<string, Promise<any>>} */
+const userTagOverridesWriteQueue = new Map();
+let userTagOverridesTmpSeq = 0;
+
+/**
+ * Resolve the atomic persistence path for `user_tag_overrides.json`.
+ * Completely decoupled from `user_overrides.json` so tag edits never trigger media-blob resets.
+ *
+ * @param {any} offlineVaultService
+ * @param {string | undefined} explicitUserDataDir
+ * @returns {string}
+ */
+function resolveUserTagOverridesFilePath(offlineVaultService, explicitUserDataDir) {
+  if (typeof explicitUserDataDir === 'string' && explicitUserDataDir.trim()) {
+    return path.join(explicitUserDataDir.trim(), 'user_tag_overrides.json');
+  }
+  if (typeof offlineVaultService?.userDataDir === 'string' && offlineVaultService.userDataDir.trim()) {
+    return path.join(offlineVaultService.userDataDir.trim(), 'user_tag_overrides.json');
+  }
+  if (typeof offlineVaultService?.vaultDir === 'string' && offlineVaultService.vaultDir.trim()) {
+    return path.join(path.dirname(offlineVaultService.vaultDir.trim()), 'user_tag_overrides.json');
+  }
+  return path.join(resolveEffectiveUserDataDir(), 'user_tag_overrides.json');
+}
+
+/**
+ * Sanitize a single tag label: strip ASCII control chars, collapse whitespace, clamp to 64 chars.
+ * @param {unknown} rawTag
+ * @returns {string}
+ */
+function sanitizeUserTagValue(rawTag) {
+  if (typeof rawTag !== 'string') return '';
+  const cleaned = rawTag
+    .replace(/[\x00-\x1f\x7f]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_USER_TAG_LENGTH)
+    .trim();
+  return cleaned;
+}
+
+/**
+ * Sanitize an array of tag labels (strings only, case-insensitive dedupe, capped at 100 entries).
+ * @param {unknown} rawList
+ * @returns {string[]}
+ */
+function sanitizeUserTagArray(rawList) {
+  if (!Array.isArray(rawList)) return [];
+  /** @type {string[]} */
+  const out = [];
+  /** @type {Set<string>} */
+  const seen = new Set();
+  for (const item of rawList) {
+    if (out.length >= MAX_USER_TAGS_PER_ARRAY) break;
+    const clean = sanitizeUserTagValue(item);
+    if (!clean) continue;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(clean);
+  }
+  return out;
+}
+
+/**
+ * Sanitize platform alias identifiers (`steam:<appId>`, `<platformId>:<platformGameId>`), capped at 50.
+ * @param {unknown} rawAliases
+ * @returns {string[]}
+ */
+function sanitizeUserTagAliases(rawAliases) {
+  if (!Array.isArray(rawAliases)) return [];
+  /** @type {string[]} */
+  const out = [];
+  /** @type {Set<string>} */
+  const seen = new Set();
+  for (const item of rawAliases) {
+    if (out.length >= MAX_USER_TAG_PLATFORM_ALIASES) break;
+    if (typeof item !== 'string') continue;
+    const stripped = item.replace(/[\x00-\x1f\x7f]+/g, '').trim();
+    const safeAlias = normalizeSafeOverrideGameId(stripped);
+    if (!safeAlias || seen.has(safeAlias)) continue;
+    seen.add(safeAlias);
+    out.push(safeAlias);
+  }
+  return out;
+}
+
+/**
+ * Validate and sanitize a `UserTagOverride` record.
+ * @param {unknown} rawGameId
+ * @param {any} rawRecord
+ * @param {string} [fallbackIso]
+ * @returns {SanitizedUserTagOverrideRecord | null}
+ */
+function sanitizeUserTagOverrideRecord(rawGameId, rawRecord, fallbackIso) {
+  const gameId = normalizeSafeOverrideGameId(
+    rawGameId || (rawRecord && typeof rawRecord === 'object' ? rawRecord.gameId : '')
+  );
+  if (!gameId || !rawRecord || typeof rawRecord !== 'object' || Array.isArray(rawRecord)) {
+    return null;
+  }
+  const addedTags = sanitizeUserTagArray(rawRecord.addedTags);
+  const addedKeys = new Set(addedTags.map((t) => t.toLowerCase()));
+  const removedTags = sanitizeUserTagArray(rawRecord.removedTags).filter(
+    (t) => !addedKeys.has(t.toLowerCase())
+  );
+  const platformAliases = sanitizeUserTagAliases(rawRecord.platformAliases);
+  const rawUpdated = typeof rawRecord.updatedAt === 'string' ? rawRecord.updatedAt.trim() : '';
+  const updatedAt = Number.isFinite(Date.parse(rawUpdated))
+    ? rawUpdated
+    : fallbackIso || new Date().toISOString();
+
+  /** @type {SanitizedUserTagOverrideRecord} */
+  const record = {
+    gameId,
+    ...(platformAliases.length > 0 ? { platformAliases } : {}),
+    addedTags,
+    removedTags,
+    updatedAt,
+  };
+  return record;
+}
+
+/**
+ * Parse and sanitize raw JSON text from `user_tag_overrides.json`.
+ * @param {string} rawText
+ * @returns {Record<string, SanitizedUserTagOverrideRecord>}
+ */
+function parseSanitizedUserTagOverridesJson(rawText) {
+  if (
+    typeof rawText !== 'string' ||
+    Buffer.byteLength(rawText, 'utf8') > MAX_USER_TAG_OVERRIDES_PAYLOAD_BYTES * 2
+  ) {
+    return {};
+  }
+  const parsed = JSON.parse(rawText);
+  const rawMap =
+    parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed.overrides && typeof parsed.overrides === 'object' && !Array.isArray(parsed.overrides)
+        ? parsed.overrides
+        : parsed
+      : {};
+  /** @type {Record<string, SanitizedUserTagOverrideRecord>} */
+  const cleanMap = {};
+  for (const [k, v] of Object.entries(rawMap)) {
+    const safeKey = normalizeSafeOverrideGameId(k);
+    if (!safeKey) continue;
+    const sanitized = sanitizeUserTagOverrideRecord(safeKey, v);
+    if (!sanitized) continue;
+    if (sanitized.addedTags.length === 0 && sanitized.removedTags.length === 0) continue;
+    cleanMap[safeKey] = sanitized;
+  }
+  return cleanMap;
+}
+
+/**
+ * Read durable user tag overrides map synchronously from `userData/user_tag_overrides.json`.
+ * @param {string} filePath
+ * @returns {Record<string, SanitizedUserTagOverrideRecord>}
+ */
+function readUserTagOverridesFromDisk(filePath) {
+  const hostFilePath = toHostFilesystemPath(filePath);
+  try {
+    if (!fs.existsSync(hostFilePath)) {
+      userTagOverridesMemoryCache.delete(hostFilePath);
+      return {};
+    }
+    const stat = fs.statSync(hostFilePath);
+    const cached = userTagOverridesMemoryCache.get(hostFilePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs) {
+      return { ...cached.overrides };
+    }
+    const cleanMap = parseSanitizedUserTagOverridesJson(fs.readFileSync(hostFilePath, 'utf8'));
+    userTagOverridesMemoryCache.set(hostFilePath, {
+      mtimeMs: stat.mtimeMs,
+      overrides: cleanMap,
+    });
+    return { ...cleanMap };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Read durable user tag overrides map asynchronously with `mtimeMs`-validated in-memory caching.
+ * @param {string} filePath
+ * @returns {Promise<Record<string, SanitizedUserTagOverrideRecord>>}
+ */
+async function readUserTagOverridesAsync(filePath) {
+  const hostFilePath = toHostFilesystemPath(filePath);
+  try {
+    let stat = null;
+    try {
+      stat = await fs.promises.stat(hostFilePath);
+    } catch {
+      stat = null;
+    }
+    if (!stat || !stat.isFile()) {
+      userTagOverridesMemoryCache.delete(hostFilePath);
+      return {};
+    }
+    const cached = userTagOverridesMemoryCache.get(hostFilePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs) {
+      return { ...cached.overrides };
+    }
+    const rawText = await fs.promises.readFile(hostFilePath, 'utf8');
+    const cleanMap = parseSanitizedUserTagOverridesJson(rawText);
+    userTagOverridesMemoryCache.set(hostFilePath, {
+      mtimeMs: stat.mtimeMs,
+      overrides: cleanMap,
+    });
+    return { ...cleanMap };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Enqueue a serialized async read/write task per resolved `user_tag_overrides.json` path so
+ * tag writes never race or contend with `user_overrides.json`.
+ *
+ * @template T
+ * @param {string} filePath
+ * @param {(hostFilePath: string) => Promise<T>} taskFn
+ * @returns {Promise<T>}
+ */
+function enqueueUserTagOverridesTask(filePath, taskFn) {
+  const hostFilePath = toHostFilesystemPath(filePath);
+  const prev = userTagOverridesWriteQueue.get(hostFilePath) || Promise.resolve();
+  const next = prev.catch(() => {}).then(() => taskFn(hostFilePath));
+  const tracked = next.catch(() => {}).finally(() => {
+    if (userTagOverridesWriteQueue.get(hostFilePath) === tracked) {
+      userTagOverridesWriteQueue.delete(hostFilePath);
+    }
+  });
+  userTagOverridesWriteQueue.set(hostFilePath, tracked);
+  return next;
+}
+
+/**
+ * Internal atomic async writer for `user_tag_overrides.json` with strict 2 MB payload cap
+ * and bounded Windows `EPERM`/`EACCES`/`EBUSY` rename retry backoff.
+ *
+ * @param {string} hostFilePath
+ * @param {Record<string, SanitizedUserTagOverrideRecord>} nextOverrides
+ * @param {string} [updatedAt]
+ * @returns {Promise<void>}
+ */
+async function performAtomicUserTagOverridesWriteAsync(hostFilePath, nextOverrides, updatedAt) {
+  const effectiveUpdatedAt = updatedAt || new Date().toISOString();
+  const serialized = JSON.stringify(
+    { overrides: nextOverrides, updatedAt: effectiveUpdatedAt },
+    null,
+    2
+  );
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_USER_TAG_OVERRIDES_PAYLOAD_BYTES) {
+    throw new Error('User tag overrides payload exceeds 2 MB limit.');
+  }
+
+  const dir = path.dirname(hostFilePath);
+  await fs.promises.mkdir(dir, { recursive: true });
+  const tmpPath = `${hostFilePath}.${process.pid}.${++userTagOverridesTmpSeq}.tmp`;
+  const retryDelaysMs = [15, 40, 80];
+
+  try {
+    await fs.promises.writeFile(tmpPath, serialized, 'utf8');
+    let renamed = false;
+    let lastRenameErr = null;
+    for (let attempt = 0; attempt <= retryDelaysMs.length; attempt++) {
+      try {
+        await fs.promises.rename(tmpPath, hostFilePath);
+        renamed = true;
+        break;
+      } catch (renErr) {
+        lastRenameErr = renErr;
+        const code = String(/** @type {any} */ (renErr)?.code || '').toUpperCase();
+        const isRetryableLock = code === 'EPERM' || code === 'EACCES' || code === 'EBUSY';
+        if (!isRetryableLock || attempt >= retryDelaysMs.length) {
+          break;
+        }
+        const delayMs = retryDelaysMs[attempt];
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+    if (!renamed) {
+      throw lastRenameErr || new Error('Failed to rename user_tag_overrides temporary file');
+    }
+  } catch (err) {
+    try {
+      await fs.promises.unlink(tmpPath);
+    } catch {}
+    if (
+      err &&
+      typeof err === 'object' &&
+      String(/** @type {any} */ (err).message || '').includes('2 MB limit')
+    ) {
+      throw err;
+    }
+    atomicWriteFileSync(hostFilePath, serialized);
+  }
+
+  try {
+    const postStat = await fs.promises.stat(hostFilePath);
+    userTagOverridesMemoryCache.set(hostFilePath, {
+      mtimeMs: postStat.mtimeMs,
+      overrides: { ...nextOverrides },
+    });
+  } catch {
+    userTagOverridesMemoryCache.set(hostFilePath, {
+      mtimeMs: -1,
+      overrides: { ...nextOverrides },
+    });
+  }
+}
+
+/**
+ * Serialized async atomic writer for `user_tag_overrides.json`.
+ *
+ * @param {string} filePath
+ * @param {Record<string, SanitizedUserTagOverrideRecord>} nextOverrides
+ * @param {string} [updatedAt]
+ * @returns {Promise<void>}
+ */
+function writeUserTagOverridesToDiskAsync(filePath, nextOverrides, updatedAt) {
+  return enqueueUserTagOverridesTask(filePath, (hostFilePath) =>
+    performAtomicUserTagOverridesWriteAsync(hostFilePath, nextOverrides, updatedAt)
+  );
+}
+
 /**
  * Registers all `offlineVault:*` and user-override IPC channels, forwarding background health
  * and hydration events to the active BrowserWindow renderer (or daemon event buffer).
@@ -1351,6 +1697,303 @@ function registerOfflineVaultIpcHandlers({
   ipcMain.handle('offlineVault:save-user-override', handleSaveUserOverride);
   ipcMain.handle('offlineVault:remove-user-override', handleRemoveUserOverride);
 
+  // Decoupled User Tag Delta Overrides (`userData/user_tag_overrides.json`)
+  // NEVER calls `offlineVaultService.saveUserOverride()` — zero media-blob invalidation!
+  const handleGetUserTagOverrides = async () => {
+    const filePath = resolveUserTagOverridesFilePath(offlineVaultService, userDataDir);
+    const hostFilePath = toHostFilesystemPath(filePath);
+    const pendingWrite = userTagOverridesWriteQueue.get(hostFilePath);
+    if (pendingWrite) {
+      try {
+        await pendingWrite;
+      } catch {}
+    }
+    return await readUserTagOverridesAsync(filePath);
+  };
+
+  const handleSaveUserTagOverride = async (
+    /** @type {any} */ _event,
+    /** @type {unknown} */ arg1,
+    /** @type {unknown} */ arg2
+  ) => {
+    try {
+      const filePath = resolveUserTagOverridesFilePath(offlineVaultService, userDataDir);
+
+      // Batch save path (used by `hydrateUserTagOverridesFromVault`)
+      if (
+        arg1 &&
+        typeof arg1 === 'object' &&
+        !Array.isArray(arg1) &&
+        /** @type {any} */ (arg1).batchOverrides &&
+        typeof /** @type {any} */ (arg1).batchOverrides === 'object' &&
+        !Array.isArray(/** @type {any} */ (arg1).batchOverrides)
+      ) {
+        const cleanBatch = sanitizeRendererIpcOptions(/** @type {any} */ (arg1).batchOverrides);
+        const batchResult = await enqueueUserTagOverridesTask(filePath, async (hostFilePath) => {
+          const current = await readUserTagOverridesAsync(hostFilePath);
+          /** @type {Record<string, SanitizedUserTagOverrideRecord>} */
+          const nextOverrides = { ...current };
+          const nowIso = new Date().toISOString();
+          let appliedCount = 0;
+
+          for (const [rawKey, rawPatch] of Object.entries(cleanBatch)) {
+            const batchGameId = normalizeSafeOverrideGameId(rawKey);
+            if (!batchGameId || !rawPatch || typeof rawPatch !== 'object' || Array.isArray(rawPatch)) {
+              continue;
+            }
+            const cleanPatch = sanitizeRendererIpcOptions(rawPatch);
+            const existing = nextOverrides[batchGameId];
+            const existingMs = Date.parse(String(existing?.updatedAt || ''));
+            const rawPatchUpdatedStr =
+              typeof cleanPatch.updatedAt === 'string' ? cleanPatch.updatedAt.trim() : '';
+            const patchMs = Date.parse(rawPatchUpdatedStr);
+
+            if (Number.isFinite(existingMs) && Number.isFinite(patchMs) && existingMs > patchMs) {
+              continue;
+            }
+
+            const candidateRaw = {
+              gameId: batchGameId,
+              addedTags: Array.isArray(cleanPatch.addedTags)
+                ? cleanPatch.addedTags
+                : existing?.addedTags || [],
+              removedTags: Array.isArray(cleanPatch.removedTags)
+                ? cleanPatch.removedTags
+                : existing?.removedTags || [],
+              platformAliases: Array.isArray(cleanPatch.platformAliases)
+                ? cleanPatch.platformAliases
+                : existing?.platformAliases,
+              updatedAt: Number.isFinite(patchMs) ? rawPatchUpdatedStr : nowIso,
+            };
+            const sanitized = sanitizeUserTagOverrideRecord(batchGameId, candidateRaw, nowIso);
+            if (!sanitized) continue;
+
+            if (Array.isArray(cleanPatch.purgeKeys)) {
+              for (const rawPk of cleanPatch.purgeKeys) {
+                const pk = normalizeSafeOverrideGameId(rawPk);
+                if (pk && pk !== batchGameId) {
+                  delete nextOverrides[pk];
+                }
+              }
+            }
+
+            if (sanitized.addedTags.length === 0 && sanitized.removedTags.length === 0) {
+              delete nextOverrides[batchGameId];
+            } else {
+              nextOverrides[batchGameId] = sanitized;
+            }
+            appliedCount += 1;
+          }
+
+          await performAtomicUserTagOverridesWriteAsync(hostFilePath, nextOverrides, nowIso);
+          return {
+            appliedCount,
+            nextOverrides,
+          };
+        });
+
+        return {
+          success: true,
+          count: batchResult.appliedCount,
+          overrides: batchResult.nextOverrides,
+        };
+      }
+
+      // Single save path
+      let gameId = '';
+      /** @type {Record<string, any>} */
+      let patch = {};
+      /** @type {Set<string>} */
+      const explicitPurgeKeys = new Set();
+
+      if (typeof arg1 === 'string') {
+        gameId = normalizeSafeOverrideGameId(arg1);
+        patch = sanitizeRendererIpcOptions(arg2);
+      } else if (arg1 && typeof arg1 === 'object' && !Array.isArray(arg1)) {
+        const cleanObj = sanitizeRendererIpcOptions(arg1);
+        gameId = normalizeSafeOverrideGameId(cleanObj.gameId || cleanObj.id);
+        if (Array.isArray(cleanObj.purgeKeys)) {
+          for (const rawPk of cleanObj.purgeKeys) {
+            const safePk = normalizeSafeOverrideGameId(rawPk);
+            if (safePk && safePk !== gameId) explicitPurgeKeys.add(safePk);
+          }
+        }
+        if (
+          cleanObj.override &&
+          typeof cleanObj.override === 'object' &&
+          !Array.isArray(cleanObj.override)
+        ) {
+          patch = sanitizeRendererIpcOptions(cleanObj.override);
+        } else {
+          patch = { ...cleanObj };
+        }
+      }
+
+      if (Array.isArray(patch.purgeKeys)) {
+        for (const rawPk of patch.purgeKeys) {
+          const safePk = normalizeSafeOverrideGameId(rawPk);
+          if (safePk && safePk !== gameId) explicitPurgeKeys.add(safePk);
+        }
+      }
+
+      if (!gameId) {
+        return { success: false, error: 'Invalid or missing gameId for user tag override.' };
+      }
+
+      const result = await enqueueUserTagOverridesTask(filePath, async (hostFilePath) => {
+        const current = await readUserTagOverridesAsync(hostFilePath);
+        const existing = current[gameId];
+        const existingMs = Date.parse(String(existing?.updatedAt || ''));
+        const rawPatchUpdatedStr =
+          typeof patch.updatedAt === 'string' ? patch.updatedAt.trim() : '';
+        const patchMs = Date.parse(rawPatchUpdatedStr);
+        const nowIso = new Date().toISOString();
+
+        if (Number.isFinite(existingMs) && Number.isFinite(patchMs) && existingMs > patchMs) {
+          return {
+            updatedRecord: existing,
+            nextOverrides: current,
+          };
+        }
+
+        const effectiveUpdatedAt = Number.isFinite(patchMs) ? rawPatchUpdatedStr : nowIso;
+        const sanitized = sanitizeUserTagOverrideRecord(
+          gameId,
+          {
+            gameId,
+            addedTags: Array.isArray(patch.addedTags)
+              ? patch.addedTags
+              : existing?.addedTags || [],
+            removedTags: Array.isArray(patch.removedTags)
+              ? patch.removedTags
+              : existing?.removedTags || [],
+            platformAliases: Array.isArray(patch.platformAliases)
+              ? patch.platformAliases
+              : existing?.platformAliases,
+            updatedAt: effectiveUpdatedAt,
+          },
+          nowIso
+        );
+
+        if (!sanitized) {
+          return {
+            updatedRecord: undefined,
+            nextOverrides: current,
+          };
+        }
+
+        /** @type {Record<string, SanitizedUserTagOverrideRecord>} */
+        const updatedMap = { ...current };
+        for (const pk of explicitPurgeKeys) {
+          if (pk !== gameId) {
+            delete updatedMap[pk];
+          }
+        }
+
+        if (sanitized.addedTags.length === 0 && sanitized.removedTags.length === 0) {
+          delete updatedMap[gameId];
+          await performAtomicUserTagOverridesWriteAsync(hostFilePath, updatedMap, effectiveUpdatedAt);
+          return {
+            updatedRecord: undefined,
+            nextOverrides: updatedMap,
+          };
+        }
+
+        updatedMap[gameId] = sanitized;
+        await performAtomicUserTagOverridesWriteAsync(hostFilePath, updatedMap, sanitized.updatedAt);
+        return {
+          updatedRecord: sanitized,
+          nextOverrides: updatedMap,
+        };
+      });
+
+      return {
+        success: true,
+        gameId,
+        ...(result.updatedRecord ? { override: result.updatedRecord } : {}),
+        overrides: result.nextOverrides,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        error:
+          err && typeof err === 'object' && 'message' in err
+            ? String(/** @type {any} */ (err).message)
+            : 'Failed to save user tag override.',
+      };
+    }
+  };
+
+  const handleRemoveUserTagOverride = async (
+    /** @type {any} */ _event,
+    /** @type {unknown} */ rawArg
+  ) => {
+    try {
+      const cleanObj =
+        rawArg && typeof rawArg === 'object' && !Array.isArray(rawArg)
+          ? sanitizeRendererIpcOptions(rawArg)
+          : null;
+      const rawId =
+        typeof rawArg === 'string' ? rawArg : cleanObj ? cleanObj.gameId || cleanObj.id : '';
+      const gameId = normalizeSafeOverrideGameId(rawId);
+      if (!gameId) {
+        return { success: false, error: 'Invalid or missing gameId for user tag override removal.' };
+      }
+
+      /** @type {Set<string>} */
+      const keysToDelete = new Set([gameId]);
+      if (cleanObj) {
+        const rawExtraKeys = [
+          ...(Array.isArray(cleanObj.aliasKeys) ? cleanObj.aliasKeys : []),
+          ...(Array.isArray(cleanObj.aliases) ? cleanObj.aliases : []),
+        ];
+        for (const k of rawExtraKeys) {
+          const safe = normalizeSafeOverrideGameId(k);
+          if (safe) keysToDelete.add(safe);
+        }
+      }
+
+      const filePath = resolveUserTagOverridesFilePath(offlineVaultService, userDataDir);
+      const nextOverrides = await enqueueUserTagOverridesTask(filePath, async (hostFilePath) => {
+        const current = await readUserTagOverridesAsync(hostFilePath);
+        const updatedMap = { ...current };
+        let changed = false;
+        for (const key of keysToDelete) {
+          if (Object.prototype.hasOwnProperty.call(updatedMap, key)) {
+            delete updatedMap[key];
+            changed = true;
+          }
+        }
+        if (changed) {
+          await performAtomicUserTagOverridesWriteAsync(
+            hostFilePath,
+            updatedMap,
+            new Date().toISOString()
+          );
+        }
+        return updatedMap;
+      });
+
+      return {
+        success: true,
+        gameId,
+        overrides: nextOverrides,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        error:
+          err && typeof err === 'object' && 'message' in err
+            ? String(/** @type {any} */ (err).message)
+            : 'Failed to remove user tag override.',
+      };
+    }
+  };
+
+  ipcMain.handle('offlineVault:get-user-tag-overrides', handleGetUserTagOverrides);
+  ipcMain.handle('offlineVault:save-user-tag-override', handleSaveUserTagOverride);
+  ipcMain.handle('offlineVault:remove-user-tag-override', handleRemoveUserTagOverride);
+
   return {
     dispose: () => {
       unsubHealth();
@@ -1366,4 +2009,8 @@ module.exports = {
   readUserOverridesFromDisk,
   readUserOverridesAsync,
   writeUserOverridesToDiskAsync,
+  readUserTagOverridesFromDisk,
+  readUserTagOverridesAsync,
+  writeUserTagOverridesToDiskAsync,
+  sanitizeUserTagOverrideRecord,
 };

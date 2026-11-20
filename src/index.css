@@ -620,3 +620,86 @@ dialog.modal-shell::backdrop {
   outline-offset: 2px;
 }
 
+/* ========================================================
+   ANCHORED TOP-LAYER TAG MANAGER POPOVER (modern-web-guidance)
+   ======================================================== */
+.ol-tag-popover {
+  border: 1px solid #2a475e;
+  border-radius: 6px;
+  padding: 0;
+  background-color: #131b26;
+  color: #c6d4df;
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.82);
+  width: min(340px, calc(100vw - 1.5rem));
+  max-width: calc(100vw - 1.5rem);
+  max-height: calc(100vh - 2rem);
+  overflow: hidden;
+  overscroll-behavior: contain;
+  opacity: 0;
+  transition-property: opacity, transform, display, overlay;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+  transition-behavior: allow-discrete;
+}
+
+.ol-tag-popover::backdrop {
+  background: transparent;
+}
+
+.ol-tag-popover:popover-open {
+  display: flex;
+  flex-direction: column;
+  opacity: 1;
+}
+
+.ol-tag-popover[data-fallback-open='true'] {
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  inset-block-start: 50%;
+  inset-inline-start: 50%;
+  translate: -50% -50%;
+  z-index: 80;
+  opacity: 1;
+}
+
+@supports (position-area: block-end) {
+  .ol-tag-popover {
+    inset: auto;
+    margin: 0;
+    margin-block-start: 6px;
+    position-area: block-end span-inline-start;
+    position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .ol-tag-popover {
+    transform: translateY(-4px) scale(0.98);
+  }
+
+  .ol-tag-popover:popover-open {
+    transform: translateY(0) scale(1);
+  }
+
+  @starting-style {
+    .ol-tag-popover:popover-open {
+      opacity: 0;
+      transform: translateY(-4px) scale(0.98);
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ol-tag-popover {
+    transition-duration: 60ms;
+  }
+
+  @starting-style {
+    .ol-tag-popover:popover-open {
+      opacity: 0;
+    }
+  }
+}
+
+

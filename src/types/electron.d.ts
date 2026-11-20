@@ -10,6 +10,12 @@ import type {
   XboxSubscriptionTierId,
 } from '../contracts/game';
 import type { UserGameOverride } from '../contracts/override';
+import type {
+  RemoveUserTagOverrideOptions,
+  SaveUserTagOverrideBatchPayload,
+  UserTagOverride,
+  UserTagOverrideMutationResult,
+} from '../contracts/tags';
 import type { SuppressedCatalogEntry } from '../services/integrations/catalogSanitizer';
 import type { StorefrontId } from '../contracts/platform';
 import type {
@@ -332,6 +338,22 @@ export interface OfflineVaultBridge {
   removeUserOverride: (
     gameId: string | RemoveUserOverrideOptions
   ) => Promise<UserOverrideMutationResult>;
+  getUserTagOverrides?: () => Promise<Record<string, UserTagOverride>>;
+  saveUserTagOverride?: (
+    gameIdOrOverride:
+      | string
+      | (Partial<UserTagOverride> & {
+          gameId?: string;
+          id?: string;
+          purgeKeys?: string[];
+          override?: Partial<UserTagOverride>;
+        })
+      | SaveUserTagOverrideBatchPayload,
+    overridePatch?: Partial<UserTagOverride>
+  ) => Promise<UserTagOverrideMutationResult>;
+  removeUserTagOverride?: (
+    gameId: string | RemoveUserTagOverrideOptions
+  ) => Promise<UserTagOverrideMutationResult>;
   onHealthChanged: (cb: (snapshot: EndpointHealthSnapshot) => void) => () => void;
   onGameHydrated: (
     cb: (payload: { gameId: string; detail?: OfflineVaultGameDetail }) => void

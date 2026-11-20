@@ -21,6 +21,7 @@ import {
   type HltbData,
 } from '../../../services/hltb/howLongToBeat';
 import { getUserOverrideForGame } from '../../../services/storage/userOverrideStorage';
+import { resolveEffectiveGameTags } from '../../../services/tags/gameTagResolver';
 import { StorefrontIcon, getStorefrontDisplayName } from '../../Common/StorefrontIcon';
 import {
   formatPlaytime,
@@ -196,6 +197,9 @@ const GameHoverPopoutContent: React.FC<RenderGameHoverPopoutArgs> = ({
 
   const displayedSynopsis =
     dynamicBlurb?.id === hoveredGame.id ? dynamicBlurb.blurb : cleanSynopsis;
+  const resolvedHoverTags = resolveEffectiveGameTags(hoveredGame, {
+    fixMatchOverride: hoveredOverride,
+  });
 
   return (
     <div
@@ -492,9 +496,9 @@ const GameHoverPopoutContent: React.FC<RenderGameHoverPopoutArgs> = ({
         </div>
 
         {/* Tags Pills */}
-        {hoveredGame.tags && hoveredGame.tags.length > 0 && (
+        {resolvedHoverTags.tags.length > 0 && (
           <div className="flex flex-wrap gap-1 pt-1">
-            {hoveredGame.tags.slice(0, 4).map((tag) => (
+            {resolvedHoverTags.tags.slice(0, 4).map((tag) => (
               <span
                 key={tag}
                 className="px-2 py-0.5 rounded text-[10px] bg-[#223042] text-steam-accent border border-steam-border/60"

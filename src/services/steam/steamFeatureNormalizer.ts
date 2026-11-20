@@ -44,6 +44,32 @@ export const CATEGORY_REBRAND_MAP: Record<number, string> = {
 };
 
 /**
+ * Known raw Valve localization category tokens that occasionally leak into Steam appdetails tags.
+ */
+const VALVE_CATEGORY_TOKEN_LABELS: Readonly<Record<string, string>> = {
+  '#category_playable_at_your_own_pace': 'Playable at Your Own Pace',
+  '#category_contrast_controls': 'Contrast Controls',
+};
+
+/**
+ * Normalizes a synced storefront tag token: collapses whitespace, trims, maps known Valve
+ * `#category_*` localization tokens to human-readable labels, and strips unknown raw `#category_*` keys.
+ */
+export function normalizeSyncedTagToken(raw: string): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.replace(/[\x00-\x1f\x7f]+/g, '').replace(/\s+/g, ' ').trim();
+  if (!trimmed) return null;
+  const lower = trimmed.toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(VALVE_CATEGORY_TOKEN_LABELS, lower)) {
+    return VALVE_CATEGORY_TOKEN_LABELS[lower];
+  }
+  if (/^#category_/i.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+/**
  * Checks whether a game has an active ownership entitlement on Steam.
  */
 export function isGameOwnedOnSteam(platforms?: Array<{ platformId: string }>): boolean {
@@ -112,37 +138,41 @@ export function getEffectiveCategories(
 
 /**
  * Dynamically normalizes tags based on Steam ownership.
- * Strips proprietary Steam services and neutralizes branded tags for non-Steam titles.
+ * Trims, maps/strips Valve `#category_*` tokens, case-insensitively deduplicates for ALL games
+ * (including Steam-owned titles so duplicate DualShock/DualSense entries collapse cleanly),
+ * and strips/rebrands Steam-proprietary services for non-Steam titles.
  */
 export function getEffectiveTags(
   tags: string[] = [],
   isOwnedOnSteam: boolean
 ): string[] {
-  if (isOwnedOnSteam) {
-    return tags;
+  if (!Array.isArray(tags) || tags.length === 0) {
+    return [];
   }
 
   const effective: string[] = [];
   const seen = new Set<string>();
 
   for (const tag of tags) {
-    if (!tag) continue;
-    const trimmed = tag.trim();
+    const normalized = normalizeSyncedTagToken(tag);
+    if (!normalized) continue;
 
-    // 1. Suppress Steam-exclusive services
-    if (isSteamExclusiveFeature(trimmed)) {
-      continue;
-    }
+    let updatedTag = normalized;
+    if (!isOwnedOnSteam) {
+      // 1. Suppress Steam-exclusive services
+      if (isSteamExclusiveFeature(normalized)) {
+        continue;
+      }
 
-    // 2. Rebrand cross-platform tags
-    let updatedTag = trimmed;
-    const lower = trimmed.toLowerCase();
-    if (lower === 'steam achievements') {
-      updatedTag = 'Achievements';
-    } else if (lower === 'steam cloud') {
-      updatedTag = 'Cloud Saves';
-    } else if (lower === 'steam leaderboards') {
-      updatedTag = 'Leaderboards';
+      // 2. Rebrand cross-platform tags
+      const lower = normalized.toLowerCase();
+      if (lower === 'steam achievements') {
+        updatedTag = 'Achievements';
+      } else if (lower === 'steam cloud') {
+        updatedTag = 'Cloud Saves';
+      } else if (lower === 'steam leaderboards') {
+        updatedTag = 'Leaderboards';
+      }
     }
 
     const normKey = updatedTag.toLowerCase();
