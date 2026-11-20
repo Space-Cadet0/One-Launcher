@@ -20,6 +20,7 @@ import {
   Download,
   Sliders,
   ShieldCheck,
+  Settings,
   Minus,
   X,
   Info,
@@ -64,6 +65,7 @@ interface TopNavBarProps {
   onOpenFixMatch?: () => void;
   onOpenLibraryMatchManager?: () => void;
   onOpenSystemSetup?: () => void;
+  onOpenSettings?: () => void;
   systemSetupAlertCount?: number;
   defaultMenuOpen?: boolean;
   onOpenAchievements?: () => void;
@@ -102,6 +104,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   onOpenFixMatch,
   onOpenLibraryMatchManager,
   onOpenSystemSetup,
+  onOpenSettings,
   systemSetupAlertCount,
   defaultMenuOpen = false,
   onOpenAchievements,
@@ -463,6 +466,16 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
     }
   };
 
+  const handleOpenSettings = () => {
+    setOpenMenu(null);
+    setIsMenuOpen(false);
+    if (onOpenSettings) {
+      onOpenSettings();
+    } else if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(new CustomEvent('antigravity:open-settings'));
+    }
+  };
+
   // All known storefront IDs in canonical order
   const allPlatforms: StorefrontId[] = [
     'steam',
@@ -599,6 +612,16 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                   }
                   className="bg-[#16202d] border border-[#2a475e] shadow-2xl rounded-md py-1.5 min-w-[230px] absolute top-full left-0 mt-0.5 z-50"
                 >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    data-testid="win-menu-settings"
+                    onClick={handleOpenSettings}
+                    className="min-h-6 w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Settings…</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl+,</span>
+                  </button>
                   <button
                     type="button"
                     role="menuitem"
@@ -1205,6 +1228,31 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                 <div role="presentation" className="px-3.5 pt-1 pb-0.5 text-[9px] font-bold uppercase tracking-wider text-slate-300">
                   Accounts &amp; Library
                 </div>
+
+                {/* 0. Settings */}
+                <button
+                  type="button"
+                  role="menuitem"
+                  data-testid="menu-open-settings"
+                  onClick={handleOpenSettings}
+                  className="min-h-6 w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer group"
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <Settings
+                      className="w-4 h-4 shrink-0 text-sky-400 group-hover:scale-110 transition-transform"
+                      aria-hidden="true"
+                    />
+                    <div className="flex flex-col min-w-0">
+                      <span className="font-semibold text-white truncate">Settings…</span>
+                      <span className="text-[10px] text-steam-subtext truncate">
+                        Footprint, display &amp; HUD defaults
+                      </span>
+                    </div>
+                  </div>
+                  <span className="text-[10px] text-steam-subtext font-mono shrink-0 ml-2">
+                    {isMacWindow ? '⌘,' : 'Ctrl+,'}
+                  </span>
+                </button>
 
                 {/* 1. Accounts */}
                 <button
@@ -1813,6 +1861,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
       onOpenFixMatch,
       onOpenLibraryMatchManager,
       onOpenSystemSetup,
+      onOpenSettings,
       systemSetupAlertCount,
       onOpenAchievements,
       onOpenDownloads,

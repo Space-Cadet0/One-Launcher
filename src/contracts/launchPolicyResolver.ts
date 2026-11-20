@@ -1,6 +1,9 @@
 import type {
+  LauncherPerformanceSettings,
   LaunchMethod,
+  PerformanceHudMode,
   StorefrontClientLifecyclePolicy,
+  StorefrontLaunchProfile,
 } from './launcher';
 import type { StorefrontId } from './platform';
 
@@ -120,6 +123,59 @@ export function sanitizeStorefrontLifecyclePolicy(
     : 'minimal_and_close_if_started';
   const clean = typeof value === 'string' ? (value.trim() as StorefrontClientLifecyclePolicy) : undefined;
   return clean && VALID_STOREFRONT_LIFECYCLE_POLICIES.has(clean) ? clean : cleanFallback;
+}
+
+const VALID_PERFORMANCE_HUD_MODES = new Set<PerformanceHudMode>(['default', 'on', 'off']);
+
+export function sanitizePerformanceHudMode(value?: unknown): PerformanceHudMode | undefined {
+  if (typeof value !== 'string') return undefined;
+  const clean = value.trim().toLowerCase() as PerformanceHudMode;
+  return VALID_PERFORMANCE_HUD_MODES.has(clean) ? clean : undefined;
+}
+
+/**
+ * Lossless, idempotent migration from legacy split `metalHud`/`dxvkHud` booleans
+ * to the unified `performanceHud` ('default' | 'on' | 'off') setting.
+ */
+export function migrateLegacyHudConfig<T extends Partial<StorefrontLaunchProfile>>(
+  cfg: T
+): T & { performanceHud: PerformanceHudMode } {
+  if (!cfg || typeof cfg !== 'object') {
+    return cfg as T & { performanceHud: PerformanceHudMode };
+  }
+  const existing = sanitizePerformanceHudMode(cfg.performanceHud);
+  if (existing) {
+    return (cfg.performanceHud === existing ? cfg : { ...cfg, performanceHud: existing }) as T & {
+      performanceHud: PerformanceHudMode;
+    };
+  }
+  const hasMetal = typeof cfg.metalHud === 'boolean';
+  const hasDxvk = typeof cfg.dxvkHud === 'boolean';
+  if (cfg.metalHud === true || cfg.dxvkHud === true) {
+    return { ...cfg, performanceHud: 'on' };
+  }
+  if (hasMetal || hasDxvk) {
+    return { ...cfg, performanceHud: 'off' };
+  }
+  return { ...cfg, performanceHud: 'default' };
+}
+
+/**
+ * Resolves the effective boolean Performance HUD state from a per-game profile
+ * (migrating legacy `metalHud`/`dxvkHud` if needed) and global performance settings.
+ */
+export function resolveEffectivePerformanceHud(
+  cfg?: Partial<StorefrontLaunchProfile> | null,
+  perfSettings?: Partial<LauncherPerformanceSettings> | null
+): boolean {
+  const globalDefault = Boolean(perfSettings?.defaultPerformanceHud);
+  if (!cfg || typeof cfg !== 'object') {
+    return globalDefault;
+  }
+  const migrated = migrateLegacyHudConfig(cfg);
+  if (migrated.performanceHud === 'on') return true;
+  if (migrated.performanceHud === 'off') return false;
+  return globalDefault;
 }
 
 export function resolveEffectiveLifecyclePolicy(

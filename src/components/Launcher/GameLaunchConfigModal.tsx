@@ -1,8 +1,9 @@
-import React from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { ModalShell } from '../Common/ModalShell';
 import { StorefrontId } from '../../contracts/platform';
-import { GameLaunchConfig } from '../../contracts/launcher';
+import { GameLaunchConfig, PerformanceHudMode } from '../../contracts/launcher';
+import { environmentSetupService } from '../../services/launcher/environmentSetupService';
 import {
   Settings,
   X,
@@ -10,9 +11,14 @@ import {
   RotateCcw,
   CheckCircle2,
   AlertTriangle,
+  Gauge,
 } from 'lucide-react';
 import { getBadgeToneClasses } from './LaunchConfig/launchConfigHelpers';
-import { LAUNCH_BUTTON_FOCUS_CLASSES } from './LaunchConfig/LaunchConfigControls';
+import {
+  LAUNCH_BUTTON_FOCUS_CLASSES,
+  LaunchDisclosure,
+  SegmentedRadioGroup,
+} from './LaunchConfig/LaunchConfigControls';
 import {
   DetectedPipelineBanner,
   DetectedPipelineBannerBase,
@@ -46,6 +52,8 @@ export interface GameLaunchConfigModalProps {
   initialPlatformId?: StorefrontId;
   onClose: () => void;
   onSaved?: (config: GameLaunchConfig) => void;
+  onOpenGlobalSettings?: (section?: 'general' | 'macos_bottle') => void;
+  onOpenRunnerSetup?: () => void;
 }
 
 export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
@@ -54,6 +62,8 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
   initialPlatformId,
   onClose,
   onSaved,
+  onOpenGlobalSettings,
+  onOpenRunnerSetup,
 }) => {
   const isRealClientRenderer = useIsRealClientRenderer();
   const idPrefix = useSafeId('launch-cfg');
@@ -65,6 +75,87 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     onSaved,
   });
 
+  const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
+  const [executionOpenOverride, setExecutionOpenOverride] = useState<boolean | null>(null);
+
+  const shouldAutoOpenExecution =
+    form.activeDisplayMethod === 'direct' || !form.preview.isInstalled;
+
+  useEffect(() => {
+    if (!isOpen) {
+      setShowDiscardConfirm(false);
+      setExecutionOpenOverride(null);
+    }
+  }, [isOpen, game.id]);
+
+  useEffect(() => {
+    if (!form.hasUnsavedChanges && showDiscardConfirm) {
+      setShowDiscardConfirm(false);
+    }
+  }, [form.hasUnsavedChanges, showDiscardConfirm]);
+
+  useEffect(() => {
+    if (shouldAutoOpenExecution) {
+      setExecutionOpenOverride(true);
+    }
+  }, [shouldAutoOpenExecution]);
+
+  const handleOpenGlobalSettings = useCallback(
+    (section: 'general' | 'macos_bottle' = 'general') => {
+      if (onOpenGlobalSettings) {
+        onOpenGlobalSettings(section);
+        return;
+      }
+      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+        window.dispatchEvent(
+          new CustomEvent('antigravity:open-settings', { detail: { section } })
+        );
+      }
+    },
+    [onOpenGlobalSettings]
+  );
+
+  const handleOpenRunnerSetup = useCallback(() => {
+    if (onOpenRunnerSetup) {
+      onOpenRunnerSetup();
+      return;
+    }
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(
+        new CustomEvent('antigravity:open-setup-wizard', {
+          detail: { initialStep: 'compatibility' },
+        })
+      );
+    }
+    environmentSetupService.openWizard({
+      mode: 'health_check',
+      initialStep: 'compatibility',
+    });
+  }, [onOpenRunnerSetup]);
+
+  const isBusy = form.isSaving;
+
+  const handleCloseAttemptWhilePrevented = useCallback(() => {
+    if (!isBusy && form.hasUnsavedChanges) {
+      setShowDiscardConfirm(true);
+    }
+  }, [isBusy, form.hasUnsavedChanges]);
+
+  const handleRequestClose = useCallback(() => {
+    if (isBusy) return;
+    if (form.hasUnsavedChanges) {
+      setShowDiscardConfirm(true);
+      return;
+    }
+    onClose();
+  }, [isBusy, form.hasUnsavedChanges, onClose]);
+
+  const handleDiscardAndClose = useCallback(() => {
+    if (isBusy) return;
+    setShowDiscardConfirm(false);
+    onClose();
+  }, [isBusy, onClose]);
+
   if (!isOpen) return null;
 
   const renderSection = <P extends object>(
@@ -74,17 +165,94 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
   ): React.ReactElement | null =>
     isRealClientRenderer ? React.createElement(MemoComp, props) : BaseFn(props);
 
-  const isBusy = form.isSaving;
+  const dialogTitleId = `${idPrefix}-dialog-title`;
+  const globalHudDefaultLabel = form.perfSettings.defaultPerformanceHud ? 'On' : 'Off';
+  const hudHelperText = form.isWindowsHost
+    ? 'Enables DXVK HUD (FPS & frametimes) on Vulkan / DXVK-wrapped games. For native DirectX titles, use Windows Game Bar (Win+G) or GPU driver overlays.'
+    : form.preview.visibleSections.compatibilityLayer
+      ? 'Uses Apple Metal HUD on D3DMetal & DXMT; automatically falls back to DXVK HUD when required by MoltenVK.'
+      : 'Enables Apple Metal Performance HUD (MTL_HUD_ENABLED=1) for live FPS, frametime, and GPU memory telemetry.';
+
+  const compatSectionProps = {
+    idPrefix,
+    isWindowsHost: form.isWindowsHost,
+    preview: form.preview,
+    activeDisplayMethod: form.activeDisplayMethod,
+    detectedLayers: form.detectedLayers,
+    runnerUpdates: form.runnerUpdates,
+    compatibilityLayer: form.compatibilityLayer,
+    onSelectCompatibilityLayer: form.handleSelectCompatibilityLayer,
+    availableBottles: form.availableBottles,
+    wineBottleName: form.wineBottleName,
+    onChangeWineBottleName: form.setWineBottleName,
+    selectedRunnerDescriptor: form.selectedRunnerDescriptor,
+    activeLayer: form.activeLayer,
+    activeUpdateInfo: form.activeUpdateInfo,
+    activeInstalledVer: form.activeInstalledVer,
+    activeSecondaryBuildText: form.activeSecondaryBuildText,
+    resolvedBottleFolderPath: form.resolvedBottleFolderPath,
+    onOpenBottleFolder: form.handleOpenBottleFolder,
+    onOpenRunnerSetup: handleOpenRunnerSetup,
+    winePrefixPath: form.winePrefixPath,
+    onChangeWinePrefixPath: form.setWinePrefixPath,
+    onBrowseWinePrefix: form.handleBrowseWinePrefix,
+    crossoverGraphicsBackend: form.crossoverGraphicsBackend,
+    onChangeCrossoverGraphicsBackend: form.setCrossoverGraphicsBackend,
+    crossoverD3DMetalVersion: form.crossoverD3DMetalVersion,
+    onChangeCrossoverD3DMetalVersion: form.setCrossoverD3DMetalVersion,
+    showD3DMetalVersionSelector: form.showD3DMetalVersionSelector,
+    primaryD3DVer: form.primaryD3DVer,
+    fallbackD3DVer: form.fallbackD3DVer,
+    crossoverHighResolutionMode: form.crossoverHighResolutionMode,
+    onChangeCrossoverHighResolutionMode: form.setCrossoverHighResolutionMode,
+    onToggleLegacy96DpiMode: form.handleToggleLegacy96DpiMode,
+    isDlssSupportedBackend: form.isDlssSupportedBackend,
+    dlssUnavailableReason: form.dlssUnavailableReason,
+    crossoverDlss: form.crossoverDlss,
+    onToggleCrossoverDlss: form.handleToggleCrossoverDlss,
+    metalfxSpatialUpscaleFactor: form.metalfxSpatialUpscaleFactor,
+    onChangeMetalfxSpatialUpscaleFactor: form.setMetalfxSpatialUpscaleFactor,
+    preferredMaxFrameRate: form.preferredMaxFrameRate,
+    onChangePreferredMaxFrameRate: form.setPreferredMaxFrameRate,
+    displayScalingMode: form.displayScalingMode,
+    onChangeDisplayScalingMode: form.setDisplayScalingMode,
+    displayAspectRatio: form.displayAspectRatio,
+    onChangeDisplayAspectRatio: form.setDisplayAspectRatio,
+    virtualDesktopResolution: form.virtualDesktopResolution,
+    onChangeVirtualDesktopResolution: form.setVirtualDesktopResolution,
+    defaultBottleDisplayScalingMode: form.perfSettings.defaultBottleDisplayScalingMode,
+    defaultDisplayAspectRatio: form.perfSettings.defaultDisplayAspectRatio,
+    enableFullscreenHotkey: form.perfSettings.enableFullscreenHotkey,
+    emulateModeset: form.emulateModeset,
+    onChangeEmulateModeset: form.setEmulateModeset,
+    forceLargeAddressAware: form.forceLargeAddressAware,
+    onToggleForceLargeAddressAware: form.handleToggleForceLargeAddressAware,
+    wineMsync: form.wineMsync,
+    onToggleWineMsync: form.handleToggleWineMsync,
+    wineEsync: form.wineEsync,
+    onToggleWineEsync: form.handleToggleWineEsync,
+    wineSyncMode: form.wineSyncMode,
+    onSelectWineSyncMode: form.handleSelectWineSyncMode,
+    displayOverrideCount: form.displayOverrideCount,
+    compatOverrideCount: form.compatOverrideCount,
+  };
+
+  const showExecutionDisclosure =
+    form.preview.visibleSections.executableAndArgs ||
+    form.preview.visibleSections.environmentAndHooks;
+  const isExecutionDisclosureOpen =
+    executionOpenOverride !== null ? executionOpenOverride : shouldAutoOpenExecution;
 
   return (
     <ModalShell
       isOpen={isOpen}
       onClose={onClose}
-      preventClose={isBusy}
+      preventClose={isBusy || form.hasUnsavedChanges}
       closeOnBackdrop={!isBusy}
+      onCloseAttemptWhilePrevented={handleCloseAttemptWhilePrevented}
       lockOverlay={false}
       testId="launch-config-modal-overlay"
-      ariaLabel={form.isWindowsHost ? 'Launch Settings' : 'Launch & Compatibility Settings'}
+      ariaLabelledBy={dialogTitleId}
       className="w-full max-w-2xl"
     >
       <div
@@ -103,7 +271,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
               <Settings className="w-5 h-5" aria-hidden="true" />
             </div>
             <div className="min-w-0">
-              <h2 className="text-base font-bold text-white truncate">
+              <h2 id={dialogTitleId} className="text-base font-bold text-white truncate">
                 {form.isWindowsHost
                   ? 'Launch Settings'
                   : form.isMacNativeBuild && !form.preview.visibleSections.compatibilityLayer
@@ -111,19 +279,15 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                     : 'Launch & Compatibility Settings'}
               </h2>
               <p className="text-xs text-steam-subtext truncate">
-                {form.isWindowsHost
-                  ? 'Configure execution mode, custom executable & launch parameters for '
-                  : form.isMacNativeBuild && !form.preview.visibleSections.compatibilityLayer
-                    ? 'Configure native macOS execution mode, Metal HUD & launch parameters for '
-                    : 'Configure execution mode, Wine/CrossOver bottles & launch parameters for '}
-                <span className="font-semibold text-white">{game.title}</span>
+                Per-game launch profile for <span className="font-semibold text-white">{game.title}</span>
               </p>
             </div>
           </div>
 
           <button
             type="button"
-            onClick={onClose}
+            data-testid="launch-config-close-btn"
+            onClick={handleRequestClose}
             disabled={isBusy}
             className={`min-w-6 min-h-6 p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
             aria-label="Close launch settings modal"
@@ -133,7 +297,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
         </div>
 
         {/* Scrollable Content */}
-        <div className="p-5 space-y-5 overflow-y-auto overscroll-contain [scrollbar-gutter:stable] flex-1 bg-[#131b26] modal-scroll-body">
+        <div className="p-5 space-y-4 overflow-y-auto overscroll-contain [scrollbar-gutter:stable] flex-1 bg-[#131b26] modal-scroll-body">
           {renderSection(DetectedPipelineBanner, DetectedPipelineBannerBase, {
             game,
             preview: form.preview,
@@ -144,103 +308,105 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             onSelectStorefront: form.handleSelectStorefront,
           })}
 
-          {/* Launch Mode */}
-          <div className="space-y-2">
-            <h3 className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
-              Launch Mode
-            </h3>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              {form.visibleLaunchModes.map((mode) => {
-                const modeNote = form.preview.modeNotes[mode.value];
-                const isModeDisabled = Boolean(modeNote?.disabled);
-                const isSelected = !isModeDisabled && form.activeDisplayMethod === mode.value;
-                const dynamicDesc =
-                  form.isWindowsHost &&
-                  modeNote?.dynamicDesc &&
-                  /CrossOver/i.test(modeNote.dynamicDesc)
-                    ? mode.desc
-                    : modeNote?.dynamicDesc || mode.desc;
-                return (
-                  <button
-                    key={mode.value}
-                    type="button"
-                    data-launch-mode={mode.value}
-                    disabled={isModeDisabled}
-                    aria-disabled={isModeDisabled}
-                    aria-pressed={isSelected}
-                    onClick={() => {
-                      if (isModeDisabled) return;
-                      form.setLaunchMethod(mode.value);
-                      if (form.isNativeInstalledBuild && form.preferredPlatformId === 'steam') {
-                        if (mode.value === 'direct') {
-                          form.setStorefrontClientLifecycle('fast_direct_bypass');
-                        } else if (
-                          mode.value === 'storefront_uri' &&
-                          form.effectiveStorefrontClientLifecycle === 'fast_direct_bypass'
-                        ) {
-                          form.setStorefrontClientLifecycle('minimal_and_close_if_started');
+          {/* Primary Control 1: Launch Mode (only shown when > 1 valid mode exists) */}
+          {form.visibleLaunchModes.length > 1 && (
+            <div className="space-y-2">
+              <h3 className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
+                Launch Mode
+              </h3>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {form.visibleLaunchModes.map((mode) => {
+                  const modeNote = form.preview.modeNotes[mode.value];
+                  const isModeDisabled = Boolean(modeNote?.disabled);
+                  const isSelected = !isModeDisabled && form.activeDisplayMethod === mode.value;
+                  const dynamicDesc =
+                    form.isWindowsHost &&
+                    modeNote?.dynamicDesc &&
+                    /CrossOver/i.test(modeNote.dynamicDesc)
+                      ? mode.desc
+                      : modeNote?.dynamicDesc || mode.desc;
+                  return (
+                    <button
+                      key={mode.value}
+                      type="button"
+                      data-launch-mode={mode.value}
+                      disabled={isModeDisabled}
+                      aria-disabled={isModeDisabled}
+                      aria-pressed={isSelected}
+                      onClick={() => {
+                        if (isModeDisabled) return;
+                        form.setLaunchMethod(mode.value);
+                        if (form.isNativeInstalledBuild && form.preferredPlatformId === 'steam') {
+                          if (mode.value === 'direct') {
+                            form.setStorefrontClientLifecycle('fast_direct_bypass');
+                          } else if (
+                            mode.value === 'storefront_uri' &&
+                            form.effectiveStorefrontClientLifecycle === 'fast_direct_bypass'
+                          ) {
+                            form.setStorefrontClientLifecycle('minimal_and_close_if_started');
+                          }
                         }
-                      }
-                    }}
-                    className={`min-h-6 p-3 rounded-lg border text-left transition-colors flex flex-col justify-between ${LAUNCH_BUTTON_FOCUS_CLASSES} ${
-                      isModeDisabled
-                        ? 'bg-[#121923] border-[#1f2e40] text-steam-subtext/60 opacity-55 cursor-not-allowed'
-                        : isSelected
-                          ? 'bg-sky-500/15 border-sky-400 text-white cursor-pointer'
-                          : 'bg-[#17212e] border-[#26384d] text-steam-subtext hover:text-white hover:bg-[#1c2838] cursor-pointer'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span
-                        className={
-                          isModeDisabled
-                            ? 'text-xs font-bold text-steam-subtext/70'
-                            : 'text-xs font-bold text-white'
-                        }
-                      >
-                        {mode.label}
-                      </span>
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        {modeNote?.badge && (
-                          <span
-                            className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold ${getBadgeToneClasses(
-                              modeNote.badgeTone
-                            )}`}
-                          >
-                            {modeNote.badge}
-                          </span>
-                        )}
-                        {isSelected && (
-                          <CheckCircle2
-                            className="w-3.5 h-3.5 text-sky-400 shrink-0"
-                            aria-hidden="true"
-                          />
-                        )}
+                      }}
+                      className={`min-h-[28px] p-3 rounded-lg border text-left transition-colors flex flex-col justify-between ${LAUNCH_BUTTON_FOCUS_CLASSES} ${
+                        isModeDisabled
+                          ? 'bg-[#121923] border-[#1f2e40] text-steam-subtext/60 opacity-55 cursor-not-allowed'
+                          : isSelected
+                            ? 'bg-sky-500/15 border-sky-400 text-white cursor-pointer'
+                            : 'bg-[#17212e] border-[#26384d] text-steam-subtext hover:text-white hover:bg-[#1c2838] cursor-pointer'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span
+                          className={
+                            isModeDisabled
+                              ? 'text-xs font-bold text-steam-subtext/70'
+                              : 'text-xs font-bold text-white'
+                          }
+                        >
+                          {mode.label}
+                        </span>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {modeNote?.badge && (
+                            <span
+                              className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold ${getBadgeToneClasses(
+                                modeNote.badgeTone
+                              )}`}
+                            >
+                              {modeNote.badge}
+                            </span>
+                          )}
+                          {isSelected && (
+                            <CheckCircle2
+                              className="w-3.5 h-3.5 text-sky-400 shrink-0"
+                              aria-hidden="true"
+                            />
+                          )}
+                        </div>
                       </div>
-                    </div>
-                    <p className="text-[10px] text-steam-subtext mt-1.5 leading-relaxed">
-                      {dynamicDesc}
-                    </p>
-                    {isModeDisabled && modeNote?.disabledReason && (
-                      <p className="text-[10px] text-amber-300/90 mt-1 font-medium leading-snug">
-                        {modeNote.disabledReason}
+                      <p className="text-[10px] text-steam-subtext mt-1.5 leading-relaxed">
+                        {dynamicDesc}
                       </p>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-
-            {form.activeModeWarning && (
-              <div className="flex items-start gap-2.5 rounded-lg bg-amber-950/50 border border-amber-500/40 px-3 py-2.5 text-xs text-amber-200">
-                <AlertTriangle
-                  className="w-4 h-4 text-amber-400 shrink-0 mt-0.5"
-                  aria-hidden="true"
-                />
-                <span className="leading-relaxed">{form.activeModeWarning}</span>
+                      {isModeDisabled && modeNote?.disabledReason && (
+                        <p className="text-[10px] text-amber-300/90 mt-1 font-medium leading-snug">
+                          {modeNote.disabledReason}
+                        </p>
+                      )}
+                    </button>
+                  );
+                })}
               </div>
-            )}
-          </div>
+
+              {form.activeModeWarning && (
+                <div className="flex items-start gap-2.5 rounded-lg bg-amber-950/50 border border-amber-500/40 px-3 py-2.5 text-xs text-amber-200">
+                  <AlertTriangle
+                    className="w-4 h-4 text-amber-400 shrink-0 mt-0.5"
+                    aria-hidden="true"
+                  />
+                  <span className="leading-relaxed">{form.activeModeWarning}</span>
+                </div>
+              )}
+            </div>
+          )}
 
           {renderSection(FastLaunchWarningBanner, FastLaunchWarningBannerBase, {
             fastLaunchAdvisory: form.fastLaunchAdvisory,
@@ -250,178 +416,123 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             mode: 'storefront_uri_only',
           })}
 
-          {!form.preview.isInstalled &&
-            renderSection(ExecutableAndArgsSection, ExecutableAndArgsSectionBase, {
-              idPrefix,
-              preview: form.preview,
-              isWindowsHost: form.isWindowsHost,
-              executablePathLabel: form.executablePathLabel,
-              customExecutablePath: form.customExecutablePath,
-              onChangeCustomExecutablePath: form.setCustomExecutablePath,
-              onBrowseExecutable: form.handleBrowseExecutable,
-              workingDirectory: form.workingDirectory,
-              onChangeWorkingDirectory: form.setWorkingDirectory,
-              onBrowseWorkingDir: form.handleBrowseWorkingDir,
-              launchArguments: form.launchArguments,
-              onChangeLaunchArguments: form.setLaunchArguments,
-              metalHud: form.metalHud,
-              onToggleMetalHud: form.handleToggleMetalHud,
-              sectionFilter: 'executable_only',
-            })}
-
+          {/* Primary Controls 2-4: Compatibility Layer, Bottle, Graphics Backend, Display Mode, FPS Cap & DLSS (bottled only) */}
           {renderSection(CompatibilityLayerSection, CompatibilityLayerSectionBase, {
-            idPrefix,
-            isWindowsHost: form.isWindowsHost,
-            preview: form.preview,
-            activeDisplayMethod: form.activeDisplayMethod,
-            detectedLayers: form.detectedLayers,
-            runnerUpdates: form.runnerUpdates,
-            compatibilityLayer: form.compatibilityLayer,
-            onSelectCompatibilityLayer: form.handleSelectCompatibilityLayer,
-            availableBottles: form.availableBottles,
-            wineBottleName: form.wineBottleName,
-            onChangeWineBottleName: form.setWineBottleName,
-            selectedRunnerDescriptor: form.selectedRunnerDescriptor,
-            activeLayer: form.activeLayer,
-            activeUpdateInfo: form.activeUpdateInfo,
-            activeInstalledVer: form.activeInstalledVer,
-            activeSecondaryBuildText: form.activeSecondaryBuildText,
-            activeRunnerProgress: form.activeRunnerProgress,
-            isCheckingUpdates: form.isCheckingUpdates,
-            isUpdatingRunner: form.isUpdatingRunner,
-            onUpdateRunner: form.handleUpdateRunner,
-            onCheckRunnerUpdates: form.handleCheckRunnerUpdates,
-            onCancelRunnerOperation: form.handleCancelRunnerOperation,
-            onInstallRunnerFromArchive: form.handleInstallRunnerFromArchive,
-            onSwitchToStableCrossOver: form.handleSwitchToStableCrossOver,
-            resolvedBottleFolderPath: form.resolvedBottleFolderPath,
-            onOpenBottleFolder: form.handleOpenBottleFolder,
-            isRescanningRunners: form.isRescanningRunners,
-            onRescanLayers: form.handleRescanLayers,
-            isInstallingRunner: form.isInstallingRunner,
-            isAnotherRunnerOperationActive: form.isAnotherRunnerOperationActive,
-            onInstallRunnerViaBrew: form.handleInstallRunnerViaBrew,
-            onDownloadRunner: form.handleDownloadRunner,
-            runnerUpdateFeedback: form.runnerUpdateFeedback,
-            runnerActionFeedback: form.runnerActionFeedback,
-            winePrefixPath: form.winePrefixPath,
-            onChangeWinePrefixPath: form.setWinePrefixPath,
-            onBrowseWinePrefix: form.handleBrowseWinePrefix,
-            crossoverGraphicsBackend: form.crossoverGraphicsBackend,
-            onChangeCrossoverGraphicsBackend: form.setCrossoverGraphicsBackend,
-            crossoverD3DMetalVersion: form.crossoverD3DMetalVersion,
-            onChangeCrossoverD3DMetalVersion: form.setCrossoverD3DMetalVersion,
-            showD3DMetalVersionSelector: form.showD3DMetalVersionSelector,
-            primaryD3DVer: form.primaryD3DVer,
-            fallbackD3DVer: form.fallbackD3DVer,
-            crossoverHighResolutionMode: form.crossoverHighResolutionMode,
-            onChangeCrossoverHighResolutionMode: form.setCrossoverHighResolutionMode,
-            isDlssSupportedBackend: form.isDlssSupportedBackend,
-            dlssUnavailableReason: form.dlssUnavailableReason,
-            isDxvkHudSupported: form.isDxvkHudSupported,
-            crossoverDlss: form.crossoverDlss,
-            onToggleCrossoverDlss: form.handleToggleCrossoverDlss,
-            metalfxSpatialUpscaleFactor: form.metalfxSpatialUpscaleFactor,
-            onChangeMetalfxSpatialUpscaleFactor: form.setMetalfxSpatialUpscaleFactor,
-            preferredMaxFrameRate: form.preferredMaxFrameRate,
-            onChangePreferredMaxFrameRate: form.setPreferredMaxFrameRate,
-            displayScalingMode: form.displayScalingMode,
-            onChangeDisplayScalingMode: form.setDisplayScalingMode,
-            displayAspectRatio: form.displayAspectRatio,
-            onChangeDisplayAspectRatio: form.setDisplayAspectRatio,
-            virtualDesktopResolution: form.virtualDesktopResolution,
-            onChangeVirtualDesktopResolution: form.setVirtualDesktopResolution,
-            defaultBottleDisplayScalingMode: form.perfSettings.defaultBottleDisplayScalingMode,
-            defaultDisplayAspectRatio: form.perfSettings.defaultDisplayAspectRatio,
-            enableFullscreenHotkey: form.perfSettings.enableFullscreenHotkey,
-            emulateModeset: form.emulateModeset,
-            onChangeEmulateModeset: form.setEmulateModeset,
-            forceLargeAddressAware: form.forceLargeAddressAware,
-            onToggleForceLargeAddressAware: form.handleToggleForceLargeAddressAware,
-            wineMsync: form.wineMsync,
-            onToggleWineMsync: form.handleToggleWineMsync,
-            wineEsync: form.wineEsync,
-            onToggleWineEsync: form.handleToggleWineEsync,
-            wineSyncMode: form.wineSyncMode,
-            onSelectWineSyncMode: form.handleSelectWineSyncMode,
-            metalHud: form.metalHud,
-            onToggleMetalHud: form.handleToggleMetalHud,
-            dxvkHud: form.dxvkHud,
-            onToggleDxvkHud: form.handleToggleDxvkHud,
+            ...compatSectionProps,
+            renderSectionPart: 'primary',
           })}
 
-          {renderSection(ExecutableAndArgsSection, ExecutableAndArgsSectionBase, {
-            idPrefix,
-            preview: form.preview,
-            isWindowsHost: form.isWindowsHost,
-            executablePathLabel: form.executablePathLabel,
-            customExecutablePath: form.customExecutablePath,
-            onChangeCustomExecutablePath: form.setCustomExecutablePath,
-            onBrowseExecutable: form.handleBrowseExecutable,
-            workingDirectory: form.workingDirectory,
-            onChangeWorkingDirectory: form.setWorkingDirectory,
-            onBrowseWorkingDir: form.handleBrowseWorkingDir,
-            launchArguments: form.launchArguments,
-            onChangeLaunchArguments: form.setLaunchArguments,
-            metalHud: form.metalHud,
-            onToggleMetalHud: form.handleToggleMetalHud,
-            sectionFilter: 'native_mac_only',
-          })}
+          {/* Primary Control 5: Unified Performance HUD 3-way Segmented Radio (ALL platforms) */}
+          <div className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5">
+            <SegmentedRadioGroup<PerformanceHudMode>
+              name={`${idPrefix}-performance-hud`}
+              legend={
+                <>
+                  <Gauge className="w-3.5 h-3.5 text-sky-400 shrink-0" aria-hidden="true" />
+                  <span>Performance HUD</span>
+                </>
+              }
+              description={hudHelperText}
+              descriptionId={`${idPrefix}-performance-hud-hint`}
+              value={form.performanceHud}
+              options={[
+                {
+                  value: 'default',
+                  label: `Global Default (${globalHudDefaultLabel})`,
+                  testId: 'performance-hud-default',
+                },
+                {
+                  value: 'on',
+                  label: 'On',
+                  testId: 'performance-hud-on',
+                },
+                {
+                  value: 'off',
+                  label: 'Off',
+                  testId: 'performance-hud-off',
+                },
+              ]}
+              onChange={form.setPerformanceHud}
+              variant="pills"
+              testId="performance-hud-group"
+            />
+          </div>
 
-          {renderSection(StorefrontLifecycleSection, StorefrontLifecycleSectionBase, {
-            idPrefix,
-            isWindowsHost: form.isWindowsHost,
-            preview: form.preview,
-            activeDisplayMethod: form.activeDisplayMethod,
-            preferredPlatformId: form.preferredPlatformId,
-            inGameLauncherBehavior: form.inGameLauncherBehavior,
-            onChangeInGameLauncherBehavior: form.setInGameLauncherBehavior,
-            storefrontClientLifecycle: form.storefrontClientLifecycle,
-            onChangeStorefrontClientLifecycle: form.handleChangeStorefrontClientLifecycle,
-            policyView: form.policyView,
-            perfSettings: form.perfSettings,
-            onChangePostGameBehavior: form.handleChangePostGameBehavior,
-            onTogglePauseSyncInGame: form.handleTogglePauseSyncInGame,
-            onTogglePauseDownloadsInGame: form.handleTogglePauseDownloadsInGame,
-            onToggleAutoShutdownWine: form.handleToggleAutoShutdownWine,
-            onChangeDefaultBottleDisplayScalingMode:
-              form.handleChangeDefaultBottleDisplayScalingMode,
-            onChangeDefaultDisplayAspectRatio: form.handleChangeDefaultDisplayAspectRatio,
-            onToggleFullscreenHotkey: form.handleToggleFullscreenHotkey,
-          })}
-
-          {form.preview.isInstalled &&
-            renderSection(ExecutableAndArgsSection, ExecutableAndArgsSectionBase, {
-              idPrefix,
-              preview: form.preview,
-              isWindowsHost: form.isWindowsHost,
-              executablePathLabel: form.executablePathLabel,
-              customExecutablePath: form.customExecutablePath,
-              onChangeCustomExecutablePath: form.setCustomExecutablePath,
-              onBrowseExecutable: form.handleBrowseExecutable,
-              workingDirectory: form.workingDirectory,
-              onChangeWorkingDirectory: form.setWorkingDirectory,
-              onBrowseWorkingDir: form.handleBrowseWorkingDir,
-              launchArguments: form.launchArguments,
-              onChangeLaunchArguments: form.setLaunchArguments,
-              metalHud: form.metalHud,
-              onToggleMetalHud: form.handleToggleMetalHud,
-              sectionFilter: 'executable_only',
+          {/* Collapsed Native <details> Disclosures for Advanced & Rare Overrides */}
+          <div className="space-y-2.5">
+            {/* Disclosures 1 & 2 (Bottled): Display & Legacy Scaling Overrides + Compatibility & Engine Tweaks */}
+            {renderSection(CompatibilityLayerSection, CompatibilityLayerSectionBase, {
+              ...compatSectionProps,
+              renderSectionPart: 'advanced',
             })}
 
-          {renderSection(EnvironmentAndHooksSection, EnvironmentAndHooksSectionBase, {
-            idPrefix,
-            preview: form.preview,
-            isWindowsHost: form.isWindowsHost,
-            currentEnvMap: form.currentEnvMap,
-            onToggleQuickEnv: form.handleToggleQuickEnv,
-            envText: form.envText,
-            onChangeEnvText: form.setEnvText,
-            preLaunchCommand: form.preLaunchCommand,
-            onChangePreLaunchCommand: form.setPreLaunchCommand,
-            postExitCommand: form.postExitCommand,
-            onChangePostExitCommand: form.setPostExitCommand,
-          })}
+            {/* Disclosure 3: Execution, Arguments & Hooks */}
+            {showExecutionDisclosure && (
+              <LaunchDisclosure
+                summary="Execution, Arguments & Hooks"
+                subtitle="Launch args, custom executable, environment & shell hooks"
+                overrideCount={form.executionOverrideCount}
+                open={isExecutionDisclosureOpen ? true : undefined}
+                onToggle={(nextOpen) => setExecutionOpenOverride(nextOpen)}
+                testId="disclosure-execution-hooks"
+                summaryTestId="disclosure-execution-hooks-summary"
+                overrideBadgeTestId="disclosure-execution-hooks-badge"
+              >
+                {renderSection(ExecutableAndArgsSection, ExecutableAndArgsSectionBase, {
+                  idPrefix,
+                  preview: form.preview,
+                  isWindowsHost: form.isWindowsHost,
+                  executablePathLabel: form.executablePathLabel,
+                  customExecutablePath: form.customExecutablePath,
+                  onChangeCustomExecutablePath: form.setCustomExecutablePath,
+                  onBrowseExecutable: form.handleBrowseExecutable,
+                  workingDirectory: form.workingDirectory,
+                  onChangeWorkingDirectory: form.setWorkingDirectory,
+                  onBrowseWorkingDir: form.handleBrowseWorkingDir,
+                  launchArguments: form.launchArguments,
+                  onChangeLaunchArguments: form.setLaunchArguments,
+                  sectionFilter: 'executable_only',
+                })}
+
+                {renderSection(EnvironmentAndHooksSection, EnvironmentAndHooksSectionBase, {
+                  idPrefix,
+                  preview: form.preview,
+                  isWindowsHost: form.isWindowsHost,
+                  envText: form.envText,
+                  onChangeEnvText: form.setEnvText,
+                  preLaunchCommand: form.preLaunchCommand,
+                  onChangePreLaunchCommand: form.setPreLaunchCommand,
+                  postExitCommand: form.postExitCommand,
+                  onChangePostExitCommand: form.setPostExitCommand,
+                })}
+              </LaunchDisclosure>
+            )}
+
+            {/* Disclosure 4: Launcher & Storefront Lifecycle Overrides */}
+            <LaunchDisclosure
+              summary="Launcher & Storefront Lifecycle Overrides"
+              subtitle="Per-game in-game behavior & storefront policy"
+              overrideCount={form.lifecycleOverrideCount}
+              testId="disclosure-lifecycle-overrides"
+              summaryTestId="disclosure-lifecycle-overrides-summary"
+              overrideBadgeTestId="disclosure-lifecycle-overrides-badge"
+            >
+              {renderSection(StorefrontLifecycleSection, StorefrontLifecycleSectionBase, {
+                idPrefix,
+                isWindowsHost: form.isWindowsHost,
+                preview: form.preview,
+                activeDisplayMethod: form.activeDisplayMethod,
+                preferredPlatformId: form.preferredPlatformId,
+                inGameLauncherBehavior: form.inGameLauncherBehavior,
+                onChangeInGameLauncherBehavior: form.setInGameLauncherBehavior,
+                storefrontClientLifecycle: form.storefrontClientLifecycle,
+                onChangeStorefrontClientLifecycle: form.handleChangeStorefrontClientLifecycle,
+                policyView: form.policyView,
+                perfSettings: form.perfSettings,
+                onOpenGlobalSettings: handleOpenGlobalSettings,
+              })}
+            </LaunchDisclosure>
+          </div>
         </div>
 
         {form.saveError && (
@@ -435,14 +546,27 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
           </div>
         )}
 
+        {/* Reserved-space unsaved-changes confirmation bar (zero layout shift!) */}
+        <div
+          data-testid="launch-config-unsaved-confirm-bar"
+          role="status"
+          aria-live="polite"
+          aria-hidden={!showDiscardConfirm}
+          style={{ visibility: showDiscardConfirm ? 'visible' : 'hidden' }}
+          className="px-5 py-2 bg-amber-950/55 border-t border-amber-500/40 flex items-center gap-2 text-xs text-amber-200 shrink-0"
+        >
+          <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" aria-hidden="true" />
+          <span>You have unsaved changes. Save configuration or discard changes to close.</span>
+        </div>
+
         {/* Footer */}
-        <div className="px-5 py-3.5 bg-[#0e151f] border-t border-[#223447] flex items-center justify-between gap-3 shrink-0">
+        <div className="px-5 py-3.5 bg-[#0e151f] border-t border-[#223447] flex flex-wrap items-center justify-between gap-3 shrink-0">
           <button
             type="button"
             data-testid="reset-launch-config-btn"
             onClick={form.handleResetDefaults}
             disabled={isBusy}
-            className={`inline-flex items-center gap-1.5 min-h-6 px-3 py-2 rounded-lg bg-[#17212e] hover:bg-[#223144] border border-[#2a475e] text-xs font-semibold text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+            className={`inline-flex items-center gap-1.5 min-h-[28px] px-3 py-2 rounded-lg bg-[#17212e] hover:bg-[#223144] border border-[#2a475e] text-xs font-semibold text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
           >
             <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
             <span>
@@ -453,18 +577,32 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
           <div className="flex items-center gap-2.5">
             <button
               type="button"
-              onClick={onClose}
+              data-testid="launch-config-discard-changes-btn"
+              onClick={handleDiscardAndClose}
+              disabled={!showDiscardConfirm || isBusy}
+              tabIndex={showDiscardConfirm ? 0 : -1}
+              aria-hidden={!showDiscardConfirm}
+              style={{ visibility: showDiscardConfirm ? 'visible' : 'hidden' }}
+              className={`min-h-[28px] px-3.5 py-2 rounded-lg bg-rose-950/75 hover:bg-rose-900/80 border border-rose-500/50 text-xs font-semibold text-rose-200 hover:text-white transition-colors cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+            >
+              Discard Changes
+            </button>
+            <button
+              type="button"
+              data-testid="launch-config-cancel-btn"
+              onClick={handleRequestClose}
               disabled={isBusy}
-              className={`min-h-6 px-4 py-2 rounded-lg bg-[#1b2838] hover:bg-[#24354a] text-xs font-semibold text-steam-text hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+              className={`min-h-[28px] px-4 py-2 rounded-lg bg-[#1b2838] hover:bg-[#24354a] text-xs font-semibold text-steam-text hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
             >
               Cancel
             </button>
             <button
               type="button"
+              data-testid="launch-config-save-btn"
               data-has-unsaved-changes={form.hasUnsavedChanges ? 'true' : 'false'}
               onClick={form.handleSave}
               disabled={form.isSaving}
-              className={`inline-flex items-center gap-1.5 min-h-6 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+              className={`inline-flex items-center gap-1.5 min-h-[28px] px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
               style={{
                 background: 'linear-gradient(to right, #059669 0%, #047857 100%)',
                 boxShadow: '0 0 16px rgba(16, 185, 129, 0.35)',

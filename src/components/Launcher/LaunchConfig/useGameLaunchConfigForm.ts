@@ -12,11 +12,11 @@ import {
   DisplayAspectRatioMode,
   GameLaunchConfig,
   GlobalBottleDisplayScalingMode,
-  GlobalDisplayAspectRatioMode,
   InGameLauncherBehavior,
   LauncherPerformanceSettings,
   LaunchMethod,
-  PostGameLauncherBehavior,
+  migrateLegacyHudConfig,
+  PerformanceHudMode,
   resolveDefaultBottleForLayer,
   StorefrontClientLifecyclePolicy,
   StorefrontLaunchProfile,
@@ -84,7 +84,9 @@ export function useGameLaunchConfigForm({
   onClose,
   onSaved,
 }: UseGameLaunchConfigFormParams) {
-  const [preferredPlatformId, setPreferredPlatformId] = useState<StorefrontId>('steam');
+  const [preferredPlatformId, setPreferredPlatformId] = useState<StorefrontId>(
+    () => initialPlatformId || game.platforms[0]?.platformId || 'steam'
+  );
   const [draftsByPlatform, setDraftsByPlatform] = useState<
     Partial<Record<StorefrontId, StorefrontLaunchProfile>>
   >({});
@@ -123,8 +125,7 @@ export function useGameLaunchConfigForm({
   );
   const [wineMsync, setWineMsync] = useState<boolean>(true);
   const [wineEsync, setWineEsync] = useState<boolean>(false);
-  const [metalHud, setMetalHud] = useState<boolean>(false);
-  const [dxvkHud, setDxvkHud] = useState<boolean>(false);
+  const [performanceHud, setPerformanceHud] = useState<PerformanceHudMode>('default');
   const [envText, setEnvText] = useState<string>('');
   const [preLaunchCommand, setPreLaunchCommand] = useState<string>('');
   const [postExitCommand, setPostExitCommand] = useState<string>('');
@@ -134,10 +135,8 @@ export function useGameLaunchConfigForm({
   const [storefrontClientLifecycle, setStorefrontClientLifecycle] = useState<
     'default' | StorefrontClientLifecyclePolicy
   >('default');
+  // Read-only global settings snapshot used purely to render resolved "Global Default (...)" labels
   const [perfSettings, setPerfSettings] = useState<LauncherPerformanceSettings>(() =>
-    launcherService.getPerformanceSettings()
-  );
-  const [initialPerfSettings, setInitialPerfSettings] = useState<LauncherPerformanceSettings>(() =>
     launcherService.getPerformanceSettings()
   );
   const [initialPlatformIdSnapshot, setInitialPlatformIdSnapshot] =
@@ -146,8 +145,9 @@ export function useGameLaunchConfigForm({
   const [baselineFieldsByPlatform, setBaselineFieldsByPlatform] = useState<
     Partial<Record<StorefrontId, string>>
   >({});
-  const [hasEditedGlobalPerfSettings, setHasEditedGlobalPerfSettings] = useState<boolean>(false);
-  const [detectedLayers, setDetectedLayers] = useState<CompatibilityLayerInfo[]>([]);
+  const [detectedLayers, setDetectedLayers] = useState<CompatibilityLayerInfo[]>(() =>
+    launcherService.getCompatibilityLayers()
+  );
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [isInstallingRunner, setIsInstallingRunner] = useState<boolean>(false);
@@ -272,7 +272,10 @@ export function useGameLaunchConfigForm({
             ? source.environmentVariables.CX_GRAPHICS_BACKEND_VERSION
             : 'auto')
       );
-      setCrossoverHighResolutionMode(source?.crossoverHighResolutionMode);
+      // Normalize legacy crossoverHighResolutionMode: true -> undefined (identical under Display Scaler v3)
+      const normalizedHighResMode =
+        source?.crossoverHighResolutionMode === false ? false : undefined;
+      setCrossoverHighResolutionMode(normalizedHighResMode);
       setCrossoverDlss(Boolean(source?.crossoverDlss));
       const envMaxFpsRaw =
         source?.environmentVariables?.DXVK_FRAME_RATE ||
@@ -353,16 +356,18 @@ export function useGameLaunchConfigForm({
       }
       setWineMsync(loadedMsync);
       setWineEsync(loadedEsync);
-      const loadedMetalHud =
-        source?.metalHud !== undefined
-          ? source.metalHud
-          : source?.environmentVariables?.MTL_HUD_ENABLED === '1';
-      setMetalHud(loadedMetalHud);
-      const loadedDxvkHud =
-        source?.dxvkHud !== undefined
-          ? source.dxvkHud
-          : Boolean(source?.environmentVariables?.DXVK_HUD);
-      setDxvkHud(loadedDxvkHud);
+      const hasExplicitHudField = Boolean(
+        source &&
+          (source.performanceHud !== undefined ||
+            typeof source.metalHud === 'boolean' ||
+            typeof source.dxvkHud === 'boolean')
+      );
+      const loadedPerformanceHud: PerformanceHudMode = hasExplicitHudField
+        ? (migrateLegacyHudConfig(source!).performanceHud ?? 'default')
+        : source?.environmentVariables?.MTL_HUD_ENABLED === '1'
+          ? 'on'
+          : 'default';
+      setPerformanceHud(loadedPerformanceHud);
       const loadedEnvText = serializeEnvVars(stripManagedEnvVars(source?.environmentVariables));
       setEnvText(loadedEnvText);
       const loadedPreLaunch = source?.preLaunchCommand || '';
@@ -417,7 +422,7 @@ export function useGameLaunchConfigForm({
         winePrefixPath: source?.winePrefixPath || '',
         crossoverGraphicsBackend: source?.crossoverGraphicsBackend || 'auto',
         crossoverD3DMetalVersion: loadedCrossoverD3DVer,
-        crossoverHighResolutionMode: source?.crossoverHighResolutionMode,
+        crossoverHighResolutionMode: normalizedHighResMode,
         crossoverDlss: Boolean(source?.crossoverDlss),
         preferredMaxFrameRate: loadedMaxFps,
         metalfxSpatialUpscaleFactor: loadedMetalfxSpatial,
@@ -428,8 +433,7 @@ export function useGameLaunchConfigForm({
         forceLargeAddressAware: loadedForceLaa,
         wineMsync: loadedMsync,
         wineEsync: loadedEsync,
-        metalHud: loadedMetalHud,
-        dxvkHud: loadedDxvkHud,
+        performanceHud: loadedPerformanceHud,
         envText: loadedEnvText,
         preLaunchCommand: loadedPreLaunch,
         postExitCommand: loadedPostExit,
@@ -495,8 +499,6 @@ export function useGameLaunchConfigForm({
     setDirtyInactivePlatforms([]);
     setBaselineFieldsByPlatform({});
     setPerfSettings(loadedPerf);
-    setInitialPerfSettings(loadedPerf);
-    setHasEditedGlobalPerfSettings(false);
 
     const initialLayers = launcherService.getCompatibilityLayers();
     const initialRunnerUpdates = launcherService.getRunnerUpdates();
@@ -823,6 +825,17 @@ export function useGameLaunchConfigForm({
     return acquireModalOverlayLock();
   }, [isOpen]);
 
+  // Keep read-only global defaults synchronized if the user edits SettingsModal while open
+  useEffect(() => {
+    if (!isOpen || typeof launcherService.subscribe !== 'function') return;
+    return launcherService.subscribe(() => {
+      const next = launcherService.getPerformanceSettings();
+      setPerfSettings((prev) =>
+        JSON.stringify(prev) === JSON.stringify(next) ? prev : next
+      );
+    });
+  }, [isOpen]);
+
   useEffect(() => {
     if (!isOpen) return;
     let active = true;
@@ -1063,8 +1076,7 @@ export function useGameLaunchConfigForm({
         forceLargeAddressAware,
         wineMsync,
         wineEsync,
-        metalHud,
-        dxvkHud,
+        performanceHud,
         envText,
         preLaunchCommand,
         postExitCommand,
@@ -1092,8 +1104,7 @@ export function useGameLaunchConfigForm({
       forceLargeAddressAware,
       wineMsync,
       wineEsync,
-      metalHud,
-      dxvkHud,
+      performanceHud,
       envText,
       preLaunchCommand,
       postExitCommand,
@@ -1107,21 +1118,15 @@ export function useGameLaunchConfigForm({
     const activeDirty =
       activeBaseline !== undefined ? currentFieldsSignature !== activeBaseline : false;
     const inactiveDirty = dirtyInactivePlatforms.some((platId) => platId !== preferredPlatformId);
-    const perfDirty =
-      hasEditedGlobalPerfSettings &&
-      JSON.stringify(perfSettings) !== JSON.stringify(initialPerfSettings);
     const platformSwitchedDirty =
       baselineFieldsByPlatform[initialPlatformIdSnapshot] !== undefined &&
       preferredPlatformId !== initialPlatformIdSnapshot;
-    return activeDirty || inactiveDirty || perfDirty || platformSwitchedDirty;
+    return activeDirty || inactiveDirty || platformSwitchedDirty;
   }, [
     baselineFieldsByPlatform,
     preferredPlatformId,
     currentFieldsSignature,
     dirtyInactivePlatforms,
-    hasEditedGlobalPerfSettings,
-    perfSettings,
-    initialPerfSettings,
     initialPlatformIdSnapshot,
   ]);
 
@@ -1130,9 +1135,6 @@ export function useGameLaunchConfigForm({
     const includeCompatSettings = !isWindowsHost && preview.visibleSections.compatibilityLayer;
     const includeCrossoverOnly =
       includeCompatSettings && preview.visibleSections.crossoverRendering;
-    const includeMetalHud =
-      !isWindowsHost &&
-      (preview.visibleSections.compatibilityLayer || preview.visibleSections.nativeMacMetalHud);
     const priorSource =
       draftsByPlatform[preferredPlatformId] ??
       launcherService.getLaunchConfig(game.id, preferredPlatformId);
@@ -1170,7 +1172,8 @@ export function useGameLaunchConfigForm({
         includeCrossoverOnly && crossoverD3DMetalVersion !== 'auto'
           ? crossoverD3DMetalVersion
           : undefined,
-      crossoverHighResolutionMode: includeCompatSettings ? crossoverHighResolutionMode : undefined,
+      crossoverHighResolutionMode:
+        includeCompatSettings && crossoverHighResolutionMode === false ? false : undefined,
       crossoverDlss: includeCrossoverOnly
         ? isDlssSupportedBackend
           ? crossoverDlss
@@ -1199,8 +1202,9 @@ export function useGameLaunchConfigForm({
       wineDebug: includeCompatSettings ? priorSource?.wineDebug : undefined,
       wineMsync: includeCompatSettings ? wineMsync : undefined,
       wineEsync: includeCompatSettings ? wineEsync : undefined,
-      metalHud: includeMetalHud ? metalHud : undefined,
-      dxvkHud: includeCompatSettings && isDxvkHudSupported ? dxvkHud : undefined,
+      performanceHud,
+      metalHud: undefined,
+      dxvkHud: undefined,
       environmentVariables: Object.keys(parsedEnv).length > 0 ? parsedEnv : undefined,
       preLaunchCommand: preLaunchCommand.trim() || undefined,
       postExitCommand: postExitCommand.trim() || undefined,
@@ -1985,8 +1989,22 @@ export function useGameLaunchConfigForm({
     setWineBottleName(value);
   }, []);
 
+  const handleSetCrossoverHighResolutionMode = useCallback((value: boolean | undefined) => {
+    setCrossoverHighResolutionMode(value === false ? false : undefined);
+  }, []);
+
+  const handleToggleLegacy96DpiMode = useCallback(() => {
+    setCrossoverHighResolutionMode((prev) => (prev === false ? undefined : false));
+  }, []);
+
+  /** @deprecated Legacy alias forwarding to unified `performanceHud` state */
   const handleToggleMetalHud = useCallback(() => {
-    setMetalHud((prev) => !prev);
+    setPerformanceHud((prev) => (prev === 'on' ? 'off' : 'on'));
+  }, []);
+
+  /** @deprecated Legacy alias forwarding to unified `performanceHud` state */
+  const handleToggleDxvkHud = useCallback(() => {
+    setPerformanceHud((prev) => (prev === 'on' ? 'off' : 'on'));
   }, []);
 
   const handleToggleCrossoverDlss = useCallback(() => {
@@ -2022,10 +2040,6 @@ export function useGameLaunchConfigForm({
     }
   }, []);
 
-  const handleToggleDxvkHud = useCallback(() => {
-    setDxvkHud((prev) => !prev);
-  }, []);
-
   const handleChangeStorefrontClientLifecycle = useCallback(
     (val: StorefrontClientLifecyclePolicy) => {
       setStorefrontClientLifecycle(val);
@@ -2056,72 +2070,6 @@ export function useGameLaunchConfigForm({
     },
     []
   );
-
-  const handleChangePostGameBehavior = useCallback((val: PostGameLauncherBehavior) => {
-    setHasEditedGlobalPerfSettings(true);
-    setPerfSettings((prev) => ({
-      ...prev,
-      postGameLauncherBehavior: val,
-    }));
-  }, []);
-
-  const handleTogglePauseSyncInGame = useCallback(() => {
-    setHasEditedGlobalPerfSettings(true);
-    setPerfSettings((prev) => ({
-      ...prev,
-      pauseBackgroundSyncInGame: !prev.pauseBackgroundSyncInGame,
-    }));
-  }, []);
-
-  const handleTogglePauseDownloadsInGame = useCallback(() => {
-    setHasEditedGlobalPerfSettings(true);
-    setPerfSettings((prev) => ({
-      ...prev,
-      pauseDownloadsInGame: !prev.pauseDownloadsInGame,
-    }));
-  }, []);
-
-  const handleToggleAutoShutdownWine = useCallback(() => {
-    setHasEditedGlobalPerfSettings(true);
-    setPerfSettings((prev) => {
-      const next = !prev.autoShutdownWinePrefixOnExit;
-      return {
-        ...prev,
-        autoShutdownWinePrefixOnExit: next,
-        suppressWineDebugLogging: next,
-      };
-    });
-  }, []);
-
-  const handleChangeDefaultBottleDisplayScalingMode = useCallback(
-    (mode: GlobalBottleDisplayScalingMode) => {
-      setHasEditedGlobalPerfSettings(true);
-      setPerfSettings((prev) => ({
-        ...prev,
-        defaultBottleDisplayScalingMode: mode,
-      }));
-    },
-    []
-  );
-
-  const handleChangeDefaultDisplayAspectRatio = useCallback(
-    (aspect: GlobalDisplayAspectRatioMode) => {
-      setHasEditedGlobalPerfSettings(true);
-      setPerfSettings((prev) => ({
-        ...prev,
-        defaultDisplayAspectRatio: aspect,
-      }));
-    },
-    []
-  );
-
-  const handleToggleFullscreenHotkey = useCallback(() => {
-    setHasEditedGlobalPerfSettings(true);
-    setPerfSettings((prev) => ({
-      ...prev,
-      enableFullscreenHotkey: !(prev.enableFullscreenHotkey ?? true),
-    }));
-  }, []);
 
   const handleResetDefaults = async () => {
     const sessionId = formSessionIdRef.current;
@@ -2179,8 +2127,7 @@ export function useGameLaunchConfigForm({
     setForceLargeAddressAware(undefined);
     setWineMsync(true);
     setWineEsync(false);
-    setMetalHud(false);
-    setDxvkHud(false);
+    setPerformanceHud('default');
     setEnvText('');
     setPreLaunchCommand('');
     setPostExitCommand('');
@@ -2188,8 +2135,6 @@ export function useGameLaunchConfigForm({
     setStorefrontClientLifecycle('default');
     const resetPerf = launcherService.getPerformanceSettings();
     setPerfSettings(resetPerf);
-    setInitialPerfSettings(resetPerf);
-    setHasEditedGlobalPerfSettings(false);
     setDirtyInactivePlatforms((prev) => prev.filter((id) => id !== targetPlatId));
     const resetSignature = JSON.stringify({
       launchMethod: resetPreview.defaultLaunchMethod,
@@ -2212,8 +2157,7 @@ export function useGameLaunchConfigForm({
       forceLargeAddressAware: undefined,
       wineMsync: true,
       wineEsync: false,
-      metalHud: false,
-      dxvkHud: false,
+      performanceHud: 'default',
       envText: '',
       preLaunchCommand: '',
       postExitCommand: '',
@@ -2246,10 +2190,8 @@ export function useGameLaunchConfigForm({
         platformConfigs: allPlatformConfigs,
       };
 
+      // Per-game save strictly writes ONLY per-game config — never mutates global settings!
       await launcherService.saveLaunchConfig(config, preferredPlatformId);
-      if (hasEditedGlobalPerfSettings) {
-        await launcherService.savePerformanceSettings(perfSettings);
-      }
 
       if (typeof window !== 'undefined') {
         for (const [platId, prof] of Object.entries(allPlatformConfigs)) {
@@ -2313,6 +2255,35 @@ export function useGameLaunchConfigForm({
           ? 'Windows Executable Path (.exe)'
           : 'Executable Path (.app, binary, or Windows .exe)';
 
+  const displayOverrideCount =
+    (displayAspectRatio !== 'default' ? 1 : 0) +
+    (displayScalingMode === 'force_fullscreen' ||
+    displayScalingMode === 'virtual_desktop' ||
+    displayScalingMode === 'native_driver'
+      ? 1
+      : 0) +
+    (crossoverHighResolutionMode === false ? 1 : 0) +
+    (emulateModeset !== undefined ? 1 : 0);
+
+  const compatOverrideCount =
+    (showD3DMetalVersionSelector && crossoverD3DMetalVersion !== 'auto' ? 1 : 0) +
+    (metalfxSpatialUpscaleFactor !== undefined ? 1 : 0) +
+    (wineSyncMode !== 'msync' ? 1 : 0) +
+    (forceLargeAddressAware === true ? 1 : 0) +
+    (winePrefixPath.trim() ? 1 : 0);
+
+  const executionOverrideCount =
+    (launchArguments.trim() ? 1 : 0) +
+    (customExecutablePath.trim() ? 1 : 0) +
+    (workingDirectory.trim() ? 1 : 0) +
+    (envText.trim() ? 1 : 0) +
+    (preLaunchCommand.trim() ? 1 : 0) +
+    (postExitCommand.trim() ? 1 : 0);
+
+  const lifecycleOverrideCount =
+    (inGameLauncherBehavior !== 'default' ? 1 : 0) +
+    (storefrontClientLifecycle !== 'default' ? 1 : 0);
+
   return {
     preferredPlatformId,
     draftsByPlatform,
@@ -2334,7 +2305,8 @@ export function useGameLaunchConfigForm({
     crossoverD3DMetalVersion,
     setCrossoverD3DMetalVersion,
     crossoverHighResolutionMode,
-    setCrossoverHighResolutionMode,
+    setCrossoverHighResolutionMode: handleSetCrossoverHighResolutionMode,
+    handleToggleLegacy96DpiMode,
     crossoverDlss,
     preferredMaxFrameRate,
     setPreferredMaxFrameRate,
@@ -2353,8 +2325,12 @@ export function useGameLaunchConfigForm({
     wineMsync,
     wineEsync,
     wineSyncMode,
-    metalHud,
-    dxvkHud,
+    performanceHud,
+    setPerformanceHud,
+    /** @deprecated Derived alias for legacy hook consumers; persisted state uses `performanceHud` */
+    metalHud: performanceHud === 'on',
+    /** @deprecated Derived alias for legacy hook consumers; persisted state uses `performanceHud` */
+    dxvkHud: performanceHud === 'on',
     envText,
     setEnvText,
     preLaunchCommand,
@@ -2366,8 +2342,11 @@ export function useGameLaunchConfigForm({
     storefrontClientLifecycle,
     setStorefrontClientLifecycle,
     perfSettings,
-    hasEditedGlobalPerfSettings,
     hasUnsavedChanges,
+    displayOverrideCount,
+    compatOverrideCount,
+    executionOverrideCount,
+    lifecycleOverrideCount,
     detectedLayers,
     isSaving,
     saveError,
@@ -2423,21 +2402,14 @@ export function useGameLaunchConfigForm({
     handleDownloadRunner,
     handleOpenBottleFolder,
     handleSelectCompatibilityLayer,
-    handleToggleMetalHud,
     handleToggleCrossoverDlss,
     handleToggleForceLargeAddressAware,
     handleToggleWineMsync,
     handleToggleWineEsync,
     handleSelectWineSyncMode,
+    handleToggleMetalHud,
     handleToggleDxvkHud,
     handleChangeStorefrontClientLifecycle,
-    handleChangePostGameBehavior,
-    handleTogglePauseSyncInGame,
-    handleTogglePauseDownloadsInGame,
-    handleToggleAutoShutdownWine,
-    handleChangeDefaultBottleDisplayScalingMode,
-    handleChangeDefaultDisplayAspectRatio,
-    handleToggleFullscreenHotkey,
     handleResetDefaults,
     handleSave,
   };

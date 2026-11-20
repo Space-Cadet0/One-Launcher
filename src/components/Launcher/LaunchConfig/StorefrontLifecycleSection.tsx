@@ -13,14 +13,11 @@ import {
 } from '../../../contracts/launcher';
 import { launcherService } from '../../../services/launcher/launcherService';
 import {
-  Activity,
   AlertTriangle,
   CheckCircle2,
   ExternalLink,
-  Globe,
   Info,
-  Maximize2,
-  Monitor,
+  Settings,
   Zap,
 } from 'lucide-react';
 import {
@@ -29,7 +26,7 @@ import {
   getBadgeToneClasses,
   resolveEffectiveUiStorefrontLifecycle,
 } from './launchConfigHelpers';
-import { LaunchSelect, SwitchControl } from './LaunchConfigControls';
+import { LAUNCH_BUTTON_FOCUS_CLASSES, LaunchSelect } from './LaunchConfigControls';
 
 export interface StorefrontLifecycleSectionProps {
   idPrefix?: string;
@@ -42,20 +39,20 @@ export interface StorefrontLifecycleSectionProps {
   storefrontClientLifecycle: 'default' | StorefrontClientLifecyclePolicy;
   onChangeStorefrontClientLifecycle: (value: StorefrontClientLifecyclePolicy) => void;
   policyView?: StorefrontLaunchPolicyView;
+  /** Read-only global settings snapshot used purely for "Use Global Default (...)" labels */
   perfSettings: LauncherPerformanceSettings;
-  onChangePostGameBehavior: (value: PostGameLauncherBehavior) => void;
-  onTogglePauseSyncInGame: () => void;
-  onTogglePauseDownloadsInGame: () => void;
-  onToggleAutoShutdownWine: () => void;
+  onOpenGlobalSettings?: (section?: 'general' | 'macos_bottle') => void;
+  /** @deprecated Global settings moved to dedicated SettingsModal; retained optional for call-site compatibility */
+  onChangePostGameBehavior?: (value: PostGameLauncherBehavior) => void;
+  onTogglePauseSyncInGame?: () => void;
+  onTogglePauseDownloadsInGame?: () => void;
+  onToggleAutoShutdownWine?: () => void;
   onChangeDefaultBottleDisplayScalingMode?: (value: GlobalBottleDisplayScalingMode) => void;
   onChangeDefaultDisplayAspectRatio?: (value: GlobalDisplayAspectRatioMode) => void;
   onToggleFullscreenHotkey?: () => void;
 }
 
-const NOOP = () => {};
-
 function StorefrontLifecycleSectionImpl({
-  idPrefix = 'launch-cfg',
   isWindowsHost,
   preview,
   activeDisplayMethod,
@@ -66,13 +63,7 @@ function StorefrontLifecycleSectionImpl({
   onChangeStorefrontClientLifecycle,
   policyView,
   perfSettings,
-  onChangePostGameBehavior,
-  onTogglePauseSyncInGame,
-  onTogglePauseDownloadsInGame,
-  onToggleAutoShutdownWine,
-  onChangeDefaultBottleDisplayScalingMode = NOOP,
-  onChangeDefaultDisplayAspectRatio = NOOP,
-  onToggleFullscreenHotkey = NOOP,
+  onOpenGlobalSettings,
 }: StorefrontLifecycleSectionProps): React.ReactElement {
   const isBottleContext =
     !isWindowsHost &&
@@ -81,14 +72,6 @@ function StorefrontLifecycleSectionImpl({
       preview.visibleSections.compatibilityLayer);
 
   const showStorefrontSection = preferredPlatformId !== 'custom';
-
-  const effectiveInGameBehavior: InGameLauncherBehavior =
-    inGameLauncherBehavior === 'default'
-      ? perfSettings.inGameLauncherBehavior
-      : inGameLauncherBehavior;
-  const showStayMinimizedPostExitOption =
-    effectiveInGameBehavior !== 'keep_open' ||
-    perfSettings.postGameLauncherBehavior === 'stay_minimized';
 
   const effectiveLifecycle: StorefrontClientLifecyclePolicy =
     resolveEffectiveUiStorefrontLifecycle({
@@ -157,39 +140,25 @@ function StorefrontLifecycleSectionImpl({
           ? 'fast-minimal-launch-warning'
           : undefined;
 
-  const pauseSyncLabelId = `${idPrefix}-pause-sync-label`;
-  const pauseSyncHintId = `${idPrefix}-pause-sync-hint`;
-  const pauseDownloadsLabelId = `${idPrefix}-pause-downloads-label`;
-  const pauseDownloadsHintId = `${idPrefix}-pause-downloads-hint`;
-  const autoShutdownWineLabelId = `${idPrefix}-auto-shutdown-wine-label`;
-  const autoShutdownWineHintId = `${idPrefix}-auto-shutdown-wine-hint`;
-  const globalDisplayModeSelectId = `${idPrefix}-global-bottle-display-mode`;
-  const globalDisplayModeHintId = `${idPrefix}-global-bottle-display-mode-hint`;
-  const globalDisplayAspectSelectId = `${idPrefix}-global-display-aspect`;
-  const globalDisplayAspectHintId = `${idPrefix}-global-display-aspect-hint`;
-  const fullscreenHotkeyLabelId = `${idPrefix}-fullscreen-hotkey-label`;
-  const fullscreenHotkeyHintId = `${idPrefix}-fullscreen-hotkey-hint`;
-
-  const effectiveGlobalDisplayMode: GlobalBottleDisplayScalingMode =
-    perfSettings.defaultBottleDisplayScalingMode ?? 'auto_fullscreen';
-  const effectiveGlobalAspectRatio: GlobalDisplayAspectRatioMode =
-    perfSettings.defaultDisplayAspectRatio ?? 'preserve_aspect';
-  const effectiveFullscreenHotkey: boolean = perfSettings.enableFullscreenHotkey ?? true;
+  const handleOpenGlobalDefaults = () => {
+    if (onOpenGlobalSettings) {
+      onOpenGlobalSettings('general');
+      return;
+    }
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(
+        new CustomEvent('antigravity:open-settings', { detail: { section: 'general' } })
+      );
+    }
+  };
 
   return (
-    <section
+    <div
       data-section="in-game-performance"
       data-testid="in-game-performance-section"
-      aria-label="In-Game Footprint & Performance"
-      className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-3.5"
+      className="space-y-3.5"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <Activity className="w-4 h-4 text-emerald-400 shrink-0" aria-hidden="true" />
-          <h3 className="text-xs font-bold text-white uppercase tracking-wider">
-            In-Game Footprint &amp; Performance
-          </h3>
-        </div>
         <span
           data-testid="in-game-footprint-mode-badge"
           className={`text-[10px] px-2 py-0.5 rounded border font-semibold ${getBadgeToneClasses(
@@ -198,6 +167,15 @@ function StorefrontLifecycleSectionImpl({
         >
           {footprintBadge.label}
         </span>
+        <button
+          type="button"
+          data-testid="edit-global-defaults-btn"
+          onClick={handleOpenGlobalDefaults}
+          className={`min-h-[24px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#17212e] hover:bg-[#223144] border border-[#2a475e] text-[11px] font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+        >
+          <Settings className="w-3 h-3" aria-hidden="true" />
+          <span>Edit Global Defaults…</span>
+        </button>
       </div>
 
       {/* Per-Game One Launcher Window Footprint */}
@@ -210,7 +188,7 @@ function StorefrontLifecycleSectionImpl({
             One Launcher During Gameplay
           </label>
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-sky-300 font-semibold">
-            Per-Game Profile
+            Per-Game Override
           </span>
         </div>
         <LaunchSelect
@@ -241,13 +219,12 @@ function StorefrontLifecycleSectionImpl({
         </LaunchSelect>
       </div>
 
-      {/* Unified Dynamic Storefront Launch Policy Card (filtered out for non-storefront custom games) */}
+      {/* Per-Game Storefront Launch Policy Card (filtered out for standalone custom games) */}
       {showStorefrontSection && (
         <div
           data-testid="storefront-launch-policy-card"
           className="rounded-lg bg-[#121a27] border border-[#24364b] p-3.5 space-y-3"
         >
-          {/* Card Header Row */}
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-1.5">
               {infoBox.policyKey === 'protocol_delegated' ? (
@@ -278,7 +255,6 @@ function StorefrontLifecycleSectionImpl({
             </span>
           </div>
 
-          {/* Structured Policy Info Box (rendered above dropdown for every option) */}
           <div
             data-testid="storefront-policy-info-box"
             data-policy-key={infoBox.policyKey}
@@ -330,10 +306,7 @@ function StorefrontLifecycleSectionImpl({
                   </div>
                   <ul className="space-y-1">
                     {infoBox.includedFeatures.map((item, idx) => (
-                      <li
-                        key={idx}
-                        className="flex items-start gap-1.5 text-[11px] leading-snug"
-                      >
+                      <li key={idx} className="flex items-start gap-1.5 text-[11px] leading-snug">
                         <span
                           aria-hidden="true"
                           className={`font-bold shrink-0 ${
@@ -401,7 +374,6 @@ function StorefrontLifecycleSectionImpl({
             </div>
           </div>
 
-          {/* Policy Dropdown (below Info Box) */}
           {resolvedPolicyView.showDropdown && (
             <div className="space-y-1.5">
               <label
@@ -431,236 +403,7 @@ function StorefrontLifecycleSectionImpl({
           )}
         </div>
       )}
-
-      {/* Global Gameplay Performance Defaults Sub-Card (distinctly badged as global scope) */}
-      <div
-        data-testid="global-gameplay-performance-card"
-        className="rounded-lg bg-[#121a27] border border-[#24364b] p-3.5 space-y-3"
-      >
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-1.5">
-            <Globe className="w-3.5 h-3.5 text-amber-400 shrink-0" aria-hidden="true" />
-            <h4 className="text-[11px] font-bold uppercase tracking-wider text-white">
-              Global Gameplay Performance Defaults
-            </h4>
-          </div>
-          <span
-            data-testid="global-performance-scope-badge"
-            className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/35 text-amber-300 font-semibold"
-          >
-            Applies to all games
-          </span>
-        </div>
-
-        <div className="space-y-1.5">
-          <label
-            htmlFor="post-game-launcher-behavior-select"
-            className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
-          >
-            When Game Exits
-          </label>
-          <LaunchSelect
-            id="post-game-launcher-behavior-select"
-            aria-label="When Game Exits"
-            data-testid="post-game-launcher-behavior-select"
-            surface="panel"
-            value={perfSettings.postGameLauncherBehavior}
-            onChange={(e) =>
-              onChangePostGameBehavior(e.target.value as PostGameLauncherBehavior)
-            }
-          >
-            <option value="restore_window">
-              {effectiveInGameBehavior === 'keep_open'
-                ? 'Keep One Launcher Window Open'
-                : 'Restore One Launcher Window'}
-            </option>
-            {showStayMinimizedPostExitOption && (
-              <option value="stay_minimized">
-                {isWindowsHost ? 'Keep Hidden in System Tray' : 'Keep Hidden in Menu Bar'}
-              </option>
-            )}
-            <option value="exit_launcher">Quit One Launcher Automatically</option>
-          </LaunchSelect>
-        </div>
-
-        <div className="space-y-2 pt-0.5">
-          <div className="flex items-center justify-between gap-3 rounded-lg bg-[#0e151f] border border-[#223447] px-3 py-2.5">
-            <div className="min-w-0 space-y-0.5">
-              <span id={pauseSyncLabelId} className="block text-xs font-semibold text-white">
-                Pause Background Store Artwork &amp; Review Scans While Playing
-              </span>
-              <p id={pauseSyncHintId} className="text-[10px] text-steam-subtext leading-snug">
-                Suspends library metadata and critic score crawlers during gameplay (game Cloud
-                Saves are unaffected)
-              </p>
-            </div>
-            <SwitchControl
-              dataTestId="toggle-pause-sync-in-game"
-              checked={perfSettings.pauseBackgroundSyncInGame}
-              ariaLabelledBy={pauseSyncLabelId}
-              ariaDescribedBy={pauseSyncHintId}
-              onChange={onTogglePauseSyncInGame}
-              tone="emerald"
-            />
-          </div>
-
-          <div className="flex items-center justify-between gap-3 rounded-lg bg-[#0e151f] border border-[#223447] px-3 py-2.5">
-            <div className="min-w-0 space-y-0.5">
-              <span id={pauseDownloadsLabelId} className="block text-xs font-semibold text-white">
-                Pause Active Game Downloads While Playing
-              </span>
-              <p id={pauseDownloadsHintId} className="text-[10px] text-steam-subtext leading-snug">
-                Pauses One Launcher downloads to free bandwidth and disk I/O during gameplay, then
-                resumes on exit
-              </p>
-            </div>
-            <SwitchControl
-              dataTestId="toggle-pause-downloads-in-game"
-              checked={perfSettings.pauseDownloadsInGame}
-              ariaLabelledBy={pauseDownloadsLabelId}
-              ariaDescribedBy={pauseDownloadsHintId}
-              onChange={onTogglePauseDownloadsInGame}
-              tone="emerald"
-            />
-          </div>
-
-          {isBottleContext && (
-            <>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-0.5">
-                <div className="rounded-lg bg-[#0e151f] border border-[#223447] p-2.5 ol-subgrid-field">
-                  <label
-                    htmlFor={globalDisplayModeSelectId}
-                    className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1 self-end"
-                  >
-                    <Maximize2 className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
-                    <span>Default Bottled Display Mode</span>
-                  </label>
-                  <LaunchSelect
-                    id={globalDisplayModeSelectId}
-                    data-testid="global-bottle-display-mode-select"
-                    surface="panel"
-                    aria-label="Default Bottled Display Mode"
-                    aria-describedby={globalDisplayModeHintId}
-                    value={effectiveGlobalDisplayMode}
-                    onChange={(e) =>
-                      onChangeDefaultBottleDisplayScalingMode(
-                        e.target.value as GlobalBottleDisplayScalingMode
-                      )
-                    }
-                  >
-                    <option value="auto_fullscreen">
-                      Auto Fullscreen &amp; Upscale (Recommended)
-                    </option>
-                    <option value="force_fullscreen">
-                      Force Fullscreen (All Bottled Windows)
-                    </option>
-                    <option value="native_driver">Native Wine Driver</option>
-                    <option value="windowed">Windowed</option>
-                    <option value="virtual_desktop">Wine Virtual Desktop</option>
-                  </LaunchSelect>
-                  <p
-                    id={globalDisplayModeHintId}
-                    className="text-[10px] text-steam-subtext leading-snug"
-                  >
-                    Global fallback for bottled Windows games set to Use Global Default.
-                  </p>
-                </div>
-
-                <div className="rounded-lg bg-[#0e151f] border border-[#223447] p-2.5 ol-subgrid-field">
-                  <label
-                    htmlFor={globalDisplayAspectSelectId}
-                    className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1 self-end"
-                  >
-                    <Monitor className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
-                    <span>Default Fullscreen Aspect Ratio</span>
-                  </label>
-                  <LaunchSelect
-                    id={globalDisplayAspectSelectId}
-                    data-testid="global-display-aspect-select"
-                    surface="panel"
-                    aria-label="Default Fullscreen Aspect Ratio"
-                    aria-describedby={globalDisplayAspectHintId}
-                    value={effectiveGlobalAspectRatio}
-                    onChange={(e) =>
-                      onChangeDefaultDisplayAspectRatio(
-                        e.target.value as GlobalDisplayAspectRatioMode
-                      )
-                    }
-                  >
-                    <option value="preserve_aspect">
-                      Preserve Aspect Ratio (4:3 Pillarbox / Notch-Safe)
-                    </option>
-                    <option value="integer">Integer Pixel-Perfect</option>
-                    <option value="stretch">Stretch to Fill Screen</option>
-                  </LaunchSelect>
-                  <p
-                    id={globalDisplayAspectHintId}
-                    className="text-[10px] text-steam-subtext leading-snug"
-                  >
-                    Controls fullscreen geometry and upscaling filter across all bottled games.
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex items-center justify-between gap-3 rounded-lg bg-[#0e151f] border border-[#223447] px-3 py-2.5">
-                <div className="min-w-0 space-y-0.5">
-                  <span
-                    id={fullscreenHotkeyLabelId}
-                    className="block text-xs font-semibold text-white"
-                  >
-                    In-Game Fullscreen Shortcut (Ctrl+Option+F)
-                  </span>
-                  <p
-                    id={fullscreenHotkeyHintId}
-                    className="text-[10px] text-steam-subtext leading-snug"
-                  >
-                    Registers global macOS shortcuts during active bottled sessions (
-                    <kbd className="font-mono text-sky-300">Ctrl+Option+F</kbd> toggles Fullscreen /
-                    Windowed; <kbd className="font-mono text-sky-300">Ctrl+Option+A</kbd> cycles
-                    Aspect Ratio)
-                  </p>
-                </div>
-                <SwitchControl
-                  dataTestId="toggle-fullscreen-hotkey"
-                  checked={effectiveFullscreenHotkey}
-                  ariaLabelledBy={fullscreenHotkeyLabelId}
-                  ariaDescribedBy={fullscreenHotkeyHintId}
-                  onChange={onToggleFullscreenHotkey}
-                  tone="emerald"
-                />
-              </div>
-
-              <div className="flex items-center justify-between gap-3 rounded-lg bg-[#0e151f] border border-[#223447] px-3 py-2.5">
-                <div className="min-w-0 space-y-0.5">
-                  <span
-                    id={autoShutdownWineLabelId}
-                    className="block text-xs font-semibold text-white"
-                  >
-                    Close Idle Bottle Background Daemons After Exit (wineserver -k)
-                  </span>
-                  <p
-                    id={autoShutdownWineHintId}
-                    className="text-[10px] text-steam-subtext leading-snug"
-                  >
-                    Waits for Cloud Save uploads and active Bottle downloads to finish, then
-                    terminates leftover wineserver / winedevice processes and silences Wine debug
-                    logs
-                  </p>
-                </div>
-                <SwitchControl
-                  dataTestId="toggle-auto-shutdown-wine"
-                  checked={perfSettings.autoShutdownWinePrefixOnExit}
-                  ariaLabelledBy={autoShutdownWineLabelId}
-                  ariaDescribedBy={autoShutdownWineHintId}
-                  onChange={onToggleAutoShutdownWine}
-                  tone="emerald"
-                />
-              </div>
-            </>
-          )}
-        </div>
-      </div>
-    </section>
+    </div>
   );
 }
 

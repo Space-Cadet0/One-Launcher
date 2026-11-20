@@ -653,6 +653,7 @@ export interface ElectronAPI {
   ) => () => void;
   onSessionUpdated: (cb: (data: SessionUpdatedPayload) => void) => () => void;
   onFullscreenChanged: (cb: (isFullScreen: boolean) => void) => () => void;
+  onOpenSettings?: (cb: (section?: string) => void) => () => void;
   isWindowFullscreen: () => Promise<boolean>;
   toggleWindowFullscreen: () => Promise<boolean>;
   toggleFullScreen?: () => Promise<boolean>;

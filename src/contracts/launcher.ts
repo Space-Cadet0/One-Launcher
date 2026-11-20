@@ -3,14 +3,19 @@ import type { ChainedHandoffTopology } from './game';
 import type { ResolvedEffectiveLaunchPolicy } from './launchPolicyResolver';
 
 export {
+  migrateLegacyHudConfig,
   resolveEffectiveLaunchPolicy,
   resolveEffectiveLifecyclePolicy,
+  resolveEffectivePerformanceHud,
   sanitizeLaunchMethod,
+  sanitizePerformanceHudMode,
   sanitizeStorefrontLifecyclePolicy,
   type LaunchPolicyBuildType,
   type ResolveEffectiveLaunchPolicyInput,
   type ResolvedEffectiveLaunchPolicy,
 } from './launchPolicyResolver';
+
+export type PerformanceHudMode = 'default' | 'on' | 'off';
 
 export type LaunchMethod =
   | 'auto'
@@ -341,6 +346,7 @@ export interface LauncherPerformanceSettings {
   defaultBottleDisplayScalingMode?: GlobalBottleDisplayScalingMode;
   defaultDisplayAspectRatio?: GlobalDisplayAspectRatioMode;
   enableFullscreenHotkey?: boolean;
+  defaultPerformanceHud?: boolean;
 }
 
 export const DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS: LauncherPerformanceSettings = {
@@ -354,6 +360,7 @@ export const DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS: LauncherPerformanceSettings 
   defaultBottleDisplayScalingMode: 'auto_fullscreen',
   defaultDisplayAspectRatio: 'preserve_aspect',
   enableFullscreenHotkey: true,
+  defaultPerformanceHud: false,
 };
 
 export interface StorefrontLaunchProfile {
@@ -379,10 +386,12 @@ export interface StorefrontLaunchProfile {
   wineEsync?: boolean;
   /** Wine debug channel verbosity override (WINEDEBUG) */
   wineDebug?: WineDebugMode | string;
-  /** Apple Metal Performance HUD overlay (MTL_HUD_ENABLED=1) */
+  /** @deprecated Migrated to `performanceHud`; kept optional for lossless read-only backward compatibility. */
   metalHud?: boolean;
-  /** DXVK FPS & frametime HUD overlay (DXVK_HUD=devinfo,fps,frametimes) */
+  /** @deprecated Migrated to `performanceHud`; kept optional for lossless read-only backward compatibility. */
   dxvkHud?: boolean;
+  /** Unified per-game Performance HUD overlay override ('default' inherits global defaultPerformanceHud) */
+  performanceHud?: PerformanceHudMode;
   /** Target maximum frame rate cap (DXVK_FRAME_RATE / D3DM_MAX_FPS / dxvk.maxFrameRate) */
   preferredMaxFrameRate?: number;
   /** DXMT MetalFX spatial swapchain upscale factor (DXMT_METALFX_SPATIAL_SWAPCHAIN: 1.33 | 1.5 | 1.7 | 2.0) */
@@ -410,6 +419,45 @@ export interface StorefrontLaunchProfile {
   /** Per-game override for storefront client lifecycle policy ('default' inherits global LauncherPerformanceSettings) */
   storefrontClientLifecycle?: 'default' | StorefrontClientLifecyclePolicy;
 }
+
+/**
+ * Canonical per-storefront launch profile keys in exact lockstep order with
+ * `electron/launcher/engineStateRegistry.cjs` (`LAUNCH_PROFILE_KEYS`).
+ */
+export const LAUNCH_PROFILE_KEYS = [
+  'launchMethod',
+  'customExecutablePath',
+  'workingDirectory',
+  'launchArguments',
+  'environmentVariables',
+  'compatibilityLayer',
+  'wineBottleName',
+  'winePrefixPath',
+  'crossoverGraphicsBackend',
+  'crossoverD3DMetalVersion',
+  'crossoverHighResolutionMode',
+  'crossoverDlss',
+  'wineMsync',
+  'wineEsync',
+  'metalHud',
+  'dxvkHud',
+  'performanceHud',
+  'wineDebug',
+  'preferredMaxFrameRate',
+  'metalfxSpatialUpscaleFactor',
+  'virtualDesktop',
+  'virtualDesktopResolution',
+  'displayScalingMode',
+  'displayAspectRatio',
+  'emulateModeset',
+  'forceLargeAddressAware',
+  'audioBufferClamp',
+  'advertiseAvx',
+  'inGameLauncherBehavior',
+  'storefrontClientLifecycle',
+  'preLaunchCommand',
+  'postExitCommand',
+] as const satisfies readonly (keyof StorefrontLaunchProfile)[];
 
 export interface GameLaunchConfig extends StorefrontLaunchProfile {
   gameId: string;
