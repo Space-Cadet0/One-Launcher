@@ -41,7 +41,6 @@ import {
   scheduleScrollIdleMemoryTrim,
 } from './Grid/gridScrollTracker';
 import {
-  TITLE_COLLATOR,
   isPlaceholderSynopsis,
   hasStoreSynopsis,
   getReleaseYear,
@@ -57,6 +56,11 @@ import {
   loadPersistedReleaseYearOrder,
   computeResponsiveColumnCount,
 } from './Grid/gridCoverUtils';
+import {
+  getAlphabeticalTitleSortKey,
+  LIBRARY_TITLE_COLLATOR,
+  sortByTitleKey,
+} from '../../services/common/titleSortUtils';
 import { GameCardCover } from './Grid/GameCardCover';
 import { renderLibraryGridCard } from './Grid/LibraryGridCard';
 import { renderGameHoverPopout } from './Grid/GameHoverPopout';
@@ -109,6 +113,7 @@ interface LibraryGridViewProps {
   libraryFilterIndex?: LibraryFilterIndex;
   unfilteredTotalCount?: number;
   isPreFiltered?: boolean;
+  ignoreLeadingTheWhenSorting?: boolean;
 }
 
 interface IgdbCoverUpdatedDetail {
@@ -147,6 +152,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   libraryFilterIndex,
   unfilteredTotalCount,
   isPreFiltered = false,
+  ignoreLeadingTheWhenSorting,
 }) => {
   const gridContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -214,7 +220,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         )
         .sort()
         .join(',');
-      return `${running}|${installed}`;
+      const ignoreLeadingThe =
+        launcherService.getPerformanceSettings?.()?.ignoreLeadingTheWhenSorting ?? true;
+      return `${running}|${installed}|${ignoreLeadingThe}`;
     };
 
     let prevSig = getLauncherGridSignature();
@@ -702,6 +710,10 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     [effectiveFilterIndex, criticUpdateTick, overrideVersion, liveCriticMemoMap]
   );
 
+  const effectiveIgnoreLeadingThe =
+    ignoreLeadingTheWhenSorting ??
+    (launcherService.getPerformanceSettings?.()?.ignoreLeadingTheWhenSorting ?? true);
+
   const ratingSortTick = sortBy === 'rating' ? criticUpdateTick : 0;
 
   const sortedGames = useMemo(() => {
@@ -716,59 +728,112 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       ? uniqueGames
       : evaluateLibraryFilter(uniqueGames, effectiveFilterIndex, effectiveFilterState);
 
+    const compareDecoratedTitleTie = (
+      a: { game: CanonicalGame; sortKey: string; rawTitle: string },
+      b: { game: CanonicalGame; sortKey: string; rawTitle: string }
+    ): number => {
+      const keyCmp = LIBRARY_TITLE_COLLATOR.compare(a.sortKey, b.sortKey);
+      if (keyCmp !== 0) return keyCmp;
+      const rawCmp = LIBRARY_TITLE_COLLATOR.compare(a.rawTitle, b.rawTitle);
+      if (rawCmp !== 0) return rawCmp;
+      if (a.game.id !== b.game.id) return a.game.id < b.game.id ? -1 : 1;
+      return 0;
+    };
+
     if (sortBy === 'rating') {
-      const decorated = new Array<{ game: CanonicalGame; score: number; rec: number }>(
-        filteredUniqueGames.length
-      );
+      const decorated = new Array<{
+        game: CanonicalGame;
+        score: number;
+        rec: number;
+        sortKey: string;
+        rawTitle: string;
+      }>(filteredUniqueGames.length);
       for (let i = 0; i < filteredUniqueGames.length; i++) {
         const g = filteredUniqueGames[i];
         const oc = resolveGameCriticData(g);
+        const rawTitle = (g.title || '').trim();
         decorated[i] = {
           game: g,
           score: oc?.score ?? -1,
           rec: oc?.percentRecommended ?? -1,
+          sortKey: getAlphabeticalTitleSortKey(rawTitle, effectiveIgnoreLeadingThe),
+          rawTitle,
         };
       }
       decorated.sort((a, b) => {
         if (b.score !== a.score) return b.score - a.score;
         if (b.rec !== a.rec) return b.rec - a.rec;
-        return TITLE_COLLATOR.compare(a.game.title, b.game.title);
+        return compareDecoratedTitleTie(a, b);
       });
       return decorated.map((d) => d.game);
     }
 
-    return filteredUniqueGames.sort((a, b) => {
-      if (sortBy === 'playtime') {
-        const ptA = a.platforms.reduce((acc, p) => acc + (p.playtimeMinutes || 0), 0);
-        const ptB = b.platforms.reduce((acc, p) => acc + (p.playtimeMinutes || 0), 0);
-        return ptB - ptA;
-      }
-      if (sortBy === 'recent') {
-        const getRecentMs = (g: CanonicalGame) => {
-          let maxMs = 0;
-          for (const p of g.platforms) {
-            const ms = parseTimestampMs(p.lastPlayed);
-            if (ms && ms > maxMs) maxMs = ms;
-          }
-          return maxMs;
+    if (sortBy === 'playtime') {
+      const decorated = filteredUniqueGames.map((g) => {
+        const rawTitle = (g.title || '').trim();
+        return {
+          game: g,
+          playtime: g.platforms.reduce((acc, p) => acc + (p.playtimeMinutes || 0), 0),
+          sortKey: getAlphabeticalTitleSortKey(rawTitle, effectiveIgnoreLeadingThe),
+          rawTitle,
         };
-        return getRecentMs(b) - getRecentMs(a);
-      }
-      if (sortBy === 'release_year') {
-        const yearA =
-          effectiveFilterIndex.entriesById.get(a.id)?.releaseYear ??
-          (Number(getReleaseYear(a, steamMatcher.getEffectiveSteamAppId(a))) || null);
-        const yearB =
-          effectiveFilterIndex.entriesById.get(b.id)?.releaseYear ??
-          (Number(getReleaseYear(b, steamMatcher.getEffectiveSteamAppId(b))) || null);
-        if (yearA === null && yearB !== null) return 1;
-        if (yearA !== null && yearB === null) return -1;
-        if (yearA !== null && yearB !== null && yearA !== yearB) {
-          return releaseYearOrder === 'asc' ? yearA - yearB : yearB - yearA;
+      });
+      decorated.sort((a, b) => {
+        if (b.playtime !== a.playtime) return b.playtime - a.playtime;
+        return compareDecoratedTitleTie(a, b);
+      });
+      return decorated.map((d) => d.game);
+    }
+
+    if (sortBy === 'recent') {
+      const decorated = filteredUniqueGames.map((g) => {
+        let maxMs = 0;
+        for (const p of g.platforms) {
+          const ms = parseTimestampMs(p.lastPlayed);
+          if (ms && ms > maxMs) maxMs = ms;
         }
-        return TITLE_COLLATOR.compare(a.title, b.title);
-      }
-      return TITLE_COLLATOR.compare(a.title, b.title);
+        const rawTitle = (g.title || '').trim();
+        return {
+          game: g,
+          recentMs: maxMs,
+          sortKey: getAlphabeticalTitleSortKey(rawTitle, effectiveIgnoreLeadingThe),
+          rawTitle,
+        };
+      });
+      decorated.sort((a, b) => {
+        if (b.recentMs !== a.recentMs) return b.recentMs - a.recentMs;
+        return compareDecoratedTitleTie(a, b);
+      });
+      return decorated.map((d) => d.game);
+    }
+
+    if (sortBy === 'release_year') {
+      const decorated = filteredUniqueGames.map((g) => {
+        const year =
+          effectiveFilterIndex.entriesById.get(g.id)?.releaseYear ??
+          (Number(getReleaseYear(g, steamMatcher.getEffectiveSteamAppId(g))) || null);
+        const rawTitle = (g.title || '').trim();
+        return {
+          game: g,
+          year,
+          sortKey: getAlphabeticalTitleSortKey(rawTitle, effectiveIgnoreLeadingThe),
+          rawTitle,
+        };
+      });
+      decorated.sort((a, b) => {
+        if (a.year === null && b.year !== null) return 1;
+        if (a.year !== null && b.year === null) return -1;
+        if (a.year !== null && b.year !== null && a.year !== b.year) {
+          return releaseYearOrder === 'asc' ? a.year - b.year : b.year - a.year;
+        }
+        return compareDecoratedTitleTie(a, b);
+      });
+      return decorated.map((d) => d.game);
+    }
+
+    return sortByTitleKey(filteredUniqueGames, (g) => g.title, {
+      ignoreLeadingThe: effectiveIgnoreLeadingThe,
+      getId: (g) => g.id,
     });
   }, [
     games,
@@ -780,6 +845,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     effectiveFilterIndex,
     effectiveFilterState,
     isPreFiltered,
+    effectiveIgnoreLeadingThe,
   ]);
 
   const handleMouseEnter = useCallback(

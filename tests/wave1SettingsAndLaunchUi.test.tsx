@@ -124,8 +124,8 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
   // ---------------------------------------------------------------------------
   // 1. Contracts, 11-Key Parity, LAUNCH_PROFILE_KEYS & HUD Migration Truth Table
   // ---------------------------------------------------------------------------
-  describe('1. Contracts, 11-Key LauncherPerformanceSettings & migrateLegacyHudConfig()', () => {
-    it('defines exact 11 keys in DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS and sanitizePerformanceSettings()', () => {
+  describe('1. Contracts, 12-Key LauncherPerformanceSettings & migrateLegacyHudConfig()', () => {
+    it('defines exact 12 keys in DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS and sanitizePerformanceSettings()', () => {
       const expectedKeys = [
         'inGameLauncherBehavior',
         'postGameLauncherBehavior',
@@ -138,15 +138,18 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
         'defaultDisplayAspectRatio',
         'enableFullscreenHotkey',
         'defaultPerformanceHud',
+        'ignoreLeadingTheWhenSorting',
       ];
       expect(Object.keys(DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS).sort()).toEqual(
         [...expectedKeys].sort()
       );
       expect(DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.defaultPerformanceHud).toBe(false);
+      expect(DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.ignoreLeadingTheWhenSorting).toBe(true);
 
       const sanitizedDefault = sanitizePerformanceSettings(null);
       expect(Object.keys(sanitizedDefault).sort()).toEqual([...expectedKeys].sort());
       expect(sanitizedDefault.defaultPerformanceHud).toBe(false);
+      expect(sanitizedDefault.ignoreLeadingTheWhenSorting).toBe(true);
 
       // Legacy dead keys enableMetalHud / enableMangoHud migrate once to defaultPerformanceHud: true
       const migratedLegacy = sanitizePerformanceSettings({
@@ -473,7 +476,7 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
       }
     });
 
-    it('hides macOS bottle section and uses honest Windows DXVK HUD copy when hostPlatform="win32"', () => {
+    it('hides macOS bottle section, uses honest Windows DXVK HUD & System Setup Wizard copy, and shows Library Sorting when hostPlatform="win32"', () => {
       vi.spyOn(launcherService, 'getPerformanceSettings').mockReturnValue({
         ...DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
       });
@@ -481,11 +484,21 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
       const html = renderToString(
         <SettingsModal isOpen={true} onClose={() => {}} hostPlatform="win32" />
       );
+      expect(html).toContain('data-testid="settings-section-library"');
+      expect(html).toContain('data-testid="settings-toggle-ignore-leading-the"');
       expect(html).toContain('data-testid="settings-section-general"');
       expect(html).not.toContain('data-testid="settings-section-macos-bottle"');
       expect(html).toContain('DXVK Performance HUD');
       expect(html).toContain('Vulkan / DXVK-wrapped games');
+      expect(html).toContain('System Setup Wizard…');
       expect(html).not.toContain('Apple Metal HUD');
+      expect(html).not.toContain('Runner &amp; Bottle Setup');
+      expect(html).not.toContain('Runner & Bottle Setup');
+      expect(html).not.toContain('CrossOver');
+      expect(html).not.toContain('D3DMetal');
+      expect(html).not.toContain('DXMT');
+      expect(html).not.toContain('MetalFX');
+      expect(html).not.toContain('Bottle');
     });
 
     it('discards unsaved changes without saving when Discard Changes is clicked', async () => {
@@ -526,7 +539,7 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
   // 4. TopNavBar Settings… Menu Item (Windows File Menu & Burger Menu)
   // ---------------------------------------------------------------------------
   describe('4. TopNavBar Settings… Menu Item', () => {
-    it('renders Settings… in burger menu (macOS ⌘,) and Windows File menu (Ctrl+,) with callback and event fallback', () => {
+    it('renders Settings… in burger menu without shortcut hint and retains Ctrl+, in Windows File menu with callback and event fallback', () => {
       const onOpenSettings = vi.fn();
       const macRenderer = createDomain12DeepRenderer(TopNavBar, {
         selectedPlatform: 'all',
@@ -549,7 +562,9 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
         const burgerSettingsItem = findByTestId(tree, 'menu-open-settings');
         expect(burgerSettingsItem).toBeDefined();
         expect(getTextContent(burgerSettingsItem)).toContain('Settings…');
-        expect(getTextContent(burgerSettingsItem)).toContain('⌘,');
+        expect(getTextContent(burgerSettingsItem)).toContain('Library, footprint, display & HUD');
+        expect(getTextContent(burgerSettingsItem)).not.toContain('⌘,');
+        expect(getTextContent(burgerSettingsItem)).not.toContain('Ctrl+,');
 
         (burgerSettingsItem!.props.onClick as () => void)();
         expect(onOpenSettings).toHaveBeenCalledTimes(1);
@@ -557,7 +572,7 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
         macRenderer.unmount();
       }
 
-      // Windows File menu + custom event fallback when onOpenSettings omitted
+      // Windows File menu + burger menu (no shortcut hint) + custom event fallback when onOpenSettings omitted
       const dispatchSpy = vi.fn(() => true);
       (globalRecord.window as Record<string, unknown>).dispatchEvent = dispatchSpy;
       (
@@ -576,10 +591,19 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
         onTriggerSync: () => {},
         onHomeClick: () => {},
         onOpenIntegrations: () => {},
+        defaultMenuOpen: true,
       });
 
       try {
         let tree = winRenderer.render();
+        const winBurgerSettingsItem = findByTestId(tree, 'menu-open-settings');
+        expect(winBurgerSettingsItem).toBeDefined();
+        expect(getTextContent(winBurgerSettingsItem)).toContain(
+          'Library, footprint & launch defaults'
+        );
+        expect(getTextContent(winBurgerSettingsItem)).not.toContain('Ctrl+,');
+        expect(getTextContent(winBurgerSettingsItem)).not.toContain('⌘,');
+
         const fileBtn = findByTestId(tree, 'win-menu-file');
         expect(fileBtn).toBeDefined();
         (fileBtn!.props.onClick as () => void)();
@@ -1056,6 +1080,41 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
         const spatialSelect = findByTestId(compatCard, 'metalfx-spatial-upscale-select');
         expect(spatialSelect).toBeDefined();
         expect(spatialSelect!.props.value).toBe('1.7');
+        expect(spatialSelect!.props.disabled).toBe(false);
+        expect(findByTestId(compatCard, 'metalfx-spatial-unavailable-badge')).toBeUndefined();
+
+        // Switching Graphics Backend to D3DMetal keeps MetalFX Spatial visible, disabled, with "DXMT Only" badge & hint
+        const backendSelect = findElements(
+          compatCard,
+          (el) => el.type === 'select' && el.props?.['aria-label'] === 'Graphics Backend'
+        )[0];
+        expect(backendSelect).toBeDefined();
+        (backendSelect!.props.onChange as (e: { target: { value: string } }) => void)({
+          target: { value: 'd3dmetal' },
+        });
+        const d3dTree = renderer.render();
+        const d3dCompatCard = findByTestId(d3dTree, 'compatibility-graphics-card');
+        const disabledSpatialSelect = findByTestId(d3dCompatCard, 'metalfx-spatial-upscale-select');
+        expect(disabledSpatialSelect).toBeDefined();
+        expect(disabledSpatialSelect!.props.disabled).toBe(true);
+        expect(disabledSpatialSelect!.props.value).toBe('');
+        expect(getTextContent(disabledSpatialSelect)).toContain('Unavailable on D3DMetal');
+        expect(
+          getTextContent(findByTestId(d3dCompatCard, 'metalfx-spatial-unavailable-badge'))
+        ).toBe('DXMT Only');
+        expect(getTextContent(findByTestId(d3dCompatCard, 'metalfx-spatial-upscale-hint'))).toContain(
+          'DXMT-only'
+        );
+
+        // Restore Auto backend for subsequent assertions
+        const d3dBackendSelect = findElements(
+          d3dCompatCard,
+          (el) => el.type === 'select' && el.props?.['aria-label'] === 'Graphics Backend'
+        )[0];
+        (d3dBackendSelect!.props.onChange as (e: { target: { value: string } }) => void)({
+          target: { value: 'auto' },
+        });
+        renderer.render();
 
         expect(findByTestId(compatCard, 'wine-sync-mode-group')).toBeDefined();
         const esyncRadio = findElements(
@@ -1099,9 +1158,11 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
   describe('6. Zero TypeScript AnyKeyword Guard across src/**', () => {
     it('contains zero TypeScript AnyKeyword nodes across all Wave 1 UI & contract files in src/**', () => {
       const filesToCheck = [
+        'src/contracts/hostPlatform.ts',
         'src/contracts/launcher.ts',
         'src/contracts/launchPolicyResolver.ts',
         'src/types/electron.d.ts',
+        'src/services/common/titleSortUtils.ts',
         'src/services/launcher/launchConfigStore.ts',
         'src/components/Common/ModalShell.tsx',
         'src/components/Settings/SettingsModal.tsx',

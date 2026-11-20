@@ -347,6 +347,7 @@ export interface LauncherPerformanceSettings {
   defaultDisplayAspectRatio?: GlobalDisplayAspectRatioMode;
   enableFullscreenHotkey?: boolean;
   defaultPerformanceHud?: boolean;
+  ignoreLeadingTheWhenSorting?: boolean;
 }
 
 export const DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS: LauncherPerformanceSettings = {
@@ -361,6 +362,7 @@ export const DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS: LauncherPerformanceSettings 
   defaultDisplayAspectRatio: 'preserve_aspect',
   enableFullscreenHotkey: true,
   defaultPerformanceHud: false,
+  ignoreLeadingTheWhenSorting: true,
 };
 
 export interface StorefrontLaunchProfile {

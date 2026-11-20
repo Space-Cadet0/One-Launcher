@@ -34,8 +34,8 @@ import { launcherService } from '../../services/launcher/launcherService';
 import { steamApi } from '../../services/steam/steamApi';
 import { toOlMediaUrl } from '../../contracts/network';
 import { onlineLifecycleManager } from '../../services/network/onlineLifecycleManager';
+import { sortByTitleKey } from '../../services/common/titleSortUtils';
 
-const SIDEBAR_TITLE_COLLATOR = new Intl.Collator(undefined, { sensitivity: 'base' });
 const COLLAPSED_STORAGE_KEY = 'antigravity_library_collapsed_groups';
 const MAX_FAILED_SIDEBAR_ICON_URLS = 2000;
 const failedSidebarIconUrls = new Set<string>();
@@ -311,6 +311,7 @@ interface LibrarySidebarProps {
   activeFilter?: ActiveGameFilter | null;
   onClearActiveFilter?: () => void;
   connectedStorefronts?: StorefrontId[];
+  ignoreLeadingTheWhenSorting?: boolean;
 }
 
 export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
@@ -333,6 +334,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
   activeFilter,
   onClearActiveFilter,
   connectedStorefronts,
+  ignoreLeadingTheWhenSorting,
 }) => {
   const sidebarSearchInputId = useSafeId('sidebar-title-search');
   const [groupByCollections, setGroupByCollections] = useState(true);
@@ -406,7 +408,9 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
         .map((t) => t.gameId)
         .sort()
         .join('|');
-      return `${runningSig}##${completedSig}`;
+      const ignoreLeadingTheSig =
+        launcherService.getPerformanceSettings?.()?.ignoreLeadingTheWhenSorting ?? true;
+      return `${runningSig}##${completedSig}##${ignoreLeadingTheSig}`;
     };
     lastLauncherSigRef.current = computeSig();
     const unsub = launcherService.subscribe(() => {
@@ -476,23 +480,29 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
     setCollapsedCollections(next);
   };
 
+  const effectiveIgnoreLeadingThe =
+    ignoreLeadingTheWhenSorting ??
+    (launcherService.getPerformanceSettings?.()?.ignoreLeadingTheWhenSorting ?? true);
+
   // Group games into collections + uncategorized
   const groupedData = useMemo(() => {
     const seenGameIds = new Set<string>();
     const seenPlatformSigs = new Set<string>();
-    const uniqueSortedGames = games
-      .filter((g) => {
-        if (!g || seenGameIds.has(g.id)) return false;
-        const platSig = g.platforms
-          ?.map((p) => `${p.platformId}:${p.platformGameId}`)
-          .sort()
-          .join('|');
-        if (platSig && seenPlatformSigs.has(platSig)) return false;
-        seenGameIds.add(g.id);
-        if (platSig) seenPlatformSigs.add(platSig);
-        return true;
-      })
-      .sort((a, b) => SIDEBAR_TITLE_COLLATOR.compare(a.title, b.title));
+    const uniqueFilteredGames = games.filter((g) => {
+      if (!g || seenGameIds.has(g.id)) return false;
+      const platSig = g.platforms
+        ?.map((p) => `${p.platformId}:${p.platformGameId}`)
+        .sort()
+        .join('|');
+      if (platSig && seenPlatformSigs.has(platSig)) return false;
+      seenGameIds.add(g.id);
+      if (platSig) seenPlatformSigs.add(platSig);
+      return true;
+    });
+    const uniqueSortedGames = sortByTitleKey(uniqueFilteredGames, (g) => g.title, {
+      ignoreLeadingThe: effectiveIgnoreLeadingThe,
+      getId: (g) => g.id,
+    });
 
     const gameMap = new Map<string, CanonicalGame>();
     uniqueSortedGames.forEach((g) => gameMap.set(g.id, g));
@@ -500,10 +510,13 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
     const categorizedGameIds = new Set<string>();
 
     const colGroups = collections.map((col) => {
-      const colGames = Array.from(new Set(col.gameIds))
+      const colUnsorted = Array.from(new Set(col.gameIds))
         .map((id) => gameMap.get(id))
-        .filter((g): g is CanonicalGame => !!g)
-        .sort((a, b) => SIDEBAR_TITLE_COLLATOR.compare(a.title, b.title));
+        .filter((g): g is CanonicalGame => !!g);
+      const colGames = sortByTitleKey(colUnsorted, (g) => g.title, {
+        ignoreLeadingThe: effectiveIgnoreLeadingThe,
+        getId: (g) => g.id,
+      });
 
       colGames.forEach((g) => categorizedGameIds.add(g.id));
 
@@ -522,7 +535,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
       uncategorizedGames,
       allSorted: uniqueSortedGames,
     };
-  }, [games, collections]);
+  }, [games, collections, effectiveIgnoreLeadingThe]);
 
   // Single flattened discriminated-union row array for the entire sidebar scroll container
   const flattenedRows = useMemo<SidebarFlatRow[]>(() => {

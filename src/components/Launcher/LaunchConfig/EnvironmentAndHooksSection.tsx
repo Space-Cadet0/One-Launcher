@@ -38,7 +38,7 @@ function EnvironmentAndHooksSectionImpl({
   }
 
   const envPlaceholder = isWindowsHost
-    ? 'KEY=VALUE (one per line, e.g. __GL_THREADED_OPTIMIZATIONS=1)'
+    ? 'KEY=VALUE (one per line, e.g. SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS=0)'
     : preview.visibleSections.compatibilityLayer
       ? 'KEY=VALUE (one per line, e.g. MVK_CONFIG_FAST_MATH_ENABLED=1)'
       : 'KEY=VALUE (one per line, e.g. METAL_DEVICE_WRAPPER_TYPE=1)';

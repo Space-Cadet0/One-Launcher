@@ -188,10 +188,7 @@ export const SteamSidebarNotices: React.FC<SteamSidebarNoticesProps> = ({
           .includes(plainExtAccountNotice.toLowerCase()))
   );
 
-  const isWindowsHost =
-    (typeof (launcherService as { isWindowsHost?: () => boolean }).isWindowsHost === 'function' &&
-      (launcherService as { isWindowsHost: () => boolean }).isWindowsHost()) ||
-    (typeof window !== 'undefined' && window.electronAPI?.platform === 'win32');
+  const hostCapabilities = launcherService.getHostCapabilities();
 
   const hasNativeMacForActiveEntry = Boolean(
     resolvedActivePlat?.isCrossPlatformLauncherRuntime ||
@@ -213,7 +210,7 @@ export const SteamSidebarNotices: React.FC<SteamSidebarNoticesProps> = ({
     resolveCanonicalKernelAntiCheatDisplayName(rawKernelAntiCheatLabel) ||
     rawKernelAntiCheatLabel;
   const shouldShowMacKernelAntiCheatNotice = Boolean(
-    !isWindowsHost &&
+    hostCapabilities.supportsWindowsTranslation &&
       !hasNativeMacForActiveEntry &&
       (resolvedHandoffId === 'riot' ||
         resolvedActivePlat?.xboxBottleCompatibilityTier === 'tier_c_kernel_anticheat' ||

@@ -5089,9 +5089,14 @@ function getCachedAuthenticatedPreviewUrl(options = {}) {
 }
 
 async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
-  const layers = Array.isArray(options.layers)
-    ? options.layers
-    : detectCompatibilityLayers(options);
+  const safeOptions = options && typeof options === 'object' ? options : {};
+  const platform = safeOptions.platform || process.platform;
+  if (platform !== 'darwin') {
+    return {};
+  }
+  const layers = Array.isArray(safeOptions.layers)
+    ? safeOptions.layers
+    : detectCompatibilityLayers(safeOptions);
   const runnerTypes = [
     'crossover',
     'crossover_preview',

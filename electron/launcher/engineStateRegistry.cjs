@@ -1781,6 +1781,7 @@ const DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS = {
   defaultDisplayAspectRatio: 'preserve_aspect',
   enableFullscreenHotkey: true,
   defaultPerformanceHud: false,
+  ignoreLeadingTheWhenSorting: true,
 };
 
 const VALID_IN_GAME_BEHAVIORS = new Set([
@@ -1880,6 +1881,10 @@ function sanitizeLauncherPerformanceSettings(/** @type {any} */ raw = {}) {
           ? src.enableMetalHud === true || src.enableMangoHud === true
           : DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.defaultPerformanceHud
     ),
+    ignoreLeadingTheWhenSorting:
+      typeof src.ignoreLeadingTheWhenSorting === 'boolean'
+        ? src.ignoreLeadingTheWhenSorting
+        : DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.ignoreLeadingTheWhenSorting,
   };
 }
 

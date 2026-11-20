@@ -9,6 +9,11 @@ import {
   type PostGameLauncherBehavior,
   type StorefrontClientLifecyclePolicy,
 } from '../../contracts/launcher';
+import {
+  getHostCapabilities,
+  type HostPlatform,
+  type HostPlatformCapabilities,
+} from '../../contracts/hostPlatform';
 import { sanitizePerformanceSettings } from '../../services/launcher/launchConfigStore';
 import { launcherService } from '../../services/launcher/launcherService';
 import { environmentSetupService } from '../../services/launcher/environmentSetupService';
@@ -23,6 +28,7 @@ import { useSafeId } from '../../utils/useSafeId';
 import {
   Activity,
   AlertTriangle,
+  ArrowDownAZ,
   Cloud,
   Cpu,
   Gauge,
@@ -41,27 +47,14 @@ export interface SettingsModalProps {
   onOpenRunnerSetup?: () => void;
   onOpenIntegrations?: () => void;
   initialSection?: 'general' | 'macos_bottle';
-  hostPlatform?: 'darwin' | 'win32' | 'linux';
+  hostPlatform?: HostPlatform;
 }
 
-function resolveSettingsHostPlatform(
-  explicit?: 'darwin' | 'win32' | 'linux'
-): 'darwin' | 'win32' | 'linux' {
-  if (explicit === 'darwin' || explicit === 'win32' || explicit === 'linux') {
-    return explicit;
+function resolveSettingsHostCapabilities(explicit?: HostPlatform): HostPlatformCapabilities {
+  if (typeof launcherService.getHostCapabilities === 'function') {
+    return launcherService.getHostCapabilities(explicit);
   }
-  const electronPlat =
-    typeof window !== 'undefined' ? window.electronAPI?.platform : undefined;
-  if (electronPlat === 'darwin' || electronPlat === 'win32' || electronPlat === 'linux') {
-    return electronPlat;
-  }
-  if (typeof launcherService.getHostPlatform === 'function') {
-    const plat = launcherService.getHostPlatform();
-    if (plat === 'darwin' || plat === 'win32' || plat === 'linux') {
-      return plat;
-    }
-  }
-  return 'darwin';
+  return getHostCapabilities(explicit);
 }
 
 function serializeSettingsForDirtyCheck(settings: LauncherPerformanceSettings): string {
@@ -77,6 +70,7 @@ function serializeSettingsForDirtyCheck(settings: LauncherPerformanceSettings): 
     defaultDisplayAspectRatio: settings.defaultDisplayAspectRatio,
     enableFullscreenHotkey: settings.enableFullscreenHotkey,
     defaultPerformanceHud: Boolean(settings.defaultPerformanceHud),
+    ignoreLeadingTheWhenSorting: settings.ignoreLeadingTheWhenSorting ?? true,
   });
 }
 
@@ -89,9 +83,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   hostPlatform,
 }) => {
   const idPrefix = useSafeId('global-settings');
-  const resolvedPlatform = resolveSettingsHostPlatform(hostPlatform);
-  const isMacHost = resolvedPlatform === 'darwin';
-  const isWindowsHost = resolvedPlatform === 'win32';
+  const hostCapabilities = resolveSettingsHostCapabilities(hostPlatform);
+  const isMacHost = hostCapabilities.supportsWindowsTranslation;
+  const isWindowsHost = hostCapabilities.isWindows;
 
   const [draft, setDraft] = useState<LauncherPerformanceSettings>(() =>
     sanitizePerformanceSettings(launcherService.getPerformanceSettings())
@@ -211,18 +205,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       onOpenRunnerSetup();
       return;
     }
+    const setupStep = hostCapabilities.supportsWindowsTranslation
+      ? 'compatibility'
+      : 'prerequisites';
     if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
       window.dispatchEvent(
         new CustomEvent('antigravity:open-setup-wizard', {
-          detail: { initialStep: 'compatibility' },
+          detail: { initialStep: setupStep },
         })
       );
     }
     environmentSetupService.openWizard({
       mode: 'health_check',
-      initialStep: 'compatibility',
+      initialStep: setupStep,
     });
-  }, [onOpenRunnerSetup]);
+  }, [onOpenRunnerSetup, hostCapabilities.supportsWindowsTranslation]);
 
   const handleOpenIntegrations = useCallback(() => {
     if (onOpenIntegrations) {
@@ -390,6 +387,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     },
   ];
 
+  const ignoreLeadingTheLabelId = `${idPrefix}-ignore-leading-the-label`;
+  const ignoreLeadingTheHintId = `${idPrefix}-ignore-leading-the-hint`;
   const pauseSyncLabelId = `${idPrefix}-pause-sync-label`;
   const pauseSyncHintId = `${idPrefix}-pause-sync-hint`;
   const pauseDownloadsLabelId = `${idPrefix}-pause-downloads-label`;
@@ -434,7 +433,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 Settings
               </h2>
               <p className="text-xs text-steam-subtext truncate">
-                Global gameplay footprint, performance HUD &amp; platform defaults for all games
+                {isWindowsHost
+                  ? 'Global library sorting, gameplay footprint & launch defaults for all games'
+                  : 'Global library sorting, gameplay footprint, performance HUD & platform defaults for all games'}
               </p>
             </div>
           </div>
@@ -453,6 +454,51 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         {/* Scrollable Body */}
         <div className="p-5 space-y-5 overflow-y-auto overscroll-contain [scrollbar-gutter:stable] flex-1 bg-[#131b26] modal-scroll-body">
+          {/* Library Sorting */}
+          <div
+            data-testid="settings-section-library"
+            className="rounded-lg bg-[#0e151f] border border-[#223447] p-4 space-y-3"
+          >
+            <div className="flex items-center gap-2">
+              <ArrowDownAZ className="w-4 h-4 text-sky-400 shrink-0" aria-hidden="true" />
+              <h3 className="text-xs font-bold uppercase tracking-wider text-white">
+                Library Sorting
+              </h3>
+            </div>
+
+            <div className="flex items-center justify-between gap-3 rounded-lg bg-[#141d2b] border border-[#26384d] px-3 py-2.5">
+              <div className="min-w-0 space-y-0.5">
+                <span
+                  id={ignoreLeadingTheLabelId}
+                  className="block text-xs font-semibold text-white"
+                >
+                  Ignore Leading &quot;The&quot; When Sorting Alphabetically
+                </span>
+                <p
+                  id={ignoreLeadingTheHintId}
+                  className="text-[10px] text-steam-subtext leading-snug"
+                >
+                  When on (default), titles starting with &quot;The&quot; are sorted by the next
+                  word (for example, &quot;The Witcher 3&quot; appears under W). Turn off to sort
+                  strictly from the first word (under T).
+                </p>
+              </div>
+              <SwitchControl
+                dataTestId="settings-toggle-ignore-leading-the"
+                checked={draft.ignoreLeadingTheWhenSorting ?? true}
+                ariaLabelledBy={ignoreLeadingTheLabelId}
+                ariaDescribedBy={ignoreLeadingTheHintId}
+                onChange={() =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    ignoreLeadingTheWhenSorting: !(prev.ignoreLeadingTheWhenSorting ?? true),
+                  }))
+                }
+                tone="sky"
+              />
+            </div>
+          </div>
+
           {/* General & Gameplay Footprint */}
           <div
             data-testid="settings-section-general"
@@ -753,7 +799,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 className={`min-h-[28px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#17212e] hover:bg-[#223144] border border-[#2a475e] text-xs font-semibold text-emerald-300 hover:text-white transition-colors cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
               >
                 <Wrench className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>Runner &amp; Bottle Setup…</span>
+                <span>
+                  {hostCapabilities.supportsWindowsTranslation
+                    ? 'Runner & Bottle Setup…'
+                    : 'System Setup Wizard…'}
+                </span>
               </button>
             </div>
           </div>

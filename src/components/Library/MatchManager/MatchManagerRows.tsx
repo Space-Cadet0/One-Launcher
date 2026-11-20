@@ -420,38 +420,20 @@ interface EntitlementOsBadge {
   title: string;
 }
 
-function getHostPlatform(): 'darwin' | 'win32' | 'other' {
-  if (typeof window !== 'undefined' && window.electronAPI?.platform) {
-    const p = window.electronAPI.platform;
-    if (p === 'darwin') return 'darwin';
-    if (p === 'win32') return 'win32';
-  }
-  if (typeof navigator !== 'undefined') {
-    const ua = `${navigator.platform || ''} ${navigator.userAgent || ''}`;
-    if (/Mac/i.test(ua)) return 'darwin';
-    if (/Win/i.test(ua)) return 'win32';
-  }
-  if (typeof process !== 'undefined' && process.platform) {
-    if (process.platform === 'darwin') return 'darwin';
-    if (process.platform === 'win32') return 'win32';
-  }
-  return 'other';
-}
-
 function resolveEntitlementOsBadge(
   game: CanonicalGame,
   p: CanonicalGame['platforms'][number],
   installedRec: ReturnType<typeof launcherService.getInstalledRecordForGame>,
   isPlatInstalled: boolean
 ): EntitlementOsBadge | null {
-  const host = getHostPlatform();
+  const hostCaps = launcherService.getHostCapabilities();
   const osSupport = (
     game as CanonicalGame & {
       osSupport?: { mac?: boolean; windows?: boolean; linux?: boolean };
     }
   ).osSupport;
 
-  if (host === 'darwin') {
+  if (hostCaps.supportsWindowsTranslation) {
     const explicitWinOnMac = installedRec?.isWindowsBinaryOnMac ?? p.isWindowsBinaryOnMac;
     if (explicitWinOnMac === true) {
       return {
@@ -539,7 +521,7 @@ function resolveEntitlementOsBadge(
         title: 'Windows-only storefront build (runs via Wine / CrossOver on macOS)',
       };
     }
-  } else if (host === 'win32') {
+  } else if (hostCaps.isWindows) {
     if (isPlatInstalled) {
       return {
         label: 'Windows Native',

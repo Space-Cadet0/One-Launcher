@@ -1,5 +1,6 @@
 import React from 'react';
 import { NativeOsPlatform } from '../../contracts/game';
+import { launcherService } from '../../services/launcher/launcherService';
 
 export const WindowsOsSvg: React.FC<{ size?: number; className?: string }> = ({
   size = 12,
@@ -52,12 +53,19 @@ export const NativeOsBadges: React.FC<NativeOsBadgesProps> = ({
 
   const hasMac = platforms.includes('mac');
   const hasWindows = platforms.includes('windows');
+  const supportsWindowsTranslation =
+    typeof launcherService.getHostCapabilities === 'function'
+      ? launcherService.getHostCapabilities().supportsWindowsTranslation
+      : !launcherService.isWindowsHost();
+  const macNativeTooltip = supportsWindowsTranslation
+    ? 'Natively available on macOS (Compatibility layers excluded)'
+    : 'Natively available on macOS';
 
   const tooltipText =
     hasMac && hasWindows
       ? 'Natively available on macOS & Windows'
       : hasMac
-        ? 'Natively available on macOS (Compatibility layers excluded)'
+        ? macNativeTooltip
         : 'Natively available on Windows';
 
   if (variant === 'cover-badge') {
@@ -87,7 +95,7 @@ export const NativeOsBadges: React.FC<NativeOsBadgesProps> = ({
               onSelectOs('mac');
             }
           }}
-          title="Natively available on macOS (Compatibility layers excluded)"
+          title={macNativeTooltip}
           className={`min-h-6 inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium bg-white/10 text-white border border-white/15 transition-colors ${
             onSelectOs ? 'hover:bg-white/20 hover:border-white/30 cursor-pointer' : 'cursor-default'
           }`}

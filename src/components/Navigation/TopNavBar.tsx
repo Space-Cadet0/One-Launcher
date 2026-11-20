@@ -223,13 +223,13 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
     }
   }, []);
 
+  const hostCapabilities = launcherService.getHostCapabilities();
   const electronPlatform = typeof window !== 'undefined' ? window.electronAPI?.platform : undefined;
   const isMacWindow =
     typeof window !== 'undefined' &&
     (electronPlatform
       ? electronPlatform === 'darwin'
-      : Boolean(window.electronAPI?.isElectron) &&
-        /Mac|Darwin/i.test(navigator.platform || navigator.userAgent || ''));
+      : Boolean(window.electronAPI?.isElectron) && hostCapabilities.isMac);
   const needsTrafficLightInset = isMacWindow && !isFullScreen;
 
   const isWindowsOrLinuxWindow =
@@ -1245,13 +1245,12 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                     <div className="flex flex-col min-w-0">
                       <span className="font-semibold text-white truncate">Settings…</span>
                       <span className="text-[10px] text-steam-subtext truncate">
-                        Footprint, display &amp; HUD defaults
+                        {hostCapabilities.supportsBottleDisplayScaler
+                          ? 'Library, footprint, display & HUD'
+                          : 'Library, footprint & launch defaults'}
                       </span>
                     </div>
                   </div>
-                  <span className="text-[10px] text-steam-subtext font-mono shrink-0 ml-2">
-                    {isMacWindow ? '⌘,' : 'Ctrl+,'}
-                  </span>
                 </button>
 
                 {/* 1. Accounts */}
@@ -1328,7 +1327,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                         )}
                       </span>
                       <span className="text-[10px] text-steam-subtext truncate">
-                        {launcherService.getHostPlatform() === 'darwin'
+                        {hostCapabilities.supportsWindowsTranslation
                           ? 'Accounts, Windows on Mac & launchers'
                           : 'Accounts & game launchers'}
                       </span>

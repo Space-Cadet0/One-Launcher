@@ -1483,6 +1483,7 @@ const ALLOWED_LAUNCHER_SETTINGS_KEYS = new Set([
   'crossoverDisplayAspect',
   'enableFullscreenHotkey',
   'defaultPerformanceHud',
+  'ignoreLeadingTheWhenSorting',
   'reset',
   'hardwareAcceleration',
   'disableHardwareAcceleration',

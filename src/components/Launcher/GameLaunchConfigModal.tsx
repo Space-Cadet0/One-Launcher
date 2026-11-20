@@ -318,12 +318,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                   const modeNote = form.preview.modeNotes[mode.value];
                   const isModeDisabled = Boolean(modeNote?.disabled);
                   const isSelected = !isModeDisabled && form.activeDisplayMethod === mode.value;
-                  const dynamicDesc =
-                    form.isWindowsHost &&
-                    modeNote?.dynamicDesc &&
-                    /CrossOver/i.test(modeNote.dynamicDesc)
-                      ? mode.desc
-                      : modeNote?.dynamicDesc || mode.desc;
+                  const dynamicDesc = modeNote?.dynamicDesc || mode.desc;
                   return (
                     <button
                       key={mode.value}

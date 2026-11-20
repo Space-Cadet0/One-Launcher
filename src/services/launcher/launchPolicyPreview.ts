@@ -2676,9 +2676,13 @@ export function buildEffectiveLaunchModePreview(
               dynamicDesc:
                 isChainedHandoff && chainedPublisherName
                   ? `${modeLabel}: ${preInstallCloudDesc}.`
-                  : isLifecycleFastBypass
-                    ? `Automatically selects the optimal native or CrossOver pipeline using Fast Direct Binary Bypass with ${preInstallCloudDesc} once installed or linked.`
-                    : `Automatically selects the optimal native or CrossOver pipeline with ${preInstallCloudDesc} once installed or linked.`,
+                  : hostPlatform === 'win32'
+                    ? isLifecycleFastBypass
+                      ? `Automatically selects the optimal native Windows pipeline using Fast Direct Binary Bypass with ${preInstallCloudDesc} once installed or linked.`
+                      : `Automatically selects the optimal native Windows pipeline with ${preInstallCloudDesc} once installed or linked.`
+                    : isLifecycleFastBypass
+                      ? `Automatically selects the optimal native or CrossOver pipeline using Fast Direct Binary Bypass with ${preInstallCloudDesc} once installed or linked.`
+                      : `Automatically selects the optimal native or CrossOver pipeline with ${preInstallCloudDesc} once installed or linked.`,
               ...(hasMacBattlEyeWarning
                 ? {
                     warning:

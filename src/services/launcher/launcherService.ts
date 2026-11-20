@@ -1,5 +1,13 @@
 import type { CanonicalGame, GamePlatformOwnership } from '../../contracts/game';
 import {
+  buildHostCapabilities,
+  resolveHostArch,
+  resolveHostPlatform,
+  type HostArch,
+  type HostPlatform,
+  type HostPlatformCapabilities,
+} from '../../contracts/hostPlatform';
+import {
   DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
   resolveEffectiveLaunchPolicy,
   resolveEffectiveLifecyclePolicy,
@@ -703,6 +711,7 @@ export class LauncherService {
           window.electronAPI.getDownloadQueue
             ? window.electronAPI.getDownloadQueue()
             : Promise.resolve([]),
+          this.getHostCapabilities().supportsWindowsTranslation &&
           window.electronAPI.detectCompatibilityLayers
             ? window.electronAPI.detectCompatibilityLayers()
             : Promise.resolve([]),
@@ -1227,46 +1236,26 @@ export class LauncherService {
     this.notifyStateChanged();
   }
 
-  public getHostPlatform(): 'darwin' | 'win32' | 'linux' {
-    const apiPlatform = typeof window !== 'undefined' ? window.electronAPI?.platform : undefined;
-    if (apiPlatform === 'win32' || apiPlatform === 'darwin' || apiPlatform === 'linux') {
-      return apiPlatform;
-    }
-    if (typeof navigator !== 'undefined' && !navigator.userAgent?.includes('Node')) {
-      const ua = navigator.platform || navigator.userAgent || '';
-      if (/Win/i.test(ua)) return 'win32';
-      if (/Linux/i.test(ua)) return 'linux';
-    }
-    return 'darwin';
+  public getHostPlatform(): HostPlatform {
+    return resolveHostPlatform();
   }
 
-  public getHostArch(): 'arm64' | 'x64' {
-    const rawArchProp = typeof window !== 'undefined' ? window.electronAPI?.arch : undefined;
-    const rawApiArch = typeof rawArchProp === 'string' ? rawArchProp.trim() : '';
-    const candidateArch = rawApiArch || (this.detectedHostArch || '').trim();
-    if (candidateArch) {
-      return /^(x64|ia32|x86_64|x86|intel|amd64)$/i.test(candidateArch) ? 'x64' : 'arm64';
-    }
-    if (typeof navigator !== 'undefined') {
-      const uaDataArch = (
-        navigator as Navigator & { userAgentData?: { architecture?: string } }
-      )?.userAgentData?.architecture;
-      if (typeof uaDataArch === 'string' && uaDataArch.trim()) {
-        return /^(x64|ia32|x86_64|x86|intel|amd64)$/i.test(uaDataArch.trim()) ? 'x64' : 'arm64';
-      }
-      const uaPlatform = `${navigator.platform || ''} ${navigator.userAgent || ''}`;
-      if (/\b(x86_64|x64|amd64|wow64|win64)\b/i.test(uaPlatform)) {
-        return 'x64';
-      }
-    }
-    if (typeof process !== 'undefined' && typeof process.arch === 'string' && process.arch.trim()) {
-      return /^(x64|ia32|x86_64|x86|intel|amd64)$/i.test(process.arch) ? 'x64' : 'arm64';
-    }
-    return 'arm64';
+  public getHostArch(): HostArch {
+    return resolveHostArch(undefined, this.detectedHostArch);
   }
 
   public isWindowsHost(): boolean {
     return this.getHostPlatform() === 'win32';
+  }
+
+  public getHostCapabilities(explicitPlatform?: HostPlatform): HostPlatformCapabilities {
+    const platform: HostPlatform =
+      explicitPlatform === 'darwin' || explicitPlatform === 'win32' || explicitPlatform === 'linux'
+        ? explicitPlatform
+        : this.isWindowsHost()
+          ? 'win32'
+          : this.getHostPlatform();
+    return buildHostCapabilities(platform, this.getHostArch());
   }
 
   public hasAuthoritativeInstallScan(): boolean {
@@ -1520,6 +1509,13 @@ export class LauncherService {
   }
 
   public async detectCompatibilityLayers(): Promise<CompatibilityLayerInfo[]> {
+    if (!this.getHostCapabilities().supportsWindowsTranslation) {
+      if (this.compatibilityLayers.length > 0) {
+        this.compatibilityLayers = [];
+        this.notifyStateChanged();
+      }
+      return [];
+    }
     if (typeof window !== 'undefined' && window.electronAPI?.detectCompatibilityLayers) {
       try {
         const layers = await window.electronAPI.detectCompatibilityLayers();
@@ -1848,6 +1844,13 @@ export class LauncherService {
   public async checkCompatibilityLayerUpdates(): Promise<
     Record<string, CompatibilityLayerUpdateInfo>
   > {
+    if (!this.getHostCapabilities().supportsWindowsTranslation) {
+      if (Object.keys(this.runnerUpdates).length > 0) {
+        this.runnerUpdates = {};
+        this.notifyStateChanged();
+      }
+      return {};
+    }
     if (
       typeof window !== 'undefined' &&
       window.electronAPI?.checkCompatibilityLayerUpdates

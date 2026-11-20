@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef, type SetStateAction } from 'react';
 import { CanonicalGame } from '../../../contracts/game';
+import { getHostCapabilities, type HostPlatformCapabilities } from '../../../contracts/hostPlatform';
 import { StorefrontId } from '../../../contracts/platform';
 import {
   BottleDisplayScalingMode,
@@ -39,13 +40,19 @@ import {
 } from './launchConfigHelpers';
 import { resolveDlssEligibility } from './CompatibilityLayerSection';
 
-interface LauncherServiceHostAware {
-  isWindowsHost?: () => boolean;
-}
-
-function checkLauncherWindowsHost(): boolean {
-  const svc = launcherService as typeof launcherService & LauncherServiceHostAware;
-  return typeof svc.isWindowsHost === 'function' ? Boolean(svc.isWindowsHost()) : false;
+function resolveFormHostCapabilities(): HostPlatformCapabilities {
+  if (typeof launcherService.getHostCapabilities === 'function') {
+    return launcherService.getHostCapabilities();
+  }
+  const explicitPlatform =
+    typeof launcherService.isWindowsHost === 'function' && launcherService.isWindowsHost()
+      ? 'win32'
+      : typeof launcherService.getHostPlatform === 'function'
+        ? launcherService.getHostPlatform()
+        : undefined;
+  const explicitArch =
+    typeof launcherService.getHostArch === 'function' ? launcherService.getHostArch() : undefined;
+  return getHostCapabilities(explicitPlatform, explicitArch);
 }
 
 function isFormBottleCompatibleWithRunner(
@@ -292,6 +299,14 @@ export function useGameLaunchConfigForm({
       );
       const envSpatialRaw = source?.environmentVariables?.DXMT_METALFX_SPATIAL_SWAPCHAIN;
       const envSpatialParsed = envSpatialRaw ? Number(envSpatialRaw) : NaN;
+      const dxmtConfigRaw = source?.environmentVariables?.DXMT_CONFIG;
+      const dxmtConfigSpatialMatch =
+        typeof dxmtConfigRaw === 'string'
+          ? /d3d11\.metalSpatialUpscaleFactor\s*=\s*([0-9.]+)/i.exec(dxmtConfigRaw)
+          : null;
+      const dxmtConfigSpatialParsed = dxmtConfigSpatialMatch
+        ? Number(dxmtConfigSpatialMatch[1])
+        : NaN;
       const loadedMetalfxSpatial =
         typeof source?.metalfxSpatialUpscaleFactor === 'number' &&
         Number.isFinite(source.metalfxSpatialUpscaleFactor) &&
@@ -299,7 +314,9 @@ export function useGameLaunchConfigForm({
           ? source.metalfxSpatialUpscaleFactor
           : Number.isFinite(envSpatialParsed) && envSpatialParsed > 1
             ? envSpatialParsed
-            : undefined;
+            : Number.isFinite(dxmtConfigSpatialParsed) && dxmtConfigSpatialParsed > 1
+              ? dxmtConfigSpatialParsed
+              : undefined;
       setMetalfxSpatialUpscaleFactor(loadedMetalfxSpatial);
       const loadedDisplayScalingMode: BottleDisplayScalingMode =
         source?.displayScalingMode &&
@@ -377,9 +394,7 @@ export function useGameLaunchConfigForm({
       const loadedInGameBehavior = source?.inGameLauncherBehavior || 'default';
       setInGameLauncherBehavior(loadedInGameBehavior);
       const isWinHostForLoad =
-        initialPreview.hostPlatform === 'win32' ||
-        checkLauncherWindowsHost() ||
-        (typeof window !== 'undefined' && window.electronAPI?.platform === 'win32');
+        initialPreview.hostPlatform === 'win32' || resolveFormHostCapabilities().isWindows;
       const isBottleContextForLoad =
         !isWinHostForLoad &&
         (initialPreview.detectedBuildType === 'windows_exe_on_mac' ||
@@ -781,11 +796,9 @@ export function useGameLaunchConfigForm({
       }
     });
 
-    const winHost =
-      checkLauncherWindowsHost() ||
-      (typeof window !== 'undefined' && window.electronAPI?.platform === 'win32');
+    const formHostCaps = resolveFormHostCapabilities();
 
-    if (!winHost) {
+    if (formHostCaps.supportsWindowsTranslation) {
       const hasCachedUpdates = Object.keys(initialRunnerUpdates).length > 0;
       if (!hasCachedUpdates) {
         setIsCheckingUpdates(true);
@@ -937,22 +950,21 @@ export function useGameLaunchConfigForm({
     ? launcherService.getInstalledRecordForGame(game, preferredPlatformId)
     : undefined;
 
+  const hostCapabilities = resolveFormHostCapabilities();
   const explicitRendererPlatform =
     typeof window !== 'undefined' ? window.electronAPI?.platform : undefined;
   const isWindowsHost =
-    explicitRendererPlatform === 'darwin' || explicitRendererPlatform === 'linux'
-      ? false
-      : checkLauncherWindowsHost() ||
-        explicitRendererPlatform === 'win32' ||
-        /^[A-Za-z]:\\/.test(
-          workingDirectory ||
-            customExecutablePath ||
-            installedRecord?.installPath ||
-            installedRecord?.executablePath ||
-            game.platforms.find((p) => p.platformId === preferredPlatformId)?.installPath ||
-            game.platforms[0]?.installPath ||
-            ''
-        );
+    hostCapabilities.isWindows ||
+    (!(explicitRendererPlatform === 'darwin' || explicitRendererPlatform === 'linux') &&
+      /^[A-Za-z]:\\/.test(
+        workingDirectory ||
+          customExecutablePath ||
+          installedRecord?.installPath ||
+          installedRecord?.executablePath ||
+          game.platforms.find((p) => p.platformId === preferredPlatformId)?.installPath ||
+          game.platforms[0]?.installPath ||
+          ''
+      ));
 
   const isDxvkHudSupported =
     compatibilityLayer === 'wine' ||
@@ -1329,6 +1341,13 @@ export function useGameLaunchConfigForm({
         return {
           ...m,
           label: 'Auto-Detect Native macOS Launch',
+        };
+      }
+      if (isWindowsHost) {
+        return {
+          ...m,
+          label: 'Auto-Detect (Recommended)',
+          desc: 'Uses the native Windows executable or Storefront Client Protocol automatically.',
         };
       }
       return {

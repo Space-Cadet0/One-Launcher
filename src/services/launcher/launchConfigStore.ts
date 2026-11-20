@@ -245,6 +245,10 @@ export function sanitizePerformanceSettings(
         : legacyHudDefault
           ? true
           : (base.defaultPerformanceHud ?? false),
+    ignoreLeadingTheWhenSorting:
+      typeof raw.ignoreLeadingTheWhenSorting === 'boolean'
+        ? raw.ignoreLeadingTheWhenSorting
+        : (base.ignoreLeadingTheWhenSorting ?? true),
   };
 }
 

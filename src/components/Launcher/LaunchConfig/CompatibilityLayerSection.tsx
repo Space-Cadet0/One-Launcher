@@ -130,6 +130,39 @@ export function resolveDlssEligibility(params: {
   return { supported: true };
 }
 
+export interface MetalfxSpatialEligibilityResult {
+  supported: boolean;
+  autoModeNote?: boolean;
+  badge?: string;
+  reason?: string;
+}
+
+export function resolveMetalfxSpatialEligibility(params: {
+  crossoverGraphicsBackend: CrossOverGraphicsBackend;
+}): MetalfxSpatialEligibilityResult {
+  const { crossoverGraphicsBackend } = params;
+  if (crossoverGraphicsBackend === 'dxmt') {
+    return { supported: true };
+  }
+  if (crossoverGraphicsBackend === 'auto') {
+    return { supported: true, autoModeNote: true };
+  }
+  if (crossoverGraphicsBackend === 'd3dmetal') {
+    return {
+      supported: false,
+      badge: 'DXMT Only',
+      reason:
+        "MetalFX spatial swapchain upscaling is a DXMT-only feature — Apple's D3DMetal only exposes MetalFX via in-game NVIDIA DLSS above. Switch Graphics Backend to DXMT to use driver-level spatial scaling on DirectX 10/11 games.",
+    };
+  }
+  return {
+    supported: false,
+    badge: 'DXMT Only',
+    reason:
+      'Requires the DXMT graphics backend (DirectX 10/11 on Metal). Not available with DXVK or WineD3D.',
+  };
+}
+
 const STANDARD_FPS_PRESETS = [30, 40, 60, 90, 120, 144] as const;
 const NOOP = () => {};
 
@@ -429,9 +462,13 @@ function CompatibilityLayerSectionImpl(
   };
 
   const activeBackendPolicy = getCrossOverGraphicsBackendPolicy(crossoverGraphicsBackend);
-  const showMetalfxSpatialControl =
-    preview.visibleSections.crossoverRendering &&
-    (crossoverGraphicsBackend === 'auto' || crossoverGraphicsBackend === 'dxmt');
+  const spatialEligibility = resolveMetalfxSpatialEligibility({ crossoverGraphicsBackend });
+  const unavailableSpatialBackendLabel =
+    crossoverGraphicsBackend === 'd3dmetal'
+      ? 'Unavailable on D3DMetal'
+      : crossoverGraphicsBackend === 'dxvk'
+        ? 'Unavailable on DXVK'
+        : 'Unavailable on WineD3D';
   const hasCustomFpsValue =
     typeof effectivePreferredMaxFrameRate === 'number' &&
     Number.isFinite(effectivePreferredMaxFrameRate) &&
@@ -1027,26 +1064,38 @@ function CompatibilityLayerSectionImpl(
             </div>
           )}
 
-          {/* DXMT MetalFX Spatial Upscaling (<select>) */}
-          {showMetalfxSpatialControl && (
+          {/* DXMT MetalFX Spatial Upscaling (<select>) — always rendered for zero layout shift */}
+          {preview.visibleSections.crossoverRendering && (
             <div className="space-y-1.5">
-              <label
-                htmlFor={metalfxSpatialSelectId}
-                className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1"
-              >
-                <Sparkles className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
-                <span>MetalFX Spatial Upscaling (DXMT)</span>
-              </label>
+              <div className="flex flex-wrap items-center gap-2">
+                <label
+                  htmlFor={metalfxSpatialSelectId}
+                  className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1"
+                >
+                  <Sparkles className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
+                  <span>MetalFX Spatial Upscaling (DXMT)</span>
+                </label>
+                {!spatialEligibility.supported && spatialEligibility.badge && (
+                  <span
+                    data-testid="metalfx-spatial-unavailable-badge"
+                    className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 border border-white/15 text-steam-subtext font-medium"
+                  >
+                    {spatialEligibility.badge}
+                  </span>
+                )}
+              </div>
               <LaunchSelect
                 id={metalfxSpatialSelectId}
                 data-testid="metalfx-spatial-upscale-select"
                 aria-describedby={metalfxSpatialHintId}
+                disabled={!spatialEligibility.supported}
                 value={
-                  effectiveMetalfxSpatialUpscaleFactor !== undefined
+                  spatialEligibility.supported && effectiveMetalfxSpatialUpscaleFactor !== undefined
                     ? String(effectiveMetalfxSpatialUpscaleFactor)
                     : ''
                 }
                 onChange={(e) => {
+                  if (!spatialEligibility.supported) return;
                   const val = e.target.value;
                   if (val === '') {
                     handleMetalfxSpatialUpscaleChange(undefined);
@@ -1058,15 +1107,28 @@ function CompatibilityLayerSectionImpl(
                   );
                 }}
               >
-                <option value="">Off (Native Resolution)</option>
-                <option value="1.33">1.33x (Ultra Quality)</option>
-                <option value="1.5">1.5x (Quality)</option>
-                <option value="1.7">1.7x (Balanced)</option>
-                <option value="2">2.0x (Performance)</option>
+                {spatialEligibility.supported ? (
+                  <>
+                    <option value="">Off (Native Resolution)</option>
+                    <option value="1.33">1.33x (Ultra Quality)</option>
+                    <option value="1.5">1.5x (Quality)</option>
+                    <option value="1.7">1.7x (Balanced)</option>
+                    <option value="2">2.0x (Performance)</option>
+                  </>
+                ) : (
+                  <option value="">{unavailableSpatialBackendLabel}</option>
+                )}
               </LaunchSelect>
-              <p id={metalfxSpatialHintId} className="text-[10px] text-steam-subtext leading-snug">
-                Applies DXMT driver-level MetalFX spatial swapchain upscaling for DirectX 10/11
-                games without built-in DLSS.
+              <p
+                id={metalfxSpatialHintId}
+                data-testid="metalfx-spatial-upscale-hint"
+                className="text-[10px] text-steam-subtext leading-snug"
+              >
+                {spatialEligibility.supported
+                  ? spatialEligibility.autoModeNote
+                    ? 'Applies DXMT driver-level MetalFX spatial swapchain upscaling when Auto selects DXMT for DirectX 10/11 games. Select DXMT explicitly if Auto routes a 64-bit game to D3DMetal.'
+                    : 'Applies DXMT driver-level MetalFX spatial swapchain upscaling for DirectX 10/11 games without built-in DLSS.'
+                  : spatialEligibility.reason}
               </p>
             </div>
           )}
