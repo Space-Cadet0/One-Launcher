@@ -57,8 +57,8 @@ function normalizeHttpsUrl(rawUrl) {
 function classifyRarityTier(globalPercentage, rawCategory = '') {
   const cat = String(rawCategory || '').trim().toLowerCase();
   if (typeof globalPercentage === 'number' && Number.isFinite(globalPercentage)) {
-    if (globalPercentage < 5) return 'ultra_rare';
-    if (globalPercentage < 15) return 'rare';
+    if (globalPercentage < 10) return 'ultra_rare';
+    if (globalPercentage < 25) return 'rare';
     if (globalPercentage < 50) return 'uncommon';
     return 'common';
   }
@@ -106,19 +106,17 @@ function parseTitleHubEntry(entry, syncedAt = new Date().toISOString()) {
     const totalGs = Number(ach.totalGamerscore || 0) || 0;
     const pctRaw = Number(ach.progressPercentage || 0) || 0;
 
-    // Derive total achievement count when TitleHub omits `totalAchievements` on 0%-unlocked games
-    const total =
-      totalRaw > 0
-        ? totalRaw
-        : unlocked > 0 && pctRaw > 0
-          ? Math.max(unlocked, Math.round((unlocked / pctRaw) * 100))
-          : 0;
+    // Modern Xbox TitleHub entries frequently omit `totalAchievements` (`0`) while reporting
+    // Gamerscore % in `progressPercentage`. Never fabricate an achievement total from Gamerscore %.
+    const total = totalRaw > 0 ? totalRaw : 0;
 
     if (total > 0 || totalGs > 0 || unlocked > 0) {
       const percentage =
         total > 0
           ? Math.min(100, Math.round((unlocked / total) * 100))
-          : Math.min(100, Math.round(pctRaw));
+          : totalGs > 0
+            ? Math.min(100, Math.round((earnedGs / totalGs) * 100))
+            : Math.min(100, Math.round(pctRaw));
       summary = {
         unlocked,
         total,
@@ -435,20 +433,21 @@ function mapXboxV2Achievement(ach, titleId = '') {
   const rawId = String(ach?.id ?? '').trim() || '0';
   const compositeId = cleanTitleId ? `xbox:${cleanTitleId}:${rawId}` : `xbox:${rawId}`;
 
-  const unlocked = String(ach?.progressState || '').trim().toLowerCase() === 'achieved';
+  const progressState = String(ach?.progressState || '').trim().toLowerCase();
+  const unlocked = progressState === 'achieved';
   const isSecret = Boolean(ach?.isSecret);
 
   const rawName = String(ach?.name || '').trim();
   const name =
-    isSecret && !unlocked && !rawName
-      ? 'Secret Achievement'
-      : rawName || (isSecret && !unlocked ? 'Secret Achievement' : `Achievement ${rawId}`);
+    rawName || (isSecret && !unlocked ? 'Secret Achievement' : `Achievement ${rawId}`);
 
+  // Preserve real lockedDescription/description on locked secret achievements so the modal's
+  // spoiler shield can mask by default and reveal the real description on user click.
+  const unlockedDesc = String(ach?.description || '').trim();
+  const lockedDesc = String(ach?.lockedDescription || '').trim();
   const description = unlocked
-    ? String(ach?.description || ach?.lockedDescription || '').trim()
-    : isSecret
-      ? 'Continue playing to unlock this secret achievement.'
-      : String(ach?.lockedDescription || ach?.description || '').trim();
+    ? unlockedDesc || lockedDesc
+    : lockedDesc || unlockedDesc || (isSecret ? 'Continue playing to unlock this secret achievement.' : '');
 
   const rawTime = ach?.progression?.timeUnlocked;
   const unlockedAt =
@@ -482,17 +481,63 @@ function mapXboxV2Achievement(ach, titleId = '') {
       : undefined;
   const rarityTier = classifyRarityTier(globalPercentage, ach?.rarity?.currentCategory);
 
+  const ZERO_GUID = '00000000-0000-0000-0000-000000000000';
   let progress = undefined;
   if (!unlocked && Array.isArray(ach?.progression?.requirements) && ach.progression.requirements.length > 0) {
-    const req = ach.progression.requirements[0];
-    const current = Number(req?.current || 0);
-    const max = Number(req?.target || 0);
-    if (Number.isFinite(current) && Number.isFinite(max) && max > 0) {
-      progress = {
-        current,
-        max,
-        percentage: Math.min(100, Math.round((current / max) * 100)),
-      };
+    const validReqs = ach.progression.requirements
+      .map((req) => ({
+        id: String(req?.id || '').trim().toLowerCase(),
+        current: Number(req?.current ?? 0),
+        max: Number(req?.target ?? 0),
+      }))
+      .filter((r) => Number.isFinite(r.current) && Number.isFinite(r.max) && r.max > 0);
+
+    if (validReqs.length === 1) {
+      const req = validReqs[0];
+      const isTitleManagedPlaceholder = req.id === ZERO_GUID && req.max === 100;
+      const shouldSuppressNotStarted =
+        req.current <= 0 &&
+        (isTitleManagedPlaceholder || (progressState === 'notstarted' && req.max <= 1));
+
+      if (!shouldSuppressNotStarted) {
+        if (isTitleManagedPlaceholder) {
+          const pct = Math.min(99, Math.max(1, Math.round(req.current)));
+          progress = {
+            current: pct,
+            max: 100,
+            percentage: pct,
+            unit: '%',
+          };
+        } else {
+          const safeCurrent = Math.max(0, Math.min(req.max, req.current));
+          const pct = Math.min(99, Math.round((safeCurrent / req.max) * 100));
+          progress = {
+            current: safeCurrent,
+            max: req.max,
+            percentage: pct,
+          };
+        }
+      }
+    } else if (validReqs.length > 1) {
+      const allZero = validReqs.every((r) => r.current <= 0);
+      const allPlaceholdersOrBinary = validReqs.every(
+        (r) => (r.id === ZERO_GUID && r.max === 100) || r.max <= 1
+      );
+      if (!(allZero && (progressState === 'notstarted' || allPlaceholdersOrBinary))) {
+        const sumRatio = validReqs.reduce(
+          (acc, r) => acc + Math.min(1, Math.max(0, r.current / r.max)),
+          0
+        );
+        const avgPct = Math.min(99, Math.round((sumRatio / validReqs.length) * 100));
+        if (avgPct > 0 || progressState === 'inprogress' || !allZero) {
+          progress = {
+            current: avgPct,
+            max: 100,
+            percentage: avgPct,
+            unit: '%',
+          };
+        }
+      }
     }
   }
 
@@ -534,15 +579,13 @@ function mapXboxV1Achievement(ach, titleId = '') {
 
   const rawName = String(ach?.name || '').trim();
   const name =
-    isSecret && !unlocked
-      ? 'Secret Achievement'
-      : rawName || `Achievement ${rawId}`;
+    rawName || (isSecret && !unlocked ? 'Secret Achievement' : `Achievement ${rawId}`);
 
+  const unlockedDesc = String(ach?.description || '').trim();
+  const lockedDesc = String(ach?.lockedDescription || '').trim();
   const description = unlocked
-    ? String(ach?.description || ach?.lockedDescription || '').trim()
-    : isSecret
-      ? 'Continue playing to unlock this secret achievement.'
-      : String(ach?.lockedDescription || ach?.description || '').trim();
+    ? unlockedDesc || lockedDesc
+    : lockedDesc || unlockedDesc || (isSecret ? 'Continue playing to unlock this secret achievement.' : '');
 
   const rawTime = ach?.timeUnlocked;
   const unlockedAt =
@@ -610,8 +653,10 @@ function buildAchievementsContainer(mappedList, schemaVersion = 'v2') {
     achievements: mappedList,
     syncedAt: new Date().toISOString(),
     source: 'live_cloud',
+    unlockPrecision: 'exact',
     supportsAchievements: total > 0,
     schemaVersion,
+    cacheVersion: 2,
   };
 }
 

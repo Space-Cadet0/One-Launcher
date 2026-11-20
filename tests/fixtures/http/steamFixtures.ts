@@ -192,6 +192,78 @@ function renderCommunityAchievementsHtml(appId: number, count: number, titlePref
   return `<!DOCTYPE html><html><body>${rows.join('\n')}</body></html>`;
 }
 
+function buildPlayerServiceGameAchievementsFixture(appId: number): Array<Record<string, unknown>> {
+  if (appId === 257350) {
+    const items: Array<Record<string, unknown>> = [
+      {
+        internal_name: 'A_DARING_ESCAPE',
+        localized_name: 'A Daring Escape',
+        localized_desc: 'Escape from the dungeon of the wizard Irenicus.',
+        icon: 'ach_escape.jpg',
+        icon_gray: 'ach_escape_gray.jpg',
+        hidden: false,
+        player_percent_unlocked: '32.0',
+      },
+    ];
+    for (let i = 2; i <= 93; i++) {
+      items.push({
+        internal_name: `AMNIAN_VALOR_${i}`,
+        localized_name: `Amnian Valor ${i}`,
+        localized_desc: `Complete heroic milestone ${i} in Amn.`,
+        icon: `ach_${i}.jpg`,
+        icon_gray: `ach_${i}_gray.jpg`,
+        hidden: false,
+        player_percent_unlocked: String(Math.max(1.5, Math.round((40 - i * 0.35) * 10) / 10)),
+      });
+    }
+    return items;
+  }
+  if (appId === 1091500) {
+    return Array.from({ length: 44 }, (_, idx) => {
+      const i = idx + 1;
+      return {
+        internal_name: `NIGHT_CITY_LEGEND_${i}`,
+        localized_name: `Night City Legend ${i}`,
+        localized_desc: `Complete night city legend milestone ${i}.`,
+        icon: `ach_${i}.jpg`,
+        icon_gray: `ach_${i}_gray.jpg`,
+        hidden: i === 44,
+        player_percent_unlocked: String(Math.max(2.0, Math.round((75 - i * 1.1) * 10) / 10)),
+      };
+    });
+  }
+  if (appId === 782330) {
+    return Array.from({ length: 33 }, (_, idx) => {
+      const i = idx + 1;
+      return {
+        internal_name: `SLAYER_MILESTONE_${i}`,
+        localized_name: `Slayer Milestone ${i}`,
+        localized_desc: `Complete slayer milestone ${i}.`,
+        icon: `ach_${i}.jpg`,
+        icon_gray: `ach_${i}_gray.jpg`,
+        hidden: false,
+        player_percent_unlocked: String(Math.max(2.0, Math.round((75 - i * 1.1) * 10) / 10)),
+      };
+    });
+  }
+  if (appId === 1643320) {
+    return [
+      {
+        internal_name: 'Progressive_NoObstacleTooBig',
+        localized_name: 'No obstacle too big…',
+        localized_desc: 'Kill 50 enemies through obstacles.',
+        icon: 'ach_obstacle.jpg',
+        icon_gray: 'ach_obstacle_gray.jpg',
+        hidden: false,
+        player_percent_unlocked: '16.7',
+        min_progress_int: 0,
+        max_progress_int: 50,
+      },
+    ];
+  }
+  return [];
+}
+
 export function handleSteamCommunityAndApi(req: FixtureRequest): FixtureResponse | null {
   if (req.url.hostname === 'steamcommunity.com') {
     const statsMatch = req.url.pathname.match(/^\/stats\/(\d+)\/achievements\/?$/i);
@@ -207,12 +279,27 @@ export function handleSteamCommunityAndApi(req: FixtureRequest): FixtureResponse
               : '<html><body></body></html>';
       return { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' }, body: html };
     }
+    if (/^\/(?:id|profiles)\/[^/]+\/achievements\/\d+\/?$/i.test(req.url.pathname)) {
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+        body: '<!DOCTYPE html><html><body><div class="profile_private_info">This profile is private.</div></body></html>',
+      };
+    }
     if (/^\/(?:id|profiles)\/[^/]*\/stats\/[^/]+\/?$/i.test(req.url.pathname)) {
       return { status: 200, headers: { 'content-type': 'application/xml; charset=utf-8' }, body: '<response><error>The specified profile could not be found.</error></response>' };
     }
   }
 
   if (req.url.hostname === 'api.steampowered.com') {
+    if (req.url.pathname.includes('/IPlayerService/GetGameAchievements/')) {
+      const appId = Number(req.url.searchParams.get('appid') || '0');
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        body: { response: { achievements: buildPlayerServiceGameAchievementsFixture(appId) } },
+      };
+    }
     if (req.url.pathname.includes('/ISteamUserStats/GetGlobalAchievementPercentagesForApp/')) {
       return {
         status: 200,

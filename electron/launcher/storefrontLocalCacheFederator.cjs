@@ -1850,7 +1850,12 @@ function resolveFederatedAsset(params = {}, options = {}) {
       return null;
     }
   }
-  const role = String(params.role || 'cover').trim();
+  const role = String(params.role || 'cover').trim().toLowerCase();
+  const ordinal = Number(params.ordinal ?? params.ord ?? 0) || 0;
+  // Individual achievement icons must never be hijacked by Tier-2 game-level app icon caches
+  if (role === 'achievement_icon' || (role === 'icon' && ordinal > 0)) {
+    return null;
+  }
   const url = typeof params.url === 'string' ? params.url.trim() : '';
   const roots = options._precomputedRoots || discoverStorefrontCacheRoots(options);
 

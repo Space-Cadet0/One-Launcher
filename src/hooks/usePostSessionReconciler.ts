@@ -1,5 +1,5 @@
 import { useEffect, Dispatch, SetStateAction, MutableRefObject } from 'react';
-import { CanonicalGame } from '../contracts/game';
+import { CanonicalGame, StoreAchievementSummary } from '../contracts/game';
 import { StorefrontId } from '../contracts/platform';
 import { scanLocalSteamAchievements } from '../services/system/localSystemScanner';
 import {
@@ -627,12 +627,169 @@ export function usePostSessionReconciler({
       }, 1500);
     };
 
-    const clearAchievementDetailCache = () => {
-      void import('../services/achievements/achievementDetailService')
-        .then(({ achievementDetailService }) => {
+    const invalidateAndRefreshDetailedAchievements = async (
+      targetGame: CanonicalGame | undefined,
+      targetStorefront: StorefrontId,
+      prevCount: number
+    ): Promise<{ handledToast: boolean }> => {
+      try {
+        const { achievementDetailService } = await import(
+          '../services/achievements/achievementDetailService'
+        );
+        if (!targetGame) {
           achievementDetailService.clearCache();
-        })
-        .catch(() => {});
+          return { handledToast: false };
+        }
+
+        // Snapshot previously unlocked achievement IDs before invalidating disk/memory cache
+        const prevCachedMap = achievementDetailService.peekCachedGameAchievements(targetGame.id);
+        const prevDetailedList = prevCachedMap?.[targetStorefront]?.achievements || [];
+        const prevUnlockedIds = new Set<string>();
+        for (const a of prevDetailedList) {
+          if (a.unlocked) {
+            if (a.id) prevUnlockedIds.add(a.id);
+            if (a.apiName) prevUnlockedIds.add(a.apiName);
+          }
+        }
+        const hadPrevExactList = prevDetailedList.length > 0 && prevCachedMap?.[targetStorefront]?.unlockPrecision !== 'summary_count_only';
+
+        await achievementDetailService.invalidateGame(targetGame.id);
+
+        const electronApi = typeof window !== 'undefined' ? window.electronAPI : undefined;
+        if (!electronApi?.getStoreAchievements) {
+          return { handledToast: false };
+        }
+
+        const freshMap = await achievementDetailService.fetchGameAchievements(targetGame, true);
+        const freshStoreData = freshMap?.[targetStorefront];
+        if (!freshStoreData || (freshStoreData.total <= 0 && freshStoreData.unlocked <= 0)) {
+          return { handledToast: false };
+        }
+
+        const summaryRecord: StoreAchievementSummary = {
+          unlocked: freshStoreData.unlocked,
+          total: freshStoreData.total,
+          percentage: freshStoreData.percentage,
+          isMastered: freshStoreData.isMastered,
+          ...(freshStoreData.totalXp !== undefined
+            ? { xp: { earned: freshStoreData.earnedXp ?? 0, total: freshStoreData.totalXp } }
+            : {}),
+          ...(freshStoreData.totalGamerscore !== undefined
+            ? {
+                gamerscore: {
+                  earned: freshStoreData.earnedGamerscore ?? 0,
+                  total: freshStoreData.totalGamerscore,
+                },
+              }
+            : {}),
+          source: freshStoreData.source === 'local_cache' ? 'local_client_cache' : 'live_cloud_api',
+          syncedAt: freshStoreData.syncedAt || new Date().toISOString(),
+        };
+
+        // Reconcile detailed fresh summary back into catalog + known caches (especially vital for
+        // Steam on macOS/CrossOver where local librarycache can be 0 while SSR/VDF has real unlocks)
+        const currentGames = readCurrentCatalogSnapshot();
+        const platEntry = targetGame.platforms.find((p) => p.platformId === targetStorefront);
+        let reconciledGames = currentGames;
+        if (targetStorefront === 'steam') {
+          const steamAppId =
+            targetGame.steamAppId ||
+            (platEntry?.platformGameId ? parseInt(platEntry.platformGameId, 10) : 0);
+          if (steamAppId > 0) {
+            const steamRec: Record<number, StoreAchievementSummary> = { [steamAppId]: summaryRecord };
+            cacheUserSteamAchievements(steamRec);
+            reconciledGames = reconcileCatalogTrophiesRecords(currentGames, steamRec, {}, {});
+          }
+        } else if (targetStorefront === 'gog') {
+          const gogKey = String(platEntry?.platformGameId || targetGame.id).replace(/^gog[-_]/i, '');
+          const gogRec: Record<string, StoreAchievementSummary> = {
+            [gogKey]: summaryRecord,
+            [`gog-${gogKey}`]: summaryRecord,
+            [targetGame.title.toLowerCase().trim()]: summaryRecord,
+          };
+          cacheUserGogAchievements(gogRec);
+          reconciledGames = reconcileCatalogTrophiesRecords(currentGames, {}, gogRec, {});
+        } else if (targetStorefront === 'epic') {
+          const epicKey = String(platEntry?.platformGameId || targetGame.id).toLowerCase();
+          const epicRec: Record<string, StoreAchievementSummary> = {
+            [epicKey]: summaryRecord,
+            [targetGame.title.toLowerCase().trim()]: summaryRecord,
+            ...(platEntry?.namespace ? { [platEntry.namespace.toLowerCase()]: summaryRecord } : {}),
+          };
+          cacheUserEpicAchievements(epicRec);
+          reconciledGames = reconcileCatalogTrophiesRecords(currentGames, {}, {}, epicRec);
+        } else if (targetStorefront === 'xbox') {
+          const xboxRec: Record<string, StoreAchievementSummary> = {
+            [String(platEntry?.platformGameId || targetGame.id)]: summaryRecord,
+            [targetGame.title.toLowerCase().trim()]: summaryRecord,
+            ...(platEntry?.xboxTitleId ? { [platEntry.xboxTitleId]: summaryRecord } : {}),
+            ...(platEntry?.xboxProductId ? { [platEntry.xboxProductId]: summaryRecord } : {}),
+          };
+          cacheUserXboxAchievements(xboxRec);
+          reconciledGames = reconcileCatalogTrophiesRecords(
+            currentGames,
+            {},
+            {},
+            {},
+            null,
+            xboxRec
+          );
+        }
+
+        if (reconciledGames !== currentGames) {
+          if (gamesRef) {
+            gamesRef.current = reconciledGames;
+            setGames(reconciledGames);
+          } else {
+            setGames(reconciledGames);
+          }
+        }
+
+        // Diff exact newly unlocked achievement names
+        let newlyUnlocked = hadPrevExactList
+          ? freshStoreData.achievements.filter(
+              (a) =>
+                a.unlocked && !prevUnlockedIds.has(a.id) && !prevUnlockedIds.has(a.apiName)
+            )
+          : [];
+
+        const unlockDelta = freshStoreData.unlocked - prevCount;
+        if (newlyUnlocked.length === 0 && unlockDelta > 0 && freshStoreData.unlockPrecision !== 'summary_count_only') {
+          newlyUnlocked = [...freshStoreData.achievements]
+            .filter((a) => a.unlocked)
+            .sort((a, b) => {
+              const tA =
+                typeof a.unlockedAt === 'number'
+                  ? a.unlockedAt
+                  : a.unlockedAt
+                    ? Date.parse(a.unlockedAt) || 0
+                    : 0;
+              const tB =
+                typeof b.unlockedAt === 'number'
+                  ? b.unlockedAt
+                  : b.unlockedAt
+                    ? Date.parse(b.unlockedAt) || 0
+                    : 0;
+              return tB - tA;
+            })
+            .slice(0, Math.min(unlockDelta, 5));
+        }
+
+        if (newlyUnlocked.length > 0 && (unlockDelta > 0 || hadPrevExactList)) {
+          const firstTitle = newlyUnlocked[0].name;
+          const extraSuffix =
+            newlyUnlocked.length > 1 ? ` (+${newlyUnlocked.length - 1} more)` : '';
+          showSyncNotice(
+            `🏆 Unlocked "${firstTitle}"${extraSuffix} in ${targetGame.title} (${freshStoreData.unlocked}/${freshStoreData.total})`,
+            6000
+          );
+          return { handledToast: true };
+        }
+
+        return { handledToast: false };
+      } catch {
+        return { handledToast: false };
+      }
     };
 
     const flushPendingMediaUpdates = () => {
@@ -823,7 +980,6 @@ export function usePostSessionReconciler({
               const fetchedEpic = normalizeAchievementRecordMap(res);
               if (fetchedEpic && Object.keys(fetchedEpic).length > 0) {
                 cacheUserEpicAchievements(fetchedEpic);
-                clearAchievementDetailCache();
 
                 const currentGames = readCurrentCatalogSnapshot();
                 const matchesEpicGame = (g: CanonicalGame) =>
@@ -855,16 +1011,27 @@ export function usePostSessionReconciler({
                   setGames((prev) => reconcileCatalogTrophiesRecords(prev, {}, {}, fetchedEpic));
                 }
                 const nextTarget = reconciled.find(matchesEpicGame);
+                const detailOutcome = await invalidateAndRefreshDetailedAchievements(
+                  nextTarget || matchedGame,
+                  'epic',
+                  prevCount
+                );
                 const nextAch = nextTarget?.platforms.find(
                   (p) => p.platformId === 'epic'
                 )?.achievements;
-                if (nextAch && nextAch.unlocked > prevCount) {
+                if (!detailOutcome.handledToast && nextAch && nextAch.unlocked > prevCount) {
                   const gameTitle = nextTarget?.title || matchedGameTitle || 'Game';
                   showSyncNotice(
                     `🏆 Trophy Unlocked! ${gameTitle} now has ${nextAch.unlocked}/${nextAch.total} Epic Trophies`,
                     5000
                   );
                 }
+              } else if (matchedGame) {
+                await invalidateAndRefreshDetailedAchievements(
+                  matchedGame,
+                  'epic',
+                  previousUnlocked
+                );
               }
             } catch (err) {
               console.warn('Post-session Epic trophy refresh warning:', err);
@@ -896,7 +1063,6 @@ export function usePostSessionReconciler({
               const fetchedXbox = normalizeAchievementRecordMap(res);
               if (fetchedXbox && Object.keys(fetchedXbox).length > 0) {
                 cacheUserXboxAchievements(fetchedXbox);
-                clearAchievementDetailCache();
 
                 const currentGames = readCurrentCatalogSnapshot();
                 const matchesXboxGame = (g: CanonicalGame) =>
@@ -937,8 +1103,13 @@ export function usePostSessionReconciler({
                 }
                 const nextTarget = reconciled.find(matchesXboxGame);
                 const nextXboxPlat = nextTarget?.platforms.find((p) => p.platformId === 'xbox');
+                const detailOutcome = await invalidateAndRefreshDetailedAchievements(
+                  nextTarget || matchedGame,
+                  'xbox',
+                  prevCount
+                );
                 const nextAch = nextXboxPlat?.achievements;
-                if (nextAch && nextAch.unlocked > prevCount) {
+                if (!detailOutcome.handledToast && nextAch && nextAch.unlocked > prevCount) {
                   const gameTitle = nextTarget?.title || matchedGameTitle || 'Game';
                   const gsText =
                     nextAch.gamerscore && nextAch.gamerscore.total > 0
@@ -971,6 +1142,12 @@ export function usePostSessionReconciler({
                     })
                     .catch(() => {});
                 }
+              } else if (matchedGame) {
+                await invalidateAndRefreshDetailedAchievements(
+                  matchedGame,
+                  'xbox',
+                  previousUnlocked
+                );
               }
             } catch (err) {
               console.warn('Post-session Xbox achievement refresh warning:', err);
@@ -993,7 +1170,6 @@ export function usePostSessionReconciler({
               const fetchedGog = normalizeAchievementRecordMap(res);
               if (fetchedGog && Object.keys(fetchedGog).length > 0) {
                 cacheUserGogAchievements(fetchedGog);
-                clearAchievementDetailCache();
 
                 const currentGames = readCurrentCatalogSnapshot();
                 const matchesGogGame = (g: CanonicalGame) =>
@@ -1025,16 +1201,27 @@ export function usePostSessionReconciler({
                   setGames((prev) => reconcileCatalogTrophiesRecords(prev, {}, fetchedGog, {}));
                 }
                 const nextTarget = reconciled.find(matchesGogGame);
+                const detailOutcome = await invalidateAndRefreshDetailedAchievements(
+                  nextTarget || matchedGame,
+                  'gog',
+                  prevCount
+                );
                 const nextAch = nextTarget?.platforms.find(
                   (p) => p.platformId === 'gog'
                 )?.achievements;
-                if (nextAch && nextAch.unlocked > prevCount) {
+                if (!detailOutcome.handledToast && nextAch && nextAch.unlocked > prevCount) {
                   const gameTitle = nextTarget?.title || matchedGameTitle || 'Game';
                   showSyncNotice(
                     `🏆 Trophy Unlocked! ${gameTitle} now has ${nextAch.unlocked}/${nextAch.total} GOG Trophies`,
                     5000
                   );
                 }
+              } else if (matchedGame) {
+                await invalidateAndRefreshDetailedAchievements(
+                  matchedGame,
+                  'gog',
+                  previousUnlocked
+                );
               }
             } catch (err) {
               console.warn('Post-session GOG trophy refresh warning:', err);
@@ -1044,27 +1231,28 @@ export function usePostSessionReconciler({
           void (async () => {
             try {
               const scannedSteam = await scanLocalSteamAchievements();
+              let handledToast = false;
+              const currentGames = readCurrentCatalogSnapshot();
+              const matchesSteamGame = (g: CanonicalGame) =>
+                g.id === gameId ||
+                Boolean(
+                  platformGameId &&
+                    g.platforms.some(
+                      (p) =>
+                        p.platformId === 'steam' &&
+                        String(p.platformGameId) === String(platformGameId)
+                    )
+                );
+              const prevTarget = currentGames.find(matchesSteamGame);
+              const prevCount = Math.max(
+                previousUnlocked,
+                prevTarget?.platforms.find((p) => p.platformId === 'steam')?.achievements
+                  ?.unlocked || 0
+              );
+
               if (scannedSteam && Object.keys(scannedSteam).length > 0) {
                 cacheUserSteamAchievements(scannedSteam);
-                clearAchievementDetailCache();
 
-                const currentGames = readCurrentCatalogSnapshot();
-                const matchesSteamGame = (g: CanonicalGame) =>
-                  g.id === gameId ||
-                  Boolean(
-                    platformGameId &&
-                      g.platforms.some(
-                        (p) =>
-                          p.platformId === 'steam' &&
-                          String(p.platformGameId) === String(platformGameId)
-                      )
-                  );
-                const prevTarget = currentGames.find(matchesSteamGame);
-                const prevCount = Math.max(
-                  previousUnlocked,
-                  prevTarget?.platforms.find((p) => p.platformId === 'steam')?.achievements
-                    ?.unlocked || 0
-                );
                 const reconciled = reconcileCatalogTrophiesRecords(
                   currentGames,
                   scannedSteam,
@@ -1078,21 +1266,44 @@ export function usePostSessionReconciler({
                   setGames((prev) => reconcileCatalogTrophiesRecords(prev, scannedSteam, {}, {}));
                 }
                 const nextTarget = reconciled.find(matchesSteamGame);
+                const detailOutcome = await invalidateAndRefreshDetailedAchievements(
+                  nextTarget || matchedGame,
+                  'steam',
+                  prevCount
+                );
+                handledToast = detailOutcome.handledToast;
                 const nextAch = nextTarget?.platforms.find(
                   (p) => p.platformId === 'steam'
                 )?.achievements;
-                if (nextAch && nextAch.unlocked > prevCount) {
+                if (!handledToast && nextAch && nextAch.unlocked > prevCount) {
                   const gameTitle = nextTarget?.title || matchedGameTitle || 'Game';
                   showSyncNotice(
                     `🏆 Trophy Unlocked! ${gameTitle} now has ${nextAch.unlocked}/${nextAch.total} Steam Trophies`,
                     5000
                   );
                 }
+              } else if (matchedGame) {
+                await invalidateAndRefreshDetailedAchievements(
+                  matchedGame,
+                  'steam',
+                  prevCount
+                );
               }
             } catch (err) {
               console.warn('Post-session Steam trophy refresh warning:', err);
             }
           })();
+        } else if (
+          matchedGame &&
+          platformId &&
+          (platformId === 'epic' || platformId === 'gog' || platformId === 'xbox') &&
+          electronApi?.getStoreAchievements
+        ) {
+          void invalidateAndRefreshDetailedAchievements(
+            matchedGame,
+            platformId,
+            previousUnlocked
+          );
         }
       }
     };

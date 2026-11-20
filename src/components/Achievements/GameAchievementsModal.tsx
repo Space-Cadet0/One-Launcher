@@ -26,6 +26,8 @@ import {
   EyeOff,
   Zap,
   Loader2,
+  RefreshCw,
+  TrendingUp,
 } from 'lucide-react';
 
 export interface GameAchievementsModalProps {
@@ -35,8 +37,37 @@ export interface GameAchievementsModalProps {
   onClose: () => void;
 }
 
-type FilterTab = 'all' | 'unlocked' | 'locked' | 'secret';
-type SortOption = 'default' | 'rarity_rarest' | 'rarity_common' | 'unlock_date' | 'name';
+type FilterTab = 'all' | 'unlocked' | 'locked' | 'in_progress' | 'secret';
+type SortOption =
+  | 'default'
+  | 'closest_progress'
+  | 'rarity_rarest'
+  | 'rarity_common'
+  | 'unlock_date'
+  | 'name';
+
+const SWR_STALE_AGE_MS = 5 * 60 * 1000;
+
+function shouldSwrRevalidateMap(map: MultiStoreAchievementsMap): boolean {
+  const entries = Object.values(map);
+  if (entries.length === 0) return true;
+  const now = Date.now();
+  return entries.some((entry) => {
+    if (!entry) return false;
+    if (entry.schemaUnavailableOffline) return true;
+    if (entry.unlockPrecision === 'summary_count_only') return true;
+    if ((entry.cacheVersion ?? 0) < 2) return true;
+    if (entry.syncedAt) {
+      const syncedMs = Date.parse(entry.syncedAt);
+      if (!Number.isNaN(syncedMs) && now - syncedMs > SWR_STALE_AGE_MS) {
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+type ProgressFillStyle = React.CSSProperties & { '--ol-progress-fill'?: string };
 
 export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
   isOpen,
@@ -47,6 +78,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
   const [multiStoreData, setMultiStoreData] = useState<MultiStoreAchievementsMap>({});
   const [activeStorefront, setActiveStorefront] = useState<StorefrontId>('steam');
   const [isLoading, setIsLoading] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilterTab, setActiveFilterTab] = useState<FilterTab>('all');
   const [sortOption, setSortOption] = useState<SortOption>('default');
@@ -56,6 +88,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
   const [listClientHeight, setListClientHeight] = useState(0);
   const listScrollRef = useRef<HTMLDivElement | null>(null);
   const multiStoreDataRef = useRef<MultiStoreAchievementsMap>(multiStoreData);
+  const fetchSeqRef = useRef(0);
   multiStoreDataRef.current = multiStoreData;
 
   // Available storefronts with achievements for this game
@@ -76,40 +109,116 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
     return ids;
   }, [game, multiStoreData]);
 
-  // Load detailed achievements on open
+  // Load detailed achievements on open with instant cache paint + non-blocking SWR refresh
   useEffect(() => {
-    if (isOpen && game) {
-      setSearchQuery('');
-      setActiveFilterTab('all');
-      setSortOption('default');
-      setRevealedSecrets(new Set());
-      setFailedIconKeys(new Set());
-      setIsOnline(onlineLifecycleManager.isOnline());
+    if (!isOpen || !game) return;
+    let cancelled = false;
+    const reqSeq = ++fetchSeqRef.current;
 
-      // Determine initial storefront tab
-      const preferredStore =
-        initialStorefrontId ||
-        (game.platforms.some((p) => p.platformId === 'steam')
-          ? 'steam'
-          : game.platforms[0]?.platformId || 'steam');
-      setActiveStorefront(preferredStore as StorefrontId);
+    setSearchQuery('');
+    setActiveFilterTab('all');
+    setSortOption('default');
+    setRevealedSecrets(new Set());
+    setFailedIconKeys(new Set());
+    const currentlyOnline = onlineLifecycleManager.isOnline();
+    setIsOnline(currentlyOnline);
 
+    // Determine initial storefront tab
+    const preferredStore = (
+      initialStorefrontId ||
+      (game.platforms.some((p) => p.platformId === 'steam')
+        ? 'steam'
+        : game.platforms[0]?.platformId || 'steam')
+    ) as StorefrontId;
+    setActiveStorefront(preferredStore);
+
+    const applyResolvedData = (data: MultiStoreAchievementsMap) => {
+      if (cancelled || fetchSeqRef.current !== reqSeq) return;
+      setMultiStoreData(data);
+      if (!data[preferredStore]) {
+        const firstWithData = Object.keys(data)[0] as StorefrontId | undefined;
+        if (firstWithData) setActiveStorefront(firstWithData);
+      }
+    };
+
+    const syncCached =
+      typeof achievementDetailService.peekCachedGameAchievements === 'function'
+        ? achievementDetailService.peekCachedGameAchievements(game.id)
+        : null;
+
+    if (syncCached && Object.keys(syncCached).length > 0) {
+      applyResolvedData(syncCached);
+      setIsLoading(false);
+
+      const hasElectronIpc =
+        typeof window !== 'undefined' && Boolean(window.electronAPI?.getStoreAchievements);
+      if (currentlyOnline && (hasElectronIpc || shouldSwrRevalidateMap(syncCached))) {
+        setIsRefreshing(true);
+        const forceSwr = hasElectronIpc && shouldSwrRevalidateMap(syncCached);
+        achievementDetailService
+          .fetchGameAchievements(game, forceSwr)
+          .then((fresh) => {
+            if (fresh && Object.keys(fresh).length > 0) {
+              applyResolvedData(fresh);
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            if (!cancelled && fetchSeqRef.current === reqSeq) {
+              setIsRefreshing(false);
+            }
+          });
+      } else {
+        setIsRefreshing(false);
+      }
+    } else {
       setIsLoading(true);
+      setIsRefreshing(false);
       achievementDetailService
         .fetchGameAchievements(game)
         .then((data) => {
-          setMultiStoreData(data);
-          // If preferred storefront has no achievements, select the first available with achievements
-          if (!data[preferredStore as StorefrontId]) {
-            const firstWithData = Object.keys(data)[0] as StorefrontId;
-            if (firstWithData) setActiveStorefront(firstWithData);
-          }
+          applyResolvedData(data);
         })
+        .catch(() => {})
         .finally(() => {
-          setIsLoading(false);
+          if (!cancelled && fetchSeqRef.current === reqSeq) {
+            setIsLoading(false);
+          }
         });
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [isOpen, game?.id, initialStorefrontId]);
+
+  const handleManualRefresh = useCallback(() => {
+    if (!game || isLoading || isRefreshing || !onlineLifecycleManager.isOnline()) return;
+    const reqSeq = ++fetchSeqRef.current;
+    setIsRefreshing(true);
+    achievementDetailService
+      .fetchGameAchievements(game, true)
+      .then((fresh) => {
+        if (fetchSeqRef.current !== reqSeq) return;
+        if (fresh && Object.keys(fresh).length > 0) {
+          setMultiStoreData(fresh);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (fetchSeqRef.current === reqSeq) {
+          setIsRefreshing(false);
+        }
+      });
+  }, [game, isLoading, isRefreshing]);
+
+  const handleSelectStorefront = useCallback((storeId: StorefrontId) => {
+    setActiveStorefront(storeId);
+    setActiveFilterTab('all');
+    if (listScrollRef.current) {
+      listScrollRef.current.scrollTop = 0;
+    }
+  }, []);
 
   // Reset failed achievement icons and re-fetch missing schemas automatically on reconnect
   useEffect(() => {
@@ -164,6 +273,20 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
   const currentStoreData: StorefrontAchievementsData | undefined = multiStoreData[activeStorefront];
   const isSummaryCountOnly = currentStoreData?.unlockPrecision === 'summary_count_only';
 
+  // Locked secret IDs for "Reveal All Secrets" toggle
+  const lockedSecretIds = useMemo(() => {
+    if (!currentStoreData?.achievements) return [];
+    return currentStoreData.achievements
+      .filter((a) => a.isSecret && !a.unlocked)
+      .map((a) => a.id);
+  }, [currentStoreData]);
+
+  const allSecretsRevealed = useMemo(
+    () =>
+      lockedSecretIds.length > 0 && lockedSecretIds.every((id) => revealedSecrets.has(id)),
+    [lockedSecretIds, revealedSecrets]
+  );
+
   // Toggle reveal for hidden / secret achievements
   const toggleSecretReveal = useCallback((id: string) => {
     setRevealedSecrets((prev) => {
@@ -173,6 +296,25 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
       return next;
     });
   }, []);
+
+  const toggleRevealAllSecrets = useCallback(() => {
+    setRevealedSecrets((prev) => {
+      const next = new Set(prev);
+      if (lockedSecretIds.every((id) => prev.has(id))) {
+        for (const id of lockedSecretIds) next.delete(id);
+      } else {
+        for (const id of lockedSecretIds) next.add(id);
+      }
+      return next;
+    });
+  }, [lockedSecretIds]);
+
+  const inProgressCount = useMemo(() => {
+    if (!currentStoreData?.achievements || isSummaryCountOnly) return 0;
+    return currentStoreData.achievements.filter(
+      (a) => !a.unlocked && Boolean(a.progress && a.progress.current > 0 && a.progress.max > 0)
+    ).length;
+  }, [currentStoreData, isSummaryCountOnly]);
 
   // Filtered and sorted achievements list
   const displayedAchievements = useMemo(() => {
@@ -185,6 +327,10 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
         list = list.filter((a) => a.unlocked);
       } else if (activeFilterTab === 'locked') {
         list = list.filter((a) => !a.unlocked);
+      } else if (activeFilterTab === 'in_progress') {
+        list = list.filter(
+          (a) => !a.unlocked && Boolean(a.progress && a.progress.current > 0 && a.progress.max > 0)
+        );
       } else if (activeFilterTab === 'secret') {
         list = list.filter((a) => a.isSecret);
       }
@@ -192,17 +338,36 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
       list = list.filter((a) => a.isSecret);
     }
 
-    // Text search query
+    // Text search query (exclude unrevealed locked secret text so search never spoils hidden trophies)
     if (searchQuery.trim()) {
-      list = list.filter(
-        (a) =>
+      list = list.filter((a) => {
+        const isHiddenUnrevealed = Boolean(a.isSecret && !a.unlocked && !revealedSecrets.has(a.id));
+        if (isHiddenUnrevealed) {
+          return matchesLooseSearchQuery('Hidden Achievement Secret', searchQuery);
+        }
+        return (
           matchesLooseSearchQuery(a.name, searchQuery) ||
           matchesLooseSearchQuery(a.description, searchQuery)
-      );
+        );
+      });
     }
 
     // Sorting
     list.sort((a, b) => {
+      if (sortOption === 'closest_progress') {
+        // 1. Locked with partial progress > 0 descending by progress %, tie-break by highest global %
+        // 2. Remaining locked by highest global % (easiest remaining)
+        // 3. Unlocked last
+        if (!a.unlocked && b.unlocked) return -1;
+        if (a.unlocked && !b.unlocked) return 1;
+        if (!a.unlocked && !b.unlocked) {
+          const progA = a.progress && a.progress.current > 0 ? a.progress.percentage : -1;
+          const progB = b.progress && b.progress.current > 0 ? b.progress.percentage : -1;
+          if (progA !== progB) return progB - progA;
+          return (b.globalPercentage ?? 0) - (a.globalPercentage ?? 0);
+        }
+        return 0;
+      }
       if (sortOption === 'rarity_rarest') {
         const pctA = a.globalPercentage ?? 100;
         const pctB = b.globalPercentage ?? 100;
@@ -231,7 +396,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
     });
 
     return list;
-  }, [currentStoreData, activeFilterTab, searchQuery, sortOption, isSummaryCountOnly]);
+  }, [currentStoreData, activeFilterTab, searchQuery, sortOption, isSummaryCountOnly, revealedSecrets]);
 
   const totalCount = currentStoreData?.total || 0;
   const unlockedCount = currentStoreData?.unlocked || 0;
@@ -327,9 +492,8 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
                 ? toOlMediaUrl({
                     url: rawIconSrc,
                     gameId: game.id,
-                    role: 'icon',
+                    role: 'achievement_icon',
                     ordinal: 1,
-                    steamAppId: game.steamAppId,
                   })
                 : '';
               const iconKey = `${activeStorefront}:${ach.id}:${isUnlocked ? 'u' : isSummaryCountOnly ? 's' : 'l'}`;
@@ -337,13 +501,15 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
               return !isIconFailed ? (
                 <img
                   src={resolvedIconSrc}
-                  alt={ach.name}
+                  alt={isSecretHidden ? 'Hidden Achievement' : ach.name}
                   loading="lazy"
                   decoding="async"
                   className={`w-full h-full object-cover transition-transform group-hover:scale-105 ${
-                    isUnlocked || isSummaryCountOnly
-                      ? 'filter-none'
-                      : 'grayscale contrast-75 brightness-60 opacity-60'
+                    isSecretHidden
+                      ? 'grayscale contrast-75 brightness-50 opacity-50 blur-[2px]'
+                      : isUnlocked || isSummaryCountOnly
+                        ? 'filter-none'
+                        : 'grayscale contrast-75 brightness-60 opacity-60'
                   }`}
                   onError={() => {
                     setFailedIconKeys((prev) => {
@@ -382,7 +548,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
 
           {/* Achievement Text Info */}
           <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <h3
                 className={`text-sm font-bold truncate ${
                   isUnlocked || isSummaryCountOnly ? 'text-white' : 'text-slate-300'
@@ -390,6 +556,20 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
               >
                 {isSecretHidden ? 'Hidden Achievement' : ach.name}
               </h3>
+
+              {/* Secret pill when hidden */}
+              {ach.isSecret && !isUnlocked && (
+                <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-purple-950/80 border border-purple-500/50 text-purple-300">
+                  Secret
+                </span>
+              )}
+
+              {/* DLC / Expansion badge for non-base sets */}
+              {ach.isBaseGame === false && (
+                <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-indigo-950/80 border border-indigo-400/50 text-indigo-200">
+                  DLC
+                </span>
+              )}
 
               {/* XP Badge if Epic */}
               {ach.xp !== undefined && (
@@ -412,34 +592,49 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
               )}
             </div>
 
-            {/* Description */}
-            <p className="text-xs text-slate-300 mt-1 leading-relaxed">
-              {isSecretHidden
-                ? 'Details of this achievement are kept hidden until unlocked in game.'
-                : ach.description || 'No description provided.'}
-            </p>
+            {/* Description (blur-to-reveal spoiler shield for locked hidden achievements) */}
+            {isSecretHidden ? (
+              <button
+                type="button"
+                onClick={() => toggleSecretReveal(ach.id)}
+                className="mt-1 text-left text-xs text-slate-300 leading-relaxed group/spoiler cursor-pointer min-h-6 inline-flex items-center gap-1.5"
+                title="Click to reveal hidden achievement details"
+              >
+                <span className="blur-[3px] select-none opacity-75 group-hover/spoiler:blur-[2px] transition-all">
+                  Details of this achievement are kept hidden until unlocked in game.
+                </span>
+              </button>
+            ) : (
+              <p className="text-xs text-slate-300 mt-1 leading-relaxed">
+                {ach.description || 'No description provided.'}
+              </p>
+            )}
 
-            {/* Progress Bar (e.g. 8/10 items collected) */}
-            {ach.progress && !isUnlocked && (
+            {/* Single native styled <progress> bar (`44 / 50 (88%)` vs `64%` for percentage-unit progress) */}
+            {ach.progress && !isUnlocked && ach.progress.max > 0 && (
               <div className="mt-2 max-w-xs">
                 <div className="flex items-center justify-between text-[10px] text-slate-300 mb-1 font-semibold">
                   <span>Progress</span>
                   <span className="font-mono text-slate-200">
-                    {ach.progress.current} / {ach.progress.max} {ach.progress.unit || ''}
+                    {ach.progress.unit === '%' ? (
+                      `${ach.progress.percentage}%`
+                    ) : (
+                      <>
+                        {ach.progress.current} / {ach.progress.max}
+                        {ach.progress.unit ? ` ${ach.progress.unit}` : ''}{' '}
+                        <span className="text-sky-300">({ach.progress.percentage}%)</span>
+                      </>
+                    )}
                   </span>
                 </div>
                 <progress
-                  className="sr-only"
-                  value={ach.progress.current}
+                  className="ol-setup-progress h-1.5 w-full block"
+                  value={Math.min(Math.max(0, ach.progress.current), Math.max(1, ach.progress.max))}
                   max={Math.max(1, ach.progress.max)}
-                  aria-label={`${ach.name} progress`}
+                  aria-label={
+                    isSecretHidden ? 'Hidden achievement progress' : `${ach.name} progress`
+                  }
                 />
-                <div aria-hidden="true" className="h-1.5 w-full bg-black/60 rounded-full overflow-hidden border border-white/10">
-                  <div
-                    className="h-full bg-[#66c0f4] rounded-full transition-all"
-                    style={{ width: `${ach.progress.percentage}%` }}
-                  />
-                </div>
               </div>
             )}
 
@@ -518,15 +713,36 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close achievements modal"
-            className="min-w-6 min-h-6 p-1.5 rounded-lg inline-flex items-center justify-center text-slate-300 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
-            title="Close"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {isRefreshing && (
+              <span
+                role="status"
+                className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-sky-950/60 border border-sky-500/40 text-[11px] font-semibold text-sky-200"
+              >
+                <Loader2 className="w-3 h-3 animate-spin text-sky-300" />
+                <span>Refreshing...</span>
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={handleManualRefresh}
+              disabled={isLoading || isRefreshing || !isOnline}
+              aria-label="Refresh achievements"
+              className="min-w-6 min-h-6 p-1.5 rounded-lg inline-flex items-center justify-center text-slate-300 hover:text-white hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+              title="Refresh achievements from storefront"
+            >
+              <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close achievements modal"
+              className="min-w-6 min-h-6 p-1.5 rounded-lg inline-flex items-center justify-center text-slate-300 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+              title="Close"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Storefront Selection Tabs (Only shown if multiple storefronts exist) */}
@@ -548,7 +764,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
                 <button
                   key={storeId}
                   type="button"
-                  onClick={() => setActiveStorefront(storeId)}
+                  onClick={() => handleSelectStorefront(storeId)}
                   className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-md text-xs font-semibold transition-all cursor-pointer shrink-0 border ${
                     isActive
                       ? 'bg-[#1b2b3d] text-white border-steam-accent shadow-[0_0_12px_rgba(102,192,244,0.25)]'
@@ -610,25 +826,21 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
                 )}
               </div>
 
-              {/* Linear Progress Bar */}
+              {/* Single Native Styled Linear Progress Bar */}
               <progress
-                className="sr-only"
-                value={unlockedCount}
+                className="ol-setup-progress w-56 sm:w-72 h-2 block mt-1.5"
+                value={Math.min(Math.max(0, unlockedCount), Math.max(1, totalCount))}
                 max={Math.max(1, totalCount)}
                 aria-label={`${unlockedCount} of ${totalCount} achievements unlocked`}
-              >
-                {percentage}%
-              </progress>
-              <div aria-hidden="true" className="w-56 sm:w-72 h-2 bg-black/60 rounded-full overflow-hidden mt-1.5 border border-white/10">
-                <div
-                  className={`h-full transition-all duration-500 ${
-                    isMastered
-                      ? 'bg-gradient-to-r from-amber-400 to-yellow-300 shadow-[0_0_10px_rgba(251,191,36,0.6)]'
-                      : 'bg-gradient-to-r from-sky-500 to-[#66c0f4]'
-                  }`}
-                  style={{ width: `${Math.min(100, Math.max(0, percentage))}%` }}
-                />
-              </div>
+                style={
+                  isMastered
+                    ? ({
+                        '--ol-progress-fill':
+                          'linear-gradient(90deg, #fbbf24 0%, #fde047 100%)',
+                      } as ProgressFillStyle)
+                    : undefined
+                }
+              />
 
               {/* Storefront XP / Gamerscore breakdown */}
               {currentStoreData?.totalXp !== undefined && currentStoreData.totalXp > 0 && (
@@ -727,6 +939,20 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
                   <Lock className="w-3 h-3 text-slate-300" />
                   <span>Locked ({lockedCount})</span>
                 </button>
+                {inProgressCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setActiveFilterTab('in_progress')}
+                    className={`min-h-6 px-3 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
+                      activeFilterTab === 'in_progress'
+                        ? 'bg-sky-950/70 text-sky-200 border border-sky-400/70'
+                        : 'text-slate-300 hover:text-white bg-[#16202d] border border-transparent'
+                    }`}
+                  >
+                    <TrendingUp className="w-3 h-3 text-sky-400" />
+                    <span>In Progress ({inProgressCount})</span>
+                  </button>
+                )}
               </>
             )}
             {secretCount > 0 && (
@@ -741,6 +967,25 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
               >
                 <EyeOff className="w-3 h-3 text-purple-400" />
                 <span>Secret ({secretCount})</span>
+              </button>
+            )}
+            {!isSummaryCountOnly && lockedSecretIds.length > 0 && (
+              <button
+                type="button"
+                onClick={toggleRevealAllSecrets}
+                className="min-h-6 px-2.5 py-1.5 rounded text-xs font-semibold text-purple-200 hover:text-white bg-purple-950/40 hover:bg-purple-950/70 border border-purple-500/40 transition-colors cursor-pointer shrink-0 flex items-center gap-1.5"
+              >
+                {allSecretsRevealed ? (
+                  <>
+                    <EyeOff className="w-3 h-3 text-purple-300" />
+                    <span>Hide All Secrets</span>
+                  </>
+                ) : (
+                  <>
+                    <Eye className="w-3 h-3 text-purple-300" />
+                    <span>Reveal All Secrets</span>
+                  </>
+                )}
               </button>
             )}
           </div>
@@ -781,6 +1026,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
                 className="bg-transparent text-xs text-slate-200 focus:outline-none cursor-pointer pr-1"
               >
                 <option value="default" className="bg-[#16202d] text-white">Default Order</option>
+                <option value="closest_progress" className="bg-[#16202d] text-white">Closest to Unlock</option>
                 <option value="unlock_date" className="bg-[#16202d] text-white">Unlock Date (Recent)</option>
                 <option value="rarity_rarest" className="bg-[#16202d] text-white">Rarity (Rarest First)</option>
                 <option value="rarity_common" className="bg-[#16202d] text-white">Rarity (Most Common)</option>

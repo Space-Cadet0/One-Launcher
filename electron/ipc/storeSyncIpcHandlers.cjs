@@ -20,6 +20,9 @@ const {
   trimSteamLocalScannerMemory,
 } = require('../storefronts/steamLocalScanner.cjs');
 const {
+  fetchSteamDetailedGameAchievements,
+} = require('../storefronts/steamAchievementsProvider.cjs');
+const {
   STORE_OAUTH_URLS,
   STEAM_AUTH_PAGE_EXTRACTOR_SCRIPT,
   STEAM_SSR_BG_EXTRACTOR_SCRIPT,
@@ -2527,7 +2530,10 @@ function registerStoreSyncIpcHandlers({
     async (/** @type {any} */ _event, /** @type {Record<string, any>} */ payload = {}) => {
       try {
         if (typeof storeSync.getEpicGameAchievementSchema === 'function') {
-          return await storeSync.getEpicGameAchievementSchema(payload);
+          return await storeSync.getEpicGameAchievementSchema(
+            payload,
+            handlerOptions.userDataDir ? { userDataDir: handlerOptions.userDataDir } : {}
+          );
         }
         return [];
       } catch (err) {
@@ -2590,28 +2596,64 @@ function registerStoreSyncIpcHandlers({
         const platformId = String(payload?.platformId || payload?.storefrontId || '')
           .trim()
           .toLowerCase();
+        const sharedVaultOpts = handlerOptions.userDataDir
+          ? { userDataDir: handlerOptions.userDataDir }
+          : {};
+
         if (platformId === 'xbox' && typeof storeSync.fetchXboxDetailedGameAchievements === 'function') {
           return await storeSync.fetchXboxDetailedGameAchievements(payload);
         }
-        if (platformId === 'epic' && typeof storeSync.getEpicGameAchievementSchema === 'function') {
-          const list = await storeSync.getEpicGameAchievementSchema(payload);
-          return {
-            storefrontId: 'epic',
-            storefrontName: 'Epic Games',
-            total: list.length,
-            unlocked: list.filter((/** @type {any} */ a) => a.unlocked).length,
-            percentage:
-              list.length > 0
-                ? Math.round(
-                    (list.filter((/** @type {any} */ a) => a.unlocked).length / list.length) * 100
-                  )
-                : 0,
-            isMastered:
-              list.length > 0 && list.every((/** @type {any} */ a) => Boolean(a.unlocked)),
-            achievements: list,
-            source: 'local_cache',
-          };
+
+        if (platformId === 'gog' && typeof storeSync.fetchGogDetailedGameAchievements === 'function') {
+          return await storeSync.fetchGogDetailedGameAchievements(payload, sharedVaultOpts);
         }
+
+        if (platformId === 'epic') {
+          if (typeof storeSync.fetchEpicDetailedGameAchievements === 'function') {
+            const ensureLegendaryAuth =
+              !launcherEngine?.isStoreDisconnectedTombstoned?.('epic') &&
+              typeof launcherEngine?.ensureLegendaryConfigAndAuth === 'function'
+                ? () => launcherEngine.ensureLegendaryConfigAndAuth()
+                : undefined;
+            const detailed = await storeSync.fetchEpicDetailedGameAchievements(payload, {
+              ...sharedVaultOpts,
+              ...(ensureLegendaryAuth ? { ensureLegendaryAuth } : {}),
+            });
+            if (detailed) return detailed;
+          }
+          if (typeof storeSync.getEpicGameAchievementSchema === 'function') {
+            const list = await storeSync.getEpicGameAchievementSchema(payload, sharedVaultOpts);
+            return {
+              storefrontId: 'epic',
+              storefrontName: 'Epic Games',
+              total: list.length,
+              unlocked: list.filter((/** @type {any} */ a) => a.unlocked).length,
+              percentage:
+                list.length > 0
+                  ? Math.round(
+                      (list.filter((/** @type {any} */ a) => a.unlocked).length / list.length) * 100
+                    )
+                  : 0,
+              isMastered:
+                list.length > 0 && list.every((/** @type {any} */ a) => Boolean(a.unlocked)),
+              achievements: list,
+              source: 'local_cache',
+            };
+          }
+        }
+
+        if (platformId === 'steam') {
+          const savedTokens =
+            typeof storeSync.loadSavedTokens === 'function' ? storeSync.loadSavedTokens() : {};
+          const savedSteam = savedTokens?.steam || {};
+          return await fetchSteamDetailedGameAchievements(payload, {
+            ...sharedVaultOpts,
+            steamId: savedSteam.steamId || payload?.steamId,
+            apiKey: savedSteam.apiKey || savedSteam.api_key,
+            webapiToken: savedSteam.webapi_token,
+          });
+        }
+
         return null;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

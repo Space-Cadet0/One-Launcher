@@ -271,6 +271,23 @@ export function handleGogEndpoints(req: FixtureRequest): FixtureResponse | null 
         body: `<!DOCTYPE html><html><body><h1>${p.title}</h1>${ocHtml}</body></html>`,
       };
     }
+    if (/^\/u\/[^/]+\/game\/\d+\/?$/i.test(req.url.pathname)) {
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+        body: '<!DOCTYPE html><html><body></body></html>',
+      };
+    }
+  }
+
+  if (host === 'content-system.gog.com') {
+    if (/^\/products\/\d+\/os\/(?:windows|osx|linux)\/builds\/?$/i.test(req.url.pathname)) {
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        body: { total_count: 0, count: 0, items: [] },
+      };
+    }
   }
 
   if (host === 'auth.gog.com' && req.url.pathname === '/token') {
@@ -295,12 +312,21 @@ export function handleGogEndpoints(req: FixtureRequest): FixtureResponse | null 
     };
   }
 
-  if (host === 'gameplay.gog.com' && /^\/clients\/[^/]+\/users\/[^/]+\/sessions\/?$/.test(req.url.pathname)) {
-    return {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-      body: { status: 'recorded' },
-    };
+  if (host === 'gameplay.gog.com') {
+    if (/^\/clients\/[^/]+\/users\/[^/]+\/sessions\/?$/.test(req.url.pathname)) {
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        body: { status: 'recorded' },
+      };
+    }
+    if (/^\/clients\/[^/]+\/users\/[^/]+\/achievements\/?$/.test(req.url.pathname)) {
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        body: { total_count: 0, items: [] },
+      };
+    }
   }
 
   return null;

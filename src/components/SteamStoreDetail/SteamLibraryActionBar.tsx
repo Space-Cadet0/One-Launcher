@@ -597,7 +597,10 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
         }) || pAchievements;
       }
     } else if (p.platformId === 'epic') {
-      const epicKnown = getKnownEpicAchievements(game.id, game.title);
+      const epicKnown =
+        getKnownEpicAchievements(p.platformGameId, game.title) ||
+        (p.namespace ? getKnownEpicAchievements(p.namespace, game.title) : undefined) ||
+        getKnownEpicAchievements(game.id, game.title);
       if (epicKnown) {
         pAchievements = reconcileAchievementSummaries(pAchievements, epicKnown, {
           title: game.title,
@@ -607,7 +610,8 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
     } else if (p.platformId === 'xbox') {
       const xboxKnown = getKnownXboxAchievements(
         p.xboxTitleId || p.platformGameId || game.id,
-        game.title
+        game.title,
+        [p.xboxProductId, p.packageFamilyName, p.platformGameId]
       );
       if (xboxKnown) {
         pAchievements = reconcileAchievementSummaries(pAchievements, xboxKnown, {
@@ -617,19 +621,35 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       }
     }
 
-    let platTotal = effectiveTotal ?? 0;
+    // Never leak Steam's `effectiveTotal` onto unverified non-Steam storefronts
+    let platTotal = 0;
     if (pAchievements && pAchievements.total > 0) {
       platTotal = pAchievements.total;
-    } else {
-      const known = getKnownAchievementTotal(targetSteamAppId, p.platformGameId || game.id, game.title);
-      if (known && known > 0) platTotal = known;
+    } else if (p.platformId === 'steam') {
+      platTotal = effectiveTotal ?? 0;
+      if (platTotal <= 0) {
+        const known = getKnownAchievementTotal(targetSteamAppId, p.platformGameId || game.id, game.title);
+        if (known && known > 0) platTotal = known;
+      }
     }
 
     const unlocked = pAchievements?.unlocked ?? 0;
     const customXp: { earned: number; total: number } | undefined = pAchievements?.xp;
+    const realGamerscore =
+      pAchievements?.gamerscore && pAchievements.gamerscore.total > 0
+        ? pAchievements.gamerscore
+        : undefined;
 
-    const percentage = platTotal > 0 ? Math.round((unlocked / platTotal) * 100) : 0;
-    const isMastered = (platTotal > 0 && unlocked >= platTotal) || !!pAchievements?.isMastered;
+    const percentage =
+      platTotal > 0
+        ? Math.round((unlocked / platTotal) * 100)
+        : realGamerscore && realGamerscore.total > 0
+          ? Math.round((realGamerscore.earned / realGamerscore.total) * 100)
+          : pAchievements?.percentage ?? 0;
+    const isMastered =
+      (platTotal > 0 && unlocked >= platTotal) ||
+      Boolean(realGamerscore && realGamerscore.total > 0 && realGamerscore.earned >= realGamerscore.total) ||
+      !!pAchievements?.isMastered;
 
     const res: PlatformAchievementSummary = {
       platformId: p.platformId,
@@ -642,17 +662,19 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       conflictDetails: pAchievements?.conflictDetails,
     };
 
-    if (p.platformId === 'epic' && platTotal > 0) {
-      res.xp = customXp || { earned: Math.round((percentage / 100) * 1000), total: 1000 };
+    if (p.platformId === 'epic' && customXp && customXp.total > 0) {
+      res.xp = customXp;
     }
-    if (p.platformId === 'xbox' && platTotal > 0) {
-      res.gamerscore = pAchievements?.gamerscore || { earned: Math.round((percentage / 100) * 1000), total: 1000 };
+    if (p.platformId === 'xbox' && realGamerscore) {
+      res.gamerscore = realGamerscore;
     }
 
     return res;
   });
 
-  const hasAchievements = platformAchievements.some((p) => p.total > 0);
+  const hasAchievements = platformAchievements.some(
+    (p) => p.total > 0 || p.unlocked > 0 || (p.gamerscore?.total ?? 0) > 0 || (p.xp?.total ?? 0) > 0
+  );
 
   // Best platform achievement by highest percentage, then unlocked count, then total
   const bestAchievement = platformAchievements.reduce((best, cur) => {
@@ -1392,15 +1414,30 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
           {/* Achievements */}
           {(() => {
+            const bestHasDisplayableAch =
+              bestAchievement.total > 0 ||
+              bestAchievement.unlocked > 0 ||
+              (bestAchievement.gamerscore?.total ?? 0) > 0 ||
+              (bestAchievement.xp?.total ?? 0) > 0;
+            const hasMultiStoreAch = platformAchievements.length > 1;
             const isInteractiveAch =
-              Boolean(onViewAchievements && hasAchievements && bestAchievement.total > 0) ||
-              platformAchievements.length > 1;
+              Boolean(onViewAchievements && hasAchievements && bestHasDisplayableAch) ||
+              hasMultiStoreAch;
+
+            const toggleBreakdownDrawer = () => {
+              setShowAchievementPopover((prev) => {
+                const next = !prev;
+                if (next) setShowPlaytimePopover(false);
+                return next;
+              });
+            };
+
             const achContent = (
               <>
                 <div className="flex items-center gap-1.5 whitespace-nowrap">
                   <span
                     className={`text-[10px] font-semibold uppercase tracking-wider flex items-center gap-1 transition-colors ${
-                      platformAchievements.length > 1
+                      hasMultiStoreAch
                         ? showAchievementPopover
                           ? 'text-steam-accent'
                           : 'text-[#94a3b8] group-hover:text-white'
@@ -1418,42 +1455,37 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                     ) : (
                       <Trophy
                         className={`w-3 h-3 shrink-0 ${
-                          hasAchievements && bestAchievement.total > 0
+                          hasAchievements && bestHasDisplayableAch
                             ? 'text-amber-400'
                             : 'text-[#94a3b8]'
                         }`}
                       />
                     )}
                     <span>Achievements</span>
-                    {platformAchievements.length > 1 && (
-                      <ChevronDown
-                        className={`w-2.5 h-2.5 transition-transform duration-200 text-sky-400/80 group-hover:text-sky-300 ${
-                          showAchievementPopover ? 'rotate-180 text-steam-accent' : ''
-                        }`}
-                      />
-                    )}
                   </span>
                 </div>
 
-                {hasAchievements && bestAchievement.total > 0 ? (
+                {hasAchievements && bestHasDisplayableAch ? (
                   <>
                     <div className="flex items-center gap-1.5 mt-0.5 whitespace-nowrap">
                       <span
                         className={`text-sm font-bold text-white transition-colors ${
-                          platformAchievements.length > 1
-                            ? 'group-hover:text-steam-accent'
-                            : ''
+                          hasMultiStoreAch ? 'group-hover:text-steam-accent' : ''
                         }`}
                       >
-                        {bestAchievement.unlocked} / {bestAchievement.total}
+                        {bestAchievement.total > 0
+                          ? `${bestAchievement.unlocked} / ${bestAchievement.total}`
+                          : `${bestAchievement.unlocked} Unlocked`}
                       </span>
-                      <span
-                        className={`text-[11px] ${
-                          isAnyMastered ? 'text-amber-300 font-semibold' : 'text-[#94a3b8]'
-                        }`}
-                      >
-                        ({bestAchievement.percentage}%)
-                      </span>
+                      {bestAchievement.total > 0 && (
+                        <span
+                          className={`text-[11px] ${
+                            isAnyMastered ? 'text-amber-300 font-semibold' : 'text-[#94a3b8]'
+                          }`}
+                        >
+                          ({bestAchievement.percentage}%)
+                        </span>
+                      )}
                       {bestAchievement.platformId === 'xbox' &&
                         bestAchievement.gamerscore &&
                         bestAchievement.gamerscore.total > 0 && (
@@ -1486,34 +1518,47 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
             if (isInteractiveAch) {
               return (
-                <button
-                  type="button"
-                  aria-expanded={
-                    platformAchievements.length > 1 &&
-                    !(onViewAchievements && hasAchievements && bestAchievement.total > 0)
-                      ? showAchievementPopover
-                      : undefined
-                  }
-                  onClick={() => {
-                    if (onViewAchievements && hasAchievements && bestAchievement.total > 0) {
-                      onViewAchievements(bestAchievement.platformId);
-                    } else if (platformAchievements.length > 1) {
-                      setShowAchievementPopover((prev) => {
-                        const next = !prev;
-                        if (next) setShowPlaytimePopover(false);
-                        return next;
-                      });
+                <div className="flex items-start gap-1 min-w-0 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (onViewAchievements && hasAchievements && bestHasDisplayableAch) {
+                        onViewAchievements(bestAchievement.platformId);
+                      } else if (hasMultiStoreAch) {
+                        toggleBreakdownDrawer();
+                      }
+                    }}
+                    className="flex flex-col min-w-0 min-h-6 shrink-0 text-left cursor-pointer group select-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-steam-accent rounded"
+                    title={
+                      hasAchievements && bestHasDisplayableAch
+                        ? 'Click to view full achievements browser, icons & unlock dates'
+                        : 'Click to view per-store achievements breakdown'
                     }
-                  }}
-                  className="flex flex-col min-w-0 min-h-6 shrink-0 text-left cursor-pointer group select-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-steam-accent rounded"
-                  title={
-                    hasAchievements && bestAchievement.total > 0
-                      ? 'Click to view full achievements browser, icons & unlock dates'
-                      : 'Click to view per-store achievements breakdown'
-                  }
-                >
-                  {achContent}
-                </button>
+                  >
+                    {achContent}
+                  </button>
+                  {hasMultiStoreAch && (
+                    <button
+                      type="button"
+                      data-testid="toggle-storefront-achievements-drawer"
+                      aria-label="Toggle storefront achievements breakdown"
+                      aria-expanded={showAchievementPopover}
+                      onClick={toggleBreakdownDrawer}
+                      className={`min-w-6 min-h-6 mt-0.5 rounded inline-flex items-center justify-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-steam-accent ${
+                        showAchievementPopover
+                          ? 'bg-[#1b2b3d] text-steam-accent'
+                          : 'text-sky-400/80 hover:text-sky-300 hover:bg-white/10'
+                      }`}
+                      title="Toggle per-store achievements breakdown"
+                    >
+                      <ChevronDown
+                        className={`w-3.5 h-3.5 transition-transform duration-200 ${
+                          showAchievementPopover ? 'rotate-180' : ''
+                        }`}
+                      />
+                    </button>
+                  )}
+                </div>
               );
             }
 
@@ -1771,18 +1816,22 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                           {plat.percentage}%
                         </span>
                       </>
+                    ) : plat.unlocked > 0 || (plat.gamerscore && plat.gamerscore.total > 0) ? (
+                      <span className="text-sm font-bold text-white">
+                        {plat.unlocked} Unlocked
+                      </span>
                     ) : (
                       <span className="text-xs text-steam-subtext">No Achievements</span>
                     )}
                   </div>
 
                   {/* Extra Gamerscore or XP badges if applicable */}
-                  {plat.total > 0 && plat.gamerscore && (
+                  {plat.gamerscore && plat.gamerscore.total > 0 && (
                     <div className="text-[10px] text-emerald-400 font-mono mt-1">
                       Gamerscore: {plat.gamerscore.earned} / {plat.gamerscore.total} G
                     </div>
                   )}
-                  {plat.total > 0 && plat.xp && (
+                  {plat.xp && plat.xp.total > 0 && (
                     <div className="text-[10px] text-sky-400 font-mono mt-1">
                       XP: {plat.xp.earned} / {plat.xp.total} XP
                     </div>
@@ -1790,7 +1839,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                 </div>
 
                 {/* Progress bar */}
-                {plat.total > 0 && (
+                {(plat.total > 0 || (plat.gamerscore && plat.gamerscore.total > 0)) && (
                   <div className="w-full bg-[#1b2838] h-1.5 rounded-full mt-2.5 overflow-hidden">
                     <div
                       className={`h-full rounded-full transition-all ${
@@ -1804,7 +1853,10 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                 )}
 
                 {/* View Achievements Button */}
-                {plat.total > 0 && onViewAchievements && (
+                {(plat.total > 0 ||
+                  plat.unlocked > 0 ||
+                  (plat.gamerscore && plat.gamerscore.total > 0)) &&
+                  onViewAchievements && (
                   <button
                     type="button"
                     onClick={() => onViewAchievements(plat.platformId)}
