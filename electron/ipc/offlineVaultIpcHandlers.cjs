@@ -7,6 +7,7 @@ const { Readable } = require('node:stream');
 const { sanitizeRendererIpcOptions } = require('./launcherIpcHandlers.cjs');
 const {
   assertSafePublicHttpsUrl,
+  assertSafePublicHttpsUrlSyntax,
   atomicWriteFileSync,
   resolveEffectiveUserDataDir,
   toHostFilesystemPath,
@@ -118,45 +119,86 @@ function createOlMediaProtocolHandler({ offlineVaultService, getOfflineVault, dn
         xboxTitleId: sp.get('xboxTitleId') || sp.get('xtid') || '',
       };
 
-      let localCacheOnly = false;
+      // Step 1: Synchronous zero-DNS lexical validation (< 0.01ms).
+      // Immediately rejects malformed, non-HTTPS, credentialed, local, and private-IP URLs with 403.
       if (params.url) {
         try {
-          await assertSafePublicHttpsUrl(
-            params.url,
-            typeof dnsLookup === 'function' ? { dnsLookup } : undefined
-          );
-        } catch (urlErr) {
-          const anyErr = /** @type {any} */ (urlErr);
-          if (!anyErr?.isDnsUnavailable) {
-            return new Response(null, {
-              status: 403,
-              headers: {
-                ...OL_MEDIA_BASE_SECURITY_HEADERS,
-                'Cache-Control': 'no-store',
-              },
-            });
-          }
-          // OS DNS is offline or domain is unresolvable (and already verified as `https:` with a
-          // public multi-label hostname and zero private IP literals): serve strictly from local
-          // SQLite/disk/federator cache unless an explicit test `fetchImpl` was injected.
-          localCacheOnly = !activeVault?.hasCustomFetchImpl;
+          assertSafePublicHttpsUrlSyntax(params.url);
+        } catch {
+          return new Response(null, {
+            status: 403,
+            headers: {
+              ...OL_MEDIA_BASE_SECURITY_HEADERS,
+              'Cache-Control': 'no-store',
+            },
+          });
         }
       }
 
-      if (!activeVault || typeof activeVault.resolveMediaRequest !== 'function') {
-        return new Response(null, {
-          status: 503,
-          headers: {
-            ...OL_MEDIA_BASE_SECURITY_HEADERS,
-            'Cache-Control': 'no-store',
-          },
-        });
+      let localCacheOnly = false;
+      /** @type {any} */
+      let resolved = null;
+
+      // Step 2: Zero-DNS local disk cache fast path (exact previously-validated URL identity,
+      // `url_resolution_cache` live blob hit, or explicit offline fallback). Bypassed whenever
+      // a custom `dnsLookup` is injected (preserving deterministic SSRF/DNS-rebinding tests).
+      if (
+        typeof dnsLookup !== 'function' &&
+        activeVault &&
+        typeof activeVault.resolveLocalCachedMedia === 'function'
+      ) {
+        try {
+          resolved = await activeVault.resolveLocalCachedMedia({
+            ...params,
+            localCacheOnly,
+          });
+        } catch {
+          resolved = null;
+        }
       }
 
-      const resolved = await activeVault.resolveMediaRequest(params, {
-        signal: request?.signal,
-        ...(localCacheOnly ? { localCacheOnly: true } : {}),
-      });
+      // Step 3: Cache miss, online URL upgrade, or injected custom `dnsLookup`:
+      // enforce full DNS SSRF/rebinding check before resolving through Tier 2/3.
+      if (!resolved) {
+        if (params.url) {
+          try {
+            await assertSafePublicHttpsUrl(
+              params.url,
+              typeof dnsLookup === 'function' ? { dnsLookup } : undefined
+            );
+          } catch (urlErr) {
+            const anyErr = /** @type {any} */ (urlErr);
+            if (!anyErr?.isDnsUnavailable) {
+              return new Response(null, {
+                status: 403,
+                headers: {
+                  ...OL_MEDIA_BASE_SECURITY_HEADERS,
+                  'Cache-Control': 'no-store',
+                },
+              });
+            }
+            // OS DNS is offline or domain is unresolvable (and already verified as `https:` with a
+            // public multi-label hostname and zero private IP literals): serve strictly from local
+            // SQLite/disk/federator cache unless an explicit test `fetchImpl` was injected.
+            localCacheOnly = !activeVault?.hasCustomFetchImpl;
+          }
+        }
+
+        if (!activeVault || typeof activeVault.resolveMediaRequest !== 'function') {
+          return new Response(null, {
+            status: 503,
+            headers: {
+              ...OL_MEDIA_BASE_SECURITY_HEADERS,
+              'Cache-Control': 'no-store',
+            },
+          });
+        }
+
+        resolved = await activeVault.resolveMediaRequest(params, {
+          signal: request?.signal,
+          ...(localCacheOnly ? { localCacheOnly: true } : {}),
+        });
+      }
 
       if (!resolved || resolved.kind === 'error') {
         const status =

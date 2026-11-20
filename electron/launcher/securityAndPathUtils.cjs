@@ -755,15 +755,30 @@ function createUnsafeUrlError(message, flags = {}) {
   return err;
 }
 
+const POSITIVE_DNS_SAFETY_CACHE_TTL_MS = 30_000;
+const POSITIVE_DNS_SAFETY_CACHE_MAX_HOSTS = 256;
+
+/** @type {Map<string, { addresses: string[], expiresAt: number }>} */
+const positiveDnsSafetyCache = new Map();
+
 /**
- * Validate that `urlStr` is a public `https:` URL whose literal IP or `dns.promises.lookup(..., { all: true })`
- * resolution contains ZERO private, loopback, link-local, or unspecified addresses.
+ * Clear the bounded positive DNS-safety cache (primarily for deterministic testing).
+ */
+function clearPublicDnsSafetyCache() {
+  positiveDnsSafetyCache.clear();
+}
+
+/**
+ * Synchronous zero-DNS lexical validator for public `https:` URLs (`< 0.01ms`).
+ * Validates `https:` protocol, rejects embedded credentials, control characters, empty host,
+ * `localhost`/`.local`/`.internal`/`.home.arpa`, single-label/numeric-TLD/malformed hostnames,
+ * and private/loopback/link-local/CGNAT/metadata IPv4/IPv6 literals using the exact same IP
+ * range checks as `assertSafePublicHttpsUrl`.
  *
  * @param {unknown} urlStr
-   * @param {{ dnsLookup?: (hostname: string, opts: { all: true }) => Promise<Array<{ address: string }>>, skipDnsForReservedTestTld?: boolean }} [options]
- * @returns {Promise<{ url: string, hostname: string, addresses: string[] }>}
+ * @returns {{ url: string, hostname: string, isIpLiteral: boolean }}
  */
-async function assertSafePublicHttpsUrl(urlStr, options = {}) {
+function assertSafePublicHttpsUrlSyntax(urlStr) {
   if (typeof urlStr !== 'string' || !urlStr.trim() || /[\x00-\x1f\x7f]/.test(urlStr)) {
     throw createUnsafeUrlError('Blocked empty or malformed URL');
   }
@@ -785,6 +800,7 @@ async function assertSafePublicHttpsUrl(urlStr, options = {}) {
     .replace(/^\[|\]$/g, '')
     .toLowerCase()
     .replace(/\.$/, '');
+  const ipFamily = net.isIP(host);
   if (
     !host ||
     host === 'localhost' ||
@@ -792,28 +808,71 @@ async function assertSafePublicHttpsUrl(urlStr, options = {}) {
     host.endsWith('.local') ||
     host.endsWith('.internal') ||
     host.endsWith('.home.arpa') ||
-    (net.isIP(host) === 0 && !host.includes('.'))
+    (ipFamily === 0 && !host.includes('.'))
   ) {
     throw createUnsafeUrlError(`Blocked local hostname: ${host || '<empty>'}`);
   }
 
-  if (net.isIP(host) !== 0) {
+  if (ipFamily !== 0) {
     if (isPrivateOrLoopbackIp(host)) {
       throw createUnsafeUrlError(`Blocked private or loopback IP literal: ${host}`);
     }
-    return { url: parsed.toString(), hostname: host, addresses: [host] };
+    return { url: parsed.toString(), hostname: host, isIpLiteral: true };
   }
+
+  const labels = host.split('.');
+  const tld = labels[labels.length - 1] || '';
+  if (labels.some((label) => !label) || /^\d+$/.test(tld)) {
+    throw createUnsafeUrlError(`Blocked non-public or malformed hostname: ${host}`);
+  }
+
+  return { url: parsed.toString(), hostname: host, isIpLiteral: false };
+}
+
+/**
+ * Validate that `urlStr` is a public `https:` URL whose literal IP or `dns.promises.lookup(..., { all: true })`
+ * resolution contains ZERO private, loopback, link-local, or unspecified addresses.
+ *
+ * When no custom `options.dnsLookup` is supplied, uses a bounded short-TTL (`30s`, max `256` hostnames)
+ * positive DNS-safety cache to avoid redundant OS `getaddrinfo` lookups across redirects and concurrent
+ * media requests. Whenever a custom `options.dnsLookup` function is passed, the cache is ALWAYS bypassed.
+ *
+ * @param {unknown} urlStr
+ * @param {{ dnsLookup?: (hostname: string, opts: { all: true }) => Promise<Array<{ address: string }>>, skipDnsForReservedTestTld?: boolean }} [options]
+ * @returns {Promise<{ url: string, hostname: string, addresses: string[] }>}
+ */
+async function assertSafePublicHttpsUrl(urlStr, options = {}) {
+  const syntax = assertSafePublicHttpsUrlSyntax(urlStr);
+  const host = syntax.hostname;
+
+  if (syntax.isIpLiteral) {
+    return { url: syntax.url, hostname: host, addresses: [host] };
+  }
+
+  const hasCustomDnsLookup = typeof options.dnsLookup === 'function';
 
   if (
     options.skipDnsForReservedTestTld === true &&
-    typeof options.dnsLookup !== 'function' &&
+    !hasCustomDnsLookup &&
     (host.endsWith('.test') || host.endsWith('.example'))
   ) {
-    return { url: parsed.toString(), hostname: host, addresses: [] };
+    return { url: syntax.url, hostname: host, addresses: [] };
   }
 
-  const lookupFn =
-    typeof options.dnsLookup === 'function' ? options.dnsLookup : dns.promises.lookup;
+  if (!hasCustomDnsLookup) {
+    const cached = positiveDnsSafetyCache.get(host);
+    if (cached) {
+      if (cached.expiresAt > Date.now()) {
+        // Refresh LRU recency
+        positiveDnsSafetyCache.delete(host);
+        positiveDnsSafetyCache.set(host, cached);
+        return { url: syntax.url, hostname: host, addresses: [...cached.addresses] };
+      }
+      positiveDnsSafetyCache.delete(host);
+    }
+  }
+
+  const lookupFn = hasCustomDnsLookup ? options.dnsLookup : dns.promises.lookup;
 
   let records;
   try {
@@ -853,7 +912,22 @@ async function assertSafePublicHttpsUrl(urlStr, options = {}) {
     addresses.push(addr);
   }
 
-  return { url: parsed.toString(), hostname: host, addresses };
+  if (!hasCustomDnsLookup) {
+    if (positiveDnsSafetyCache.has(host)) {
+      positiveDnsSafetyCache.delete(host);
+    }
+    while (positiveDnsSafetyCache.size >= POSITIVE_DNS_SAFETY_CACHE_MAX_HOSTS) {
+      const oldestHost = positiveDnsSafetyCache.keys().next().value;
+      if (oldestHost === undefined) break;
+      positiveDnsSafetyCache.delete(oldestHost);
+    }
+    positiveDnsSafetyCache.set(host, {
+      addresses: [...addresses],
+      expiresAt: Date.now() + POSITIVE_DNS_SAFETY_CACHE_TTL_MS,
+    });
+  }
+
+  return { url: syntax.url, hostname: host, addresses };
 }
 
 /**
@@ -1408,6 +1482,7 @@ const ALLOWED_LAUNCHER_SETTINGS_KEYS = new Set([
   'crossoverDisplayScalingMode',
   'crossoverDisplayAspect',
   'enableFullscreenHotkey',
+  'defaultPerformanceHud',
   'reset',
   'hardwareAcceleration',
   'disableHardwareAcceleration',
@@ -1447,11 +1522,9 @@ const ALLOWED_LAUNCHER_SETTINGS_KEYS = new Set([
   'enableEsync',
   'enableFsync',
   'enableMsync',
-  'enableMetalHud',
   'enableDxvk',
   'enableD3dMetal',
   'enableGameMode',
-  'enableMangoHud',
   'minimizeToTray',
   'minimizeToTrayOnClose',
   'closeToTray',
@@ -1619,6 +1692,8 @@ function sanitizeLaunchConfigRecursive(rawValue, depth = 0) {
 
 /**
  * Strict allowlist validator for `launcher:save-settings` / `launcher:save-performance-settings`.
+ * Migrates legacy `enableMetalHud === true || enableMangoHud === true` onto `defaultPerformanceHud`
+ * when `defaultPerformanceHud` is not explicitly provided, without ever emitting the retired keys.
  */
 function sanitizeLauncherSettingsPayload(rawSettings) {
   if (!rawSettings || typeof rawSettings !== 'object' || Array.isArray(rawSettings)) {
@@ -1641,6 +1716,15 @@ function sanitizeLauncherSettingsPayload(rawSettings) {
         .filter((v) => typeof v === 'string' && !v.includes('\0') && v.length <= 2048)
         .slice(0, 64);
     }
+  }
+  if (
+    clean.defaultPerformanceHud === undefined &&
+    ((Object.prototype.hasOwnProperty.call(rawSettings, 'enableMetalHud') &&
+      rawSettings.enableMetalHud === true) ||
+      (Object.prototype.hasOwnProperty.call(rawSettings, 'enableMangoHud') &&
+        rawSettings.enableMangoHud === true))
+  ) {
+    clean.defaultPerformanceHud = true;
   }
   return clean;
 }
@@ -2058,16 +2142,33 @@ function getImportedEpicInstalls(options = {}) {
   return { imports: {} };
 }
 
+function normalizeEpicInstallPathForComparison(rawPath) {
+  const trimmed = String(rawPath || '').trim();
+  if (!trimmed) return '';
+  let normalized = trimmed.replace(/[\\/]+/g, '/');
+  if (normalized.length > 1) {
+    normalized = normalized.replace(/\/+$/, '');
+  }
+  if (process.platform === 'win32' || /^[a-z]:\//i.test(normalized)) {
+    normalized = normalized.toLowerCase();
+  }
+  return normalized;
+}
+
 function recordImportedEpicInstall(appNameOrEntry, installPathOrOptions, maybeOptions = {}) {
   let rawApp = '';
   let rawPath = '';
   let rawSource = '';
+  let rawExecutable = '';
+  let rawVersion = '';
   let options = maybeOptions || {};
 
   if (appNameOrEntry && typeof appNameOrEntry === 'object') {
     rawApp = appNameOrEntry.appName || appNameOrEntry.app_name || '';
     rawPath = appNameOrEntry.installPath || appNameOrEntry.install_path || '';
     rawSource = appNameOrEntry.source || '';
+    rawExecutable = appNameOrEntry.executable || appNameOrEntry.executablePath || '';
+    rawVersion = appNameOrEntry.version || '';
     options =
       installPathOrOptions && typeof installPathOrOptions === 'object' ? installPathOrOptions : {};
   } else {
@@ -2077,6 +2178,8 @@ function recordImportedEpicInstall(appNameOrEntry, installPathOrOptions, maybeOp
 
   const cleanApp = String(rawApp || '').trim();
   const cleanPath = String(rawPath || '').trim();
+  const cleanExecutable = String(rawExecutable || '').trim();
+  const cleanVersion = String(rawVersion || '').trim();
   if (!cleanApp && !cleanPath) return false;
   const recordKey = cleanApp || cleanPath;
   const filePath = getEpicImportsFilePath(options);
@@ -2086,9 +2189,15 @@ function recordImportedEpicInstall(appNameOrEntry, installPathOrOptions, maybeOp
     if (
       prev &&
       prev.appName === cleanApp &&
-      prev.installPath === cleanPath &&
-      (!rawSource || prev.source === rawSource)
+      normalizeEpicInstallPathForComparison(prev.installPath) ===
+        normalizeEpicInstallPathForComparison(cleanPath) &&
+      (!cleanExecutable ||
+        normalizeEpicInstallPathForComparison(prev.executable) ===
+          normalizeEpicInstallPathForComparison(cleanExecutable)) &&
+      (!cleanVersion || String(prev.version || '').trim() === cleanVersion)
     ) {
+      // Do NOT treat `prev.source !== rawSource` (e.g. `*.item` vs `LauncherInstalled.dat`)
+      // as a dirty change requiring a disk rewrite.
       return true;
     }
     const next = {
@@ -2097,7 +2206,21 @@ function recordImportedEpicInstall(appNameOrEntry, installPathOrOptions, maybeOp
         [recordKey]: {
           appName: cleanApp,
           installPath: cleanPath,
-          ...(rawSource ? { source: String(rawSource) } : {}),
+          ...(cleanExecutable
+            ? { executable: cleanExecutable }
+            : prev?.executable
+              ? { executable: prev.executable }
+              : {}),
+          ...(cleanVersion
+            ? { version: cleanVersion }
+            : prev?.version
+              ? { version: prev.version }
+              : {}),
+          ...(rawSource
+            ? { source: String(rawSource) }
+            : prev?.source
+              ? { source: prev.source }
+              : {}),
           importedAt: prev?.importedAt || new Date().toISOString(),
         },
       },
@@ -2993,7 +3116,9 @@ module.exports = {
   isContainedWithinRoot,
   isAllowedHttpsHost,
   isPrivateOrLoopbackIp,
+  assertSafePublicHttpsUrlSyntax,
   assertSafePublicHttpsUrl,
+  clearPublicDnsSafetyCache,
   readSafeResponseBuffer,
   safePublicHttpsFetch,
   resolveTrustedDevStartUrl,

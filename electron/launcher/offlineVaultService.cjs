@@ -299,6 +299,7 @@ const ASSET_IDENTITY_QUERY_KEYS = new Set([
 /**
  * Normalizes an asset source URL for identity comparison across sync cycles:
  * - Aliases Steam CDN mirror hosts to `steamstatic.canonical`
+ * - Collapses Steam `/steam/apps/` path aliases to `/store_item_assets/steam/apps/`
  * - Preserves host + pathname + deterministic sizing/format parameters (`w`, `h`, `mode`)
  * - Strips volatile CDN signature / cache-buster query tokens (`t`, `sig`, `se`, `token`, etc.)
  */
@@ -308,8 +309,11 @@ function normalizeAssetIdentityUrl(url) {
   try {
     const parsed = new URL(comparable);
     const host = parsed.hostname.toLowerCase();
-    const pathname =
+    let pathname =
       parsed.pathname.length > 1 ? parsed.pathname.replace(/\/+$/, '') : parsed.pathname;
+    if (host === 'steamstatic.canonical' && /^\/steam\/apps\//i.test(pathname)) {
+      pathname = pathname.replace(/^\/steam\/apps\//i, '/store_item_assets/steam/apps/');
+    }
     const keptParams = [];
     for (const [k, v] of parsed.searchParams.entries()) {
       const keyLower = k.toLowerCase();
@@ -1567,6 +1571,21 @@ class OfflineVaultService {
       CREATE INDEX IF NOT EXISTS idx_game_media_assets_source_url
         ON game_media_assets(source_url);
 
+      CREATE TABLE IF NOT EXISTS url_resolution_cache (
+        norm_url TEXT PRIMARY KEY,
+        game_id TEXT NOT NULL,
+        blob_sha256 TEXT REFERENCES media_blobs(sha256) ON DELETE SET NULL,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER NOT NULL DEFAULT 0,
+        last_status_code INTEGER,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_url_resolution_cache_game
+        ON url_resolution_cache(game_id);
+      CREATE INDEX IF NOT EXISTS idx_url_resolution_cache_blob
+        ON url_resolution_cache(blob_sha256);
+
       CREATE TABLE IF NOT EXISTS storefront_endpoint_health (
         host TEXT PRIMARY KEY,
         state TEXT NOT NULL DEFAULT 'CLOSED',
@@ -2113,6 +2132,7 @@ class OfflineVaultService {
 
     db.exec('BEGIN IMMEDIATE');
     try {
+      db.exec('DELETE FROM url_resolution_cache;');
       db.exec('DELETE FROM media_blobs;');
       if (preserveMetadata) {
         db.exec(`
@@ -2175,7 +2195,7 @@ class OfflineVaultService {
     const db = this.ensureOpen();
     const urlKey = buildAssetUrlKey(gameId, assetRole, ordinal, cleanUrl);
     const existing = db
-      .prepare('SELECT source_url, storage_kind FROM game_media_assets WHERE url_key = ?')
+      .prepare('SELECT source_url, storage_kind, blob_sha256 FROM game_media_assets WHERE url_key = ?')
       .get(urlKey);
 
     if (!existing) {
@@ -2198,29 +2218,59 @@ class OfflineVaultService {
       return;
     }
 
-    // Adaptive 404 & Artwork Upgrade Self-Heal Rule:
-    // Whenever normalized asset identity changes (e.g., upgrading Microsoft Store cover -> Steam 2x cover
-    // or updating SHA1 asset hash path), reset cached blob pinning when online while preserving Steam CDN mirror aliases!
+    // Non-destructive sync candidate update:
+    // During routine upsertGames() syncs, NEVER wipe a healthy on-disk cover blob just because
+    // raw g.capsuleImage differs from the resolved cover URL rendered by GameCardCover
+    // (e.g., Epic ?h=480, Steam 1x vs 2x, GOG boxart vs IGDB). Explicit user overrides invalidate
+    // via saveUserOverride() / removeUserOverride(). Only update pending rows, rows whose disk
+    // blob is missing, or non-cover online updates.
     if (
       existing.source_url !== cleanUrl &&
       normalizeAssetIdentityUrl(existing.source_url) !== normalizeAssetIdentityUrl(cleanUrl)
     ) {
-      if (existing.storage_kind === 'pending' || this.isNetworkOnline()) {
-        db.prepare(
-          `
-          UPDATE game_media_assets
-          SET source_url = ?,
-              storage_kind = 'pending',
-              blob_sha256 = NULL,
-              federated_path = NULL,
-              failure_count = 0,
-              next_retry_at = 0,
-              last_status_code = NULL,
-              last_verified_at = ?
-          WHERE url_key = ?
-        `
-        ).run(cleanUrl, nowTs, urlKey);
+      const normalizedRole = String(assetRole || 'cover').toLowerCase();
+      const isCoverRole = normalizedRole === 'cover' || normalizedRole === 'capsule';
+
+      if (existing.storage_kind === 'blob') {
+        let hasLiveBlobOnDisk = false;
+        if (existing.blob_sha256) {
+          const mb = db
+            .prepare('SELECT ext FROM media_blobs WHERE sha256 = ?')
+            .get(existing.blob_sha256);
+          if (mb) {
+            const blobPath = this.getBlobFilePath(existing.blob_sha256, mb.ext);
+            if (
+              isContainedWithinRoot(this.blobsDir, blobPath, this.options.platform) &&
+              fs.existsSync(blobPath)
+            ) {
+              hasLiveBlobOnDisk = true;
+            }
+          }
+        }
+        if (hasLiveBlobOnDisk && isCoverRole) {
+          return;
+        }
+        if (hasLiveBlobOnDisk && !this.isNetworkOnline()) {
+          return;
+        }
+      } else if (existing.storage_kind !== 'pending' && !this.isNetworkOnline()) {
+        return;
       }
+
+      db.prepare(
+        `
+        UPDATE game_media_assets
+        SET source_url = ?,
+            storage_kind = 'pending',
+            blob_sha256 = NULL,
+            federated_path = NULL,
+            failure_count = 0,
+            next_retry_at = 0,
+            last_status_code = NULL,
+            last_verified_at = ?
+        WHERE url_key = ?
+      `
+      ).run(cleanUrl, nowTs, urlKey);
     }
   }
 
@@ -2236,6 +2286,7 @@ class OfflineVaultService {
       'SELECT steam_app_id, is_favorited, archived_by_subscription_rotation, enriched_json, metadata_quality, enriched_at FROM vault_games WHERE game_id = ?'
     );
     const deleteOrphanAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
+    const deleteOrphanUrlCacheStmt = db.prepare('DELETE FROM url_resolution_cache WHERE game_id = ?');
     const deleteOrphanGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
     const upsertStmt = db.prepare(`
       INSERT INTO vault_games (
@@ -2351,6 +2402,7 @@ class OfflineVaultService {
           if (existing) {
             try {
               deleteOrphanAssetsStmt.run(gameId);
+              deleteOrphanUrlCacheStmt.run(gameId);
               deleteOrphanGameStmt.run(gameId);
             } catch {}
           }
@@ -2370,6 +2422,7 @@ class OfflineVaultService {
             for (const dupId of dupVariants) {
               if (dupId !== gameId) {
                 deleteOrphanAssetsStmt.run(dupId);
+                deleteOrphanUrlCacheStmt.run(dupId);
                 deleteOrphanGameStmt.run(dupId);
               }
             }
@@ -2638,6 +2691,7 @@ class OfflineVaultService {
 
     const db = this.ensureOpen();
     const deleteAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
+    const deleteUrlCacheStmt = db.prepare('DELETE FROM url_resolution_cache WHERE game_id = ?');
     const deleteGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
     let deleted = 0;
 
@@ -2645,6 +2699,7 @@ class OfflineVaultService {
     try {
       for (const id of safeIds) {
         deleteAssetsStmt.run(id);
+        deleteUrlCacheStmt.run(id);
         const res = deleteGameStmt.run(id);
         if (res && res.changes > 0) {
           deleted += Number(res.changes);
@@ -2757,11 +2812,24 @@ class OfflineVaultService {
     const resetHydratedStmt = db.prepare(
       'UPDATE vault_games SET media_hydrated_at = 0 WHERE game_id = ?'
     );
+    const clearUrlCache404Stmt = db.prepare(
+      'DELETE FROM url_resolution_cache WHERE game_id = ? AND blob_sha256 IS NULL'
+    );
+    const clearExactUrlCache404Stmt = db.prepare(
+      'DELETE FROM url_resolution_cache WHERE norm_url = ? AND blob_sha256 IS NULL'
+    );
 
     let invalidated = 0;
     db.exec('BEGIN IMMEDIATE');
     try {
+      if (nextCoverNorm) {
+        clearExactUrlCache404Stmt.run(nextCoverNorm);
+      }
+      if (nextHeaderNorm) {
+        clearExactUrlCache404Stmt.run(nextHeaderNorm);
+      }
       for (const cid of candidateIds) {
+        clearUrlCache404Stmt.run(cid);
         const rows = selectRowsStmt.all(cid);
         let touchedGame = false;
         for (const row of rows) {
@@ -2851,11 +2919,15 @@ class OfflineVaultService {
     const resetHydratedStmt = db.prepare(
       'UPDATE vault_games SET media_hydrated_at = 0 WHERE game_id = ?'
     );
+    const clearUrlCache404Stmt = db.prepare(
+      'DELETE FROM url_resolution_cache WHERE game_id = ? AND blob_sha256 IS NULL'
+    );
 
     let invalidated = 0;
     db.exec('BEGIN IMMEDIATE');
     try {
       for (const cid of candidateIds) {
+        clearUrlCache404Stmt.run(cid);
         const r1 = resetCoverHeaderStmt.run(cid);
         const r2 = resetFederatedStmt.run(cid);
         const changes = Number(r1?.changes || 0) + Number(r2?.changes || 0);
@@ -3808,39 +3880,94 @@ class OfflineVaultService {
   recordAssetAdaptive404(urlKey, gameId, assetRole, ordinal, sourceUrl) {
     const db = this.ensureOpen();
     const nowTs = this.now();
+    const cleanGameId = String(gameId || '').trim();
+    const cleanSourceUrl = String(sourceUrl || '').trim();
+    const normUrl = cleanSourceUrl ? normalizeAssetIdentityUrl(cleanSourceUrl) : '';
+
     const existing = db
-      .prepare('SELECT failure_count, source_url FROM game_media_assets WHERE url_key = ?')
+      .prepare(
+        'SELECT failure_count, source_url, storage_kind, blob_sha256 FROM game_media_assets WHERE url_key = ?'
+      )
       .get(urlKey);
 
-    const prevFailures =
-      existing && existing.source_url === sourceUrl ? Number(existing.failure_count || 0) : 0;
-    const nextFailures = prevFailures + 1;
+    const existingCache = normUrl
+      ? db
+          .prepare('SELECT failure_count, blob_sha256 FROM url_resolution_cache WHERE norm_url = ?')
+          .get(normUrl)
+      : null;
+
+    const existingNorm =
+      existing && existing.source_url ? normalizeAssetIdentityUrl(existing.source_url) : '';
+    const prevAssetFailures =
+      existing && existingNorm && normUrl && existingNorm === normUrl
+        ? Number(existing.failure_count || 0)
+        : existing && existing.source_url === cleanSourceUrl
+          ? Number(existing.failure_count || 0)
+          : 0;
+    const prevCacheFailures =
+      existingCache && !existingCache.blob_sha256 ? Number(existingCache.failure_count || 0) : 0;
+    const nextFailures = Math.max(prevAssetFailures, prevCacheFailures) + 1;
     const delayMs = computeAdaptive404DelayMs(nextFailures);
     const nextRetryAt = nowTs + delayMs;
 
-    db.prepare(
-      `
-      INSERT INTO game_media_assets (
-        url_key, game_id, asset_role, ordinal, source_url, storage_kind,
-        blob_sha256, federated_path, failure_count, next_retry_at, last_status_code, last_verified_at
-      ) VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, 404, ?)
-      ON CONFLICT(url_key) DO UPDATE SET
-        source_url = excluded.source_url,
-        failure_count = excluded.failure_count,
-        next_retry_at = excluded.next_retry_at,
-        last_status_code = 404,
-        last_verified_at = excluded.last_verified_at
-    `
-    ).run(
-      urlKey,
-      String(gameId || ''),
-      String(assetRole || 'cover'),
-      Math.max(0, Math.floor(Number(ordinal) || 0)),
-      String(sourceUrl || ''),
-      nextFailures,
-      nextRetryAt,
-      nowTs
+    const hasHealthyPinnedBlob = Boolean(
+      existing && existing.storage_kind === 'blob' && existing.blob_sha256
     );
+
+    db.exec('SAVEPOINT record_adaptive_404');
+    try {
+      if (normUrl) {
+        db.prepare(
+          `
+          INSERT INTO url_resolution_cache (
+            norm_url, game_id, blob_sha256, failure_count, next_retry_at, last_status_code, updated_at
+          ) VALUES (?, ?, NULL, ?, ?, 404, ?)
+          ON CONFLICT(norm_url) DO UPDATE SET
+            game_id = CASE WHEN excluded.game_id != '' THEN excluded.game_id ELSE url_resolution_cache.game_id END,
+            blob_sha256 = NULL,
+            failure_count = excluded.failure_count,
+            next_retry_at = excluded.next_retry_at,
+            last_status_code = 404,
+            updated_at = excluded.updated_at
+        `
+        ).run(normUrl, cleanGameId, nextFailures, nextRetryAt, nowTs);
+      }
+
+      // Non-destructive guard: NEVER overwrite or unpin a healthy `storage_kind = 'blob'`
+      // row in `game_media_assets` when an alternate candidate URL returns HTTP 404!
+      if (!hasHealthyPinnedBlob) {
+        db.prepare(
+          `
+          INSERT INTO game_media_assets (
+            url_key, game_id, asset_role, ordinal, source_url, storage_kind,
+            blob_sha256, federated_path, failure_count, next_retry_at, last_status_code, last_verified_at
+          ) VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, 404, ?)
+          ON CONFLICT(url_key) DO UPDATE SET
+            source_url = excluded.source_url,
+            failure_count = excluded.failure_count,
+            next_retry_at = excluded.next_retry_at,
+            last_status_code = 404,
+            last_verified_at = excluded.last_verified_at
+        `
+        ).run(
+          urlKey,
+          cleanGameId,
+          String(assetRole || 'cover'),
+          Math.max(0, Math.floor(Number(ordinal) || 0)),
+          cleanSourceUrl,
+          nextFailures,
+          nextRetryAt,
+          nowTs
+        );
+      }
+      db.exec('RELEASE SAVEPOINT record_adaptive_404');
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK TO SAVEPOINT record_adaptive_404');
+        db.exec('RELEASE SAVEPOINT record_adaptive_404');
+      } catch {}
+      throw err;
+    }
 
     return {
       failureCount: nextFailures,
@@ -4225,7 +4352,7 @@ class OfflineVaultService {
       const nonCoverRows = db
         .prepare(
           `
-          SELECT url_key, game_id, failure_count, next_retry_at
+          SELECT url_key, game_id, source_url, failure_count, next_retry_at
           FROM game_media_assets
           WHERE asset_role NOT IN ('cover', 'capsule', 'icon')
             AND storage_kind != 'federated'
@@ -4237,12 +4364,21 @@ class OfflineVaultService {
       const unpinBackoffKeyStmt = db.prepare(
         "UPDATE game_media_assets SET storage_kind = 'pending', blob_sha256 = NULL WHERE url_key = ?"
       );
+      const deleteDemotedUrlCacheStmt = db.prepare(
+        'DELETE FROM url_resolution_cache WHERE norm_url = ? AND game_id = ?'
+      );
 
       db.exec('BEGIN IMMEDIATE');
       try {
         for (const ar of nonCoverRows) {
           const gid = String(ar.game_id || '').trim();
           if (!gid || protectedP0OrP1Ids.has(gid)) continue;
+          if (ar.source_url) {
+            const demotedNorm = normalizeAssetIdentityUrl(ar.source_url);
+            if (demotedNorm) {
+              deleteDemotedUrlCacheStmt.run(demotedNorm, gid);
+            }
+          }
           if (Number(ar.failure_count || 0) > 0 && Number(ar.next_retry_at || 0) > nowTs) {
             unpinBackoffKeyStmt.run(ar.url_key);
           } else {
@@ -4258,14 +4394,98 @@ class OfflineVaultService {
       }
     }
 
-    // Remove unreferenced `media_blobs` rows (or rows whose disk blob disappeared)
+    // Prune `url_resolution_cache` BEFORE computing unreferenced `media_blobs`:
+    // 1. Delete stale 404 entries (`blob_sha256 IS NULL AND updated_at < now - 30d`).
+    // 2. Delete entries belonging to nonexistent `game_id`s.
+    // 3. For secondary (non-pinned) cached blobs (`blob_sha256 IS NOT NULL` not referenced by
+    //    `game_media_assets`), delete any older than 14 days and retain at most 1 newest
+    //    secondary cached blob per `game_id` so valid fallback covers survive without leaking disk.
+    const fourteenDaysAgo = nowTs - 14 * 24 * 60 * 60 * 1000;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare(
+        'DELETE FROM url_resolution_cache WHERE blob_sha256 IS NULL AND updated_at < ?'
+      ).run(thirtyDaysAgo);
+
+      const vaultGamesCountRow = db.prepare('SELECT COUNT(*) AS cnt FROM vault_games').get();
+      const hasVaultGames = Number(vaultGamesCountRow?.cnt || 0) > 0;
+      if (hasVaultGames) {
+        db.exec(`
+          DELETE FROM url_resolution_cache
+          WHERE game_id = ''
+             OR NOT EXISTS (
+               SELECT 1 FROM vault_games vg WHERE vg.game_id = url_resolution_cache.game_id
+             );
+        `);
+      } else {
+        db.exec(`
+          DELETE FROM url_resolution_cache
+          WHERE game_id = ''
+             OR NOT EXISTS (
+               SELECT 1 FROM game_media_assets gma WHERE gma.game_id = url_resolution_cache.game_id
+             );
+        `);
+      }
+
+      // Drop secondary cached blob rows older than 14 days
+      db.prepare(
+        `
+        DELETE FROM url_resolution_cache
+        WHERE blob_sha256 IS NOT NULL
+          AND updated_at < ?
+          AND NOT EXISTS (
+            SELECT 1 FROM game_media_assets gma WHERE gma.blob_sha256 = url_resolution_cache.blob_sha256
+          )
+      `
+      ).run(fourteenDaysAgo);
+
+      // Keep at most 1 newest secondary cached blob per `game_id`
+      const secondaryRows = db
+        .prepare(
+          `
+          SELECT urc.norm_url AS norm_url, urc.game_id AS game_id, urc.updated_at AS updated_at
+          FROM url_resolution_cache urc
+          WHERE urc.blob_sha256 IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM game_media_assets gma WHERE gma.blob_sha256 = urc.blob_sha256
+            )
+          ORDER BY urc.game_id ASC, urc.updated_at DESC, urc.norm_url ASC
+        `
+        )
+        .all();
+
+      const deleteUrlCacheByNormStmt = db.prepare(
+        'DELETE FROM url_resolution_cache WHERE norm_url = ?'
+      );
+      /** @type {Set<string>} */
+      const seenSecondaryGameIds = new Set();
+      for (const sRow of secondaryRows) {
+        if (!sRow || !sRow.norm_url) continue;
+        const gid = String(sRow.game_id || '');
+        if (seenSecondaryGameIds.has(gid)) {
+          deleteUrlCacheByNormStmt.run(sRow.norm_url);
+        } else {
+          seenSecondaryGameIds.add(gid);
+        }
+      }
+
+      db.exec('COMMIT');
+    } catch {
+      try {
+        db.exec('ROLLBACK');
+      } catch {}
+    }
+
+    // Remove unreferenced `media_blobs` rows (excluding BOTH `game_media_assets` AND surviving `url_resolution_cache`)
     const unrefBlobs = db
       .prepare(
         `
         SELECT mb.sha256 AS sha256, mb.ext AS ext, mb.size_bytes AS size_bytes
         FROM media_blobs mb
         LEFT JOIN game_media_assets gma ON gma.blob_sha256 = mb.sha256
+        LEFT JOIN url_resolution_cache urc ON urc.blob_sha256 = mb.sha256
         WHERE gma.url_key IS NULL
+          AND urc.norm_url IS NULL
       `
       )
       .all();
@@ -4539,7 +4759,29 @@ class OfflineVaultService {
     const role = String(params.role || 'cover').trim();
     const ordinal = Math.max(0, Math.floor(Number(params.ordinal ?? params.ord ?? 0)));
     const sourceUrl = String(params.url || '').trim();
+    const normSourceUrl = sourceUrl ? normalizeAssetIdentityUrl(sourceUrl) : '';
     const urlKey = buildAssetUrlKey(gameId, role, ordinal, sourceUrl);
+    const nowTs = this.now();
+
+    if (normSourceUrl) {
+      const cacheRow = db
+        .prepare(
+          'SELECT blob_sha256, next_retry_at FROM url_resolution_cache WHERE norm_url = ?'
+        )
+        .get(normSourceUrl);
+      if (cacheRow) {
+        if (cacheRow.blob_sha256) {
+          const mb = db
+            .prepare('SELECT ext FROM media_blobs WHERE sha256 = ?')
+            .get(cacheRow.blob_sha256);
+          if (mb && fs.existsSync(this.getBlobFilePath(cacheRow.blob_sha256, mb.ext))) {
+            return true;
+          }
+        } else if (cacheRow.next_retry_at && Number(cacheRow.next_retry_at) > nowTs) {
+          return true;
+        }
+      }
+    }
 
     const row = db.prepare('SELECT * FROM game_media_assets WHERE url_key = ?').get(urlKey);
     if (!row) return false;
@@ -4547,7 +4789,7 @@ class OfflineVaultService {
     if (
       sourceUrl &&
       row.source_url &&
-      normalizeAssetIdentityUrl(row.source_url) !== normalizeAssetIdentityUrl(sourceUrl)
+      normalizeAssetIdentityUrl(row.source_url) !== normSourceUrl
     ) {
       return false;
     }
@@ -4573,7 +4815,7 @@ class OfflineVaultService {
       } catch {}
     }
 
-    if (row.next_retry_at && Number(row.next_retry_at) > this.now()) {
+    if (row.next_retry_at && Number(row.next_retry_at) > nowTs) {
       return true;
     }
 
@@ -4588,7 +4830,24 @@ class OfflineVaultService {
     const role = String(params.role || 'cover').trim();
     const ordinal = Math.max(0, Math.floor(Number(params.ordinal ?? params.ord ?? 0)));
     const sourceUrl = String(params.url || '').trim();
+    const normSourceUrl = sourceUrl ? normalizeAssetIdentityUrl(sourceUrl) : '';
     const urlKey = buildAssetUrlKey(gameId, role, ordinal, sourceUrl);
+    const nowTs = this.now();
+
+    if (normSourceUrl) {
+      const cacheRow = db
+        .prepare(
+          'SELECT blob_sha256, failure_count, next_retry_at FROM url_resolution_cache WHERE norm_url = ?'
+        )
+        .get(normSourceUrl);
+      if (
+        cacheRow &&
+        !cacheRow.blob_sha256 &&
+        (Number(cacheRow.failure_count || 0) > 0 || Number(cacheRow.next_retry_at || 0) > nowTs)
+      ) {
+        return true;
+      }
+    }
 
     const row = db
       .prepare(
@@ -4596,12 +4855,49 @@ class OfflineVaultService {
       )
       .get(urlKey);
     if (!row || row.storage_kind !== 'pending') return false;
-    return Number(row.failure_count || 0) > 0 || Number(row.next_retry_at || 0) > this.now();
+    return Number(row.failure_count || 0) > 0 || Number(row.next_retry_at || 0) > nowTs;
   }
 
   bindAssetBlobRow(urlKey, gameId, role, ordinal, rawUrl, sha256) {
-    this.ensureOpen()
-      .prepare(
+    const db = this.ensureOpen();
+    const nowTs = this.now();
+    const cleanGameId = String(gameId || '').trim();
+    const cleanRawUrl = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+    const normUrl = cleanRawUrl ? normalizeAssetIdentityUrl(cleanRawUrl) : '';
+
+    db.exec('SAVEPOINT bind_asset_blob');
+    try {
+      // Preserve any previously-pinned live blob URL in `url_resolution_cache` before swapping
+      // (ensures pre-upgrade databases also retain fast secondary fallback hits!).
+      const prevRow = db
+        .prepare(
+          'SELECT game_id, source_url, storage_kind, blob_sha256 FROM game_media_assets WHERE url_key = ?'
+        )
+        .get(urlKey);
+      if (
+        prevRow &&
+        prevRow.storage_kind === 'blob' &&
+        prevRow.blob_sha256 &&
+        prevRow.source_url
+      ) {
+        const prevNorm = normalizeAssetIdentityUrl(prevRow.source_url);
+        if (prevNorm && prevNorm !== normUrl) {
+          db.prepare(
+            `
+            INSERT OR IGNORE INTO url_resolution_cache (
+              norm_url, game_id, blob_sha256, failure_count, next_retry_at, last_status_code, updated_at
+            ) VALUES (?, ?, ?, 0, 0, 200, ?)
+          `
+          ).run(
+            prevNorm,
+            String(prevRow.game_id || cleanGameId),
+            String(prevRow.blob_sha256),
+            nowTs
+          );
+        }
+      }
+
+      db.prepare(
         `
         INSERT INTO game_media_assets (
           url_key, game_id, asset_role, ordinal, source_url, storage_kind,
@@ -4617,27 +4913,46 @@ class OfflineVaultService {
           last_status_code = 200,
           last_verified_at = excluded.last_verified_at
       `
-      )
-      .run(urlKey, gameId, role, ordinal, rawUrl, sha256, this.now());
+      ).run(urlKey, cleanGameId, role, ordinal, cleanRawUrl, sha256, nowTs);
+
+      if (normUrl) {
+        db.prepare(
+          `
+          INSERT INTO url_resolution_cache (
+            norm_url, game_id, blob_sha256, failure_count, next_retry_at, last_status_code, updated_at
+          ) VALUES (?, ?, ?, 0, 0, 200, ?)
+          ON CONFLICT(norm_url) DO UPDATE SET
+            game_id = CASE WHEN excluded.game_id != '' THEN excluded.game_id ELSE url_resolution_cache.game_id END,
+            blob_sha256 = excluded.blob_sha256,
+            failure_count = 0,
+            next_retry_at = 0,
+            last_status_code = 200,
+            updated_at = excluded.updated_at
+        `
+        ).run(normUrl, cleanGameId, sha256, nowTs);
+      }
+
+      db.exec('RELEASE SAVEPOINT bind_asset_blob');
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK TO SAVEPOINT bind_asset_blob');
+        db.exec('RELEASE SAVEPOINT bind_asset_blob');
+      } catch {}
+      throw err;
+    }
   }
 
   /**
-   * Resolves a media asset request for `ol-media://` or `MediaHydrationEngine` across:
-   * 1. Content-addressed SQLite blob vault / verified federated path
-   * 2. Zero-copy local first-party cache federation (Steam, GOG Galaxy, Heroic, Xbox)
-   * 3. Reference-counted `AbortSignal`-coalesced upstream fetch + async normalization + persist-on-read
-   *
+   * Parse `paramsInput` (object, `ol-media://` URL string, or URL instance) into a uniform params object.
    * @param {Record<string, any> | string | URL} paramsInput
-   * @param {{ signal?: AbortSignal, backgroundHydration?: boolean, hydrationTier?: number, throwOnAbort?: boolean, localCacheOnly?: boolean }} [reqOpts]
+   * @returns {Record<string, any>}
    */
-  async resolveMediaRequest(paramsInput = {}, reqOpts = {}) {
-    /** @type {Record<string, any>} */
-    let params = {};
+  parseMediaRequestParams(paramsInput = {}) {
     if (typeof paramsInput === 'string' || paramsInput instanceof URL) {
       try {
         const parsedReq = new URL(String(paramsInput));
         const sp = parsedReq.searchParams;
-        params = {
+        return {
           gameId: sp.get('gameId') || '',
           role: sp.get('role') || 'cover',
           ordinal: Number(sp.get('ord') || sp.get('ordinal') || 0),
@@ -4652,11 +4967,292 @@ class OfflineVaultService {
           ov: sp.get('ov') || '',
         };
       } catch {
-        params = {};
+        return {};
       }
-    } else if (paramsInput && typeof paramsInput === 'object') {
-      params = paramsInput;
     }
+    if (paramsInput && typeof paramsInput === 'object') {
+      return paramsInput;
+    }
+    return {};
+  }
+
+  /**
+   * Async Tier 1A blob verification and response builder.
+   * @param {string} sha256
+   * @param {string} [cacheControl]
+   */
+  async tryResolveBlobBySha(sha256, cacheControl = 'public, max-age=31536000, immutable') {
+    if (!sha256 || typeof sha256 !== 'string') return null;
+    const db = this.ensureOpen();
+    const mb = db
+      .prepare('SELECT sha256, ext, mime_type, size_bytes FROM media_blobs WHERE sha256 = ?')
+      .get(sha256);
+    if (!mb) return null;
+    const blobPath = this.getBlobFilePath(mb.sha256, mb.ext);
+    if (!isContainedWithinRoot(this.blobsDir, blobPath, this.options.platform)) {
+      return null;
+    }
+    let blobStat = null;
+    try {
+      blobStat = await fs.promises.stat(blobPath);
+    } catch {}
+    if (!blobStat || !blobStat.isFile() || blobStat.size <= 0) {
+      return null;
+    }
+    this.touchBlobAccess(mb.sha256);
+    return {
+      kind: 'file',
+      filePath: blobPath,
+      mimeType: mb.mime_type,
+      sizeBytes: Number(mb.size_bytes || blobStat.size || 0),
+      cacheControl,
+      source: 'vault_blob',
+    };
+  }
+
+  /**
+   * Async Tier 1B federated local file verification and response builder.
+   * @param {Record<string, any>} assetRow
+   * @param {string} rawUrl
+   * @param {Record<string, any>} params
+   * @param {boolean} isExplicitOverride
+   * @param {{ selfHealMissing?: boolean }} [opts]
+   */
+  async tryResolveFederatedRow(
+    assetRow,
+    rawUrl,
+    params,
+    isExplicitOverride,
+    opts = { selfHealMissing: false }
+  ) {
+    if (!assetRow || assetRow.storage_kind !== 'federated' || !assetRow.federated_path) {
+      return null;
+    }
+    const db = this.ensureOpen();
+    const federatedPath = String(assetRow.federated_path);
+    if (
+      isExplicitOverride ||
+      !isFederatedAssetRowCompatible(rawUrl || assetRow.source_url, federatedPath, params)
+    ) {
+      if (opts.selfHealMissing) {
+        db.prepare(
+          "UPDATE game_media_assets SET storage_kind = 'pending', federated_path = NULL WHERE url_key = ?"
+        ).run(assetRow.url_key);
+      }
+      return null;
+    }
+    try {
+      const lst = await fs.promises.lstat(federatedPath);
+      if (!lst.isSymbolicLink() && lst.isFile() && lst.size >= 33) {
+        const header = Buffer.allocUnsafe(16);
+        header.fill(0);
+        const fh = await fs.promises.open(federatedPath, 'r');
+        let bytesRead = 0;
+        try {
+          const readRes = await fh.read(header, 0, 16, 0);
+          bytesRead = Number(readRes?.bytesRead || 0);
+        } finally {
+          try {
+            await fh.close();
+          } catch {}
+        }
+        const magic = detectImageMagicBytes(header.subarray(0, bytesRead));
+        if (magic.valid && magic.mimeType) {
+          return {
+            kind: 'file',
+            filePath: federatedPath,
+            mimeType: magic.mimeType,
+            sizeBytes: lst.size,
+            cacheControl: 'public, max-age=86400',
+            source: 'federated_local',
+          };
+        }
+      }
+    } catch {}
+    if (opts.selfHealMissing) {
+      db.prepare(
+        "UPDATE game_media_assets SET storage_kind = 'pending', federated_path = NULL WHERE url_key = ?"
+      ).run(assetRow.url_key);
+    }
+    return null;
+  }
+
+  /**
+   * Zero-DNS Tier 1A/1B local disk cache lookup for `ol-media://` fast path.
+   * Returns a resolved local file hit ONLY when:
+   *   (a) `assetRow` matches `url_key` AND `normalizeAssetIdentityUrl(assetRow.source_url) === normalizeAssetIdentityUrl(params.url)`
+   *       (exact previously-validated URL) with a live blob/federated file on disk, OR
+   *   (b) `url_resolution_cache` has a live disk blob for `normalizeAssetIdentityUrl(params.url)`
+   *       (re-binding `game_media_assets` if needed), OR
+   *   (c) `params.localCacheOnly === true` or `!this.isNetworkOnline()` (explicit offline fallback to existing `assetRow` blob/federated file).
+   *
+   * Returns `null` whenever `params.url` is a new/different URL while online (forcing full DNS check
+   * + Tier 3 upgrade path!).
+   *
+   * @param {Record<string, any> | string | URL} paramsInput
+   */
+  async resolveLocalCachedMedia(paramsInput = {}) {
+    const params = this.parseMediaRequestParams(paramsInput);
+    const gameId = String(params.gameId || '').trim();
+    const role = String(params.role || 'cover').trim();
+    const ordinal = Math.max(0, Math.floor(Number(params.ordinal ?? params.ord ?? 0)));
+    const rawUrl = typeof params.url === 'string' ? params.url.trim() : '';
+    const isExplicitOverride = isExplicitOverrideParam(params.ov);
+    const localCacheOnly = params.localCacheOnly === true;
+
+    if (rawUrl && isRejectedVideoUrl(rawUrl)) {
+      return null;
+    }
+    if (!rawUrl && !gameId) {
+      return null;
+    }
+
+    const db = this.ensureOpen();
+    const normRawUrl = rawUrl ? normalizeAssetIdentityUrl(rawUrl) : '';
+    const urlKey = buildAssetUrlKey(gameId, role, ordinal, rawUrl);
+    const assetRow = db.prepare('SELECT * FROM game_media_assets WHERE url_key = ?').get(urlKey);
+    const assetSourceNorm =
+      assetRow && assetRow.source_url ? normalizeAssetIdentityUrl(assetRow.source_url) : '';
+    const isExactUrlMatch = Boolean(
+      assetRow && (!normRawUrl || (assetSourceNorm && assetSourceNorm === normRawUrl))
+    );
+
+    const recordDetailViewIfNeeded = () => {
+      if (
+        !params.backgroundHydration &&
+        gameId &&
+        ['header', 'hero', 'logo', 'screenshot', 'screenshot_thumb', 'screenshot_full'].includes(
+          role
+        )
+      ) {
+        this.recordP1DetailGame(gameId);
+        if (this.hydrationEngine && typeof this.hydrationEngine.recordP1DetailView === 'function') {
+          try {
+            this.hydrationEngine.recordP1DetailView(gameId);
+          } catch {}
+        }
+      }
+    };
+
+    // (a) Exact previously-validated URL hit on `game_media_assets`
+    if (isExactUrlMatch && assetRow) {
+      if (assetRow.storage_kind === 'blob' && assetRow.blob_sha256) {
+        const blobHit = await this.tryResolveBlobBySha(
+          String(assetRow.blob_sha256),
+          'public, max-age=31536000, immutable'
+        );
+        if (blobHit) {
+          recordDetailViewIfNeeded();
+          return blobHit;
+        }
+      } else if (assetRow.storage_kind === 'federated' && assetRow.federated_path) {
+        const fedHit = await this.tryResolveFederatedRow(
+          assetRow,
+          rawUrl,
+          params,
+          isExplicitOverride,
+          { selfHealMissing: false }
+        );
+        if (fedHit) {
+          recordDetailViewIfNeeded();
+          return fedHit;
+        }
+      }
+    }
+
+    // (b) Live disk blob in `url_resolution_cache` for exact normalized URL
+    if (normRawUrl) {
+      const cacheRow = db
+        .prepare('SELECT blob_sha256 FROM url_resolution_cache WHERE norm_url = ?')
+        .get(normRawUrl);
+      if (cacheRow && cacheRow.blob_sha256) {
+        const cachedHit = await this.tryResolveBlobBySha(
+          String(cacheRow.blob_sha256),
+          'public, max-age=31536000, immutable'
+        );
+        if (cachedHit) {
+          if (
+            !assetRow ||
+            assetRow.storage_kind !== 'blob' ||
+            assetRow.blob_sha256 !== cacheRow.blob_sha256 ||
+            assetSourceNorm !== normRawUrl
+          ) {
+            try {
+              this.bindAssetBlobRow(
+                urlKey,
+                gameId,
+                role,
+                ordinal,
+                rawUrl,
+                String(cacheRow.blob_sha256)
+              );
+            } catch {}
+          }
+          recordDetailViewIfNeeded();
+          return cachedHit;
+        }
+      }
+
+      // Upgrade compatibility: check exact `source_url` match across pre-upgrade `game_media_assets`
+      if (!assetRow) {
+        const bySourceRow = db
+          .prepare(
+            "SELECT blob_sha256 FROM game_media_assets WHERE source_url = ? AND storage_kind = 'blob' AND blob_sha256 IS NOT NULL LIMIT 1"
+          )
+          .get(rawUrl);
+        if (bySourceRow && bySourceRow.blob_sha256) {
+          const sourceHit = await this.tryResolveBlobBySha(
+            String(bySourceRow.blob_sha256),
+            'public, max-age=31536000, immutable'
+          );
+          if (sourceHit) {
+            recordDetailViewIfNeeded();
+            return sourceHit;
+          }
+        }
+      }
+    }
+
+    // (c) Explicit offline fallback to existing `assetRow` blob / federated file
+    if ((localCacheOnly || !this.isNetworkOnline()) && assetRow) {
+      if (assetRow.storage_kind === 'blob' && assetRow.blob_sha256) {
+        const offlineHit = await this.tryResolveBlobBySha(
+          String(assetRow.blob_sha256),
+          isExactUrlMatch ? 'public, max-age=31536000, immutable' : 'public, max-age=3600'
+        );
+        if (offlineHit) {
+          recordDetailViewIfNeeded();
+          return offlineHit;
+        }
+      } else if (assetRow.storage_kind === 'federated' && assetRow.federated_path) {
+        const fedHit = await this.tryResolveFederatedRow(
+          assetRow,
+          rawUrl,
+          params,
+          isExplicitOverride,
+          { selfHealMissing: false }
+        );
+        if (fedHit) {
+          recordDetailViewIfNeeded();
+          return fedHit;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Resolves a media asset request for `ol-media://` or `MediaHydrationEngine` across:
+   * 1. Content-addressed SQLite blob vault / `url_resolution_cache` / verified federated path
+   * 2. Zero-copy local first-party cache federation (Steam, GOG Galaxy, Heroic, Xbox)
+   * 3. Reference-counted `AbortSignal`-coalesced upstream fetch + async normalization + persist-on-read
+   *
+   * @param {Record<string, any> | string | URL} paramsInput
+   * @param {{ signal?: AbortSignal, backgroundHydration?: boolean, hydrationTier?: number, throwOnAbort?: boolean, localCacheOnly?: boolean }} [reqOpts]
+   */
+  async resolveMediaRequest(paramsInput = {}, reqOpts = {}) {
+    const params = this.parseMediaRequestParams(paramsInput);
 
     const gameId = String(params.gameId || '').trim();
     const role = String(params.role || 'cover').trim();
@@ -4686,6 +5282,7 @@ class OfflineVaultService {
     }
 
     const nowTs = this.now();
+    const normRawUrl = rawUrl ? normalizeAssetIdentityUrl(rawUrl) : '';
     const urlKey = buildAssetUrlKey(gameId, role, ordinal, rawUrl);
 
     let assetRow = db.prepare('SELECT * FROM game_media_assets WHERE url_key = ?').get(urlKey);
@@ -4697,28 +5294,116 @@ class OfflineVaultService {
         .get(rawUrl);
     }
 
-    // Track prior blob in case an upgraded URL fails strictly due to transient offline network loss
+    const assetSourceNorm =
+      assetRow && assetRow.source_url ? normalizeAssetIdentityUrl(assetRow.source_url) : '';
+    const isUrlMismatch = Boolean(
+      assetRow &&
+        assetRow.url_key === urlKey &&
+        normRawUrl &&
+        assetSourceNorm &&
+        assetSourceNorm !== normRawUrl
+    );
+    const onlineNow = this.isNetworkOnline();
+
+    // Look up `url_resolution_cache` for the requested normalized URL (fast secondary hits & 404 backoff)
+    const urlCacheRow = normRawUrl
+      ? db
+          .prepare(
+            'SELECT blob_sha256, failure_count, next_retry_at, last_status_code FROM url_resolution_cache WHERE norm_url = ?'
+          )
+          .get(normRawUrl)
+      : null;
+
+    // Track prior blob in case an upgraded URL fails due to offline/network loss
     let offlineFallbackBlobSha = null;
     let offlineFallbackPrevSourceUrl = '';
+    let skipTier1ForOnlineBlobUpgrade = false;
 
-    // When asset identity changes (e.g., upgrading Microsoft Store cover -> Steam 2x portrait cover
-    // or SHA1 hashed asset path), unpin stale cached blob when online so the upgraded image is fetched,
-    // while keeping Steam CDN mirror aliases and offline safety intact!
-    if (
-      assetRow &&
-      assetRow.url_key === urlKey &&
-      rawUrl &&
-      assetRow.source_url &&
-      assetRow.source_url !== rawUrl &&
-      normalizeAssetIdentityUrl(assetRow.source_url) !== normalizeAssetIdentityUrl(rawUrl)
-    ) {
-      const onlineNow = this.isNetworkOnline();
+    if (isUrlMismatch && assetRow) {
       if (assetRow.storage_kind === 'blob' && assetRow.blob_sha256) {
         offlineFallbackBlobSha = String(assetRow.blob_sha256);
         offlineFallbackPrevSourceUrl = String(assetRow.source_url);
-      }
 
-      if (assetRow.storage_kind === 'pending' || onlineNow) {
+        // 1. Check `url_resolution_cache` for `normRawUrl` first:
+        //    - Live disk blob -> serve in `< 1ms` and rebind `game_media_assets`
+        //    - Active 404 backoff -> fast-fail `404` in `< 0.1ms` WITHOUT unpinning healthy blob!
+        if (urlCacheRow && urlCacheRow.blob_sha256) {
+          const cachedHit = await this.tryResolveBlobBySha(
+            String(urlCacheRow.blob_sha256),
+            'public, max-age=31536000, immutable'
+          );
+          if (cachedHit) {
+            this.bindAssetBlobRow(
+              urlKey,
+              gameId,
+              role,
+              ordinal,
+              rawUrl,
+              String(urlCacheRow.blob_sha256)
+            );
+            return cachedHit;
+          }
+          db.prepare(
+            'UPDATE url_resolution_cache SET blob_sha256 = NULL WHERE norm_url = ?'
+          ).run(normRawUrl);
+        } else if (
+          onlineNow &&
+          reqOpts.localCacheOnly !== true &&
+          urlCacheRow &&
+          !urlCacheRow.blob_sha256 &&
+          Number(urlCacheRow.next_retry_at || 0) > nowTs
+        ) {
+          return {
+            kind: 'error',
+            status: 404,
+            reason: 'adaptive_404_cooldown',
+            nextRetryAt: Number(urlCacheRow.next_retry_at),
+          };
+        }
+
+        // 2. When online (and not `localCacheOnly`), proceed to Tier 2/3 WITHOUT wiping
+        //    `assetRow` to `pending` beforehand! Only `bindAssetBlobRow()` on HTTP 200 OK swaps it.
+        if (onlineNow && reqOpts.localCacheOnly !== true) {
+          skipTier1ForOnlineBlobUpgrade = true;
+        }
+      } else if (assetRow.storage_kind === 'pending') {
+        // Preserve instant 0s reset when `storage_kind === 'pending'` and `source_url` changes
+        db.prepare(
+          `
+          UPDATE game_media_assets
+          SET source_url = ?,
+              storage_kind = 'pending',
+              blob_sha256 = NULL,
+              federated_path = NULL,
+              failure_count = 0,
+              next_retry_at = 0,
+              last_status_code = NULL,
+              last_verified_at = ?
+          WHERE url_key = ?
+        `
+        ).run(rawUrl, nowTs, urlKey);
+        assetRow = db.prepare('SELECT * FROM game_media_assets WHERE url_key = ?').get(urlKey);
+      } else if (assetRow.storage_kind === 'federated' && onlineNow && reqOpts.localCacheOnly !== true) {
+        if (urlCacheRow && urlCacheRow.blob_sha256) {
+          const cachedHit = await this.tryResolveBlobBySha(
+            String(urlCacheRow.blob_sha256),
+            'public, max-age=31536000, immutable'
+          );
+          if (cachedHit) {
+            this.bindAssetBlobRow(
+              urlKey,
+              gameId,
+              role,
+              ordinal,
+              rawUrl,
+              String(urlCacheRow.blob_sha256)
+            );
+            return cachedHit;
+          }
+          db.prepare(
+            'UPDATE url_resolution_cache SET blob_sha256 = NULL WHERE norm_url = ?'
+          ).run(normRawUrl);
+        }
         db.prepare(
           `
           UPDATE game_media_assets
@@ -4738,79 +5423,64 @@ class OfflineVaultService {
     }
 
     // Tier 1A: Existing content-addressed blob hit (async stat — zero main-thread blocking)
-    if (assetRow && assetRow.storage_kind === 'blob' && assetRow.blob_sha256) {
-      const mb = db
-        .prepare('SELECT sha256, ext, mime_type, size_bytes FROM media_blobs WHERE sha256 = ?')
-        .get(assetRow.blob_sha256);
-      if (mb) {
-        const blobPath = this.getBlobFilePath(mb.sha256, mb.ext);
-        if (isContainedWithinRoot(this.blobsDir, blobPath, this.options.platform)) {
-          let blobStat = null;
-          try {
-            blobStat = await fs.promises.stat(blobPath);
-          } catch {}
-          if (blobStat && blobStat.isFile() && blobStat.size > 0) {
-            this.touchBlobAccess(mb.sha256);
-            return {
-              kind: 'file',
-              filePath: blobPath,
-              mimeType: mb.mime_type,
-              sizeBytes: Number(mb.size_bytes || blobStat.size || 0),
-              cacheControl: 'public, max-age=31536000, immutable',
-              source: 'vault_blob',
-            };
-          }
-        }
+    if (!skipTier1ForOnlineBlobUpgrade && assetRow && assetRow.storage_kind === 'blob' && assetRow.blob_sha256) {
+      const blobHit = await this.tryResolveBlobBySha(
+        String(assetRow.blob_sha256),
+        isUrlMismatch ? 'public, max-age=3600' : 'public, max-age=31536000, immutable'
+      );
+      if (blobHit) {
+        return blobHit;
       }
       // Self-heal missing blob file
       db.prepare(
         "UPDATE game_media_assets SET storage_kind = 'pending', blob_sha256 = NULL WHERE url_key = ?"
       ).run(assetRow.url_key);
+      if (normRawUrl && !isUrlMismatch) {
+        db.prepare(
+          'UPDATE url_resolution_cache SET blob_sha256 = NULL WHERE norm_url = ?'
+        ).run(normRawUrl);
+      }
+    }
+
+    // Tier 1A secondary hit: `url_resolution_cache` when `assetRow` is missing or `pending`
+    if (
+      !skipTier1ForOnlineBlobUpgrade &&
+      normRawUrl &&
+      urlCacheRow &&
+      urlCacheRow.blob_sha256 &&
+      (!assetRow || assetRow.storage_kind === 'pending')
+    ) {
+      const cachedHit = await this.tryResolveBlobBySha(
+        String(urlCacheRow.blob_sha256),
+        'public, max-age=31536000, immutable'
+      );
+      if (cachedHit) {
+        this.bindAssetBlobRow(
+          urlKey,
+          gameId,
+          role,
+          ordinal,
+          rawUrl,
+          String(urlCacheRow.blob_sha256)
+        );
+        return cachedHit;
+      }
+      db.prepare(
+        'UPDATE url_resolution_cache SET blob_sha256 = NULL WHERE norm_url = ?'
+      ).run(normRawUrl);
     }
 
     // Tier 1B: Existing verified federated local file hit (async lstat + 16-byte header probe)
-    if (assetRow && assetRow.storage_kind === 'federated' && assetRow.federated_path) {
-      const federatedPath = String(assetRow.federated_path);
-      if (
-        isExplicitOverride ||
-        !isFederatedAssetRowCompatible(rawUrl || assetRow.source_url, federatedPath, params)
-      ) {
-        db.prepare(
-          "UPDATE game_media_assets SET storage_kind = 'pending', federated_path = NULL WHERE url_key = ?"
-        ).run(assetRow.url_key);
-      } else {
-        try {
-          const lst = await fs.promises.lstat(federatedPath);
-          if (!lst.isSymbolicLink() && lst.isFile() && lst.size >= 33) {
-            const header = Buffer.allocUnsafe(16);
-            header.fill(0);
-            const fh = await fs.promises.open(federatedPath, 'r');
-            let bytesRead = 0;
-            try {
-              const readRes = await fh.read(header, 0, 16, 0);
-              bytesRead = Number(readRes?.bytesRead || 0);
-            } finally {
-              try {
-                await fh.close();
-              } catch {}
-            }
-            const magic = detectImageMagicBytes(header.subarray(0, bytesRead));
-            if (magic.valid && magic.mimeType) {
-              return {
-                kind: 'file',
-                filePath: federatedPath,
-                mimeType: magic.mimeType,
-                sizeBytes: lst.size,
-                cacheControl: 'public, max-age=86400',
-                source: 'federated_local',
-              };
-            }
-          }
-        } catch {}
-        // Self-heal if local storefront cache file was deleted
-        db.prepare(
-          "UPDATE game_media_assets SET storage_kind = 'pending', federated_path = NULL WHERE url_key = ?"
-        ).run(assetRow.url_key);
+    if (!skipTier1ForOnlineBlobUpgrade && assetRow && assetRow.storage_kind === 'federated' && assetRow.federated_path) {
+      const fedHit = await this.tryResolveFederatedRow(
+        assetRow,
+        rawUrl,
+        params,
+        isExplicitOverride,
+        { selfHealMissing: true }
+      );
+      if (fedHit) {
+        return fedHit;
       }
     }
 
@@ -4953,13 +5623,26 @@ class OfflineVaultService {
       return { kind: 'error', status: 499, reason: 'aborted' };
     }
 
-    // Check Adaptive 404 Backoff before touching network
-    if (assetRow && assetRow.url_key === urlKey && Number(assetRow.next_retry_at || 0) > nowTs) {
+    // Check Adaptive 404 Backoff before touching network (slot-level & URL-level)
+    if (
+      assetRow &&
+      assetRow.url_key === urlKey &&
+      !skipTier1ForOnlineBlobUpgrade &&
+      Number(assetRow.next_retry_at || 0) > nowTs
+    ) {
       return {
         kind: 'error',
         status: 404,
         reason: 'adaptive_404_cooldown',
         nextRetryAt: Number(assetRow.next_retry_at),
+      };
+    }
+    if (urlCacheRow && !urlCacheRow.blob_sha256 && Number(urlCacheRow.next_retry_at || 0) > nowTs) {
+      return {
+        kind: 'error',
+        status: 404,
+        reason: 'adaptive_404_cooldown',
+        nextRetryAt: Number(urlCacheRow.next_retry_at),
       };
     }
 
