@@ -12,6 +12,13 @@ import {
 } from './epicCodenames';
 import { normalizeChainedHandoffId } from './catalogSanitizer';
 import { steamMatcher } from '../steam/steamMatcher';
+import { steamApi } from '../steam/steamApi';
+import { isKnownDeadSteamCover } from '../igdb/igdbCoverService';
+import {
+  reconcileCapsuleImage,
+  reconcileHeaderImage,
+  type ArtworkRecoveryContext,
+} from '../storage/metadataReconciliation';
 import { cacheUserEpicAchievements } from '../storage/knownGameAchievements';
 import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
 
@@ -559,7 +566,9 @@ export class EpicIntegrationService {
             continue;
           }
 
-          const tallCover = keyImages.find((img: EpicKeyImage) => img.type === 'DieselGameBoxTall')?.url;
+          const tallCover =
+            keyImages.find((img: EpicKeyImage) => img.type === 'DieselGameBoxTall')?.url ||
+            keyImages.find((img: EpicKeyImage) => img.type === 'OfferImageTall')?.url;
           const wideBanner = keyImages.find((img: EpicKeyImage) => img.type === 'DieselGameBox')?.url || tallCover;
           const appId = item.catalogItemId || item.appName;
 
@@ -600,13 +609,35 @@ export class EpicIntegrationService {
             ? codename.steamAppId
             : ((await steamMatcher.matchGameToSteam(title)) || undefined);
 
-          const headerImg = steamAppId
-            ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/header.jpg`
-            : (codename && codename.headerImage) || wideBanner || '';
+          const epicHeaderCandidate = (codename && codename.headerImage) || wideBanner || '';
+          const epicCapsuleCandidate = (codename && codename.capsuleImage) || tallCover || undefined;
+          const browseAssets = steamAppId ? steamApi.peekCachedBrowseAssets(steamAppId) : null;
+          const steamHeaderCandidate = steamAppId
+            ? browseAssets?.headerImage ||
+              `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/header.jpg`
+            : undefined;
+          const steamCapsuleCandidate = steamAppId
+            ? browseAssets?.capsuleImage ||
+              (!isKnownDeadSteamCover(steamAppId)
+                ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`
+                : undefined)
+            : undefined;
 
-          const capsuleImg = steamAppId
-            ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`
-            : (codename && codename.capsuleImage) || tallCover || wideBanner || '';
+          const artworkCtx: ArtworkRecoveryContext = {
+            gameId: steamAppId ? `steam-${steamAppId}` : `epic-${appId}`,
+            title,
+            steamAppId,
+          };
+          const headerImg =
+            reconcileHeaderImage(epicHeaderCandidate, steamHeaderCandidate, artworkCtx) ||
+            epicHeaderCandidate ||
+            steamHeaderCandidate ||
+            '';
+          const capsuleImg =
+            reconcileCapsuleImage(epicCapsuleCandidate, steamCapsuleCandidate, {
+              ...artworkCtx,
+              headerUrl: headerImg,
+            }) || '';
 
           const iconImg = (codename && codename.iconUrl) ? codename.iconUrl : undefined;
 

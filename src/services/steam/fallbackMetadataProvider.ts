@@ -18,6 +18,7 @@ import {
   updateRoutedMetadataSnapshot,
 } from '../storage/userOverrideStorage';
 import { getSteamCategoryIconUrl } from './steamApi';
+import { reconcileCapsuleImage } from '../storage/metadataReconciliation';
 import {
   isSequelMismatch,
   normalizeTitleKey,
@@ -1997,14 +1998,28 @@ export class FallbackMetadataProvider {
     const preservedXboxHints =
       storeMetadata?.xboxDeliveryHints || game.enrichedMetadata?.xboxDeliveryHints;
 
+    const resolvedHeaderImage = ensureHttps(storeMetadata?.headerImage || game.headerImage);
+    const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
+    const reconciledCapsule = reconcileCapsuleImage(
+      game.capsuleImage,
+      storeMetadata?.capsuleImage,
+      {
+        gameId: game.id,
+        title: game.title,
+        steamAppId: game.steamAppId,
+        gogId: gogPlat?.platformGameId,
+        headerUrl: resolvedHeaderImage,
+      }
+    );
+
     return {
       appId: storeMetadata?.appId ?? 0,
       name: storeMetadata?.name || game.title,
       shortDescription,
       detailedDescription,
       aboutTheGame: storeMetadata?.aboutTheGame || detailedDescription,
-      headerImage: ensureHttps(storeMetadata?.headerImage || game.headerImage),
-      capsuleImage: ensureHttps(storeMetadata?.capsuleImage || game.capsuleImage || storeMetadata?.headerImage || game.headerImage),
+      headerImage: resolvedHeaderImage,
+      capsuleImage: reconciledCapsule ? ensureHttps(reconciledCapsule) : undefined,
       iconUrl: ensureHttps(storeMetadata?.iconUrl || game.iconUrl || ''),
       developers: devs,
       publishers: pubs,

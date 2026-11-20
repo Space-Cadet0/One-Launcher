@@ -2,14 +2,14 @@ import { CanonicalGame } from '../../contracts/game';
 import { FULL_USER_STEAM_GAMES } from './fullUserSteamGames';
 import { USER_SCANNED_STEAM_GAMES } from './userScannedLibrary';
 import { reconcileAchievementSummaries } from './achievementReconciliation';
-import { isUnsuitableCoverUrl, isUnsuitableHeaderUrl } from '../igdb/igdbCoverService';
+import { isUnsuitableHeaderUrl } from '../igdb/igdbCoverService';
 import {
-  isMicrosoftStoreCdnUrl,
-  isSteamCdnAssetUrl,
-  sanitizeStoreReleaseDate,
-} from '../common/titleUtils';
+  reconcileCapsuleImage,
+  reconcileHeaderImage,
+  type ArtworkRecoveryContext,
+} from './metadataReconciliation';
+import { sanitizeStoreReleaseDate } from '../common/titleUtils';
 
-const STEAM_HASHED_ASSET_RE = /\/apps\/\d+\/[a-f0-9]{40}\//i;
 const RICH_MEDIA_HTML_RE = /<(?:video|img)\b/i;
 
 export function getEnrichedMetadataQualityRank(
@@ -196,68 +196,18 @@ export function pickBestEnrichedMetadata(
 
 export function pickPreferredCapsuleImage(
   existingUrl?: string,
-  incomingUrl?: string
+  incomingUrl?: string,
+  ctx?: ArtworkRecoveryContext
 ): string | undefined {
-  const validExisting =
-    existingUrl && !isUnsuitableCoverUrl(existingUrl) ? existingUrl : undefined;
-  const validIncoming =
-    incomingUrl && !isUnsuitableCoverUrl(incomingUrl) ? incomingUrl : undefined;
-
-  if (!validExisting) return validIncoming;
-  if (!validIncoming) return validExisting;
-
-  const existingIsSteam = isSteamCdnAssetUrl(validExisting);
-  const incomingIsSteam = isSteamCdnAssetUrl(validIncoming);
-  const existingIsMs = isMicrosoftStoreCdnUrl(validExisting);
-  const incomingIsMs = isMicrosoftStoreCdnUrl(validIncoming);
-
-  // Authoritative Steam CDN covers always beat MS Store covers (both protecting against clobber and allowing upgrade)
-  if (existingIsSteam && incomingIsMs) return validExisting;
-  if (incomingIsSteam && existingIsMs) return validIncoming;
-
-  // Prefer 40-char SHA1-hashed Steam browse assets over unhashed legacy URLs
-  if (
-    existingIsSteam &&
-    incomingIsSteam &&
-    !STEAM_HASHED_ASSET_RE.test(validExisting) &&
-    STEAM_HASHED_ASSET_RE.test(validIncoming)
-  ) {
-    return validIncoming;
-  }
-
-  return validExisting;
+  return reconcileCapsuleImage(existingUrl, incomingUrl, ctx);
 }
 
 export function pickPreferredHeaderImage(
   existingUrl?: string,
-  incomingUrl?: string
+  incomingUrl?: string,
+  ctx?: ArtworkRecoveryContext
 ): string | undefined {
-  const validExisting =
-    existingUrl && !isUnsuitableHeaderUrl(existingUrl) ? existingUrl : undefined;
-  const validIncoming =
-    incomingUrl && !isUnsuitableHeaderUrl(incomingUrl) ? incomingUrl : undefined;
-
-  if (!validExisting) return validIncoming;
-  if (!validIncoming) return validExisting;
-
-  const existingIsSteam = isSteamCdnAssetUrl(validExisting);
-  const incomingIsSteam = isSteamCdnAssetUrl(validIncoming);
-  const existingIsMs = isMicrosoftStoreCdnUrl(validExisting);
-  const incomingIsMs = isMicrosoftStoreCdnUrl(validIncoming);
-
-  if (existingIsSteam && incomingIsMs) return validExisting;
-  if (incomingIsSteam && existingIsMs) return validIncoming;
-
-  if (
-    existingIsSteam &&
-    incomingIsSteam &&
-    !STEAM_HASHED_ASSET_RE.test(validExisting) &&
-    STEAM_HASHED_ASSET_RE.test(validIncoming)
-  ) {
-    return validIncoming;
-  }
-
-  return validExisting;
+  return reconcileHeaderImage(existingUrl, incomingUrl, ctx);
 }
 
 export function pickPreferredDetailedDescription(
@@ -335,12 +285,28 @@ export function mergeScannedSteamGames(existingGames: CanonicalGame[]): Canonica
         updatedPlatforms.push(scannedSteam);
       }
 
+      const gogPlat = updatedPlatforms.find((p) => p.platformId === 'gog');
+      const artworkCtx: ArtworkRecoveryContext = {
+        gameId: existing.id,
+        title: existing.title,
+        steamAppId: existing.steamAppId || scanned.steamAppId,
+        gogId: gogPlat?.platformGameId,
+      };
+      const mergedHeader =
+        pickPreferredHeaderImage(existing.headerImage, scanned.headerImage, artworkCtx) ||
+        existing.headerImage ||
+        scanned.headerImage;
+      const mergedCapsule = pickPreferredCapsuleImage(existing.capsuleImage, scanned.capsuleImage, {
+        ...artworkCtx,
+        headerUrl: mergedHeader,
+      });
+
       merged[existingIndex] = {
         ...existing,
         steamAppId: existing.steamAppId || scanned.steamAppId,
         platforms: updatedPlatforms,
-        headerImage: pickPreferredHeaderImage(existing.headerImage, scanned.headerImage) || existing.headerImage || scanned.headerImage,
-        capsuleImage: pickPreferredCapsuleImage(existing.capsuleImage, scanned.capsuleImage),
+        headerImage: mergedHeader,
+        capsuleImage: mergedCapsule,
         iconUrl: !isUnsuitableHeaderUrl(existing.iconUrl) ? existing.iconUrl : (scanned.iconUrl || scanned.capsuleImage || scanned.headerImage),
         shortDescription: existing.shortDescription || scanned.shortDescription,
         detailedDescription: pickPreferredDetailedDescription(

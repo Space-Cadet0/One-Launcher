@@ -569,9 +569,122 @@ export async function whenStagedCacheHydrated(timeoutMs: number = 3000): Promise
   }
 }
 
+const STAGED_VAULT_DB_NAME = 'one-launcher-db';
+const STAGED_VAULT_STORE_NAME = 'kv';
+const STAGED_VAULT_KEY_PREFIX = 'staged:';
+const STAGED_VAULT_READ_CHUNK_SIZE = 64;
+
+function wrapIdbRequest<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error('IndexedDB request failed'));
+  });
+}
+
+/**
+ * Reads ONLY `'staged:*'` entries directly via `store.getAllKeys(range)` + chunked `store.get(key)`,
+ * avoiding `vaultEntries()`'s full-store `getAll()` which would deserialize the ~19 MB
+ * `idb_universal_game_library_catalog_v2` snapshot during cold boot.
+ *
+ * Returns `null` when native `indexedDB.open` / `getAllKeys` is unavailable (e.g. minimal test mocks),
+ * signaling callers to fall back to `vaultEntries()`.
+ */
+async function readStagedEntriesViaKeyFilteredIdb(): Promise<Array<[string, unknown]> | null> {
+  if (typeof indexedDB === 'undefined' || indexedDB === null || typeof indexedDB.open !== 'function') {
+    return null;
+  }
+
+  let db: IDBDatabase | null = null;
+  try {
+    db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const openReq = indexedDB.open(STAGED_VAULT_DB_NAME);
+      openReq.onupgradeneeded = () => {
+        const upgradeDb = openReq.result;
+        if (
+          upgradeDb &&
+          upgradeDb.objectStoreNames &&
+          !upgradeDb.objectStoreNames.contains(STAGED_VAULT_STORE_NAME)
+        ) {
+          upgradeDb.createObjectStore(STAGED_VAULT_STORE_NAME);
+        }
+      };
+      openReq.onsuccess = () => resolve(openReq.result);
+      openReq.onerror = () => reject(openReq.error ?? new Error('Failed to open IndexedDB vault'));
+    });
+
+    if (!db || !db.objectStoreNames || !db.objectStoreNames.contains(STAGED_VAULT_STORE_NAME)) {
+      return [];
+    }
+
+    const keysTx = db.transaction(STAGED_VAULT_STORE_NAME, 'readonly');
+    const keysStore = keysTx.objectStore(STAGED_VAULT_STORE_NAME);
+    if (typeof keysStore.getAllKeys !== 'function') {
+      return null;
+    }
+
+    let rawKeys: IDBValidKey[];
+    if (typeof IDBKeyRange !== 'undefined' && typeof IDBKeyRange.bound === 'function') {
+      try {
+        const prefixRange = IDBKeyRange.bound(
+          STAGED_VAULT_KEY_PREFIX,
+          `${STAGED_VAULT_KEY_PREFIX}\uffff`,
+          false,
+          true
+        );
+        rawKeys = await wrapIdbRequest(keysStore.getAllKeys(prefixRange));
+      } catch {
+        rawKeys = await wrapIdbRequest(keysStore.getAllKeys());
+      }
+    } else {
+      rawKeys = await wrapIdbRequest(keysStore.getAllKeys());
+    }
+
+    const stagedKeys = Array.isArray(rawKeys)
+      ? rawKeys.filter(
+          (k): k is string => typeof k === 'string' && k.startsWith(STAGED_VAULT_KEY_PREFIX)
+        )
+      : [];
+
+    if (stagedKeys.length === 0) {
+      return [];
+    }
+
+    const results: Array<[string, unknown]> = [];
+    for (let offset = 0; offset < stagedKeys.length; offset += STAGED_VAULT_READ_CHUNK_SIZE) {
+      const chunk = stagedKeys.slice(offset, offset + STAGED_VAULT_READ_CHUNK_SIZE);
+      const readTx = db.transaction(STAGED_VAULT_STORE_NAME, 'readonly');
+      const readStore = readTx.objectStore(STAGED_VAULT_STORE_NAME);
+      const chunkPairs = await Promise.all(
+        chunk.map(async (key): Promise<[string, unknown] | null> => {
+          try {
+            const val = await wrapIdbRequest(readStore.get(key));
+            return val !== undefined ? [key, val] : null;
+          } catch {
+            return null;
+          }
+        })
+      );
+      for (const pair of chunkPairs) {
+        if (pair) results.push(pair);
+      }
+    }
+
+    return results;
+  } catch {
+    return null;
+  } finally {
+    if (db && typeof db.close === 'function') {
+      try {
+        db.close();
+      } catch {}
+    }
+  }
+}
+
 /**
  * Bulk-hydrates all `'staged:*'` entries from IndexedDB vault into the bounded in-memory cache
- * in a single cursor read so oversized (> 2KB) payloads achieve 100% full-detail hit rates after reload.
+ * using prefix-filtered key enumeration (`getAllKeys`) + chunked point reads (`get`) so non-staged
+ * megabyte snapshots (such as the main game catalog) are never deserialized during hydration.
  * Safe and non-throwing in headless/test environments without IndexedDB.
  */
 export async function hydrateAllStagedCacheFromVault(): Promise<number> {
@@ -585,15 +698,17 @@ export async function hydrateAllStagedCacheFromVault(): Promise<number> {
 
   inFlightBulkVaultHydration = (async (): Promise<number> => {
     try {
-      const allEntries = await vaultEntries<IDBValidKey, unknown>();
+      const filteredEntries = await readStagedEntriesViaKeyFilteredIdb();
+      const allEntries: Array<[IDBValidKey, unknown]> =
+        filteredEntries !== null ? filteredEntries : await vaultEntries<IDBValidKey, unknown>();
       if (!Array.isArray(allEntries) || allEntries.length === 0) return 0;
       const now = Date.now();
       let hydratedCount = 0;
       for (const pair of allEntries) {
         if (!Array.isArray(pair) || pair.length < 2) continue;
         const [rawKey, rawVal] = pair;
-        if (typeof rawKey !== 'string' || !rawKey.startsWith('staged:')) continue;
-        const cacheKey = rawKey.slice('staged:'.length);
+        if (typeof rawKey !== 'string' || !rawKey.startsWith(STAGED_VAULT_KEY_PREFIX)) continue;
+        const cacheKey = rawKey.slice(STAGED_VAULT_KEY_PREFIX.length);
         if (!cacheKey || !rawVal || typeof rawVal !== 'object' || Array.isArray(rawVal)) continue;
 
         const entry = rawVal as StagedCacheEntry<unknown>;

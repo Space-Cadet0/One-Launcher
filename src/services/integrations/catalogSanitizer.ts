@@ -11,11 +11,14 @@ import {
 } from '../common/titleUtils';
 import {
   pickBestEnrichedMetadata,
-  pickPreferredCapsuleImage,
   pickPreferredDetailedDescription,
-  pickPreferredHeaderImage,
   pickPreferredReleaseDate,
 } from '../storage/librarySync';
+import {
+  reconcileCapsuleImage,
+  reconcileHeaderImage,
+  type ArtworkRecoveryContext,
+} from '../storage/metadataReconciliation';
 import {
   hasStructuralEpicCodenameTraits,
   KNOWN_EPIC_APP_NAMES,
@@ -26,10 +29,10 @@ import { EPIC_USER_LIBRARY } from '../storage/epicUserLibrary';
 import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
 import {
   igdbCoverService,
+  isGogCroppedHorizontalCover,
   isKnownDeadSteamCover,
   isUnsuitableCoverUrl,
   isUnsuitableHeaderUrl,
-  KNOWN_IGDB_COVERS,
 } from '../igdb/igdbCoverService';
 import { steamMatcher } from '../steam/steamMatcher';
 import steamBlurbCache from '../storage/steamBlurbCache.json';
@@ -1223,8 +1226,12 @@ for (const g of FULL_USER_STEAM_GAMES) {
   validSteamTitles.add(normalizeCanonicalTitle(g.title));
 }
 // Eagerly warm static Steam matcher and browse-asset caches at module load so first catalog pass never pays cold index cost
-steamMatcher.peekCachedMatch('__warmup__');
-steamApi.peekCachedBrowseAssets(1);
+if (steamMatcher && typeof steamMatcher.peekCachedMatch === 'function') {
+  steamMatcher.peekCachedMatch('__warmup__');
+}
+if (steamApi && typeof steamApi.peekCachedBrowseAssets === 'function') {
+  steamApi.peekCachedBrowseAssets(1);
+}
 
 /**
  * Blacklist of non-game SDK test AppIDs (e.g. Spacewar 480).
@@ -2620,10 +2627,14 @@ export function sanitizeGameCatalog(
       rawGame.title;
 
     const hadRawPlatforms = Array.isArray(rawGame.platforms) && rawGame.platforms.length > 0;
+    let platformsMutated = !Array.isArray(rawGame.platforms);
     const sanitizedPlatforms: GamePlatformOwnership[] = [];
     if (Array.isArray(rawGame.platforms)) {
       for (const p of rawGame.platforms) {
-        if (!p || typeof p !== 'object') continue;
+        if (!p || typeof p !== 'object') {
+          platformsMutated = true;
+          continue;
+        }
         const isPhysicallyInstalled = Boolean(
           p.installed ||
             (typeof p.installPath === 'string' && p.installPath.trim().length > 0) ||
@@ -2635,27 +2646,40 @@ export function sanitizeGameCatalog(
           p.ownershipType === 'subscription' &&
           p.subscriptionExpired === true
         ) {
+          platformsMutated = true;
           continue;
         }
-        const workingP: GamePlatformOwnership = {
-          ...p,
-          originalTitle: p.originalTitle || rawSourceTitle,
-        };
-        if (!isPhysicallyInstalled && workingP.version !== undefined) {
-          delete workingP.version;
+        const needsOriginalTitle = !p.originalTitle && Boolean(rawSourceTitle);
+        const needsStripVersion = !isPhysicallyInstalled && p.version !== undefined;
+        let workingP: GamePlatformOwnership = p;
+        if (needsOriginalTitle || needsStripVersion) {
+          workingP = {
+            ...p,
+            originalTitle: p.originalTitle || rawSourceTitle,
+          };
+          if (needsStripVersion) {
+            delete workingP.version;
+          }
         }
-        sanitizedPlatforms.push(sanitizePlatformOwnershipOsFlags(workingP));
+        const osSanitizedP = sanitizePlatformOwnershipOsFlags(workingP);
+        if (osSanitizedP !== p) {
+          platformsMutated = true;
+        }
+        sanitizedPlatforms.push(osSanitizedP);
       }
     }
     if (hadRawPlatforms && sanitizedPlatforms.length === 0) {
       continue;
     }
 
-    let game: CanonicalGame = {
-      ...rawGame,
-      originalStoreTitle: rawSourceTitle,
-      platforms: sanitizedPlatforms,
-    };
+    let game: CanonicalGame =
+      rawGame.originalStoreTitle === rawSourceTitle && !platformsMutated
+        ? rawGame
+        : {
+            ...rawGame,
+            originalStoreTitle: rawSourceTitle,
+            platforms: platformsMutated ? sanitizedPlatforms : rawGame.platforms,
+          };
 
     if (
       game.worksOn &&
@@ -2784,18 +2808,35 @@ export function sanitizeGameCatalog(
 
     if (epicMapping) {
       const steamId = epicMapping.steamAppId;
+      const epicArtCtx: ArtworkRecoveryContext = {
+        gameId: steamId ? `steam-${steamId}` : game.id,
+        title: epicMapping.title,
+        steamAppId: steamId || game.steamAppId,
+      };
+      const nextHeader = steamId
+        ? reconcileHeaderImage(
+            game.headerImage,
+            `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamId}/header.jpg`,
+            epicArtCtx
+          ) || game.headerImage
+        : game.headerImage;
+      const nextCapsule = steamId
+        ? reconcileCapsuleImage(
+            game.capsuleImage,
+            !isKnownDeadSteamCover(steamId)
+              ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamId}/library_600x900_2x.jpg`
+              : undefined,
+            { ...epicArtCtx, headerUrl: nextHeader }
+          )
+        : game.capsuleImage;
       game = {
         ...game,
         id: steamId ? `steam-${steamId}` : game.id,
         title: epicMapping.title,
         sortTitle: epicMapping.title.replace(/^(The|A|An)\s+/i, ''),
         steamAppId: steamId || game.steamAppId,
-        headerImage: steamId
-          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamId}/header.jpg`
-          : game.headerImage,
-        capsuleImage: steamId
-          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamId}/library_600x900_2x.jpg`
-          : game.capsuleImage,
+        headerImage: nextHeader,
+        capsuleImage: nextCapsule,
         shortDescription: epicMapping.description || game.shortDescription,
         developers: epicMapping.developer ? [epicMapping.developer] : game.developers,
       };
@@ -2882,8 +2923,8 @@ export function sanitizeGameCatalog(
           validGogTitles.has(normalizeCanonicalTitle(rawGame.title)) ||
           getIsRestoredNonGame());
 
-      if (isVerifiedGogDynamic && !isMockOrUnownedGog) {
-        game.isVerifiedEntitlement = true;
+      if (isVerifiedGogDynamic && !isMockOrUnownedGog && !game.isVerifiedEntitlement) {
+        game = { ...game, isVerifiedEntitlement: true };
       }
 
       if (!isRealGogGame) {
@@ -2943,8 +2984,8 @@ export function sanitizeGameCatalog(
           validEpicTitles.has(normalizeCanonicalTitle(rawGame.title)) ||
           getIsRestoredNonGame());
 
-      if (isVerifiedEpicDynamic && !isMockOrInvalidEpic) {
-        game.isVerifiedEntitlement = true;
+      if (isVerifiedEpicDynamic && !isMockOrInvalidEpic && !game.isVerifiedEntitlement) {
+        game = { ...game, isVerifiedEntitlement: true };
       }
 
       if (!isRealEpicGame) {
@@ -3012,8 +3053,8 @@ export function sanitizeGameCatalog(
           hasValidXboxIdentifier ||
           getIsRestoredNonGame());
 
-      if ((isVerifiedXboxDynamic || hasValidXboxIdentifier) && !isMockOrInvalidXbox) {
-        game.isVerifiedEntitlement = true;
+      if ((isVerifiedXboxDynamic || hasValidXboxIdentifier) && !isMockOrInvalidXbox && !game.isVerifiedEntitlement) {
+        game = { ...game, isVerifiedEntitlement: true };
       }
 
       if (!isRealXboxGame) {
@@ -3082,8 +3123,8 @@ export function sanitizeGameCatalog(
         isRealSteamGame = true;
       }
 
-      if (isVerifiedSteamDynamic && isRealSteamGame) {
-        game.isVerifiedEntitlement = true;
+      if (isVerifiedSteamDynamic && isRealSteamGame && !game.isVerifiedEntitlement) {
+        game = { ...game, isVerifiedEntitlement: true };
       }
 
       if (isUnownedPromo || !isRealSteamGame) {
@@ -3271,7 +3312,9 @@ export function sanitizeGameCatalog(
           ? extractFirstParagraph(game.shortDescription) ||
             sanitizeShortDescriptionText(game.shortDescription.replace(/<[^>]+>/g, ' '))
           : sanitizeShortDescriptionText(game.shortDescription);
-      game = { ...game, shortDescription: cleanedShort };
+      if (cleanedShort !== game.shortDescription) {
+        game = { ...game, shortDescription: cleanedShort };
+      }
     }
 
     if ((!game.developers || game.developers.length === 0) && game.enrichedMetadata?.developers?.length) {
@@ -3402,50 +3445,60 @@ export function sanitizeGameCatalog(
       }
     }
 
-    // Systemic resolution of GOG official vertical covers from verified enriched cache
+    // Systemic resolution of GOG official vertical covers from verified enriched cache AND runtime GOG boxArt cache
     const gogPlat = game.platforms.find((p) => p.platformId === 'gog');
     if (!userOverride?.capsuleImage && gogPlat && gogPlat.platformGameId) {
       const enrichedGog = (gogEnrichedCache as Record<string, GogEnrichedCacheItem>)[
         gogPlat.platformGameId
       ];
-      if (enrichedGog?.coverVertical) {
-        const hHash = enrichedGog.coverHorizontal ? enrichedGog.coverHorizontal.match(/\/([a-f0-9]{64})/i)?.[1] : null;
+      const hHash = enrichedGog?.coverHorizontal
+        ? enrichedGog.coverHorizontal.match(/\/([a-f0-9]{64})/i)?.[1]
+        : null;
+      const needsVerticalCover =
+        !game.capsuleImage ||
+        (hHash && game.capsuleImage.includes(hHash)) ||
+        game.capsuleImage.includes('_glx_vertical_cover') ||
+        isUnsuitableCoverUrl(game.capsuleImage) ||
+        isGogCroppedHorizontalCover(game.capsuleImage, game.headerImage);
+      if (needsVerticalCover) {
+        const gogVerticalCover =
+          (enrichedGog?.coverVertical && !isUnsuitableCoverUrl(enrichedGog.coverVertical)
+            ? enrichedGog.coverVertical
+            : null) ||
+          igdbCoverService.getGogVerticalCoverInstant(gogPlat.platformGameId, game.title);
         if (
-          !game.capsuleImage ||
-          (hHash && game.capsuleImage.includes(hHash)) ||
-          game.capsuleImage.includes('_glx_vertical_cover') ||
-          isUnsuitableCoverUrl(game.capsuleImage)
+          gogVerticalCover &&
+          !isUnsuitableCoverUrl(gogVerticalCover) &&
+          !isGogCroppedHorizontalCover(gogVerticalCover, game.headerImage) &&
+          gogVerticalCover !== game.capsuleImage
         ) {
           game = {
             ...game,
-            capsuleImage: enrichedGog.coverVertical,
-            iconUrl: game.iconUrl || enrichedGog.coverVertical,
+            capsuleImage: gogVerticalCover,
+            iconUrl: game.iconUrl || gogVerticalCover,
           };
         }
       }
     }
 
-    // Attach verified IGDB portrait cover if game is curated in KNOWN_IGDB_COVERS, lacks vertical art, has unsuitable/cropped covers, or known dead Steam art
+    // Attach verified IGDB portrait cover ONLY when capsuleImage is missing or actually unsuitable/dead
+    // (never clobber valid GOG, Epic, or SHA1-hashed Steam covers just because an unhashed Steam URL is dead)
     if (!userOverride?.capsuleImage) {
-      const isCuratedIgdb = Boolean(
-        KNOWN_IGDB_COVERS[game.title.toLowerCase().trim()] ||
-          KNOWN_IGDB_COVERS[normTitle] ||
-          (game.id && KNOWN_IGDB_COVERS[game.id.toLowerCase().trim()])
-      );
       if (
-        isCuratedIgdb ||
         !game.capsuleImage ||
-        isKnownDeadSteamCover(game.steamAppId) ||
         isUnsuitableCoverUrl(game.capsuleImage) ||
-        game.capsuleImage.includes('231x87') ||
-        game.capsuleImage.includes('616x353')
+        isGogCroppedHorizontalCover(game.capsuleImage, game.headerImage)
       ) {
         const instantIgdbCover = igdbCoverService.getIgdbCoverInstant(
           game.title,
           game.steamAppId || matchedAppIdForBlurb || undefined,
           game.id
         );
-        if (instantIgdbCover) {
+        if (
+          instantIgdbCover &&
+          !isUnsuitableCoverUrl(instantIgdbCover) &&
+          instantIgdbCover !== game.capsuleImage
+        ) {
           game = {
             ...game,
             capsuleImage: instantIgdbCover,
@@ -3564,58 +3617,47 @@ export function sanitizeGameCatalog(
         }
       }
 
+      const primaryOv = hasUserOverrides
+        ? getUserOverrideForGame(primary, userOverrides)
+        : undefined;
+      const secondaryOv = hasUserOverrides
+        ? getUserOverrideForGame(secondary, userOverrides)
+        : undefined;
+      const pinnedOvCover =
+        primaryOv?.capsuleImage?.trim() || secondaryOv?.capsuleImage?.trim();
+      const pinnedOvHeader =
+        primaryOv?.headerImage?.trim() || secondaryOv?.headerImage?.trim();
+      const mergedGogPlat = mergedPlatforms.find((p) => p.platformId === 'gog');
+      const mergedSteamAppId = primary.steamAppId || secondary.steamAppId;
+      const mergeArtCtx: ArtworkRecoveryContext = {
+        gameId: primary.id || secondary.id,
+        title: primary.title,
+        steamAppId: mergedSteamAppId,
+        gogId: mergedGogPlat?.platformGameId,
+        userOverrideCapsule: pinnedOvCover,
+        userOverrideHeader: pinnedOvHeader,
+      };
+      const mergedHeader =
+        reconcileHeaderImage(primary.headerImage, secondary.headerImage, mergeArtCtx) ||
+        primary.headerImage ||
+        secondary.headerImage;
+      const mergedCapsule = reconcileCapsuleImage(
+        primary.capsuleImage,
+        secondary.capsuleImage,
+        { ...mergeArtCtx, headerUrl: mergedHeader }
+      );
+
       cleaned[existingIndex] = {
         ...primary,
-        steamAppId: primary.steamAppId || secondary.steamAppId,
+        steamAppId: mergedSteamAppId,
         id: primary.steamAppId
           ? `steam-${primary.steamAppId}`
           : secondary.steamAppId
           ? `steam-${secondary.steamAppId}`
           : primary.id,
         platforms: mergedPlatforms,
-        headerImage:
-          pickPreferredHeaderImage(primary.headerImage, secondary.headerImage) ||
-          primary.headerImage ||
-          secondary.headerImage,
-        capsuleImage: (() => {
-          const primaryOv = hasUserOverrides
-            ? getUserOverrideForGame(primary, userOverrides)
-            : undefined;
-          const secondaryOv = hasUserOverrides
-            ? getUserOverrideForGame(secondary, userOverrides)
-            : undefined;
-          const pinnedOvCover =
-            primaryOv?.capsuleImage?.trim() || secondaryOv?.capsuleImage?.trim();
-          if (pinnedOvCover) {
-            return pinnedOvCover;
-          }
-          if (
-            isKnownDeadSteamCover(primary.steamAppId) ||
-            isKnownDeadSteamCover(secondary.steamAppId) ||
-            isUnsuitableCoverUrl(primary.capsuleImage) ||
-            isUnsuitableCoverUrl(secondary.capsuleImage)
-          ) {
-            const igdb = igdbCoverService.getIgdbCoverInstant(
-              primary.title,
-              primary.steamAppId || secondary.steamAppId,
-              primary.id || secondary.id
-            );
-            if (igdb) {
-              return igdb;
-            }
-          }
-          if (
-            secondary.capsuleImage &&
-            (isKnownDeadSteamCover(primary.steamAppId) || isUnsuitableCoverUrl(primary.capsuleImage))
-          ) {
-            return secondary.capsuleImage;
-          }
-          return (
-            pickPreferredCapsuleImage(primary.capsuleImage, secondary.capsuleImage) ||
-            primary.capsuleImage ||
-            secondary.capsuleImage
-          );
-        })(),
+        headerImage: mergedHeader,
+        capsuleImage: mergedCapsule,
         iconUrl:
           secondary.iconUrl && isUnsuitableHeaderUrl(primary.iconUrl)
             ? secondary.iconUrl
@@ -3726,92 +3768,96 @@ export function sanitizeGameCatalog(
           }
 
           if (baseTarget) {
-            const restoredTitle = baseTarget.title
+            const isExistingTarget = baseTarget === existing;
+            const clonedTarget: CanonicalGame = { ...baseTarget };
+            const restoredTitle = clonedTarget.title
               .replace(/\s*[-–—:]?\s*\b(remastered|remaster|enhanced(?:\s+edition)?)\b/gi, '')
               .replace(/\s{2,}/g, ' ')
               .trim();
-            const collidingAppId = baseTarget.steamAppId;
-            baseTarget.title = restoredTitle;
-            baseTarget.sortTitle = restoredTitle.replace(/^(The|A|An)\s+/i, '');
-            baseTarget.steamAppId = undefined;
-            baseTarget.enrichedMetadata = undefined;
-            const primaryPlat = baseTarget.platforms?.[0];
+            const collidingAppId = clonedTarget.steamAppId;
+            clonedTarget.title = restoredTitle;
+            clonedTarget.sortTitle = restoredTitle.replace(/^(The|A|An)\s+/i, '');
+            clonedTarget.steamAppId = undefined;
+            clonedTarget.enrichedMetadata = undefined;
+            const primaryPlat = clonedTarget.platforms?.[0];
             if (primaryPlat?.platformId && primaryPlat?.platformGameId) {
-              baseTarget.id = `${primaryPlat.platformId}-${primaryPlat.platformGameId}`;
+              clonedTarget.id = `${primaryPlat.platformId}-${primaryPlat.platformGameId}`;
             }
             if (collidingAppId) {
               const appIdToken = `/steam/apps/${collidingAppId}/`;
-              if (baseTarget.headerImage?.includes(appIdToken)) baseTarget.headerImage = '';
-              if (baseTarget.capsuleImage?.includes(appIdToken)) baseTarget.capsuleImage = '';
-              if (baseTarget.iconUrl?.includes(appIdToken)) baseTarget.iconUrl = undefined;
+              if (clonedTarget.headerImage?.includes(appIdToken)) clonedTarget.headerImage = '';
+              if (clonedTarget.capsuleImage?.includes(appIdToken)) clonedTarget.capsuleImage = '';
+              if (clonedTarget.iconUrl?.includes(appIdToken)) clonedTarget.iconUrl = undefined;
               const igdbRestored = igdbCoverService.getIgdbCoverInstant(
                 restoredTitle,
                 undefined,
-                baseTarget.id
+                clonedTarget.id
               );
               if (igdbRestored) {
-                baseTarget.capsuleImage = igdbRestored;
-                baseTarget.iconUrl = baseTarget.iconUrl || igdbRestored;
+                clonedTarget.capsuleImage = igdbRestored;
+                clonedTarget.iconUrl = clonedTarget.iconUrl || igdbRestored;
               }
             }
-            if (baseTarget === existing) {
-              titleToIndex.set(normalizeCanonicalTitle(existing.title), candidateIndex);
+            if (isExistingTarget) {
+              cleaned[candidateIndex] = clonedTarget;
+              titleToIndex.set(normalizeCanonicalTitle(clonedTarget.title), candidateIndex);
               if (collidingAppId && steamIdToIndex.get(collidingAppId) === candidateIndex) {
                 steamIdToIndex.delete(collidingAppId);
               }
               if (prevExistingId && idToIndex.get(prevExistingId) === candidateIndex) {
                 idToIndex.delete(prevExistingId);
               }
-              if (existing.id) {
-                idToIndex.set(existing.id, candidateIndex);
+              if (clonedTarget.id) {
+                idToIndex.set(clonedTarget.id, candidateIndex);
               }
             } else {
+              game = clonedTarget;
               normTitle = normalizeCanonicalTitle(game.title);
             }
           }
         }
 
         // B. Disambiguate Shared steamAppId / id Between Same-Storefront Editions
+        const curExisting = cleaned[candidateIndex];
         if (
-          (existing.steamAppId && game.steamAppId && existing.steamAppId === game.steamAppId) ||
-          existing.id === game.id
+          (curExisting.steamAppId && game.steamAppId && curExisting.steamAppId === game.steamAppId) ||
+          curExisting.id === game.id
         ) {
-          const sharedAppId = existing.steamAppId || game.steamAppId;
-          const existingHasSteam = existing.platforms.some((p) => p.platformId === 'steam');
+          const sharedAppId = curExisting.steamAppId || game.steamAppId;
+          const existingHasSteam = curExisting.platforms.some((p) => p.platformId === 'steam');
           const gameHasSteam = game.platforms.some((p) => p.platformId === 'steam');
-          const existingHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(existing.title);
+          const existingHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(curExisting.title);
           const gameHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(game.title);
 
           if (existingOv && gameOv) {
             // Both colliding entries have explicit UserGameOverrides: preserve steamAppId, title, and artwork on BOTH,
             // disambiguating ONLY `id` on the secondary non-Steam entry if their IDs collide!
-            if (existing.id === game.id) {
-              const idDisambigTarget =
-                existingHasSteam && !gameHasSteam
-                  ? game
-                  : !existingHasSteam && gameHasSteam
-                    ? existing
-                    : game;
+            if (curExisting.id === game.id) {
+              const targetIsExisting = !existingHasSteam && gameHasSteam;
+              const idDisambigTarget = targetIsExisting ? curExisting : game;
               const plat = idDisambigTarget.platforms?.[0];
               if (plat?.platformId && plat?.platformGameId) {
                 const oldId = idDisambigTarget.id;
-                idDisambigTarget.id = `${plat.platformId}-${plat.platformGameId}`;
-                if (idDisambigTarget === existing) {
+                const nextId = `${plat.platformId}-${plat.platformGameId}`;
+                if (targetIsExisting) {
+                  cleaned[candidateIndex] = { ...curExisting, id: nextId };
                   if (oldId && idToIndex.get(oldId) === candidateIndex) {
                     idToIndex.delete(oldId);
                   }
-                  idToIndex.set(existing.id, candidateIndex);
+                  idToIndex.set(nextId, candidateIndex);
+                } else {
+                  game = { ...game, id: nextId };
                 }
               }
             }
           } else {
-            let targetToDemote: CanonicalGame = game;
+            let targetIsExisting = false;
             if (existingOv && !gameOv) {
-              targetToDemote = game;
+              targetIsExisting = false;
             } else if (gameOv && !existingOv) {
-              targetToDemote = existing;
+              targetIsExisting = true;
             } else if (existingHasSteam !== gameHasSteam) {
-              targetToDemote = existingHasSteam ? game : existing;
+              targetIsExisting = !existingHasSteam;
             } else if (existingHasEdition !== gameHasEdition) {
               const steamCachedName = sharedAppId
                 ? (steamEnrichedCache as Record<string, SteamEnrichedCacheItem>)[String(sharedAppId)]
@@ -3821,25 +3867,36 @@ export function sanitizeGameCatalog(
                 ? /\b(remastered|remaster|remake|enhanced)\b/i.test(steamCachedName)
                 : true;
               if (steamCacheHasEdition) {
-                targetToDemote = existingHasEdition ? game : existing;
+                targetIsExisting = !existingHasEdition;
               } else {
-                targetToDemote = existingHasEdition ? existing : game;
+                targetIsExisting = existingHasEdition;
               }
             }
 
+            const targetToDemote = targetIsExisting ? curExisting : game;
             const plat = targetToDemote.platforms?.[0];
             if (plat?.platformId && plat?.platformGameId) {
               const oldId = targetToDemote.id;
-              targetToDemote.id = `${plat.platformId}-${plat.platformGameId}`;
-              targetToDemote.steamAppId = undefined;
-              if (targetToDemote === existing) {
+              const nextId = `${plat.platformId}-${plat.platformGameId}`;
+              if (targetIsExisting) {
+                cleaned[candidateIndex] = {
+                  ...curExisting,
+                  id: nextId,
+                  steamAppId: undefined,
+                };
                 if (sharedAppId && steamIdToIndex.get(sharedAppId) === candidateIndex) {
                   steamIdToIndex.delete(sharedAppId);
                 }
                 if (oldId && idToIndex.get(oldId) === candidateIndex) {
                   idToIndex.delete(oldId);
                 }
-                idToIndex.set(existing.id, candidateIndex);
+                idToIndex.set(nextId, candidateIndex);
+              } else {
+                game = {
+                  ...game,
+                  id: nextId,
+                  steamAppId: undefined,
+                };
               }
             }
           }
@@ -3860,12 +3917,13 @@ export function sanitizeGameCatalog(
 
   // C. Final Strict Unique game.id & Same-Storefront Steam AppID Guarantee Pass
   const seenIds = new Set<string>();
-  const seenSteamAppIds = new Map<number, CanonicalGame>();
+  const seenSteamAppIds = new Map<number, number>();
   for (let idx = 0; idx < finalCatalog.length; idx++) {
-    const g = finalCatalog[idx];
+    let g = finalCatalog[idx];
     if (g.steamAppId) {
-      const prevWithAppId = seenSteamAppIds.get(g.steamAppId);
-      if (prevWithAppId && hasSameStorefrontConflict(prevWithAppId, g)) {
+      const prevIdx = seenSteamAppIds.get(g.steamAppId);
+      const prevWithAppId = prevIdx !== undefined ? finalCatalog[prevIdx] : undefined;
+      if (prevWithAppId && prevIdx !== undefined && hasSameStorefrontConflict(prevWithAppId, g)) {
         const prevOv = hasUserOverrides
           ? getUserOverrideForGame(prevWithAppId, userOverrides)
           : undefined;
@@ -3878,33 +3936,40 @@ export function sanitizeGameCatalog(
           // Two distinct same-storefront editions still share the same steamAppId
           const prevHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(prevWithAppId.title);
           const currHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(g.title);
-          const targetToDemote =
-            prevOv && !currOv
-              ? g
-              : currOv && !prevOv
-                ? prevWithAppId
+          const demotePrev =
+            currOv && !prevOv
+              ? true
+              : prevOv && !currOv
+                ? false
                 : !prevWithAppId.platforms.some((p) => p.platformId === 'steam') &&
                     prevWithAppId.platforms.length <= g.platforms.length &&
                     !prevHasEdition &&
-                    currHasEdition
-                  ? prevWithAppId
-                  : g;
+                    currHasEdition;
+          const targetToDemote = demotePrev ? prevWithAppId : g;
           const plat = targetToDemote.platforms?.[0];
           if (plat?.platformId && plat?.platformGameId) {
-            if (targetToDemote === prevWithAppId) {
+            const nextId = `${plat.platformId}-${plat.platformGameId}`;
+            if (demotePrev) {
               seenIds.delete(prevWithAppId.id);
-              prevWithAppId.id = `${plat.platformId}-${plat.platformGameId}`;
-              prevWithAppId.steamAppId = undefined;
-              seenIds.add(prevWithAppId.id);
-              seenSteamAppIds.set(g.steamAppId, g);
+              finalCatalog[prevIdx] = {
+                ...prevWithAppId,
+                id: nextId,
+                steamAppId: undefined,
+              };
+              seenIds.add(nextId);
+              seenSteamAppIds.set(g.steamAppId, idx);
             } else {
-              g.id = `${plat.platformId}-${plat.platformGameId}`;
-              g.steamAppId = undefined;
+              g = {
+                ...g,
+                id: nextId,
+                steamAppId: undefined,
+              };
+              finalCatalog[idx] = g;
             }
           }
         }
       } else {
-        seenSteamAppIds.set(g.steamAppId, g);
+        seenSteamAppIds.set(g.steamAppId, idx);
       }
     }
     if (seenIds.has(g.id)) {
@@ -3913,7 +3978,9 @@ export function sanitizeGameCatalog(
         primaryPlat?.platformId && primaryPlat?.platformGameId
           ? `${primaryPlat.platformId}-${primaryPlat.platformGameId}`
           : `${g.id}-${idx}`;
-      g.id = !seenIds.has(fallbackId) ? fallbackId : `${fallbackId}-${idx}`;
+      const nextId = !seenIds.has(fallbackId) ? fallbackId : `${fallbackId}-${idx}`;
+      g = { ...g, id: nextId };
+      finalCatalog[idx] = g;
     }
     seenIds.add(g.id);
   }
