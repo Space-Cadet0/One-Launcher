@@ -82,6 +82,105 @@ const SECRET_TOKEN_OBJECT_KEYS = new Set([
   'sDAToken',
 ]);
 
+const STEAM_GET_OWNED_GAMES_TIMEOUT_MS = 10_000;
+
+const OFFLINE_NETWORK_ERROR_CODES = new Set([
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ERR_INTERNET_DISCONNECTED',
+  'ERR_NAME_NOT_RESOLVED',
+  'ERR_NETWORK_CHANGED',
+  'ERR_ADDRESS_UNREACHABLE',
+  'ERR_CONNECTION_TIMED_OUT',
+  'ERR_CONNECTION_REFUSED',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
+
+/**
+ * Check whether the host currently reports online reachability via Electron `net.isOnline()`
+ * (or injected test override in `handlerOptions`).
+ *
+ * @param {Record<string, any>} [handlerOptions]
+ * @returns {boolean}
+ */
+function isNetworkOnlineForStoreSync(handlerOptions) {
+  if (typeof handlerOptions?.isOnline === 'function') {
+    try {
+      return Boolean(handlerOptions.isOnline());
+    } catch {}
+  }
+  if (typeof handlerOptions?.net?.isOnline === 'function') {
+    try {
+      return Boolean(handlerOptions.net.isOnline());
+    } catch {}
+  }
+  try {
+    const electronMod = require('electron');
+    if (typeof electronMod?.net?.isOnline === 'function') {
+      return Boolean(electronMod.net.isOnline());
+    }
+  } catch {}
+  return true;
+}
+
+/**
+ * Classify whether a thrown fetch/network error indicates offline reachability loss or timeout
+ * (distinct from HTTP 401/403 auth expiration where interactive/SSR token recovery makes sense).
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isOfflineOrNetworkError(err) {
+  if (!err) return false;
+  const anyErr = /** @type {any} */ (err);
+  const name = String(anyErr?.name || '');
+  if (name === 'AbortError' || name === 'TimeoutError') return true;
+  const code = String(anyErr?.code || anyErr?.cause?.code || '').toUpperCase();
+  if (code && OFFLINE_NETWORK_ERROR_CODES.has(code)) return true;
+  const msg = String(anyErr?.message || anyErr?.cause?.message || String(err));
+  return /ERR_INTERNET_DISCONNECTED|ERR_NAME_NOT_RESOLVED|ERR_NETWORK_CHANGED|ERR_ADDRESS_UNREACHABLE|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|ECONNREFUSED|ETIMEDOUT|fetch failed|network(?:\s+request)?\s+failed|timed?\s*out|aborted/i.test(
+    msg
+  );
+}
+
+/**
+ * Read per-call non-enumerable metadata attached to the returned games array, falling back
+ * to legacy function-static properties only when a test stub omits per-array metadata.
+ *
+ * @param {any} gamesArray
+ * @param {any} fnRef
+ * @returns {{ authoritativeComplete: boolean, achievementsMap: Record<string, any>, suppressedItems: any[] }}
+ */
+function readSyncResultMeta(gamesArray, fnRef) {
+  const hasPerArrayAuth =
+    gamesArray &&
+    typeof gamesArray === 'object' &&
+    typeof gamesArray.authoritativeComplete === 'boolean';
+  const authoritativeComplete = hasPerArrayAuth
+    ? gamesArray.authoritativeComplete
+    : Boolean(fnRef?.lastAuthoritativeComplete);
+  const achievementsMap =
+    gamesArray &&
+    typeof gamesArray === 'object' &&
+    gamesArray.achievementsMap &&
+    typeof gamesArray.achievementsMap === 'object'
+      ? gamesArray.achievementsMap
+      : fnRef?.lastAchievementsMap || {};
+  const suppressedItems =
+    gamesArray && typeof gamesArray === 'object' && Array.isArray(gamesArray.suppressedItems)
+      ? gamesArray.suppressedItems
+      : Array.isArray(fnRef?.lastSuppressedItems)
+        ? fnRef.lastSuppressedItems
+        : [];
+  return { authoritativeComplete, achievementsMap, suppressedItems };
+}
+
 /**
  * Determine whether a candidate string is a real credential rather than an empty or redacted sentinel.
  * @param {unknown} val
@@ -1079,12 +1178,12 @@ function registerStoreSyncIpcHandlers({
           accountName,
           account.userId
         );
-        authoritativeComplete = Boolean(storeSync.fetchGogOwnedGames.lastAuthoritativeComplete);
+        authoritativeComplete = readSyncResultMeta(games, storeSync.fetchGogOwnedGames).authoritativeComplete;
       } else if (storefrontId === 'epic') {
         tokenData = await storeSync.exchangeEpicCode(codeLabel);
         accountName = tokenData.displayName || tokenData.account_id || 'Epic Games User';
         games = await storeSync.fetchEpicOwnedGames(tokenData.access_token, tokenData.account_id);
-        authoritativeComplete = Boolean(storeSync.fetchEpicOwnedGames.lastAuthoritativeComplete);
+        authoritativeComplete = readSyncResultMeta(games, storeSync.fetchEpicOwnedGames).authoritativeComplete;
       } else if (storefrontId === 'xbox') {
         const xboxRes = await storeSync.loginXbox(codeOrPayload);
         if (xboxRes && xboxRes.requiresInlineConsent) {
@@ -1393,9 +1492,17 @@ function registerStoreSyncIpcHandlers({
               steamId: parsedSteam.accountId,
               accountName: parsedSteam.accountName,
               avatarUrl: parsedSteam.avatarUrl,
-              games: parsedSteam.games,
             };
+            const steamCacheOpts = handlerOptions.userDataDir
+              ? { userDataDir: handlerOptions.userDataDir }
+              : {};
             storeSync.saveTokens('steam', tokenPayload);
+            if (typeof storeSync.saveSteamOwnedGamesCache === 'function') {
+              storeSync.saveSteamOwnedGamesCache(parsedSteam.games, {
+                ...steamCacheOpts,
+                steamId: parsedSteam.accountId,
+              });
+            }
             try {
               launcherEngine?.clearStoreDisconnectedTombstone?.('steam');
             } catch {}
@@ -1559,17 +1666,53 @@ function registerStoreSyncIpcHandlers({
           let games = [];
 
           if (storefrontId === 'steam') {
+            const steamCacheOpts = handlerOptions.userDataDir
+              ? { userDataDir: handlerOptions.userDataDir }
+              : {};
+            const steamFetchImpl =
+              typeof handlerOptions.fetchFn === 'function' ? handlerOptions.fetchFn : fetch;
+            const steamTimeoutMs =
+              typeof handlerOptions.steamTimeoutMs === 'number' && handlerOptions.steamTimeoutMs > 0
+                ? handlerOptions.steamTimeoutMs
+                : STEAM_GET_OWNED_GAMES_TIMEOUT_MS;
             accountName = tokenData.accountName || 'Steam User';
             avatarUrl = tokenData.avatarUrl;
-            games = Array.isArray(tokenData.games) ? tokenData.games : [];
-            let refreshedLive = false;
+            const initialWebApiToken = tokenData.webapi_token;
+            const initialAccountName = tokenData.accountName;
+            const initialAvatarUrl = tokenData.avatarUrl;
+            const initialSteamId = tokenData.steamId;
+            const hadLegacyGamesInVault = Object.prototype.hasOwnProperty.call(tokenData, 'games');
 
-            if (tokenData.webapi_token && tokenData.steamId) {
+            const loadedCachedGames =
+              typeof storeSync.loadSteamOwnedGamesCache === 'function'
+                ? storeSync.loadSteamOwnedGamesCache({
+                    ...steamCacheOpts,
+                    steamId: tokenData.steamId,
+                    legacyGames: tokenData.games,
+                  })
+                : Array.isArray(tokenData.games)
+                  ? tokenData.games
+                  : [];
+            const loadedFromDiskCache = Boolean(
+              loadedCachedGames && /** @type {any} */ (loadedCachedGames).fromDiskCache === true
+            );
+            games = Array.isArray(loadedCachedGames) ? loadedCachedGames : [];
+            let refreshedLive = false;
+            let networkOfflineDetected = !isNetworkOnlineForStoreSync(handlerOptions);
+
+            if (!networkOfflineDetected && tokenData.webapi_token && tokenData.steamId) {
               try {
-                const res = await fetch(
+                const res = await steamFetchImpl(
                   `https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?access_token=${encodeURIComponent(
                     tokenData.webapi_token
-                  )}&steamid=${encodeURIComponent(tokenData.steamId)}&include_appinfo=1&include_played_free_games=1&include_free_sub=0`
+                  )}&steamid=${encodeURIComponent(tokenData.steamId)}&include_appinfo=1&include_played_free_games=1&include_free_sub=0`,
+                  {
+                    signal:
+                      typeof AbortSignal !== 'undefined' &&
+                      typeof AbortSignal.timeout === 'function'
+                        ? AbortSignal.timeout(steamTimeoutMs)
+                        : undefined,
+                  }
                 );
                 if (res.ok) {
                   /** @type {{ response?: { games?: Array<{ appid?: number }> } } | null} */
@@ -1578,7 +1721,11 @@ function registerStoreSyncIpcHandlers({
                     const ownedAppIds = apiJson.response.games
                       .map((/** @type {any} */ g) => g.appid)
                       .filter(Boolean);
-                    const storeItems = await fetchSteamStoreBrowseItemsMap(ownedAppIds);
+                    const storeItems = await fetchSteamStoreBrowseItemsMap(ownedAppIds, {
+                      ...(typeof handlerOptions.fetchFn === 'function'
+                        ? { fetchImpl: handlerOptions.fetchFn }
+                        : {}),
+                    });
                     const refreshed = await parseSteamGamesListJson(
                       { rgGames: apiJson.response.games, storeItems, strProfileName: accountName },
                       tokenData.steamId,
@@ -1588,15 +1735,21 @@ function registerStoreSyncIpcHandlers({
                       storeSync
                     );
                     games = refreshed.games;
-                    tokenData = { ...tokenData, games };
-                    storeSync.saveTokens('steam', tokenData);
                     refreshedLive = true;
                   }
                 }
-              } catch {}
+              } catch (steamApiErr) {
+                if (isOfflineOrNetworkError(steamApiErr)) {
+                  networkOfflineDetected = true;
+                }
+              }
             }
 
-            if (!refreshedLive) {
+            if (
+              !refreshedLive &&
+              !networkOfflineDetected &&
+              isNetworkOnlineForStoreSync(handlerOptions)
+            ) {
               try {
                 const cleanBrowserUA = resolveCleanBrowserUserAgent(session);
 
@@ -1706,7 +1859,11 @@ function registerStoreSyncIpcHandlers({
                       clearTimeout(fetchTimer);
                     }
                   }
-                } catch {}
+                } catch (ssrErr) {
+                  if (isOfflineOrNetworkError(ssrErr)) {
+                    networkOfflineDetected = true;
+                  }
+                }
 
                 if (ssrResult && Array.isArray(ssrResult.rgGames) && ssrResult.rgGames.length > 0) {
                   const refreshed = await parseSteamGamesListJson(
@@ -1725,13 +1882,16 @@ function registerStoreSyncIpcHandlers({
                   tokenData = {
                     ...tokenData,
                     webapi_token: ssrResult.webApiToken || tokenData.webapi_token,
-                    games,
                   };
-                  storeSync.saveTokens('steam', tokenData);
                   refreshedLive = true;
                 }
 
-                if (!refreshedLive && BrowserWindow) {
+                if (
+                  !refreshedLive &&
+                  !networkOfflineDetected &&
+                  isNetworkOnlineForStoreSync(handlerOptions) &&
+                  BrowserWindow
+                ) {
                   ssrResult = await new Promise((resolveSsr) => {
                     let done = false;
                     const bgWin = new BrowserWindow({
@@ -1821,9 +1981,7 @@ function registerStoreSyncIpcHandlers({
                     tokenData = {
                       ...tokenData,
                       webapi_token: ssrResult.webApiToken || tokenData.webapi_token,
-                      games,
                     };
-                    storeSync.saveTokens('steam', tokenData);
                     refreshedLive = true;
                   }
                 }
@@ -1832,6 +1990,7 @@ function registerStoreSyncIpcHandlers({
 
             /** @type {Record<number, any>} */
             let steamAchMap = {};
+            let mergedLocalDelta = false;
             if (Array.isArray(games) && games.length > 0) {
               const localPlaytimes = await readLocalSteamPlaytimes();
               const appIds = games
@@ -1844,11 +2003,17 @@ function registerStoreSyncIpcHandlers({
                   )
                 )
                 .filter((id) => id > 0);
-              steamAchMap = await fetchSteamBatchAchievements(
-                tokenData.webapi_token,
-                tokenData.steamId,
-                appIds
-              );
+              steamAchMap =
+                networkOfflineDetected || !isNetworkOnlineForStoreSync(handlerOptions)
+                  ? await scanLocalSteamAchievements({ activeSteamId64: tokenData.steamId })
+                  : await fetchSteamBatchAchievements(
+                      tokenData.webapi_token,
+                      tokenData.steamId,
+                      appIds,
+                      typeof handlerOptions.fetchFn === 'function'
+                        ? { fetchImpl: handlerOptions.fetchFn }
+                        : undefined
+                    );
 
               games = games.map((g) => {
                 const appId = Number(
@@ -1860,8 +2025,11 @@ function registerStoreSyncIpcHandlers({
                 const localPt = appId ? localPlaytimes[appId] : null;
                 const ach = appId ? steamAchMap[appId] : null;
                 if ((!localPt || !localPt.playtimeMinutes) && !ach) {
-                  return g.isVerifiedEntitlement === true ? g : { ...g, isVerifiedEntitlement: true };
+                  if (g.isVerifiedEntitlement === true) return g;
+                  mergedLocalDelta = true;
+                  return { ...g, isVerifiedEntitlement: true };
                 }
+                mergedLocalDelta = true;
                 return {
                   ...g,
                   isVerifiedEntitlement: true,
@@ -1897,9 +2065,34 @@ function registerStoreSyncIpcHandlers({
                   }),
                 };
               });
-              tokenData = { ...tokenData, games };
-              storeSync.saveTokens('steam', tokenData);
+
+              if (
+                typeof storeSync.saveSteamOwnedGamesCache === 'function' &&
+                (refreshedLive || hadLegacyGamesInVault || !loadedFromDiskCache || mergedLocalDelta)
+              ) {
+                storeSync.saveSteamOwnedGamesCache(games, {
+                  ...steamCacheOpts,
+                  steamId: tokenData.steamId,
+                });
+              }
             }
+
+            const steamCredentialsChanged =
+              tokenData.webapi_token !== initialWebApiToken ||
+              tokenData.accountName !== initialAccountName ||
+              tokenData.avatarUrl !== initialAvatarUrl ||
+              tokenData.steamId !== initialSteamId;
+
+            if (steamCredentialsChanged || hadLegacyGamesInVault) {
+              const { games: _strippedGames, ...cleanSteamTokens } = tokenData;
+              storeSync.saveTokens(
+                'steam',
+                hadLegacyGamesInVault
+                  ? { ...cleanSteamTokens, games: undefined }
+                  : cleanSteamTokens
+              );
+            }
+
             return {
               success: true,
               storefrontId,
@@ -1952,9 +2145,8 @@ function registerStoreSyncIpcHandlers({
                     .scanLocalSuppressedStorefrontItems({ gogUserId: accountId })
                     .filter((/** @type {any} */ x) => x.platformId === 'gog')
                 : [];
-            const gogAuthoritativeComplete = Boolean(
-              storeSync.fetchGogOwnedGames.lastAuthoritativeComplete
-            );
+            const gogSyncMeta = readSyncResultMeta(games, storeSync.fetchGogOwnedGames);
+            const gogAuthoritativeComplete = gogSyncMeta.authoritativeComplete;
             return {
               success: true,
               storefrontId,
@@ -1964,11 +2156,8 @@ function registerStoreSyncIpcHandlers({
               games,
               authoritativeComplete: gogAuthoritativeComplete,
               transientOffline: games.length === 0 && !gogAuthoritativeComplete,
-              achievements: storeSync.fetchGogOwnedGames.lastAchievementsMap || {},
-              suppressedItems: [
-                ...(storeSync.fetchGogOwnedGames.lastSuppressedItems || []),
-                ...localGogSuppressed,
-              ],
+              achievements: gogSyncMeta.achievementsMap,
+              suppressedItems: [...gogSyncMeta.suppressedItems, ...localGogSuppressed],
             };
           } else if (storefrontId === 'epic') {
             const epicDisconnected = Boolean(
@@ -2006,7 +2195,7 @@ function registerStoreSyncIpcHandlers({
                   games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
                   recoveredSync =
                     games.length > 0 ||
-                    Boolean(storeSync.fetchEpicOwnedGames.lastAuthoritativeComplete);
+                    readSyncResultMeta(games, storeSync.fetchEpicOwnedGames).authoritativeComplete;
                   storeSync.saveTokens('epic', {
                     ...tokenData,
                     access_token: accessToken,
@@ -2031,7 +2220,7 @@ function registerStoreSyncIpcHandlers({
                     games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
                     recoveredSync =
                       games.length > 0 ||
-                      Boolean(storeSync.fetchEpicOwnedGames.lastAuthoritativeComplete);
+                      readSyncResultMeta(games, storeSync.fetchEpicOwnedGames).authoritativeComplete;
                   } catch {}
                 }
                 if (
@@ -2062,9 +2251,8 @@ function registerStoreSyncIpcHandlers({
                     .scanLocalSuppressedStorefrontItems({ epicAccountId: accountId })
                     .filter((/** @type {any} */ x) => x.platformId === 'epic')
                 : [];
-            const epicAuthoritativeComplete = Boolean(
-              storeSync.fetchEpicOwnedGames.lastAuthoritativeComplete
-            );
+            const epicSyncMeta = readSyncResultMeta(games, storeSync.fetchEpicOwnedGames);
+            const epicAuthoritativeComplete = epicSyncMeta.authoritativeComplete;
             return {
               success: true,
               storefrontId,
@@ -2074,11 +2262,8 @@ function registerStoreSyncIpcHandlers({
               games,
               authoritativeComplete: epicAuthoritativeComplete,
               transientOffline: games.length === 0 && !epicAuthoritativeComplete,
-              achievements: storeSync.fetchEpicOwnedGames.lastAchievementsMap || {},
-              suppressedItems: [
-                ...(storeSync.fetchEpicOwnedGames.lastSuppressedItems || []),
-                ...localEpicSuppressed,
-              ],
+              achievements: epicSyncMeta.achievementsMap,
+              suppressedItems: [...epicSyncMeta.suppressedItems, ...localEpicSuppressed],
             };
           } else if (storefrontId === 'xbox') {
             const xboxSync = await storeSync.syncXboxLibrary({
@@ -2225,6 +2410,13 @@ function registerStoreSyncIpcHandlers({
         ? rawStorefrontArg.storefrontId || rawStorefrontArg.store || ''
         : String(rawStorefrontArg || '');
     storeSync.clearTokens(storefrontId);
+    if ((!storefrontId || storefrontId === 'steam') && typeof storeSync.clearSteamOwnedGamesCache === 'function') {
+      try {
+        storeSync.clearSteamOwnedGamesCache(
+          handlerOptions.userDataDir ? { userDataDir: handlerOptions.userDataDir } : {}
+        );
+      } catch {}
+    }
     try {
       launcherEngine?.purgeStoreHelperCredentials?.(storefrontId);
     } catch {}
@@ -2253,7 +2445,15 @@ function registerStoreSyncIpcHandlers({
     'epic:fetch-achievements',
     async (
       /** @type {any} */ _event,
-      /** @type {{ accountId?: string, accessToken?: string }} */ { accountId, accessToken } = {}
+      /** @type {{ accountId?: string, accessToken?: string, sandboxId?: string, namespace?: string, appName?: string, catalogItemId?: string, title?: string }} */ {
+        accountId,
+        accessToken,
+        sandboxId,
+        namespace,
+        appName,
+        catalogItemId,
+        title,
+      } = {}
     ) => {
       try {
         const savedTokens = storeSync.loadSavedTokens();
@@ -2273,13 +2473,26 @@ function registerStoreSyncIpcHandlers({
             resolvedAccountId = resolvedAccountId || legAuth?.accountId;
           } catch {}
         }
-        let result = await storeSync.fetchEpicAchievements(resolvedToken, resolvedAccountId);
+        /** @type {Record<string, any>} */
+        const targetOpts = {
+          ...(sandboxId ? { sandboxId } : {}),
+          ...(namespace ? { namespace } : {}),
+          ...(appName ? { appName } : {}),
+          ...(catalogItemId ? { catalogItemId } : {}),
+          ...(title ? { title } : {}),
+        };
+        const hasTargetFilter = Object.keys(targetOpts).length > 0;
+        let result = hasTargetFilter
+          ? await storeSync.fetchEpicAchievements(resolvedToken, resolvedAccountId, targetOpts)
+          : await storeSync.fetchEpicAchievements(resolvedToken, resolvedAccountId);
         if ((!result || Object.keys(result).length === 0) && savedEpic.refresh_token) {
           try {
             const renewed = await storeSync.renewEpicTokens(savedEpic.refresh_token);
             resolvedToken = renewed.access_token;
             resolvedAccountId = renewed.account_id || resolvedAccountId;
-            result = await storeSync.fetchEpicAchievements(resolvedToken, resolvedAccountId);
+            result = hasTargetFilter
+              ? await storeSync.fetchEpicAchievements(resolvedToken, resolvedAccountId, targetOpts)
+              : await storeSync.fetchEpicAchievements(resolvedToken, resolvedAccountId);
           } catch {}
         }
         return result || {};
@@ -2442,10 +2655,13 @@ function registerStoreSyncIpcHandlers({
     'gog:fetch-achievements',
     async (
       /** @type {any} */ _event,
-      /** @type {{ username?: string, accessToken?: string, userId?: string }} */ {
+      /** @type {{ username?: string, accessToken?: string, userId?: string, productId?: string, gameId?: string, title?: string }} */ {
         username,
         accessToken,
         userId,
+        productId,
+        gameId,
+        title,
       } = {}
     ) => {
       try {
@@ -2454,10 +2670,19 @@ function registerStoreSyncIpcHandlers({
         let resolvedToken =
           (isRealSecretToken(accessToken) ? accessToken.trim() : '') ||
           (isRealSecretToken(savedGog.access_token) ? savedGog.access_token : '');
-        let resolvedUsername = username;
+        let resolvedUsername = username || savedGog.username;
         let resolvedUserId = userId || savedGog.user_id;
 
-        if (resolvedToken) {
+        /** @type {Record<string, any>} */
+        const targetOpts = {
+          ...(productId ? { productId } : {}),
+          ...(gameId ? { gameId } : {}),
+          ...(title ? { title } : {}),
+        };
+        const isSingleGameScoped = Boolean(productId || gameId);
+
+        // When single-game scoped and userId is already saved, skip extra fetchGogAccount round-trip
+        if (resolvedToken && (!isSingleGameScoped || !resolvedUserId)) {
           try {
             const account = await storeSync.fetchGogAccount(resolvedToken);
             resolvedUsername = account.username || resolvedUsername;
@@ -2476,7 +2701,32 @@ function registerStoreSyncIpcHandlers({
         }
 
         if (!resolvedUsername && !resolvedToken) return {};
-        return await storeSync.fetchGogAchievements(resolvedToken, resolvedUsername, resolvedUserId);
+        let result = isSingleGameScoped
+          ? await storeSync.fetchGogAchievements(
+              resolvedToken,
+              resolvedUsername,
+              resolvedUserId,
+              targetOpts
+            )
+          : await storeSync.fetchGogAchievements(resolvedToken, resolvedUsername, resolvedUserId);
+
+        if (
+          isSingleGameScoped &&
+          Boolean(/** @type {any} */ (result)?.authExpired) &&
+          isRealSecretToken(savedGog.refresh_token)
+        ) {
+          try {
+            const renewed = await storeSync.renewGogTokens(savedGog.refresh_token);
+            resolvedToken = renewed.access_token;
+            result = await storeSync.fetchGogAchievements(
+              resolvedToken,
+              resolvedUsername,
+              resolvedUserId,
+              targetOpts
+            );
+          } catch {}
+        }
+        return result;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn('IPC gog:fetch-achievements warning:', msg);
@@ -2494,11 +2744,21 @@ function registerStoreSyncIpcHandlers({
       try {
         const savedTokens = storeSync.loadSavedTokens();
         const savedSteam = savedTokens?.steam || {};
+        const cachedSteamGames =
+          typeof storeSync.loadSteamOwnedGamesCache === 'function'
+            ? storeSync.loadSteamOwnedGamesCache({
+                ...(handlerOptions.userDataDir ? { userDataDir: handlerOptions.userDataDir } : {}),
+                steamId: savedSteam.steamId,
+                legacyGames: savedSteam.games,
+              })
+            : Array.isArray(savedSteam.games)
+              ? savedSteam.games
+              : [];
         const resolvedAppIds =
           Array.isArray(appIds) && appIds.length > 0
             ? appIds
-            : Array.isArray(savedSteam.games)
-              ? savedSteam.games
+            : Array.isArray(cachedSteamGames)
+              ? cachedSteamGames
                   .map((/** @type {any} */ g) => Number(g.steamAppId || 0))
                   .filter((/** @type {number} */ id) => id > 0)
               : [];

@@ -34,14 +34,14 @@ const {
   resolveXboxBridgeDllPath,
   resolveBundledGameInputBridgeDllPath,
 } = require('./wineAndCrossOverManager.cjs');
+const macNativeInstallerAndCodesign = require('./macNativeInstallerAndCodesign.cjs');
 const {
   isValidBottleDirectory,
   inspectBottleConfMetadata,
   detectCompatibilityLayers,
-  checkCompatibilityLayerUpdates,
   resolveBottleGogGalaxyExe,
   resolveBottleEpicLauncherExe,
-} = require('./macNativeInstallerAndCodesign.cjs');
+} = macNativeInstallerAndCodesign;
 const {
   resolveSteamClientBinaryPath,
 } = require('./sessionAndProcessSupervisor.cjs');
@@ -70,12 +70,132 @@ const {
   discoverHostPublisherLauncher,
 } = require('./chainedPublisherLaunchers.cjs');
 
-const PROBER_RUNNER_UPDATES_TTL_MS = 15 * 60 * 1000; // 15-minute in-memory TTL
-/** @type {{ key: string, expiresAt: number, value: Record<string, any> | null }} */
-let cachedProberRunnerUpdates = { key: '', expiresAt: 0, value: null };
+const RUNNER_UPDATE_CHECK_CACHE_FILENAME = 'one_launcher_runner_update_check_cache.json';
+const PROBER_RUNNER_UPDATES_TTL_MS = 24 * 60 * 60 * 1000; // 24-hour persisted + in-memory TTL
+/** @type {{ userDataDir: string, key: string, expiresAt: number, value: Record<string, any> | null }} */
+let cachedProberRunnerUpdates = { userDataDir: '', key: '', expiresAt: 0, value: null };
+
+/**
+ * Resolve the path to the 24-hour runner update check cache file in `userDataDir`.
+ *
+ * @param {string} userDataDir
+ * @returns {string}
+ */
+function getRunnerUpdateCheckCachePath(userDataDir) {
+  return path.join(userDataDir, RUNNER_UPDATE_CHECK_CACHE_FILENAME);
+}
+
+/**
+ * Build a deterministic cache key capturing installed runner versions and paths.
+ *
+ * @param {any[]} detectedRunners
+ * @returns {string}
+ */
+function buildRunnerUpdatesLayersKey(detectedRunners) {
+  return (Array.isArray(detectedRunners) ? detectedRunners : [])
+    .map(
+      (r) =>
+        `${r.type}:${r.version || ''}:${r.buildVersion || ''}:${r.previewDate || ''}:${r.appPath || r.binaryPath || ''}`
+    )
+    .join('|');
+}
+
+/**
+ * Read the persisted 24-hour runner update check cache from `<userDataDir>/one_launcher_runner_update_check_cache.json`.
+ *
+ * @param {string} userDataDir
+ * @param {string} layersCacheKey
+ * @param {number} nowMs
+ * @returns {Promise<{ updates: Record<string, any>, expiresAt: number } | null>}
+ */
+async function readPersistedRunnerUpdateCheckCacheAsync(userDataDir, layersCacheKey, nowMs) {
+  if (!userDataDir) return null;
+  try {
+    const cachePath = getRunnerUpdateCheckCachePath(userDataDir);
+    const raw = await fs.promises.readFile(cachePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      parsed.layersKey !== layersCacheKey ||
+      !parsed.updates ||
+      typeof parsed.updates !== 'object' ||
+      Array.isArray(parsed.updates)
+    ) {
+      return null;
+    }
+    const checkedAt = Number(parsed.checkedAt || 0);
+    const expiresAt = Number(parsed.expiresAt || checkedAt + PROBER_RUNNER_UPDATES_TTL_MS);
+    if (
+      !Number.isFinite(checkedAt) ||
+      checkedAt <= 0 ||
+      nowMs - checkedAt >= PROBER_RUNNER_UPDATES_TTL_MS ||
+      (Number.isFinite(expiresAt) && nowMs >= expiresAt)
+    ) {
+      return null;
+    }
+    return { updates: parsed.updates, expiresAt };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Atomically persist the 24-hour runner update check cache into `userDataDir`.
+ *
+ * @param {string} userDataDir
+ * @param {string} layersCacheKey
+ * @param {Record<string, any>} updates
+ * @param {number} nowMs
+ */
+async function writePersistedRunnerUpdateCheckCacheAsync(
+  userDataDir,
+  layersCacheKey,
+  updates,
+  nowMs
+) {
+  if (!userDataDir || !updates || typeof updates !== 'object') return;
+  try {
+    const cachePath = getRunnerUpdateCheckCachePath(userDataDir);
+    await fs.promises.mkdir(path.dirname(cachePath), { recursive: true, mode: 0o700 });
+    const payload = JSON.stringify({
+      schemaVersion: 1,
+      layersKey: layersCacheKey,
+      checkedAt: nowMs,
+      expiresAt: nowMs + PROBER_RUNNER_UPDATES_TTL_MS,
+      updates,
+    });
+    const tmpPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      await fs.promises.writeFile(tmpPath, payload, { encoding: 'utf8', mode: 0o600 });
+      await fs.promises.rename(tmpPath, cachePath);
+    } catch {
+      try {
+        await fs.promises.unlink(tmpPath);
+      } catch {}
+      await fs.promises.writeFile(cachePath, payload, { encoding: 'utf8', mode: 0o600 });
+    }
+  } catch {}
+}
 
 function invalidateProberRunnerUpdatesCache(options = {}) {
-  cachedProberRunnerUpdates = { key: '', expiresAt: 0, value: null };
+  cachedProberRunnerUpdates = { userDataDir: '', key: '', expiresAt: 0, value: null };
+  if (!options?.memoryOnly) {
+    try {
+      const targetUserDataDir =
+        typeof options?.userDataDir === 'string' && options.userDataDir.trim()
+          ? toHostFilesystemPath(options.userDataDir.trim())
+          : !isTestEnvironment(options)
+            ? resolveReadOnlyPaths(options).userDataDir
+            : '';
+      if (targetUserDataDir) {
+        const cachePath = getRunnerUpdateCheckCachePath(targetUserDataDir);
+        if (fs.existsSync(cachePath)) {
+          fs.unlinkSync(cachePath);
+        }
+      }
+    } catch {}
+  }
   if (!options?.skipPreviewUrlCacheClear) {
     try {
       const macNative = require('./macNativeInstallerAndCodesign.cjs');
@@ -2737,19 +2857,26 @@ async function probeEnvironmentHealth(options = {}) {
   /** @type {Record<string, any>} */
   let runnerUpdates = {};
   if (hostPlatform === 'darwin') {
+    const checkUpdatesImpl =
+      typeof options.checkCompatibilityLayerUpdatesFn === 'function'
+        ? options.checkCompatibilityLayerUpdatesFn
+        : macNativeInstallerAndCodesign.checkCompatibilityLayerUpdates;
+    const hasInlineFixtureOverrides = Boolean(
+      options.mockFeeds || options.previewCandidateUrls || options.previewPortalHtml
+    );
+    const hasNetworkHandlerOverride = Boolean(
+      typeof options.httpGetText === 'function' ||
+        typeof options.previewSessionFetch === 'function' ||
+        typeof options.sessionFetch === 'function' ||
+        (typeof options.fetchFn === 'function' && options.skipNetwork !== true) ||
+        typeof options.checkCompatibilityLayerUpdatesFn === 'function'
+    );
+
     if (options.runnerUpdates && typeof options.runnerUpdates === 'object') {
       runnerUpdates = options.runnerUpdates;
-    } else if (
-      options.mockFeeds ||
-      options.previewCandidateUrls ||
-      options.previewPortalHtml ||
-      typeof options.httpGetText === 'function' ||
-      typeof options.previewSessionFetch === 'function' ||
-      typeof options.sessionFetch === 'function' ||
-      (typeof options.fetchFn === 'function' && options.skipNetwork !== true)
-    ) {
+    } else if (hasInlineFixtureOverrides) {
       try {
-        runnerUpdates = await checkCompatibilityLayerUpdates({
+        runnerUpdates = await checkUpdatesImpl({
           ...options,
           ...explicitHomedirOpt(options),
           layers: detectedRunners,
@@ -2759,35 +2886,75 @@ async function probeEnvironmentHealth(options = {}) {
       } catch {
         runnerUpdates = {};
       }
-    } else if (!isTestEnvironment(options) && options.skipNetwork !== true) {
-      const layersCacheKey = detectedRunners
-        .map(
-          (r) =>
-            `${r.type}:${r.version || ''}:${r.buildVersion || ''}:${r.previewDate || ''}:${r.appPath || r.binaryPath || ''}`
-        )
-        .join('|');
-      const nowMs = Date.now();
+    } else if (
+      hasNetworkHandlerOverride ||
+      (!isTestEnvironment(options) && options.skipNetwork !== true)
+    ) {
+      const layersCacheKey = buildRunnerUpdatesLayersKey(detectedRunners);
+      const nowMs =
+        typeof options.nowMs === 'number' && Number.isFinite(options.nowMs)
+          ? options.nowMs
+          : Date.now();
       const shouldBypassCache =
-        options.forceRefreshRunnerUpdates === true || options.forceFresh === true;
-      if (
-        !shouldBypassCache &&
-        cachedProberRunnerUpdates.value &&
-        cachedProberRunnerUpdates.key === layersCacheKey &&
-        nowMs < cachedProberRunnerUpdates.expiresAt
-      ) {
-        runnerUpdates = cachedProberRunnerUpdates.value;
-      } else {
+        options.forceRefresh === true ||
+        options.forceRefreshRunnerUpdates === true ||
+        options.forceFresh === true;
+
+      let cacheHit = false;
+      if (!shouldBypassCache) {
+        if (
+          cachedProberRunnerUpdates.value &&
+          cachedProberRunnerUpdates.userDataDir === userDataDir &&
+          cachedProberRunnerUpdates.key === layersCacheKey &&
+          nowMs < cachedProberRunnerUpdates.expiresAt
+        ) {
+          runnerUpdates = cachedProberRunnerUpdates.value;
+          cacheHit = true;
+        } else {
+          const persisted = await readPersistedRunnerUpdateCheckCacheAsync(
+            userDataDir,
+            layersCacheKey,
+            nowMs
+          );
+          if (persisted) {
+            runnerUpdates = persisted.updates;
+            cachedProberRunnerUpdates = {
+              userDataDir,
+              key: layersCacheKey,
+              expiresAt: persisted.expiresAt,
+              value: runnerUpdates,
+            };
+            cacheHit = true;
+          }
+        }
+      }
+
+      if (!cacheHit) {
         try {
-          runnerUpdates = await checkCompatibilityLayerUpdates({
+          runnerUpdates = await checkUpdatesImpl({
             ...options,
+            ...explicitHomedirOpt(options),
             layers: detectedRunners,
             timeoutMs: Number(options.runnerUpdateTimeoutMs || 3500),
           });
-          cachedProberRunnerUpdates = {
-            key: layersCacheKey,
-            expiresAt: nowMs + PROBER_RUNNER_UPDATES_TTL_MS,
-            value: runnerUpdates,
-          };
+          if (
+            runnerUpdates &&
+            typeof runnerUpdates === 'object' &&
+            (Object.keys(runnerUpdates).length > 0 || detectedRunners.length === 0)
+          ) {
+            cachedProberRunnerUpdates = {
+              userDataDir,
+              key: layersCacheKey,
+              expiresAt: nowMs + PROBER_RUNNER_UPDATES_TTL_MS,
+              value: runnerUpdates,
+            };
+            await writePersistedRunnerUpdateCheckCacheAsync(
+              userDataDir,
+              layersCacheKey,
+              runnerUpdates,
+              nowMs
+            );
+          }
         } catch {
           runnerUpdates = {};
         }
@@ -3730,6 +3897,8 @@ module.exports = {
   probeClientLoginStates,
   probeEnvironmentHealth,
   invalidateProberRunnerUpdatesCache,
+  getRunnerUpdateCheckCachePath,
+  PROBER_RUNNER_UPDATES_TTL_MS,
   parseSteamLoginUsersVdfDetails,
   parseEpicGameUserSettingsIni,
   parseWineGogRegistryUser,
