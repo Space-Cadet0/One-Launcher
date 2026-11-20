@@ -926,7 +926,12 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
         const stopElapsedMs = Date.now() - stopStart;
 
         expect(stopRes.success).toBe(true);
-        expect(stopElapsedMs).toBeGreaterThanOrEqual(25);
+        if (process.platform !== 'win32') {
+          // Windows TerminateProcess cannot be trapped via Node SIGTERM handlers and exits immediately
+          expect(stopElapsedMs).toBeGreaterThanOrEqual(25);
+        } else if (realChild.exitCode === null && realChild.signalCode === null) {
+          await new Promise<void>((resolve) => realChild.once('exit', () => resolve()));
+        }
         expect(events).toEqual(['graceful-exit']);
         expect(activeEntry?.deferredPrefixShutdownToFinalize).toBe(true);
         expect(shutdownInvoked).toBe(false);
