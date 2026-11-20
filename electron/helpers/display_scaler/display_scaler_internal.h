@@ -248,6 +248,7 @@ typedef struct ds_runtime_s {
     bool                mode_virtualized;
     bool                fullscreen_active;
     bool                borderless_active;
+    bool                modern_subnative_fs_expanded;
     bool                window_mutated_by_scaler;
     bool                passthrough_restored;
     bool                user_forced_windowed;

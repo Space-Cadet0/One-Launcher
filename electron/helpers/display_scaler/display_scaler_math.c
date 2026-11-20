@@ -36,32 +36,67 @@ static void ds_trim_span(const char **inout_ptr, size_t *inout_len)
     *inout_len = n;
 }
 
+/*
+ * Compact zero-relocation tagged multi-sz enum matcher: each entry is
+ * `<tag = enum_val + 1><ascii_literal>\0`, terminated by an empty string `\0`.
+ */
+static bool ds_match_enum_msz(const char *p, size_t n, const char *msz, uint8_t *out_val)
+{
+    if (!p || !msz || !out_val) return false;
+    ds_trim_span(&p, &n);
+    for (const char *q = msz; *q != '\0'; q += strlen(q) + 1u) {
+        if (ds_ascii_ieq_span(p, n, q + 1)) {
+            *out_val = (uint8_t)((unsigned char)q[0] - 1u);
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char k_mode_msz[] =
+    "\x02" "auto_fullscreen\0"
+    "\x02" "auto\0"
+    "\x03" "force_fullscreen\0"
+    "\x01" "off\0"
+    "\x01" "passthrough\0"
+    "\x01" "windowed\0";
+
+static const char k_aspect_msz[] =
+    "\x01" "preserve_aspect\0"
+    "\x01" "preserve\0"
+    "\x02" "integer\0"
+    "\x03" "stretch\0";
+
+static const char k_filter_msz[] =
+    "\x01" "auto\0"
+    "\x02" "sharp\0"
+    "\x02" "sharp_bilinear\0"
+    "\x02" "pixel_aa\0"
+    "\x03" "linear\0"
+    "\x03" "bilinear\0"
+    "\x04" "nearest\0"
+    "\x04" "point\0";
+
+static const char k_bool_msz[] =
+    "\x02" "1\0"
+    "\x02" "true\0"
+    "\x01" "0\0"
+    "\x01" "false\0";
+
 ds_scaling_mode_t ds_parse_scaling_mode(const char *value)
 {
-    if (!value) return DS_MODE_PASSTHROUGH;
-    const char *p = value;
-    size_t n = strlen(value);
-    ds_trim_span(&p, &n);
-    if (ds_ascii_ieq_span(p, n, "auto_fullscreen") || ds_ascii_ieq_span(p, n, "auto")) {
-        return DS_MODE_AUTO_FULLSCREEN;
-    }
-    if (ds_ascii_ieq_span(p, n, "force_fullscreen")) {
-        return DS_MODE_FORCE_FULLSCREEN;
+    uint8_t v = (uint8_t)DS_MODE_PASSTHROUGH;
+    if (value && ds_match_enum_msz(value, strlen(value), k_mode_msz, &v)) {
+        return (ds_scaling_mode_t)v;
     }
     return DS_MODE_PASSTHROUGH;
 }
 
 ds_aspect_mode_t ds_parse_aspect_mode(const char *value)
 {
-    if (!value) return DS_ASPECT_PRESERVE;
-    const char *p = value;
-    size_t n = strlen(value);
-    ds_trim_span(&p, &n);
-    if (ds_ascii_ieq_span(p, n, "integer")) {
-        return DS_ASPECT_INTEGER;
-    }
-    if (ds_ascii_ieq_span(p, n, "stretch")) {
-        return DS_ASPECT_STRETCH;
+    uint8_t v = (uint8_t)DS_ASPECT_PRESERVE;
+    if (value && ds_match_enum_msz(value, strlen(value), k_aspect_msz, &v)) {
+        return (ds_aspect_mode_t)v;
     }
     return DS_ASPECT_PRESERVE;
 }
@@ -92,36 +127,11 @@ ds_aspect_mode_t ds_cycle_aspect_mode(ds_aspect_mode_t current)
     }
 }
 
-static bool ds_parse_scale_filter_span(const char *p, size_t n, ds_scale_filter_t *out_filter)
-{
-    if (!p || !out_filter) return false;
-    ds_trim_span(&p, &n);
-    if (ds_ascii_ieq_span(p, n, "auto")) {
-        *out_filter = DS_FILTER_AUTO;
-        return true;
-    }
-    if (ds_ascii_ieq_span(p, n, "sharp") || ds_ascii_ieq_span(p, n, "sharp_bilinear") ||
-        ds_ascii_ieq_span(p, n, "pixel_aa")) {
-        *out_filter = DS_FILTER_SHARP;
-        return true;
-    }
-    if (ds_ascii_ieq_span(p, n, "linear") || ds_ascii_ieq_span(p, n, "bilinear")) {
-        *out_filter = DS_FILTER_LINEAR;
-        return true;
-    }
-    if (ds_ascii_ieq_span(p, n, "nearest") || ds_ascii_ieq_span(p, n, "point")) {
-        *out_filter = DS_FILTER_NEAREST;
-        return true;
-    }
-    return false;
-}
-
 ds_scale_filter_t ds_parse_scale_filter(const char *value)
 {
-    if (!value) return DS_FILTER_AUTO;
-    ds_scale_filter_t f = DS_FILTER_AUTO;
-    if (ds_parse_scale_filter_span(value, strlen(value), &f)) {
-        return f;
+    uint8_t v = (uint8_t)DS_FILTER_AUTO;
+    if (value && ds_match_enum_msz(value, strlen(value), k_filter_msz, &v)) {
+        return (ds_scale_filter_t)v;
     }
     return DS_FILTER_AUTO;
 }
@@ -848,15 +858,12 @@ static bool ds_copy_unquoted_span(const char *s, size_t len, char *out_buf, size
 
 static bool ds_parse_bool_span(const char *val, size_t val_len, bool *out_val)
 {
-    if (ds_ascii_ieq_span(val, val_len, "1") || ds_ascii_ieq_span(val, val_len, "true")) {
-        *out_val = true;
-        return true;
+    uint8_t v = 0;
+    if (!ds_match_enum_msz(val, val_len, k_bool_msz, &v)) {
+        return false;
     }
-    if (ds_ascii_ieq_span(val, val_len, "0") || ds_ascii_ieq_span(val, val_len, "false")) {
-        *out_val = false;
-        return true;
-    }
-    return false;
+    *out_val = (v != 0u);
+    return true;
 }
 
 bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_state)
@@ -913,16 +920,10 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
                 out_state->has_fullscreen = true;
             }
         } else if (ds_ascii_ieq_span(key, key_len, "aspect")) {
-            if (ds_ascii_ieq_span(val, val_len, "preserve_aspect") ||
-                ds_ascii_ieq_span(val, val_len, "preserve")) {
+            uint8_t v = 0;
+            if (ds_match_enum_msz(val, val_len, k_aspect_msz, &v)) {
                 out_state->has_aspect = true;
-                out_state->aspect = DS_ASPECT_PRESERVE;
-            } else if (ds_ascii_ieq_span(val, val_len, "integer")) {
-                out_state->has_aspect = true;
-                out_state->aspect = DS_ASPECT_INTEGER;
-            } else if (ds_ascii_ieq_span(val, val_len, "stretch")) {
-                out_state->has_aspect = true;
-                out_state->aspect = DS_ASPECT_STRETCH;
+                out_state->aspect = (ds_aspect_mode_t)v;
             }
         } else if (ds_ascii_ieq_span(key, key_len, "safe_inset_top")) {
             int32_t inset = 0;
@@ -932,25 +933,17 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
             }
         } else if (ds_ascii_ieq_span(key, key_len, "filter") ||
                    ds_ascii_ieq_span(key, key_len, "scaling_filter")) {
-            ds_scale_filter_t parsed_filter = DS_FILTER_AUTO;
-            if (ds_parse_scale_filter_span(val, val_len, &parsed_filter)) {
+            uint8_t v = 0;
+            if (ds_match_enum_msz(val, val_len, k_filter_msz, &v)) {
                 out_state->has_filter = true;
-                out_state->filter = parsed_filter;
+                out_state->filter = (ds_scale_filter_t)v;
             }
         } else if (ds_ascii_ieq_span(key, key_len, "mode") ||
                    ds_ascii_ieq_span(key, key_len, "scaling_mode")) {
-            if (ds_ascii_ieq_span(val, val_len, "auto_fullscreen") ||
-                ds_ascii_ieq_span(val, val_len, "auto")) {
+            uint8_t v = 0;
+            if (ds_match_enum_msz(val, val_len, k_mode_msz, &v)) {
                 out_state->has_scaling_mode = true;
-                out_state->scaling_mode = DS_MODE_AUTO_FULLSCREEN;
-            } else if (ds_ascii_ieq_span(val, val_len, "force_fullscreen")) {
-                out_state->has_scaling_mode = true;
-                out_state->scaling_mode = DS_MODE_FORCE_FULLSCREEN;
-            } else if (ds_ascii_ieq_span(val, val_len, "off") ||
-                       ds_ascii_ieq_span(val, val_len, "passthrough") ||
-                       ds_ascii_ieq_span(val, val_len, "windowed")) {
-                out_state->has_scaling_mode = true;
-                out_state->scaling_mode = DS_MODE_PASSTHROUGH;
+                out_state->scaling_mode = (ds_scaling_mode_t)v;
             }
         } else if (ds_ascii_ieq_span(key, key_len, "hotkey")) {
             if (ds_parse_bool_span(val, val_len, &out_state->hotkey)) {
@@ -1049,4 +1042,114 @@ ds_presenter_tier_t ds_compute_presenter_tier(const ds_tier_input_t *in)
     return want_borderless
         ? DS_PRESENTER_MODERN_BORDERLESS
         : DS_PRESENTER_MODERN_PASSTHROUGH;
+}
+
+int ds_gl_ctx_map_op(ds_gl_ctx_entry_t *slots, size_t cap, uintptr_t key, int op)
+{
+    if (!slots || cap == 0u || key == 0u) return -1;
+
+    size_t empty_idx = cap;
+    size_t first_w3d_idx = cap;
+    for (size_t i = 0; i < cap; i++) {
+        if (slots[i].key == key) {
+            if (op == 0) return (int)slots[i].is_wined3d;
+            if (op < 0) {
+                slots[i].key = 0u;
+                slots[i].is_wined3d = 0u;
+                return 0;
+            }
+            slots[i].is_wined3d = (op == 2) ? 1u : 0u;
+            return (int)slots[i].is_wined3d;
+        }
+        if (slots[i].key == 0u) {
+            if (empty_idx == cap) empty_idx = i;
+        } else if (slots[i].is_wined3d != 0u && first_w3d_idx == cap) {
+            first_w3d_idx = i;
+        }
+    }
+
+    if (op <= 0) return -1;
+
+    uint8_t tag = (op == 2) ? 1u : 0u;
+    size_t dst = empty_idx;
+    if (dst == cap) {
+        if (tag == 0u && first_w3d_idx < cap) {
+            dst = first_w3d_idx;
+        } else {
+            if (cap > 1u) {
+                memmove(&slots[0], &slots[1], (cap - 1u) * sizeof(slots[0]));
+            }
+            dst = cap - 1u;
+        }
+    }
+    slots[dst].key = key;
+    slots[dst].is_wined3d = tag;
+    return (int)tag;
+}
+
+bool ds_is_subnative_exclusive_fullscreen_window(
+    int32_t  win_x,
+    int32_t  win_y,
+    int32_t  win_w,
+    int32_t  win_h,
+    int32_t  mon_x,
+    int32_t  mon_y,
+    int32_t  mon_w,
+    int32_t  mon_h,
+    uint32_t style,
+    uint32_t exstyle,
+    bool     is_topmost_target,
+    bool     is_visible,
+    bool     is_iconic,
+    bool     is_dialog_class
+)
+{
+    /* Canonical immutable Win32 style bitmasks (portable across POSIX ASan & Win32/Win64) */
+    const uint32_t k_non_borderless_mask = 0x40000000u | 0x00C00000u | 0x00040000u | 0x00400000u | 0x00800000u;
+    const uint32_t k_ws_ex_topmost = 0x00000008u;
+    const uint32_t k_ws_ex_toolwindow = 0x00000080u;
+
+    if (!is_visible || is_iconic || is_dialog_class) return false;
+    if (mon_w < 640 || mon_h < 480) return false;
+    if (win_w < 640 || win_h < 360) return false;
+    if (win_w > mon_w || win_h > mon_h) return false;
+    if (win_w == mon_w && win_h == mon_h) return false;
+    if ((style & k_non_borderless_mask) != 0u) return false;
+    if ((!is_topmost_target && (exstyle & k_ws_ex_topmost) == 0u) || (exstyle & k_ws_ex_toolwindow) != 0u) {
+        return false;
+    }
+
+    int64_t dx = (int64_t)win_x - (int64_t)mon_x;
+    int64_t dy = (int64_t)win_y - (int64_t)mon_y;
+    if (dx < -8 || dx > 8 || dy < -8 || dy > 128) {
+        return false;
+    }
+    return true;
+}
+
+void ds_clamp_live_backing_dims(
+    int32_t  live_w,
+    int32_t  live_h,
+    int32_t  virt_w,
+    int32_t  virt_h,
+    int32_t  real_screen_w,
+    int32_t  real_screen_h,
+    int32_t  phys_screen_w,
+    int32_t  phys_screen_h,
+    int32_t *io_backing_w,
+    int32_t *io_backing_h
+)
+{
+    if (!io_backing_w || !io_backing_h) return;
+    if (live_w >= virt_w && live_h >= virt_h &&
+        real_screen_w > 0 && real_screen_h > 0 &&
+        phys_screen_w > 0 && phys_screen_h > 0 &&
+        (live_w < real_screen_w || live_h < real_screen_h)) {
+        int32_t scaled_w = (int32_t)ds_div_round_nearest((int64_t)live_w * (int64_t)phys_screen_w, (int64_t)real_screen_w);
+        int32_t scaled_h = (int32_t)ds_div_round_nearest((int64_t)live_h * (int64_t)phys_screen_h, (int64_t)real_screen_h);
+        if (scaled_w >= virt_w && scaled_h >= virt_h) {
+            *io_backing_w = scaled_w;
+            *io_backing_h = scaled_h;
+        }
+    }
 }

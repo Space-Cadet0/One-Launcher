@@ -751,6 +751,155 @@ static void test_round3_vulkan_d3d9_subnative_viewport_and_cursor(void)
     ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_BORDERLESS);
 }
 
+static void test_round4_gl_ctx_isolation_map(void)
+{
+    /* R2-L1 (1C): Per-HGLRC isolation map prevents hidden wined3d probes from poisoning native GL */
+    ds_gl_ctx_entry_t slots[DS_MAX_GL_CTX_MAP];
+    memset(slots, 0, sizeof(slots));
+
+    /* NULL / empty / unknown queries safely return -1 */
+    ASSERT_TRUE(ds_gl_ctx_map_op(NULL, DS_MAX_GL_CTX_MAP, 0x1001u, 0) == -1);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, 0u, 0x1001u, 0) == -1);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0u, 0) == -1);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x1001u, 0) == -1);
+
+    /* Record native game context + two hidden wined3d probe contexts */
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x1001u, 1) == 0);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x2001u, 2) == 1);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x2002u, 2) == 1);
+
+    /* Lookups remain cleanly isolated */
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x1001u, 0) == 0);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x2001u, 0) == 1);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x2002u, 0) == 1);
+
+    /* Delete probe context and verify slot reuse */
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x2001u, -1) == 0);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x2001u, 0) == -1);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x2001u, -1) == -1);
+
+    /* Flood remaining slots with wined3d probes -> inserting a 2nd native ctx must evict a probe, never native 0x1001 */
+    for (uintptr_t k = 0x3000u; k < 0x3000u + 20u; k++) {
+        ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, k, 2) == 1);
+    }
+    /* Re-insert native ctx 0x1001 + 15 probes, then insert native ctx 0x1002 */
+    memset(slots, 0, sizeof(slots));
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x1001u, 1) == 0);
+    for (size_t i = 0; i < DS_MAX_GL_CTX_MAP - 1u; i++) {
+        ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, (uintptr_t)(0x4000u + i), 2) == 1);
+    }
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x1002u, 1) == 0);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x1001u, 0) == 0);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x1002u, 0) == 0);
+
+    /* Overflow full native table (17 inserts) -> oldest evicted cleanly without ASan/UB errors */
+    memset(slots, 0, sizeof(slots));
+    for (size_t i = 0; i < DS_MAX_GL_CTX_MAP + 2u; i++) {
+        ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, (uintptr_t)(0x5000u + i), 1) == 0);
+    }
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, 0x5000u, 0) == -1);
+    ASSERT_TRUE(ds_gl_ctx_map_op(slots, DS_MAX_GL_CTX_MAP, (uintptr_t)(0x5000u + DS_MAX_GL_CTX_MAP + 1u), 0) == 0);
+}
+
+static void test_round4_subnative_exclusive_fullscreen_predicate(void)
+{
+    /* R2-L2: Exhaustive matrix for Tier 1 64-bit sub-native exclusive-fullscreen geometry guard */
+    const uint32_t k_popup_vis = 0x80000000u | 0x10000000u; /* WS_POPUP | WS_VISIBLE */
+    const uint32_t k_child = 0x40000000u;
+    const uint32_t k_caption = 0x00C00000u;
+    const uint32_t k_thickframe = 0x00040000u;
+    const uint32_t k_dlgframe = 0x00400000u;
+    const uint32_t k_border = 0x00800000u;
+    const uint32_t k_topmost = 0x00000008u;
+    const uint32_t k_toolwindow = 0x00000080u;
+
+    /* Positive cases */
+    /* 1. 1920x1080 at (0, 0) on 3024x1964, borderless + WS_EX_TOPMOST */
+    ASSERT_TRUE(ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis, k_topmost, false, true, false, false));
+    /* 2. 1920x1080 at (0, 66) (2x Retina Cocoa menu bar clamp) on 3024x1964 */
+    ASSERT_TRUE(ds_is_subnative_exclusive_fullscreen_window(
+        0, 66, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis, k_topmost, false, true, false, false));
+    /* 3. Pre-exstyle WM_WINDOWPOSCHANGING with is_topmost_target=true */
+    ASSERT_TRUE(ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis, 0u, true, true, false, false));
+    /* 4. 1280x720 virtualized at 640x360 (96 DPI 2x) at (0, 33) on 1512x982 */
+    ASSERT_TRUE(ds_is_subnative_exclusive_fullscreen_window(
+        0, 33, 640, 360, 0, 0, 1512, 982, k_popup_vis, k_topmost, false, true, false, false));
+    /* 5. External monitor negative origin (-1920, 0, 1920, 1080) with 1280x720 at (-1920, 24) */
+    ASSERT_TRUE(ds_is_subnative_exclusive_fullscreen_window(
+        -1920, 24, 1280, 720, -1920, 0, 1920, 1080, k_popup_vis, k_topmost, false, true, false, false));
+
+    /* Negative cases (must NEVER hijack native FS, windowed exits, splashes, dialogs, or tool windows) */
+    /* 6. Native 3024x1964 on 3024x1964 */
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 3024, 1964, 0, 0, 3024, 1964, k_popup_vis, k_topmost, false, true, false, false));
+    /* 7. External 1080p monitor running native 1920x1080 */
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 1920, 1080, k_popup_vis, k_topmost, false, true, false, false));
+    /* 8. Windowed exits (WS_CAPTION / WS_THICKFRAME / WS_DLGFRAME / WS_BORDER / WS_CHILD) */
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis | k_caption, k_topmost, false, true, false, false));
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis | k_thickframe, k_topmost, false, true, false, false));
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis | k_dlgframe, k_topmost, false, true, false, false));
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis | k_border, k_topmost, false, true, false, false));
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis | k_child, k_topmost, false, true, false, false));
+    /* 9. Neither WS_EX_TOPMOST nor is_topmost_target */
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis, 0u, false, true, false, false));
+    /* 10. Centered splash (800x450 at (1112, 757)) */
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        1112, 757, 800, 450, 0, 0, 3024, 1964, k_popup_vis, k_topmost, false, true, false, false));
+    /* 11. Dialog (#32770), toolwindow, hidden, minimized, tiny (< 640x360), out-of-range anchor */
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis, k_topmost, false, true, false, true));
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis, k_topmost | k_toolwindow, false, true, false, false));
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis, k_topmost, false, false, false, false));
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis, k_topmost, false, true, true, false));
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 639, 360, 0, 0, 3024, 1964, k_popup_vis, k_topmost, false, true, false, false));
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 0, 640, 359, 0, 0, 3024, 1964, k_popup_vis, k_topmost, false, true, false, false));
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        0, 129, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis, k_topmost, false, true, false, false));
+    ASSERT_TRUE(!ds_is_subnative_exclusive_fullscreen_window(
+        9, 0, 1920, 1080, 0, 0, 3024, 1964, k_popup_vis, k_topmost, false, true, false, false));
+}
+
+static void test_round4_live_backing_clamp(void)
+{
+    /* L4(b): Live client-rect backing clamp eliminates mid-transition 4x top-left crop */
+    /* 1. Retina PMv2 mid-transition (window still 1280x960 before expanding to 3024x1964) */
+    int32_t bw = 3024, bh = 1964;
+    ds_clamp_live_backing_dims(1280, 960, 640, 480, 3024, 1964, 3024, 1964, &bw, &bh);
+    ASSERT_TRUE(bw == 1280 && bh == 960);
+    ds_viewport_t vp;
+    ASSERT_TRUE(ds_compute_viewport(bw, bh, 0, 640, 480, DS_ASPECT_PRESERVE, &vp));
+    ASSERT_TRUE(vp.dst_x == 0 && vp.dst_y == 0 && vp.dst_w == 1280 && vp.dst_h == 960);
+
+    /* 2. Steady-state fullscreen (3024x1964) remains untouched */
+    bw = 3024; bh = 1964;
+    ds_clamp_live_backing_dims(3024, 1964, 640, 480, 3024, 1964, 3024, 1964, &bw, &bh);
+    ASSERT_TRUE(bw == 3024 && bh == 1964);
+
+    /* 3. 96-DPI HWND on 2x Retina (live 640x480 logical on 1512x982 -> 1280x960 physical) */
+    bw = 3024; bh = 1964;
+    ds_clamp_live_backing_dims(640, 480, 640, 480, 1512, 982, 3024, 1964, &bw, &bh);
+    ASSERT_TRUE(bw == 1280 && bh == 960);
+
+    /* 4. Live rect smaller than virtual resolution leaves backing untouched */
+    bw = 3024; bh = 1964;
+    ds_clamp_live_backing_dims(320, 240, 640, 480, 3024, 1964, 3024, 1964, &bw, &bh);
+    ASSERT_TRUE(bw == 3024 && bh == 1964);
+}
+
 int main(void)
 {
     test_viewport_and_notch_geometry();
@@ -762,6 +911,9 @@ int main(void)
     test_v3_user_override_and_mode_union();
     test_v3_three_tier_state_machine_and_multimonitor();
     test_round3_vulkan_d3d9_subnative_viewport_and_cursor();
+    test_round4_gl_ctx_isolation_map();
+    test_round4_subnative_exclusive_fullscreen_predicate();
+    test_round4_live_backing_clamp();
     printf("[DS-ASAN-PASS] All display_scaler C11 geometry, mode-table, zero-drift mouselook & INI tests passed.\n");
     return 0;
 }

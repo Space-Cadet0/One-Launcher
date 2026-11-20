@@ -256,6 +256,49 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
 bool ds_is_vulkan_legacy_d3d(const ds_tier_input_t *in);
 ds_presenter_tier_t ds_compute_presenter_tier(const ds_tier_input_t *in);
 
+/* Per-HGLRC OpenGL context isolation map (native game vs WineD3D probe contexts) */
+#define DS_MAX_GL_CTX_MAP 16u
+
+typedef struct ds_gl_ctx_entry_s {
+    uintptr_t key;
+    uint8_t   is_wined3d; /* 1 = wined3d probe/renderer, 0 = native game/app */
+} ds_gl_ctx_entry_t;
+
+/* op: 0 = lookup (-1 unknown / 0 native / 1 wined3d), 1 = record native, 2 = record wined3d, -1 = remove */
+int ds_gl_ctx_map_op(ds_gl_ctx_entry_t *slots, size_t cap, uintptr_t key, int op);
+
+/* Pure Tier 1 64-bit sub-native exclusive-fullscreen window geometry predicate */
+bool ds_is_subnative_exclusive_fullscreen_window(
+    int32_t  win_x,
+    int32_t  win_y,
+    int32_t  win_w,
+    int32_t  win_h,
+    int32_t  mon_x,
+    int32_t  mon_y,
+    int32_t  mon_w,
+    int32_t  mon_h,
+    uint32_t style,
+    uint32_t exstyle,
+    bool     is_topmost_target,
+    bool     is_visible,
+    bool     is_iconic,
+    bool     is_dialog_class
+);
+
+/* Proportional live client-rect backing clamp during windowed->fullscreen GL transition */
+void ds_clamp_live_backing_dims(
+    int32_t  live_w,
+    int32_t  live_h,
+    int32_t  virt_w,
+    int32_t  virt_h,
+    int32_t  real_screen_w,
+    int32_t  real_screen_h,
+    int32_t  phys_screen_w,
+    int32_t  phys_screen_h,
+    int32_t *io_backing_w,
+    int32_t *io_backing_h
+);
+
 /*
  * Canonical monotonic version key for `active_session.ini` shared between `DllMain`
  * initialization and `ds_poll_active_session_if_needed` hot-updates. Prefers

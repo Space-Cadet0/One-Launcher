@@ -717,6 +717,28 @@ runTest('TRK7-04', 'detectDisplayGeometry parses Apple Silicon main display & Mo
   assert.strictEqual(fallback.height, 1080);
 });
 
+runTest('TRK7-05', 'Round 4 universal contracts: GL detach-before-rebind, per-HGLRC isolation, 64-bit sub-native FS guard & live backing clamp', () => {
+  const glSrc = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler_gl_gdi.c'), 'utf8');
+  const winSrc = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler_window.c'), 'utf8');
+  const mathSrc = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler_math.c'), 'utf8');
+
+  // R2-L1: detach-before-rebind defeats winemac.drv [context view]/[context latentView] short-circuit
+  assert.match(glSrc, /g_ds\.real_wglMakeCurrent\(NULL,\s*NULL\);\s*\n\s*BOOL rebind_ok = g_ds\.real_wglMakeCurrent\(target_hdc,\s*rebind_ctx\);/);
+  assert.match(glSrc, /ds_gl_ctx_map_op/);
+  assert.match(glSrc, /g_ds\.wined3d_uses_gl\s*&&\s*!g_ds\.game_gl_active/);
+  assert.match(winSrc, /ds_refresh_gl_host_drawable_on_owner_thread\(hwnd_game\)/);
+
+  // R2-L2: 64-bit sub-native exclusive-fullscreen geometry guard present & tested
+  assert.match(mathSrc, /bool ds_is_subnative_exclusive_fullscreen_window\(/);
+  assert.match(winSrc, /ds_check_modern_subnative_fs_and_request/);
+  assert.match(winSrc, /modern_subnative_fs_expanded/);
+
+  // L4(b): live backing clamp + InvalidateRect repaint with zero SW_MINIMIZE
+  assert.match(mathSrc, /void ds_clamp_live_backing_dims\(/);
+  assert.match(glSrc, /ds_clamp_live_backing_dims\(/);
+  assert.doesNotMatch(winSrc, /\bSW_MINIMIZE\b|\bSW_FORCEMINIMIZE\b/);
+});
+
 // ============================================================================
 // FINAL SUMMARY & VERDICT
 // ============================================================================

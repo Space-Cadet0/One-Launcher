@@ -25,29 +25,29 @@
     ]
   },
   "sources": {
-    "electron/helpers/display_scaler/display_scaler.h": "d873264b1c66057f209465d0a2f5c83ef1f01c408d6827b321bf2ae425d87abe",
-    "electron/helpers/display_scaler/display_scaler_internal.h": "65adc370a0a59155e35c7cc88fdbb24f92c2137e76b44e742196d25e3be54a29",
-    "electron/helpers/display_scaler/display_scaler_math.c": "882124dfa37416b39d0b5f80add787245110fff822b2e1fe7aa9d2fce02604d1",
-    "electron/helpers/display_scaler/display_scaler_gl_gdi.c": "4950c13f8206c0bc5b22c951718acaa7ad601e11b4c3bfefec104d3a090f0934",
-    "electron/helpers/display_scaler/display_scaler_window.c": "50f1d7be22fb053d54e80279ce47dc68e12690b03d15007ab7d108a1dc6b1d9c",
-    "electron/helpers/display_scaler/display_scaler_dll.c": "f2734ec9b0306e7fc199cc2649a13d3b0525b1103752c22d28a3ab51f5fefaa8",
+    "electron/helpers/display_scaler/display_scaler.h": "89fbadbf7f6099f0d69a0f344534f34c816e53b4714f0996aaebf5f543b789c5",
+    "electron/helpers/display_scaler/display_scaler_internal.h": "4d0c561d44d05faaafddb1a4ae8351c18663b38d1d5b598410cabd9150309565",
+    "electron/helpers/display_scaler/display_scaler_math.c": "42ad46e9557d23324a3ba49d7dadf9f4bb2f0639aada0cc8dbab7f13e681097f",
+    "electron/helpers/display_scaler/display_scaler_gl_gdi.c": "ecabbe750a558c094711904ebb45a57016b1d8e33bb5838630aa250dc0c314c0",
+    "electron/helpers/display_scaler/display_scaler_window.c": "bc948b1c62c64c04a71b7f1995065d5689015d3503cc4e89f64e322f5e7fbe19",
+    "electron/helpers/display_scaler/display_scaler_dll.c": "703a7a6e5de7d2c1d39825224d5fa0b5e26eaa845a1fedc12385a75c9c9e3abd",
     "electron/helpers/display_scaler/display_launcher.c": "278d8fc33fc6a94b9adb5fd0479f86d5c899e5201f21e3013d85932859c11f8c",
     "electron/helpers/display_scaler/display_scaler.def": "a975f9534e4087f11271db76527cbdea06c7f30954041ac3e73f57e29a47aad1",
     "scripts/build-display-scaler.cjs": "508fdbfe7983333865a8640e02d22f8716da60dc7b21345d0f3596003bcc6c25"
   },
   "outputs": {
     "one_display_scaler_x86.dll": {
-      "sha256": "0da423e0ca0b5bbfc3be82a3fd14dcb2ff226320ac2b8ebce760a59ced9b27d1",
-      "sizeBytes": 122368,
+      "sha256": "a1745f8c49b6bec26bfb4a900f06cd9f0d96906f21a1aabbddc49eb7f84d517f",
+      "sizeBytes": 121856,
       "machine": "0x14c",
-      "peCheckSum": "0x00028929",
+      "peCheckSum": "0x00028f35",
       "exportedCount": 2
     },
     "one_display_scaler_x64.dll": {
-      "sha256": "6e529d1db5e3746d4e4a710aa9c0a7d34c72b9468405ccf81aca12f5b8338fc8",
-      "sizeBytes": 115200,
+      "sha256": "f4606506d384d1d3f0d116ea082d0e2feb4b2a1ebe5cf51ca8e40ec1266db888",
+      "sizeBytes": 118784,
       "machine": "0x8664",
-      "peCheckSum": "0x000293f2",
+      "peCheckSum": "0x00027434",
       "exportedCount": 2
     },
     "one_display_launcher_x86.exe": {

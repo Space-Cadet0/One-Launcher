@@ -144,7 +144,7 @@ typedef struct {
 
 static ds_mod_cache_entry_t s_mod_cache[DS_MOD_CACHE_SLOTS];
 
-static void ds_invalidate_mod_cache(void)
+DS_ALWAYS_INLINE void ds_invalidate_mod_cache(void)
 {
     if (g_ds.lock_initialized) ds_lock();
     memset(s_mod_cache, 0, sizeof(s_mod_cache));
@@ -316,7 +316,7 @@ static bool ds_current_exe_in_multisz(const char *msz, bool on_err)
     return false;
 }
 
-static bool ds_is_passthrough_chaining_process(void)
+DS_ALWAYS_INLINE bool ds_is_passthrough_chaining_process(void)
 {
     static const char k_chain_msz[] =
         "cmd.exe\0powershell.exe\0rundll32.exe\0steam.exe\0"
@@ -325,7 +325,7 @@ static bool ds_is_passthrough_chaining_process(void)
     return ds_current_exe_in_multisz(k_chain_msz, false);
 }
 
-static bool ds_should_ignore_current_process(void)
+DS_ALWAYS_INLINE bool ds_should_ignore_current_process(void)
 {
     static const char k_ignored_msz[] =
         "services.exe\0plugplay.exe\0rpcss.exe\0winedevice.exe\0"
@@ -537,7 +537,7 @@ static void ds_fill_devmode_w(DEVMODEW *dm, int32_t w, int32_t h, int32_t bpp, i
     dm->dmFields |= DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_DISPLAYFLAGS;
 }
 
-static void ds_fill_devmode_a(DEVMODEA *dm, int32_t w, int32_t h, int32_t bpp, int32_t hz)
+DS_ALWAYS_INLINE void ds_fill_devmode_a(DEVMODEA *dm, int32_t w, int32_t h, int32_t bpp, int32_t hz)
 {
     dm->dmPelsWidth = (DWORD)w;
     dm->dmPelsHeight = (DWORD)h;
@@ -553,8 +553,9 @@ static BOOL WINAPI hook_EnumDisplaySettingsExW(LPCWSTR lpszDeviceName, DWORD iMo
     if (!ds_is_internal_call()) {
         ds_ensure_runtime_started();
     }
+    pfn_EnumDisplaySettingsExW_t real_eds = g_ds.real_EnumDisplaySettingsExW;
     if (ds_is_internal_call()) {
-        return g_ds.real_EnumDisplaySettingsExW ? g_ds.real_EnumDisplaySettingsExW(lpszDeviceName, iModeNum, lpDevMode, dwFlags) : FALSE;
+        return real_eds ? real_eds(lpszDeviceName, iModeNum, lpDevMode, dwFlags) : FALSE;
     }
 
     ds_lock();
@@ -578,18 +579,14 @@ static BOOL WINAPI hook_EnumDisplaySettingsExW(LPCWSTR lpszDeviceName, DWORD iMo
     ds_unlock();
 
     if (pass_through || non_target_dev) {
-        return g_ds.real_EnumDisplaySettingsExW ? g_ds.real_EnumDisplaySettingsExW(lpszDeviceName, iModeNum, lpDevMode, dwFlags) : FALSE;
+        return real_eds ? real_eds(lpszDeviceName, iModeNum, lpDevMode, dwFlags) : FALSE;
     }
 
     if (iModeNum == ENUM_CURRENT_SETTINGS || iModeNum == ENUM_REGISTRY_SETTINGS) {
         if (!mode_virt || iModeNum == ENUM_REGISTRY_SETTINGS) {
-            return g_ds.real_EnumDisplaySettingsExW
-                ? g_ds.real_EnumDisplaySettingsExW(lpszDeviceName, iModeNum, lpDevMode, dwFlags)
-                : FALSE;
+            return real_eds ? real_eds(lpszDeviceName, iModeNum, lpDevMode, dwFlags) : FALSE;
         }
-        BOOL ok = g_ds.real_EnumDisplaySettingsExW
-            ? g_ds.real_EnumDisplaySettingsExW(lpszDeviceName, ENUM_CURRENT_SETTINGS, lpDevMode, dwFlags)
-            : FALSE;
+        BOOL ok = real_eds ? real_eds(lpszDeviceName, ENUM_CURRENT_SETTINGS, lpDevMode, dwFlags) : FALSE;
         if (!ok) {
             WORD sz = lpDevMode->dmSize ? lpDevMode->dmSize : (WORD)sizeof(DEVMODEW);
             memset(lpDevMode, 0, sz);
@@ -721,7 +718,7 @@ static LONG ds_handle_change_display_mode(bool is_reset, int32_t req_w, int32_t 
             int32_t keep_vw = g_ds.virt_w;
             int32_t keep_vh = g_ds.virt_h;
             ds_unlock();
-            ds_tracef("CDS rst ignored focus-loss virt=%dx%d",
+            ds_tracef("CDS rst skip blur %dx%d",
                       (int)keep_vw, (int)keep_vh);
             return DISP_CHANGE_SUCCESSFUL;
         }
@@ -1211,7 +1208,7 @@ static BOOL WINAPI hook_SetWindowPlacement(HWND hWnd, const WINDOWPLACEMENT *lpw
  * `NSWindow` frame never changed, leaving `wineserver` hit-testing (`window_from_point` inside
  * `NtUserPeekMessage`) permanently clamped to the top-left `1280x1024` sub-rectangle.
  */
-static bool ds_try_promote_fullscreen_resize_locked(
+DS_ALWAYS_INLINE bool ds_try_promote_fullscreen_resize_locked(
     HWND hWnd,
     HWND hWndInsertAfter,
     int X,
@@ -1365,7 +1362,7 @@ static LONG WINAPI hook_D3DKMTEscape(const ds_d3dkmt_escape_t *desc)
     return real_fn(desc);
 }
 
-static void ds_compute_centered_windowed_bounds(HWND hWnd, int32_t client_w, int32_t client_h, int *out_x, int *out_y, int *out_w, int *out_h)
+DS_ALWAYS_INLINE void ds_compute_centered_windowed_bounds(HWND hWnd, int32_t client_w, int32_t client_h, int *out_x, int *out_y, int *out_w, int *out_h)
 {
     DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_STYLE);
     DWORD cur_exstyle = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_EXSTYLE);
@@ -1383,7 +1380,7 @@ static void ds_compute_centered_windowed_bounds(HWND hWnd, int32_t client_w, int
     *out_h = wh;
 }
 
-static bool ds_is_hwnd_already_full_panel_internal(HWND hWnd)
+DS_ALWAYS_INLINE bool ds_is_hwnd_already_full_panel_internal(HWND hWnd)
 {
     RECT cur_rc = { 0, 0, 0, 0 };
     return IsWindowVisible(hWnd) &&
@@ -1393,18 +1390,27 @@ static bool ds_is_hwnd_already_full_panel_internal(HWND hWnd)
            (cur_rc.bottom - cur_rc.top) == g_ds.real_screen_h;
 }
 
-static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, UINT uFlags)
+static BOOL ds_call_real_pos_or_move(HWND hWnd, HWND after, int x, int y, int cx, int cy, UINT uFlags, BOOL bRepaint, bool is_move)
+{
+    return is_move
+        ? g_ds.real_MoveWindow(hWnd, x, y, cx, cy, bRepaint)
+        : g_ds.real_SetWindowPos(hWnd, after, x, y, cx, cy, uFlags);
+}
+
+static BOOL ds_set_or_move_window_common(
+    HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy,
+    UINT uFlags, BOOL bRepaint, bool is_move, const void *caller_ret
+)
 {
     if (!ds_is_internal_call()) {
         ds_ensure_runtime_started();
     }
-    if (!g_ds.real_SetWindowPos) return FALSE;
-    if (ds_is_internal_call() || !hWnd) {
-        return g_ds.real_SetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
+    if (is_move ? (!g_ds.real_MoveWindow) : (!g_ds.real_SetWindowPos)) return FALSE;
+    if (ds_is_internal_call() || !hWnd || (is_move && ds_is_passthrough_locked())) {
+        return ds_call_real_pos_or_move(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags, bRepaint, is_move);
     }
 
-    const void *caller_ret = __builtin_return_address(0);
-    if (g_ds.hwnd_game == NULL && (uFlags & SWP_HIDEWINDOW) == 0) {
+    if (!is_move && g_ds.hwnd_game == NULL && (uFlags & SWP_HIDEWINDOW) == 0) {
         ds_attach_and_apply_game_window(hWnd, (uFlags & SWP_NOSIZE) == 0 ? cx : 0, (uFlags & SWP_NOSIZE) == 0 ? cy : 0);
     }
 
@@ -1422,7 +1428,7 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
         int32_t mon_w = g_ds.real_screen_w;
         int32_t mon_h = g_ds.real_screen_h;
         bool promoted_vk = false;
-        if (vk_d3d9 && is_target && !g_ds.borderless_active && !g_ds.user_forced_windowed &&
+        if (!is_move && vk_d3d9 && is_target && !g_ds.borderless_active && !g_ds.user_forced_windowed &&
             (uFlags & (SWP_NOSIZE | SWP_HIDEWINDOW)) == 0 &&
             cx >= 240 && cy >= 180 && mon_w > 0 && mon_h > 0 &&
             (cx < mon_w || cy < mon_h)) {
@@ -1450,6 +1456,15 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
         );
         ds_unlock();
         if (enforce_borderless) {
+            if (is_move) {
+                HANDLE prev_dpi = ds_dpi_guard_enter_for_hwnd(hWnd);
+                ds_enter_internal();
+                ds_clear_wine_present_rect_on_hwnd(hWnd);
+                BOOL bres = g_ds.real_MoveWindow(hWnd, mon_x, mon_y, mon_w, mon_h, bRepaint);
+                ds_leave_internal();
+                ds_dpi_guard_leave(prev_dpi);
+                return bres;
+            }
             UINT eff_flags = promoted_vk
                 ? ((uFlags & ~(UINT)(SWP_NOMOVE | SWP_NOSIZE)) | SWP_FRAMECHANGED)
                 : uFlags;
@@ -1463,13 +1478,13 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
             }
             return bres;
         }
-        return g_ds.real_SetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
+        return ds_call_real_pos_or_move(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags, bRepaint, is_move);
     }
 
     bool promoted_fs = ds_try_promote_fullscreen_resize_locked(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags, sys_caller, cur_style, is_vis);
     bool is_game_fs = (hWnd == g_ds.hwnd_game && g_ds.fullscreen_active && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0);
     bool app_inactive = g_ds.app_inactive;
-    bool staging_birth = (is_game_fs && !g_ds.cocoa_fs_synced && g_ds.first_visible_tick != 0 &&
+    bool staging_birth = (!is_move && is_game_fs && !g_ds.cocoa_fs_synced && g_ds.first_visible_tick != 0 &&
                           (GetTickCount() - g_ds.first_visible_tick) < 250);
     int32_t win_scale = (hWnd == g_ds.hwnd_game && !g_ds.fullscreen_active) ? ds_get_windowed_scale_locked() : 1;
     int32_t vw = g_ds.virt_w;
@@ -1478,7 +1493,7 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
     int32_t mon_y = g_ds.win_mon_y;
     int32_t mon_w = g_ds.real_screen_w;
     int32_t mon_h = g_ds.real_screen_h;
-    if (!promoted_fs && is_game_fs && (uFlags & SWP_NOSIZE) == 0 && cx >= 240 && cy >= 180 &&
+    if (!is_move && !promoted_fs && is_game_fs && (uFlags & SWP_NOSIZE) == 0 && cx >= 240 && cy >= 180 &&
         !sys_caller && !g_ds.mode_virtualized) {
         g_ds.virt_w = cx;
         g_ds.virt_h = cy;
@@ -1505,15 +1520,20 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
             eff_flags |= SWP_FRAMECHANGED;
         }
         ds_enter_internal();
-        bool already_full = !staging_birth && !promoted_fs && !app_inactive &&
+        bool already_full = !staging_birth && !promoted_fs && (is_move || !app_inactive) &&
                             ds_is_hwnd_already_full_panel_internal(hWnd) &&
-                            (eff_flags & (SWP_HIDEWINDOW | SWP_FRAMECHANGED)) == 0;
-        if (already_full) {
-            eff_flags = (eff_flags & ~(UINT)SWP_SHOWWINDOW) | SWP_NOMOVE | SWP_NOSIZE;
+                            (is_move || (eff_flags & (SWP_HIDEWINDOW | SWP_FRAMECHANGED)) == 0);
+        BOOL res = TRUE;
+        if (already_full && is_move) {
+            if (bRepaint) InvalidateRect(hWnd, NULL, FALSE);
         } else {
-            ds_clear_wine_present_rect_on_hwnd(hWnd);
+            if (already_full) {
+                eff_flags = (eff_flags & ~(UINT)SWP_SHOWWINDOW) | SWP_NOMOVE | SWP_NOSIZE;
+            } else {
+                ds_clear_wine_present_rect_on_hwnd(hWnd);
+            }
+            res = ds_call_real_pos_or_move(hWnd, z_order, nx, ny, ncx, ncy, eff_flags, bRepaint, is_move);
         }
-        BOOL res = g_ds.real_SetWindowPos(hWnd, z_order, nx, ny, ncx, ncy, eff_flags);
         if (GetCurrentThreadId() == g_ds.game_thread_id) {
             if (promoted_fs) {
                 ds_ensure_gl_host_child_on_owner_thread(hWnd);
@@ -1538,7 +1558,7 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
         int ncy = (uFlags & SWP_NOSIZE) ? cy : wh;
         ds_enter_internal();
         ds_clear_wine_present_rect_on_hwnd(hWnd);
-        BOOL res = g_ds.real_SetWindowPos(hWnd, HWND_NOTOPMOST, nx, ny, ncx, ncy, uFlags);
+        BOOL res = ds_call_real_pos_or_move(hWnd, HWND_NOTOPMOST, nx, ny, ncx, ncy, uFlags, bRepaint, is_move);
         ds_leave_internal();
         if (GetCurrentThreadId() == g_ds.game_thread_id) {
             ds_sync_gl_host_bounds_on_owner_thread(hWnd);
@@ -1546,112 +1566,21 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
         return res;
     }
 
-    BOOL res = g_ds.real_SetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
+    BOOL res = ds_call_real_pos_or_move(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags, bRepaint, is_move);
     if (hWnd == g_ds.hwnd_game && GetCurrentThreadId() == g_ds.game_thread_id) {
         ds_sync_gl_host_bounds_on_owner_thread(hWnd);
     }
     return res;
 }
 
+static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, UINT uFlags)
+{
+    return ds_set_or_move_window_common(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags, FALSE, false, __builtin_return_address(0));
+}
+
 static BOOL WINAPI hook_MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHeight, BOOL bRepaint)
 {
-    if (!ds_is_internal_call()) {
-        ds_ensure_runtime_started();
-    }
-    if (!g_ds.real_MoveWindow) return FALSE;
-    if (ds_is_internal_call() || !hWnd || ds_is_passthrough_locked()) {
-        return g_ds.real_MoveWindow(hWnd, X, Y, nWidth, nHeight, bRepaint);
-    }
-
-    bool sys_caller = ds_is_system_renderer_caller(__builtin_return_address(0));
-    DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_STYLE);
-    bool is_vis = (IsWindowVisible(hWnd) != FALSE);
-    ds_lock();
-    if (ds_is_modern_tier_locked()) {
-        bool is_target = (hWnd == g_ds.hwnd_game);
-        bool enforce_borderless = (
-            ds_is_modern_borderless_locked() &&
-            is_target &&
-            g_ds.borderless_active &&
-            !g_ds.app_inactive &&
-            g_ds.real_screen_w > 0 && g_ds.real_screen_h > 0
-        );
-        int32_t bx = g_ds.win_mon_x;
-        int32_t by = g_ds.win_mon_y;
-        int32_t bw = g_ds.real_screen_w;
-        int32_t bh = g_ds.real_screen_h;
-        ds_unlock();
-        if (enforce_borderless) {
-            HANDLE prev_dpi = ds_dpi_guard_enter_for_hwnd(hWnd);
-            ds_enter_internal();
-            ds_clear_wine_present_rect_on_hwnd(hWnd);
-            BOOL bres = g_ds.real_MoveWindow(hWnd, bx, by, bw, bh, bRepaint);
-            ds_leave_internal();
-            ds_dpi_guard_leave(prev_dpi);
-            return bres;
-        }
-        return g_ds.real_MoveWindow(hWnd, X, Y, nWidth, nHeight, bRepaint);
-    }
-    bool promoted_fs = ds_try_promote_fullscreen_resize_locked(hWnd, NULL, X, Y, nWidth, nHeight, 0, sys_caller, cur_style, is_vis);
-    bool is_game_fs = (hWnd == g_ds.hwnd_game && g_ds.fullscreen_active && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0);
-    int32_t win_scale = (hWnd == g_ds.hwnd_game && !g_ds.fullscreen_active) ? ds_get_windowed_scale_locked() : 1;
-    int32_t vw = g_ds.virt_w;
-    int32_t vh = g_ds.virt_h;
-    int32_t mon_x = g_ds.win_mon_x;
-    int32_t mon_y = g_ds.win_mon_y;
-    int32_t mon_w = g_ds.real_screen_w;
-    int32_t mon_h = g_ds.real_screen_h;
-    if (is_game_fs) {
-        g_ds.window_mutated_by_scaler = true;
-    }
-    ds_unlock();
-
-    if (is_game_fs) {
-        if (GetCurrentThreadId() == g_ds.game_thread_id) {
-            ds_ensure_fullscreen_styles_on_owner_thread(hWnd);
-        }
-        ds_enter_internal();
-        bool already_full = !promoted_fs && ds_is_hwnd_already_full_panel_internal(hWnd);
-        if (!already_full) {
-            ds_clear_wine_present_rect_on_hwnd(hWnd);
-        }
-        BOOL res = already_full
-            ? TRUE
-            : g_ds.real_MoveWindow(hWnd, mon_x, mon_y, mon_w, mon_h, bRepaint);
-        if (already_full && bRepaint) {
-            InvalidateRect(hWnd, NULL, FALSE);
-        }
-        if (GetCurrentThreadId() == g_ds.game_thread_id) {
-            if (promoted_fs) {
-                ds_ensure_gl_host_child_on_owner_thread(hWnd);
-            } else {
-                ds_sync_gl_host_bounds_on_owner_thread(hWnd);
-            }
-        }
-        ds_leave_internal();
-        if (promoted_fs) {
-            ds_gl_notify_mode_changed();
-            ds_write_status_file();
-        }
-        return res;
-    }
-    if (win_scale > 1 && vw > 0 && vh > 0) {
-        int wx = 0, wy = 0, ww = 0, wh = 0;
-        ds_compute_centered_windowed_bounds(hWnd, vw * win_scale, vh * win_scale, &wx, &wy, &ww, &wh);
-        ds_enter_internal();
-        ds_clear_wine_present_rect_on_hwnd(hWnd);
-        BOOL res = g_ds.real_MoveWindow(hWnd, wx, wy, ww, wh, bRepaint);
-        ds_leave_internal();
-        if (GetCurrentThreadId() == g_ds.game_thread_id) {
-            ds_sync_gl_host_bounds_on_owner_thread(hWnd);
-        }
-        return res;
-    }
-    BOOL res = g_ds.real_MoveWindow(hWnd, X, Y, nWidth, nHeight, bRepaint);
-    if (hWnd == g_ds.hwnd_game && GetCurrentThreadId() == g_ds.game_thread_id) {
-        ds_sync_gl_host_bounds_on_owner_thread(hWnd);
-    }
-    return res;
+    return ds_set_or_move_window_common(hWnd, NULL, X, Y, nWidth, nHeight, 0, bRepaint, true, __builtin_return_address(0));
 }
 
 static LONG_PTR ds_handle_get_window_long(HWND hWnd, int nIndex, bool unicode)
@@ -1800,50 +1729,40 @@ static LONG_PTR WINAPI hook_SetWindowLongPtrW(HWND hWnd, int nIndex, LONG_PTR dw
 }
 #endif
 
-static BOOL WINAPI hook_GetClientRect(HWND hWnd, LPRECT lpRect)
+static bool ds_try_get_virt_rect(HWND hWnd, LPRECT lpRect, bool allow_win_scale, const void *caller_ret)
 {
-    if (!lpRect) return FALSE;
-    if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
+    if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(caller_ret)) {
         HWND desk = GetDesktopWindow();
         ds_lock();
-        bool is_game_virt = (hWnd != NULL &&
-                             ((hWnd == g_ds.hwnd_game && (g_ds.fullscreen_active || ds_get_windowed_scale_locked() > 1)) ||
-                              (hWnd == desk && g_ds.fullscreen_active)) &&
-                             g_ds.virt_w > 0 && g_ds.virt_h > 0);
+        bool match = (hWnd != NULL &&
+                      ((hWnd == g_ds.hwnd_game && (g_ds.fullscreen_active || (allow_win_scale && ds_get_windowed_scale_locked() > 1))) ||
+                       (hWnd == desk && g_ds.fullscreen_active)) &&
+                      g_ds.virt_w > 0 && g_ds.virt_h > 0);
         int32_t vw = g_ds.virt_w;
         int32_t vh = g_ds.virt_h;
         ds_unlock();
-
-        if (is_game_virt) {
+        if (match) {
             lpRect->left = 0;
             lpRect->top = 0;
             lpRect->right = vw;
             lpRect->bottom = vh;
-            return TRUE;
+            return true;
         }
     }
+    return false;
+}
+
+static BOOL WINAPI hook_GetClientRect(HWND hWnd, LPRECT lpRect)
+{
+    if (!lpRect) return FALSE;
+    if (ds_try_get_virt_rect(hWnd, lpRect, true, __builtin_return_address(0))) return TRUE;
     return g_ds.real_GetClientRect ? g_ds.real_GetClientRect(hWnd, lpRect) : FALSE;
 }
 
 static BOOL WINAPI hook_GetWindowRect(HWND hWnd, LPRECT lpRect)
 {
     if (!lpRect) return FALSE;
-    if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
-        ds_lock();
-        bool is_game_fs = ((hWnd == g_ds.hwnd_game || hWnd == GetDesktopWindow()) &&
-                           g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0);
-        int32_t vw = g_ds.virt_w;
-        int32_t vh = g_ds.virt_h;
-        ds_unlock();
-
-        if (is_game_fs) {
-            lpRect->left = 0;
-            lpRect->top = 0;
-            lpRect->right = vw;
-            lpRect->bottom = vh;
-            return TRUE;
-        }
-    }
+    if (ds_try_get_virt_rect(hWnd, lpRect, false, __builtin_return_address(0))) return TRUE;
     return g_ds.real_GetWindowRect ? g_ds.real_GetWindowRect(hWnd, lpRect) : FALSE;
 }
 
@@ -2092,6 +2011,15 @@ static DWORD WINAPI hook_GetMessagePos(void)
     return mapped ? (DWORD)MAKELONG((WORD)(short)vx, (WORD)(short)vy) : raw;
 }
 
+static LONG ds_remap_raw_axis(LONG raw_v, double base, double span, int32_t dst_origin, int32_t dst_dim)
+{
+    double phys = base + ((double)raw_v * span) / 65535.0;
+    double norm = ((phys - (double)dst_origin) * 65535.0) / (double)dst_dim;
+    if (norm < 0.0) norm = 0.0;
+    if (norm > 65535.0) norm = 65535.0;
+    return (LONG)(norm + 0.5);
+}
+
 static void ds_remap_rawinput_mouse_packet(RAWINPUT *raw)
 {
     if (!raw || raw->header.dwType != RIM_TYPEMOUSE) {
@@ -2150,18 +2078,8 @@ static void ds_remap_rawinput_mouse_packet(RAWINPUT *raw)
         }
     }
 
-    double phys_x = base_x + ((double)raw->data.mouse.lLastX * span_w) / 65535.0;
-    double phys_y = base_y + ((double)raw->data.mouse.lLastY * span_h) / 65535.0;
-    double scr_dst_x = (double)(mon_x + vp.dst_x);
-    double scr_dst_y = (double)(mon_y + vp.dst_y);
-    double norm_x = ((phys_x - scr_dst_x) * 65535.0) / (double)vp.dst_w;
-    double norm_y = ((phys_y - scr_dst_y) * 65535.0) / (double)vp.dst_h;
-    if (norm_x < 0.0) norm_x = 0.0;
-    if (norm_x > 65535.0) norm_x = 65535.0;
-    if (norm_y < 0.0) norm_y = 0.0;
-    if (norm_y > 65535.0) norm_y = 65535.0;
-    raw->data.mouse.lLastX = (LONG)(norm_x + 0.5);
-    raw->data.mouse.lLastY = (LONG)(norm_y + 0.5);
+    raw->data.mouse.lLastX = ds_remap_raw_axis(raw->data.mouse.lLastX, base_x, span_w, mon_x + vp.dst_x, vp.dst_w);
+    raw->data.mouse.lLastY = ds_remap_raw_axis(raw->data.mouse.lLastY, base_y, span_h, mon_y + vp.dst_y, vp.dst_h);
 }
 
 static UINT WINAPI hook_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData, PUINT pcbSize, UINT cbSizeHeader)
@@ -2654,7 +2572,7 @@ static WCHAR *ds_build_merged_child_env_w(LPVOID caller_env, DWORD caller_flags)
     return out_buf;
 }
 
-static BOOL ds_finish_created_process(
+DS_ALWAYS_INLINE BOOL ds_finish_created_process(
     BOOL ok, DWORD last_err, WCHAR *merged_env, bool caller_suspended,
     LPPROCESS_INFORMATION caller_pi, LPPROCESS_INFORMATION out_pi
 )
@@ -2796,7 +2714,7 @@ static bool ds_is_url_or_protocol_w(const WCHAR *str)
     return false;
 }
 
-static WCHAR *ds_alloc_unquoted_w(const WCHAR *src)
+DS_ALWAYS_INLINE WCHAR *ds_alloc_unquoted_w(const WCHAR *src)
 {
     if (!src) return NULL;
     while (*src == L' ' || *src == L'\t') src++;
@@ -3238,7 +3156,7 @@ static void *ds_lookup_hook_by_name_flags(const char *func_name, uint8_t req_mas
     return NULL;
 }
 
-static void *ds_lookup_hook_by_name(const char *func_name, bool allow_loader_hooks)
+DS_ALWAYS_INLINE void *ds_lookup_hook_by_name(const char *func_name, bool allow_loader_hooks)
 {
     return ds_lookup_hook_by_name_flags(func_name, 0, allow_loader_hooks, false);
 }
@@ -3257,7 +3175,7 @@ static void *ds_lookup_hook_by_real_ptr(const void *fn_ptr, bool allow_loader_ho
     return NULL;
 }
 
-static bool ds_is_nul_terminated_within(const char *s, size_t max_bytes)
+DS_ALWAYS_INLINE bool ds_is_nul_terminated_within(const char *s, size_t max_bytes)
 {
     if (!s || max_bytes == 0) return false;
     for (size_t i = 0; i < max_bytes; i++) {
@@ -3300,6 +3218,13 @@ static void *ds_lookup_ibn_hook(
         return NULL;
     }
     return ds_lookup_hook_by_name(fn_name, !is_wine_gfx_mod);
+}
+
+static size_t ds_resolve_delay_rva(DWORD attrs, uintptr_t raw, uintptr_t img_base)
+{
+    if (raw == 0) return 0;
+    if ((attrs & 1u) != 0) return (size_t)raw;
+    return (raw >= img_base) ? (size_t)(raw - img_base) : 0;
 }
 
 static void ds_patch_single_module_iat(HMODULE hmod)
@@ -3475,13 +3400,8 @@ static void ds_patch_single_module_iat(HMODULE hmod)
                 const ds_delay_desc_t *dd = (const ds_delay_desc_t *)(img + d_off);
                 if (dd->rvaDLLName == 0 && dd->rvaIAT == 0 && dd->rvaINT == 0) break;
                 if (dd->rvaIAT == 0) continue;
-                size_t iat_rva = (dd->grAttrs & 1u)
-                    ? (size_t)dd->rvaIAT
-                    : ((uintptr_t)dd->rvaIAT >= img_base ? (size_t)((uintptr_t)dd->rvaIAT - img_base) : 0);
-                size_t int_rva = (dd->rvaINT == 0) ? 0
-                    : ((dd->grAttrs & 1u)
-                        ? (size_t)dd->rvaINT
-                        : ((uintptr_t)dd->rvaINT >= img_base ? (size_t)((uintptr_t)dd->rvaINT - img_base) : 0));
+                size_t iat_rva = ds_resolve_delay_rva(dd->grAttrs, (uintptr_t)dd->rvaIAT, img_base);
+                size_t int_rva = ds_resolve_delay_rva(dd->grAttrs, (uintptr_t)dd->rvaINT, img_base);
                 if (iat_rva == 0 || iat_rva + sizeof(IMAGE_THUNK_DATA) > size_of_image) continue;
                 bool has_int = (int_rva != 0 && int_rva != iat_rva && int_rva + sizeof(IMAGE_THUNK_DATA) <= size_of_image);
                 for (size_t io = iat_rva, no = int_rva;
@@ -3496,10 +3416,7 @@ static void ds_patch_single_module_iat(HMODULE hmod)
                         ((uintptr_t)cur_fn < img_base || (uintptr_t)cur_fn >= img_base + size_of_image)) {
                         IMAGE_THUNK_DATA *orig_thunk = (IMAGE_THUNK_DATA *)(img + no);
                         if (orig_thunk->u1.AddressOfData != 0 && !IMAGE_SNAP_BY_ORDINAL(orig_thunk->u1.Ordinal)) {
-                            size_t ibn_rva = (dd->grAttrs & 1u)
-                                ? (size_t)orig_thunk->u1.AddressOfData
-                                : ((uintptr_t)orig_thunk->u1.AddressOfData >= img_base
-                                    ? (size_t)((uintptr_t)orig_thunk->u1.AddressOfData - img_base) : 0);
+                            size_t ibn_rva = ds_resolve_delay_rva(dd->grAttrs, (uintptr_t)orig_thunk->u1.AddressOfData, img_base);
                             replacement = ds_lookup_ibn_hook(img, size_of_image, ibn_rva, false, is_wine_gfx_mod);
                         }
                     }
@@ -3604,7 +3521,7 @@ static HMODULE WINAPI hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
  * Initialization, Lazy Runtime Start & `DllMain`
  * ------------------------------------------------------------------------- */
 
-static void ds_read_env_w(const char *name_a, WCHAR *out_buf, size_t max_chars)
+DS_ALWAYS_INLINE void ds_read_env_w(const char *name_a, WCHAR *out_buf, size_t max_chars)
 {
     out_buf[0] = L'\0';
     WCHAR wk[48];
@@ -3646,7 +3563,7 @@ static bool ds_read_ini_file_raw(const WCHAR *path, ds_control_state_t *out_ctl)
     return ds_parse_control_ini(buf, (size_t)bytes_read, out_ctl);
 }
 
-static void ds_fill_sibling_path_if_empty(WCHAR *dst, size_t dst_cch, const WCHAR *dir, const WCHAR *filename)
+DS_ALWAYS_INLINE void ds_fill_sibling_path_if_empty(WCHAR *dst, size_t dst_cch, const WCHAR *dir, const WCHAR *filename)
 {
     if (!dst || dst[0] != L'\0' || !dir || !dir[0] || !filename) return;
     WCHAR candidate[MAX_PATH] = { 0 };
