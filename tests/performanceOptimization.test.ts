@@ -523,14 +523,15 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
       expect(typeof steamApi.trimMemoryCache).toBe('function');
     });
 
-    it('caps CriticScoreService inMemoryCache at 1200 entries (MAX_IN_MEMORY_CACHE_SIZE = 1200) and evicts oldest entries down to 1000', () => {
+    it('caps CriticScoreService inMemoryCache at 4096 entries (MAX_IN_MEMORY_CACHE_SIZE = 4096) and evicts oldest entries down to 3500', () => {
       const svc = criticScoreService as any;
       const Ctor = svc.constructor;
-      expect(Ctor.MAX_IN_MEMORY_CACHE_SIZE).toBe(1200);
+      expect(Ctor.MAX_IN_MEMORY_CACHE_SIZE).toBe(4096);
+      expect(Ctor.EVICT_TARGET_CACHE_SIZE).toBe(3500);
 
       svc.inMemoryCache.clear();
 
-      for (let i = 1; i <= 1201; i++) {
+      for (let i = 1; i <= 4097; i++) {
         svc.setInMemoryCache(`perf-test-game-${i}`, {
           score: 80,
           tier: 'Strong',
@@ -538,12 +539,12 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
         });
       }
 
-      // Upon inserting the 1201st entry, oldest entries are evicted down to 1000
-      expect(svc.inMemoryCache.size).toBe(1000);
+      // Upon inserting the 4097th entry, oldest entries are evicted down to 3500
+      expect(svc.inMemoryCache.size).toBe(3500);
       expect(svc.inMemoryCache.has('perf-test-game-1')).toBe(false);
-      expect(svc.inMemoryCache.has('perf-test-game-201')).toBe(false);
-      expect(svc.inMemoryCache.has('perf-test-game-202')).toBe(true);
-      expect(svc.inMemoryCache.has('perf-test-game-1201')).toBe(true);
+      expect(svc.inMemoryCache.has('perf-test-game-597')).toBe(false);
+      expect(svc.inMemoryCache.has('perf-test-game-598')).toBe(true);
+      expect(svc.inMemoryCache.has('perf-test-game-4097')).toBe(true);
     });
   });
 

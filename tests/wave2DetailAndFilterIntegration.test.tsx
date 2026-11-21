@@ -953,9 +953,9 @@ describe('Wave 2 Integration: SteamStorePage (T2/T3/T6/T7), ActionBar (T5), Vaul
     it('wires tagOverridesVersion, availableLibraryTags, ignoreLeadingTheWhenSorting, host-aware Setup Wizard initialStep, and handleUpdateLibraryFilterState in src/App.tsx', () => {
       const appSrc = fs.readFileSync(path.join(ROOT_DIR, 'src/App.tsx'), 'utf8');
 
-      // 1. USER_TAG_OVERRIDES_UPDATED_EVENT -> tagOverridesVersion -> libraryFilterIndex deps
+      // 1. USER_TAG_OVERRIDES_UPDATED_EVENT & criticIndexRevision -> libraryFilterIndex deps
       expect(appSrc).toContain('USER_TAG_OVERRIDES_UPDATED_EVENT');
-      expect(appSrc).toContain('[games, gameRefreshKey, tagOverridesVersion]');
+      expect(appSrc).toContain('[games, gameRefreshKey, tagOverridesVersion, criticIndexRevision]');
 
       // 2. availableLibraryTags passed to SteamStorePage
       expect(appSrc).toContain('availableLibraryTags={libraryFilterIndex.tagCounts}');
