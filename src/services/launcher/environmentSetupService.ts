@@ -69,6 +69,23 @@ export interface ShouldAutoOpenSetupWizardParams {
   isElectronRuntime: boolean;
 }
 
+export interface ProvisionBottleSteamParams {
+  runnerType: CompatibilityLayerType;
+  bottleName: string;
+  needsInstall: boolean;
+  needsSignIn: boolean;
+  onPhaseChange?: (message: string) => void;
+}
+
+export interface ProvisionBottleSteamResult {
+  success: boolean;
+  installed: boolean;
+  authenticated: boolean;
+  cancelled?: boolean;
+  message: string;
+  error?: string;
+}
+
 function isVitestRuntime(): boolean {
   if (
     typeof import.meta !== 'undefined' &&
@@ -1032,6 +1049,8 @@ export class EnvironmentSetupService {
   private activeGuidedLoginTarget: ClientLoginTargetId | null = null;
   private runnerUpdateOptIn: Map<EnvironmentComponentId, boolean> = new Map();
   private runSeq = 0;
+  private bottleSteamProvisionSeq = 0;
+  private activeBottleSteamProvisionRunToken: number | null = null;
   private boundElectronApiRef: unknown = null;
   private unsubscribeProgress: (() => void) | null = null;
 
@@ -1554,7 +1573,10 @@ export class EnvironmentSetupService {
           };
         }
         if (result?.authenticated || result?.probeState?.installed) {
-          await launcherService.detectInstalledStorefrontClients().catch(() => {});
+          await Promise.allSettled([
+            launcherService.detectCompatibilityLayers(),
+            launcherService.detectInstalledStorefrontClients(),
+          ]);
         }
         return result;
       }
@@ -1613,6 +1635,201 @@ export class EnvironmentSetupService {
       }
       this.notifyListeners();
     }
+  }
+
+  public async provisionAndSignInBottleSteam(
+    params: ProvisionBottleSteamParams
+  ): Promise<ProvisionBottleSteamResult> {
+    const trimmedBottle = params.bottleName.trim();
+    if (!trimmedBottle || params.runnerType === 'native') {
+      const errMsg = 'A compatibility runner and target bottle are required to set up Windows Steam.';
+      return {
+        success: false,
+        installed: false,
+        authenticated: false,
+        message: errMsg,
+        error: errMsg,
+      };
+    }
+
+    const nonNativeRunnerType: Exclude<CompatibilityLayerType, 'native'> = params.runnerType;
+    const token = ++this.bottleSteamProvisionSeq;
+    this.activeBottleSteamProvisionRunToken = token;
+    const isCancelled = (): boolean => this.activeBottleSteamProvisionRunToken !== token;
+
+    let lastForwardedProgressRef = this.getLatestProgress();
+    let lastForwardedProgressMsg = '';
+    const unsubscribe = this.subscribe(() => {
+      if (isCancelled()) return;
+      const latest = this.getLatestProgress();
+      if (
+        latest &&
+        latest !== lastForwardedProgressRef &&
+        typeof latest.message === 'string' &&
+        latest.message.trim() &&
+        latest.message.trim() !== lastForwardedProgressMsg
+      ) {
+        lastForwardedProgressRef = latest;
+        lastForwardedProgressMsg = latest.message.trim();
+        params.onPhaseChange?.(lastForwardedProgressMsg);
+      }
+    });
+
+    let installed = false;
+    try {
+      const initialMsg = params.needsInstall
+        ? `Installing Windows Steam into "${trimmedBottle}"...`
+        : params.needsSignIn
+          ? `Linking installed Steam games & preparing sign-in in "${trimmedBottle}"...`
+          : `Linking installed Steam games into "${trimmedBottle}"...`;
+      lastForwardedProgressMsg = initialMsg;
+      params.onPhaseChange?.(initialMsg);
+
+      const setupResult = await this.runSetupTasks({
+        tasks: [
+          {
+            componentId: 'bottle_steam',
+            action: 'install_client',
+            runnerType: nonNativeRunnerType,
+            bottleName: trimmedBottle,
+          },
+        ],
+        connectedStorefronts: ['steam'],
+      });
+
+      const bottleSteamOutcome = setupResult.outcomes.find((o) => o.componentId === 'bottle_steam');
+      const step1Succeeded =
+        Boolean(setupResult.success) &&
+        bottleSteamOutcome?.status !== 'failed' &&
+        bottleSteamOutcome?.status !== 'cancelled' &&
+        bottleSteamOutcome?.status !== 'opened_external';
+
+      if (step1Succeeded) {
+        installed = true;
+      }
+
+      const step1Cancelled =
+        Boolean(setupResult.cancelled) ||
+        bottleSteamOutcome?.status === 'cancelled' ||
+        isCancelled();
+      if (step1Cancelled) {
+        if (installed) {
+          await Promise.allSettled([
+            launcherService.detectCompatibilityLayers(),
+            launcherService.detectInstalledStorefrontClients(),
+          ]);
+        }
+        return {
+          success: false,
+          installed,
+          authenticated: false,
+          cancelled: true,
+          message: `Cancelled Steam setup in "${trimmedBottle}".`,
+        };
+      }
+
+      if (!step1Succeeded) {
+        const errMsg =
+          bottleSteamOutcome?.error ||
+          setupResult.error ||
+          bottleSteamOutcome?.message ||
+          `Failed to install Windows Steam in "${trimmedBottle}".`;
+        return {
+          success: false,
+          installed: false,
+          authenticated: false,
+          message: errMsg,
+          error: errMsg,
+        };
+      }
+
+      if (params.needsInstall || params.needsSignIn) {
+        const signInPrompt = `Steam opened in "${trimmedBottle}" — sign in once (QR or password) to enable Steam Cloud...`;
+        lastForwardedProgressMsg = signInPrompt;
+        params.onPhaseChange?.(signInPrompt);
+
+        const loginResult = await this.startGuidedLogin({
+          targetId: 'bottle_steam',
+          runnerType: nonNativeRunnerType,
+          bottleName: trimmedBottle,
+          autoCloseOnSuccess: true,
+        });
+
+        await Promise.allSettled([
+          launcherService.detectCompatibilityLayers(),
+          launcherService.detectInstalledStorefrontClients(),
+        ]);
+
+        const step2Cancelled = Boolean(loginResult.cancelled) || isCancelled();
+        if (step2Cancelled) {
+          return {
+            success: false,
+            installed: true,
+            authenticated: Boolean(loginResult.authenticated),
+            cancelled: true,
+            message: `Windows Steam is installed in "${trimmedBottle}", but sign-in was cancelled.`,
+          };
+        }
+
+        const authenticated = Boolean(loginResult.authenticated);
+        if (!loginResult.success || !authenticated) {
+          const errMsg =
+            loginResult.error ||
+            loginResult.message ||
+            `Steam sign-in in "${trimmedBottle}" did not complete.`;
+          return {
+            success: false,
+            installed: true,
+            authenticated,
+            message: errMsg,
+            error: errMsg,
+          };
+        }
+
+        return {
+          success: true,
+          installed: true,
+          authenticated: true,
+          message:
+            loginResult.message || `Steam is ready and signed in inside "${trimmedBottle}".`,
+        };
+      }
+
+      await Promise.allSettled([
+        launcherService.detectCompatibilityLayers(),
+        launcherService.detectInstalledStorefrontClients(),
+      ]);
+
+      return {
+        success: true,
+        installed: true,
+        authenticated: true,
+        message:
+          bottleSteamOutcome?.message || `Linked installed Steam games into "${trimmedBottle}".`,
+      };
+    } catch (err: unknown) {
+      const errMsg =
+        err instanceof Error && err.message
+          ? err.message
+          : `Could not complete Windows Steam setup in "${trimmedBottle}".`;
+      return {
+        success: false,
+        installed,
+        authenticated: false,
+        message: errMsg,
+        error: errMsg,
+      };
+    } finally {
+      unsubscribe();
+      if (this.activeBottleSteamProvisionRunToken === token) {
+        this.activeBottleSteamProvisionRunToken = null;
+      }
+    }
+  }
+
+  public async cancelBottleSteamProvisioning(): Promise<void> {
+    this.activeBottleSteamProvisionRunToken = null;
+    await Promise.allSettled([this.cancelActiveSetup(), this.cancelGuidedLogin('bottle_steam')]);
   }
 
   public openWizard(options?: OpenSystemSetupEventDetail): void {

@@ -30,12 +30,14 @@ import {
   launcherService,
   COMPATIBILITY_RUNNER_DESCRIPTORS,
 } from '../../../services/launcher/launcherService';
+import { environmentSetupService } from '../../../services/launcher/environmentSetupService';
 import {
   formatRunnerSecondaryBuildText,
   resolveEffectiveUiStorefrontLifecycle,
   resolveWineSyncMode,
   type WineSyncMode,
 } from './launchConfigHelpers';
+import type { BottleSteamFixMode, BottleSteamFixState } from './CompatRunnerAndBottleControls';
 import {
   resolveDlssEligibility,
   resolveMetalfxSpatialEligibility,
@@ -63,6 +65,29 @@ export interface UseGameLaunchConfigFormParams {
   initialPlatformId?: StorefrontId;
   onClose: () => void;
   onSaved?: (config: GameLaunchConfig) => void;
+}
+
+const INITIAL_BOTTLE_STEAM_FIX_STATE: BottleSteamFixState = {
+  active: false,
+  statusText: '',
+  errorText: null,
+  successText: null,
+};
+
+function parseNumericSteamAppId(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isInteger(value) && value > 0) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const match = /^(?:steam-)?(\d+)$/i.exec(value.trim());
+    if (match) {
+      const parsed = Number.parseInt(match[1], 10);
+      if (Number.isSafeInteger(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+  }
+  return undefined;
 }
 
 function isLayerCompatibleWithInstallBottle(
@@ -185,6 +210,9 @@ export function useGameLaunchConfigForm({
   const [runnerUpdates, setRunnerUpdates] = useState<Record<string, CompatibilityLayerUpdateInfo>>(
     () => launcherService.getRunnerUpdates()
   );
+  const [bottleSteamFixState, setBottleSteamFixState] = useState<BottleSteamFixState>(
+    INITIAL_BOTTLE_STEAM_FIX_STATE
+  );
   const [, setInstallInfoTick] = useState(0);
 
   const userEditedCompatPlatformsRef = useRef<Set<StorefrontId>>(new Set());
@@ -193,6 +221,7 @@ export function useGameLaunchConfigForm({
   const latestDetectedLayersRef = useRef<CompatibilityLayerInfo[]>([]);
   const formSessionIdRef = useRef<number>(0);
   const compatEditEpochByPlatformRef = useRef<Partial<Record<StorefrontId, number>>>({});
+  const bottleSteamFixActiveRef = useRef<boolean>(false);
 
   const selectedRunnerDescriptor =
     COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === compatibilityLayer) ||
@@ -331,6 +360,8 @@ export function useGameLaunchConfigForm({
       userResetPendingDetectPlatformsRef.current.clear();
       hasDetectedLayersResolvedRef.current = false;
       latestDetectedLayersRef.current = [];
+      bottleSteamFixActiveRef.current = false;
+      setBottleSteamFixState(INITIAL_BOTTLE_STEAM_FIX_STATE);
       resetRunnerLifecycleFlags();
       return;
     }
@@ -341,6 +372,8 @@ export function useGameLaunchConfigForm({
     userEditedCompatPlatformsRef.current.clear();
     userResetPendingDetectPlatformsRef.current.clear();
     hasDetectedLayersResolvedRef.current = false;
+    bottleSteamFixActiveRef.current = false;
+    setBottleSteamFixState(INITIAL_BOTTLE_STEAM_FIX_STATE);
     resetRunnerLifecycleFlags();
 
     const existingBase = launcherService.getLaunchConfig(game.id);
@@ -624,6 +657,14 @@ export function useGameLaunchConfigForm({
     ? launcherService.getInstalledRecordForGame(game, preferredPlatformId)
     : undefined;
   const activePlatformRecord = game.platforms.find((p) => p.platformId === preferredPlatformId);
+  const numericSteamAppId: number | undefined =
+    preferredPlatformId === 'steam'
+      ? parseNumericSteamAppId(game.steamAppId) ??
+        parseNumericSteamAppId(activePlatformRecord?.platformGameId) ??
+        parseNumericSteamAppId(installedRecord?.appId) ??
+        parseNumericSteamAppId(installedRecord?.platformGameId) ??
+        parseNumericSteamAppId(game.id)
+      : undefined;
   const installBottleName = extractBottleNameFromPath(
     installedRecord?.installPath ||
       installedRecord?.executablePath ||
@@ -921,6 +962,7 @@ export function useGameLaunchConfigForm({
     launchMethod,
     compatibilityLayer,
     wineBottleName,
+    effectiveSelectedBottleName,
     detectedLayers,
     resolvedBottleFolderPath,
     isNativeInstalledBuild,
@@ -945,6 +987,7 @@ export function useGameLaunchConfigForm({
     launchMethod,
     compatibilityLayer,
     wineBottleName,
+    effectiveSelectedBottleName,
     detectedLayers,
     resolvedBottleFolderPath,
     isNativeInstalledBuild,
@@ -977,6 +1020,11 @@ export function useGameLaunchConfigForm({
     setDraftsByPlatform(nextDrafts);
     setPreferredPlatformId(nextPlatId);
     cur.loadFormFieldsForPlatform(nextPlatId, nextDrafts);
+    if (!bottleSteamFixActiveRef.current) {
+      setBottleSteamFixState((prev) =>
+        prev.errorText || prev.successText ? INITIAL_BOTTLE_STEAM_FIX_STATE : prev
+      );
+    }
     if (!launcherService.isGameInstalled(cur.game, nextPlatId)) {
       const sessionId = formSessionIdRef.current;
       launcherService
@@ -1053,6 +1101,13 @@ export function useGameLaunchConfigForm({
     }
   }, []);
 
+  const clearBottleSteamFixFeedback = useCallback(() => {
+    if (bottleSteamFixActiveRef.current) return;
+    setBottleSteamFixState((prev) =>
+      prev.errorText || prev.successText ? INITIAL_BOTTLE_STEAM_FIX_STATE : prev
+    );
+  }, []);
+
   const handleSelectCompatibilityLayer = useCallback(
     (nextLayer: CompatibilityLayerType) => {
       const cur = latestRef.current;
@@ -1074,16 +1129,21 @@ export function useGameLaunchConfigForm({
         }
       }
       clearRunnerFeedback();
+      clearBottleSteamFixFeedback();
     },
-    [clearRunnerFeedback]
+    [clearRunnerFeedback, clearBottleSteamFixFeedback]
   );
 
-  const handleChangeWineBottleName = useCallback((value: SetStateAction<string>) => {
-    const curPlatId = latestRef.current.preferredPlatformId;
-    userEditedCompatPlatformsRef.current.add(curPlatId);
-    userResetPendingDetectPlatformsRef.current.delete(curPlatId);
-    setWineBottleName(value);
-  }, []);
+  const handleChangeWineBottleName = useCallback(
+    (value: SetStateAction<string>) => {
+      const curPlatId = latestRef.current.preferredPlatformId;
+      userEditedCompatPlatformsRef.current.add(curPlatId);
+      userResetPendingDetectPlatformsRef.current.delete(curPlatId);
+      setWineBottleName(value);
+      clearBottleSteamFixFeedback();
+    },
+    [clearBottleSteamFixFeedback]
+  );
 
   const handleAlignToInstallBottle = useCallback(
     (runnerType: CompatibilityLayerType, bottleName: string) => {
@@ -1095,9 +1155,135 @@ export function useGameLaunchConfigForm({
       setCompatibilityLayer(runnerType);
       setWineBottleName(bottleName);
       clearRunnerFeedback();
+      clearBottleSteamFixFeedback();
     },
-    [clearRunnerFeedback]
+    [clearRunnerFeedback, clearBottleSteamFixFeedback]
   );
+
+  const handleFixBottleSteam = useCallback(
+    async (params: {
+      mode: BottleSteamFixMode;
+      runnerType?: CompatibilityLayerType;
+      bottleName?: string;
+    }) => {
+      if (bottleSteamFixActiveRef.current) return;
+      const cur = latestRef.current;
+      const targetRunner = params.runnerType ?? cur.compatibilityLayer;
+      const targetBottle = (params.bottleName ?? cur.effectiveSelectedBottleName).trim();
+      if (!targetBottle || targetRunner === 'native') {
+        setBottleSteamFixState({
+          active: false,
+          statusText: '',
+          errorText: 'Select a compatibility runner and target bottle before setting up Steam.',
+          successText: null,
+        });
+        return;
+      }
+
+      const sessionId = formSessionIdRef.current;
+      const needsInstall = params.mode === 'install_and_signin';
+      const needsSignIn = params.mode === 'install_and_signin' || params.mode === 'signin_only';
+      const initialStatus = needsInstall
+        ? `Installing Windows Steam into "${targetBottle}"...`
+        : params.mode === 'signin_only'
+          ? `Opening Windows Steam in "${targetBottle}" for sign-in...`
+          : `Linking installed Steam games into "${targetBottle}"...`;
+
+      bottleSteamFixActiveRef.current = true;
+      setBottleSteamFixState({
+        active: true,
+        statusText: initialStatus,
+        errorText: null,
+        successText: null,
+        sourceMode: params.mode,
+      });
+
+      try {
+        const result = await environmentSetupService.provisionAndSignInBottleSteam({
+          runnerType: targetRunner,
+          bottleName: targetBottle,
+          needsInstall,
+          needsSignIn,
+          onPhaseChange: (msg: string) => {
+            if (formSessionIdRef.current !== sessionId || !bottleSteamFixActiveRef.current) {
+              return;
+            }
+            setBottleSteamFixState((prev) => (prev.active ? { ...prev, statusText: msg } : prev));
+          },
+        });
+
+        const refreshedLayers = await launcherService
+          .detectCompatibilityLayers()
+          .catch(() => null);
+        if (formSessionIdRef.current !== sessionId) return;
+        if (Array.isArray(refreshedLayers)) {
+          const nextLayers = [...refreshedLayers];
+          hasDetectedLayersResolvedRef.current = true;
+          latestDetectedLayersRef.current = nextLayers;
+          setDetectedLayers(nextLayers);
+        }
+
+        if (result.cancelled) {
+          setBottleSteamFixState({
+            active: false,
+            statusText: '',
+            errorText: result.message || `Cancelled Steam setup in "${targetBottle}".`,
+            successText: null,
+          });
+        } else if (result.success) {
+          setBottleSteamFixState({
+            active: false,
+            statusText: '',
+            errorText: null,
+            successText:
+              result.message ||
+              (params.mode === 'link_only'
+                ? `Linked installed Steam games into "${targetBottle}".`
+                : `Steam is ready in "${targetBottle}".`),
+          });
+        } else {
+          setBottleSteamFixState({
+            active: false,
+            statusText: '',
+            errorText:
+              result.error ||
+              result.message ||
+              `Could not complete Steam setup in "${targetBottle}".`,
+            successText: null,
+          });
+        }
+      } catch (err: unknown) {
+        if (formSessionIdRef.current !== sessionId) return;
+        const errMsg =
+          err instanceof Error && err.message
+            ? err.message
+            : `Could not complete Steam setup in "${targetBottle}".`;
+        setBottleSteamFixState({
+          active: false,
+          statusText: '',
+          errorText: errMsg,
+          successText: null,
+        });
+      } finally {
+        bottleSteamFixActiveRef.current = false;
+        if (formSessionIdRef.current === sessionId) {
+          setBottleSteamFixState((prev) =>
+            prev.active ? { ...prev, active: false, statusText: '' } : prev
+          );
+        }
+      }
+    },
+    []
+  );
+
+  const handleCancelFixBottleSteam = useCallback(async () => {
+    const sessionId = formSessionIdRef.current;
+    setBottleSteamFixState((prev) =>
+      prev.active ? { ...prev, statusText: 'Cancelling Steam setup...' } : prev
+    );
+    await environmentSetupService.cancelBottleSteamProvisioning();
+    if (formSessionIdRef.current !== sessionId) return;
+  }, []);
 
   const handleSetCrossoverHighResolutionMode = useCallback((value: boolean | undefined) => {
     setCrossoverHighResolutionMode(value === false ? false : undefined);
@@ -1302,6 +1488,7 @@ export function useGameLaunchConfigForm({
       [targetPlatId]: resetSignature,
     }));
     clearRunnerFeedback();
+    clearBottleSteamFixFeedback();
     setSaveError(null);
   };
 
@@ -1501,9 +1688,11 @@ export function useGameLaunchConfigForm({
     activeUpdateInfo,
     availableBottles,
     installedRecord,
+    numericSteamAppId,
     installBottleName,
     effectiveSelectedBottleName,
     isFastDirectActive,
+    bottleSteamFixState,
     activeInstalledVer,
     activeSecondaryBuildText,
     resolvedBottleFolderPath,
@@ -1541,6 +1730,8 @@ export function useGameLaunchConfigForm({
     handleOpenBottleFolder,
     handleSelectCompatibilityLayer,
     handleAlignToInstallBottle,
+    handleFixBottleSteam,
+    handleCancelFixBottleSteam,
     handleToggleCrossoverDlss,
     handleToggleForceLargeAddressAware,
     handleToggleWineMsync,

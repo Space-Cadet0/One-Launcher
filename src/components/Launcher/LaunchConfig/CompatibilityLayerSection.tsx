@@ -43,7 +43,11 @@ import {
   resolveWineSyncMode,
   type WineSyncMode,
 } from './launchConfigHelpers';
-import { renderCompatRunnerAndBottleControls } from './CompatRunnerAndBottleControls';
+import {
+  renderCompatRunnerAndBottleControls,
+  type BottleSteamFixMode,
+  type BottleSteamFixState,
+} from './CompatRunnerAndBottleControls';
 import { renderCompatGraphicsControls } from './CompatGraphicsControls';
 import { renderCompatAdvancedDisplayDisclosure } from './CompatAdvancedDisplayDisclosure';
 
@@ -226,6 +230,14 @@ export interface CompatibilityLayerSectionProps {
   platformId?: StorefrontId;
   isFastDirectActive?: boolean;
   onAlignToInstallBottle?: (runnerType: CompatibilityLayerType, bottleName: string) => void;
+  numericSteamAppId?: number;
+  bottleSteamFixState?: BottleSteamFixState;
+  onFixBottleSteam?: (params: {
+    mode: BottleSteamFixMode;
+    runnerType?: CompatibilityLayerType;
+    bottleName?: string;
+  }) => void;
+  onCancelFixBottleSteam?: () => void;
   /** @deprecated Legacy embedded runner management props retained optional for call-site compatibility */
   activeRunnerProgress?: CompatibilityRunnerProgressEvent;
   isCheckingUpdates?: boolean;
@@ -686,6 +698,10 @@ function CompatibilityLayerSectionImpl(
             recommendedInstallRunner,
             recommendedInstallRunnerLabel,
             onAlignToInstallBottle: handleAlignToInstallBottle,
+            numericSteamAppId: props.numericSteamAppId,
+            bottleSteamFixState: props.bottleSteamFixState,
+            onFixBottleSteam: props.onFixBottleSteam,
+            onCancelFixBottleSteam: props.onCancelFixBottleSteam,
           })}
 
           {renderCompatGraphicsControls({

@@ -111,6 +111,7 @@ export interface CompatibilityLayerInfo {
       timestamp?: string;
       hasSteam?: boolean;
       steamSignedIn?: boolean;
+      installedSteamAppIds?: number[];
       hasGogGalaxy?: boolean;
       hasEpicLauncher?: boolean;
     }
@@ -766,6 +767,7 @@ export interface LauncherActionResult {
   targetBottlePath?: string;
   installBottleName?: string;
   installBottleHasSteam?: boolean;
+  chosenRunnerType?: CompatibilityLayerType;
   recommendedRunnerType?: CompatibilityLayerType;
   session?: ActiveGameSession;
   sessionMinutesPlayed?: number;
