@@ -1453,6 +1453,7 @@ export function App() {
               onClose={handleCloseManageCollections}
               collections={collections}
               game={collectionModalGame}
+              games={games}
               onCreateCollection={handleCreateCollection}
               onRenameCollection={handleRenameCollection}
               onDeleteCollection={handleDeleteCollection}
