@@ -340,6 +340,153 @@ async function reapOrphanedGogOverlayProcesses(options = {}) {
 }
 
 /**
+ * Normalize a bottle prefix path into lowercase POSIX forward-slash form (raw resolved + realpath).
+ *
+ * @param {string | null | undefined} bottlePath
+ * @returns {{ normTargetPrefix: string, normRealTargetPrefix: string }}
+ */
+function normalizeBottlePrefixMatchPair(bottlePath) {
+  const trimmedBottlePath = String(bottlePath || '').trim();
+  if (!trimmedBottlePath) {
+    return { normTargetPrefix: '', normRealTargetPrefix: '' };
+  }
+  const normTargetPrefix = (
+    trimmedBottlePath.startsWith('/')
+      ? path.posix.resolve(trimmedBottlePath)
+      : path.resolve(trimmedBottlePath)
+  )
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '')
+    .toLowerCase();
+  let normRealTargetPrefix = normTargetPrefix;
+  try {
+    if (fs.existsSync(trimmedBottlePath)) {
+      normRealTargetPrefix = fs
+        .realpathSync(trimmedBottlePath)
+        .replace(/\\/g, '/')
+        .replace(/\/+$/, '')
+        .toLowerCase();
+    }
+  } catch {}
+  return { normTargetPrefix, normRealTargetPrefix };
+}
+
+/**
+ * Determine whether a `ps` / `ps eww` process line belongs to the target Wine/CrossOver bottle.
+ *
+ * Uses space-safe `WINEPREFIX=` matching (supporting unquoted macOS paths like
+ * `WINEPREFIX=<homedir>/Library/Application Support/CrossOver/Bottles/OneLauncher`, quoted values, and
+ * `realpath` aliases) without cross-matching prefix substrings (`OneLauncher-arm64`), while
+ * preserving the fallback for synthetic `mockProcessListOutput` lines that omit `WINEPREFIX=`
+ * and `/Bottles/...`.
+ *
+ * @param {string} rawLine
+ * @param {string | null | undefined} normTargetPrefix
+ * @param {string | null | undefined} [normRealTargetPrefix]
+ * @returns {boolean}
+ */
+function lineMatchesBottlePrefix(rawLine, normTargetPrefix, normRealTargetPrefix = '') {
+  if (!rawLine || typeof rawLine !== 'string') return false;
+  const candidatePrefixes = Array.from(
+    new Set(
+      [normTargetPrefix, normRealTargetPrefix]
+        .map((p) =>
+          String(p || '')
+            .trim()
+            .replace(/\\/g, '/')
+            .replace(/\/+$/, '')
+            .toLowerCase()
+        )
+        .filter(Boolean)
+    )
+  );
+  if (candidatePrefixes.length === 0) {
+    return true;
+  }
+
+  const lowerLine = rawLine.replace(/\\/g, '/').toLowerCase();
+  const hasWinePrefixEnv = /\bwineprefix=/i.test(lowerLine);
+
+  if (hasWinePrefixEnv) {
+    for (const pfx of candidatePrefixes) {
+      const escapedPfx = pfx.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const exactWinePrefixEnvRegex = new RegExp(
+        `\\bwineprefix=(?:["']${escapedPfx}\\/?["']|${escapedPfx}\\/?(?=\\s+[a-z_][a-z0-9_]*=|\\s+["'/]|["'](?:\\s|$)|$))`,
+        'i'
+      );
+      if (exactWinePrefixEnvRegex.test(lowerLine)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  for (const pfx of candidatePrefixes) {
+    const escapedPfx = pfx.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const boundedTargetPathRegex = new RegExp(
+      `(?:^|[\\s"'=])${escapedPfx}(?:\\/|["']|$)`,
+      'i'
+    );
+    if (boundedTargetPathRegex.test(lowerLine)) {
+      return true;
+    }
+  }
+
+  if (/\/bottles\/[^/\r\n"']+/i.test(lowerLine)) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Acquire raw process-list output for Wine/CrossOver bottle process inspection.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<string | null>}
+ */
+async function readBottleProcessListOutputAsync(options = {}) {
+  if (typeof options.mockProcessListOutput === 'string') {
+    return options.mockProcessListOutput;
+  }
+  if (typeof options.getProcessListOutput === 'function') {
+    try {
+      return String((await options.getProcessListOutput()) || '');
+    } catch {
+      return null;
+    }
+  }
+
+  const customExec =
+    typeof options.execFileImpl === 'function'
+      ? options.execFileImpl
+      : typeof options.execFileFn === 'function'
+        ? options.execFileFn
+        : null;
+
+  if (options.homedir && !options.allowProcessCheckInTest && !customExec) {
+    return null;
+  }
+
+  const targetPlatform = options.platform || process.platform;
+  const execFn = customExec || execFile;
+  const psArgs =
+    targetPlatform === 'darwin' && !customExec
+      ? ['eww', '-ax', '-o', 'command=']
+      : ['-ax', '-o', 'command='];
+
+  return new Promise((resolve) => {
+    try {
+      execFn('ps', psArgs, { timeout: 1500 }, (/** @type {any} */ err, /** @type {any} */ stdout) => {
+        resolve(err ? null : String(stdout || ''));
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
  * Check whether a Windows `.exe` is currently running inside a specific Wine/CrossOver bottle
  * (`WINEPREFIX`-scoped when environment info is exposed via `ps eww`, falling back cleanly when
  * synthetic `mockProcessListOutput` or custom `execFileImpl` mocks are supplied).
@@ -353,103 +500,66 @@ async function isBottleWinExeRunning(exeName, bottlePath = '', options = {}) {
   const cleanExe = String(exeName || '').trim();
   if (!cleanExe) return false;
 
+  const outStr = await readBottleProcessListOutputAsync(options);
+  if (outStr === null) return false;
+
   const escapedExe = cleanExe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const exeRegex = new RegExp(`(?:^|[\\\\/\\s"'])${escapedExe}(?:\\s|["']|$)`, 'i');
-  const trimmedBottlePath = String(bottlePath || '').trim();
-  const normTargetPrefix = trimmedBottlePath
-    ? (trimmedBottlePath.startsWith('/')
-        ? path.posix.resolve(trimmedBottlePath)
-        : path.resolve(trimmedBottlePath)
-      )
-        .replace(/\\/g, '/')
-        .replace(/\/+$/, '')
-        .toLowerCase()
-    : '';
+  const { normTargetPrefix, normRealTargetPrefix } = normalizeBottlePrefixMatchPair(bottlePath);
 
-  const escapedTargetPrefix = normTargetPrefix
-    ? normTargetPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    : '';
-  const exactWinePrefixEnvRegex = escapedTargetPrefix
-    ? new RegExp(
-        `\\bwineprefix=(?:["']${escapedTargetPrefix}\\/?["']|${escapedTargetPrefix}\\/?(?=\\s+[a-z_][a-z0-9_]*=|\\s+["'/]|$))`,
-        'i'
-      )
-    : null;
-  const boundedTargetPathRegex = escapedTargetPrefix
-    ? new RegExp(`(?:^|[\\s"'=])${escapedTargetPrefix}(?:\\/|["']|$)`, 'i')
-    : null;
-
-  /**
-   * @param {string} outStr
-   * @returns {boolean}
-   */
-  const matchesBottleProcess = (outStr) => {
-    const lines = String(outStr || '').split(/\r?\n/);
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line || !exeRegex.test(line)) continue;
-      if (/^(?:\/bin\/|\/usr\/bin\/)?ps(?:\s|$)/i.test(line)) continue;
-
-      if (normTargetPrefix && exactWinePrefixEnvRegex && boundedTargetPathRegex) {
-        const lowerLine = line.replace(/\\/g, '/').toLowerCase();
-        // Match unquoted WINEPREFIX paths containing spaces (e.g., macOS "Application Support/CrossOver/Bottles/<name>")
-        // as well as single/double-quoted WINEPREFIX values.
-        if (/\bwineprefix=/i.test(lowerLine)) {
-          if (!exactWinePrefixEnvRegex.test(lowerLine)) {
-            continue;
-          }
-          return true;
-        }
-        if (boundedTargetPathRegex.test(lowerLine)) {
-          return true;
-        }
-        if (/\/bottles\/[^/\r\n"']+/i.test(lowerLine)) {
-          continue;
-        }
-      }
-      return true;
-    }
-    return false;
-  };
-
-  if (typeof options.mockProcessListOutput === 'string') {
-    return matchesBottleProcess(options.mockProcessListOutput);
+  const lines = String(outStr || '').split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || !exeRegex.test(line)) continue;
+    if (/^(?:\/bin\/|\/usr\/bin\/)?ps(?:\s|$)/i.test(line)) continue;
+    if (!lineMatchesBottlePrefix(line, normTargetPrefix, normRealTargetPrefix)) continue;
+    return true;
   }
-  if (typeof options.getProcessListOutput === 'function') {
-    try {
-      return matchesBottleProcess(String((await options.getProcessListOutput()) || ''));
-    } catch {
-      return false;
-    }
+  return false;
+}
+
+/**
+ * Inspect whether Windows `steam.exe` is currently running inside `bottlePath`, returning
+ * `{ running, observedBackend, launchedSilent }` using space-safe `WINEPREFIX` matching.
+ *
+ * @param {string} [bottlePath]
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ running: boolean, observedBackend: string, launchedSilent: boolean }>}
+ */
+async function inspectRunningBottleSteam(bottlePath = '', options = {}) {
+  const outStr = await readBottleProcessListOutputAsync(options);
+  if (outStr === null) {
+    return { running: false, observedBackend: '', launchedSilent: false };
   }
 
-  const customExec =
-    typeof options.execFileImpl === 'function'
-      ? options.execFileImpl
-      : typeof options.execFileFn === 'function'
-        ? options.execFileFn
-        : null;
+  const steamExeRegex = /(?:^|[\\/\s"'])steam\.exe(?:\s|["']|$)/i;
+  const { normTargetPrefix, normRealTargetPrefix } = normalizeBottlePrefixMatchPair(bottlePath);
+  const lines = String(outStr || '').split(/\r?\n/);
 
-  if (options.homedir && !options.allowProcessCheckInTest && !customExec) {
-    return false;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || !steamExeRegex.test(line)) continue;
+    if (/^(?:\/bin\/|\/usr\/bin\/)?ps(?:\s|$)/i.test(line)) continue;
+    if (!lineMatchesBottlePrefix(line, normTargetPrefix, normRealTargetPrefix)) continue;
+
+    let observedBackend = '';
+    const backendMatch = line.match(
+      /\bCX_GRAPHICS_BACKEND=(?:"([^"]+)"|'([^']+)'|([^\s"']+))/i
+    );
+    if (backendMatch) {
+      observedBackend = String(backendMatch[1] || backendMatch[2] || backendMatch[3] || '')
+        .trim()
+        .toLowerCase();
+    }
+    const launchedSilent = /\s-silent(?:\s|["']|$)/i.test(line);
+    return {
+      running: true,
+      observedBackend,
+      launchedSilent,
+    };
   }
 
-  const targetPlatform = options.platform || process.platform;
-  const execFn = customExec || execFile;
-  const psArgs =
-    targetPlatform === 'darwin' && !customExec
-      ? ['eww', '-ax', '-o', 'command=']
-      : ['-ax', '-o', 'command='];
-
-  return new Promise((resolve) => {
-    try {
-      execFn('ps', psArgs, { timeout: 1500 }, (/** @type {any} */ err, /** @type {any} */ stdout) => {
-        resolve(!err && matchesBottleProcess(String(stdout || '')));
-      });
-    } catch {
-      resolve(false);
-    }
-  });
+  return { running: false, observedBackend: '', launchedSilent: false };
 }
 
 /**
@@ -539,6 +649,57 @@ function resolveGogCommunicationLogPath(params = {}) {
   }
 
   return '/Users/Shared/GOG.com/Galaxy/Logs/CommunicationService.log';
+}
+
+/**
+ * Resolve `GalaxyClient.log` path across native macOS, native Windows, and Wine/CrossOver bottles.
+ *
+ * @param {{ platform?: string, bottlePath?: string, homedir?: string, gogClientLogPath?: string, gogCommunicationLogPath?: string, options?: Record<string, any> }} [params]
+ * @returns {string}
+ */
+function resolveGogClientLogPath(params = {}) {
+  const opts = params.options || {};
+  const explicitClientLogPath = params.gogClientLogPath || opts.gogClientLogPath;
+  if (explicitClientLogPath && typeof explicitClientLogPath === 'string') {
+    return explicitClientLogPath;
+  }
+
+  const explicitCommLogPath = params.gogCommunicationLogPath || opts.gogCommunicationLogPath;
+  if (explicitCommLogPath && typeof explicitCommLogPath === 'string') {
+    return path.join(path.dirname(explicitCommLogPath), 'GalaxyClient.log');
+  }
+
+  if (params.bottlePath && typeof params.bottlePath === 'string') {
+    const driveC = path.join(params.bottlePath, 'drive_c');
+    const resolvedLower = resolveDriveCPathCaseInsensitive(driveC, [
+      'ProgramData',
+      'GOG.com',
+      'Galaxy',
+      'logs',
+      'GalaxyClient.log',
+    ]);
+    if (fs.existsSync(resolvedLower)) return resolvedLower;
+    const resolvedUpper = resolveDriveCPathCaseInsensitive(driveC, [
+      'ProgramData',
+      'GOG.com',
+      'Galaxy',
+      'Logs',
+      'GalaxyClient.log',
+    ]);
+    if (fs.existsSync(resolvedUpper)) return resolvedUpper;
+    return resolvedLower;
+  }
+
+  const targetPlatform = params.platform || opts.platform || process.platform;
+  if (targetPlatform === 'win32') {
+    const progData = String(opts.programDataDir || process.env.PROGRAMDATA || 'C:\\ProgramData');
+    if (progData.startsWith('/')) {
+      return path.join(progData, 'GOG.com', 'Galaxy', 'logs', 'GalaxyClient.log');
+    }
+    return path.win32.join(progData, 'GOG.com', 'Galaxy', 'logs', 'GalaxyClient.log');
+  }
+
+  return '/Users/Shared/GOG.com/Galaxy/Logs/GalaxyClient.log';
 }
 
 /**
@@ -730,8 +891,41 @@ async function waitForGogCommunicationServiceReady(params = {}) {
 }
 
 /**
+ * Inspect appended GOG Galaxy log text line-by-line for active vs completed cloud-sync uploads.
+ *
+ * @param {string} text
+ * @returns {{ activitySeen: boolean, inFlight: boolean, completedObserved: boolean }}
+ */
+function inspectGogCloudSyncLogState(text) {
+  let activitySeen = false;
+  let inFlight = false;
+  let completedObserved = false;
+  if (!text) return { activitySeen, inFlight, completedObserved };
+
+  const doneRegex =
+    /(?:Upload\s+finished|Synchronization\s+finished|Sync\s+finished|CloudStorage[^\r\n]*(?:finished|completed|up\s+to\s+date|no\s+changes))/i;
+  const activeRegex = /(?:CloudStorage|Syncing\s+saves|Uploading)/i;
+
+  for (const line of text.split(/\r?\n/)) {
+    if (!line) continue;
+    if (doneRegex.test(line)) {
+      activitySeen = true;
+      inFlight = false;
+      completedObserved = true;
+    } else if (activeRegex.test(line)) {
+      activitySeen = true;
+      inFlight = true;
+    }
+  }
+  return { activitySeen, inFlight, completedObserved };
+}
+
+/**
  * Post-exit flush barrier ensuring `GalaxyCommunication` flushes final `StoreStatsAndAchievements`
- * packets before `/command=shutdown` is issued.
+ * packets before `/command=shutdown` is issued. When `isStorefrontUri` is true, also inspects
+ * `GalaxyClient.log` and `CommunicationService.log` for Galaxy cloud-sync upload completion up
+ * to `15000 ms` (`0 ms` in tests unless `enableUriCloudFlushWaitInTest` or explicit `maxFlushWaitMs`
+ * / `gogPostExitFlushMs` is provided).
  *
  * @param {Record<string, any>} [params]
  * @returns {Promise<{ flushed: boolean, waitedMs: number, reason: string }>}
@@ -739,26 +933,47 @@ async function waitForGogCommunicationServiceReady(params = {}) {
 async function waitForGogPostExitFlush(params = {}) {
   const opts = params.options && typeof params.options === 'object' ? params.options : params;
   const isTestEnv = isSyntheticTestBarrierEnv(params, opts);
-  if (
+  const isStorefrontUri = Boolean(params.isStorefrontUri || opts.isStorefrontUri);
+  const hasExplicitFlushWait =
+    opts.gogPostExitFlushMs !== undefined || params.maxFlushWaitMs !== undefined;
+
+  if (isStorefrontUri) {
+    if (
+      isTestEnv &&
+      opts.enableUriCloudFlushWaitInTest !== true &&
+      params.enableUriCloudFlushWaitInTest !== true &&
+      !hasExplicitFlushWait
+    ) {
+      return { flushed: true, waitedMs: 0, reason: 'skipped_in_test' };
+    }
+  } else if (
     isTestEnv &&
     opts.enableGogReadinessBarrier !== true &&
     opts.enableStorefrontReadinessBarrier !== true &&
     params.enableGogReadinessBarrier !== true &&
     params.enableStorefrontReadinessBarrier !== true &&
-    opts.gogPostExitFlushMs === undefined &&
-    params.maxFlushWaitMs === undefined
+    !hasExplicitFlushWait
   ) {
     return { flushed: true, waitedMs: 0, reason: 'skipped_in_test' };
   }
 
+  const defaultMaxFlushWaitMs = isStorefrontUri ? 15000 : 2500;
   const maxFlushWaitMs = Math.max(
     0,
-    Number(opts.gogPostExitFlushMs ?? params.maxFlushWaitMs ?? 2500)
+    Number(opts.gogPostExitFlushMs ?? params.maxFlushWaitMs ?? defaultMaxFlushWaitMs)
   );
+  if (maxFlushWaitMs === 0) {
+    return { flushed: true, waitedMs: 0, reason: 'zero_wait' };
+  }
+
   const settleMs = Math.max(0, Number(params.settleMs ?? opts.gogPostExitSettleMs ?? 600));
+  const quietSettleMs = Math.max(
+    0,
+    Number(params.quietSettleMs ?? opts.gogUriQuietSettleMs ?? 4000)
+  );
   const baselineGraceMs = Math.max(
     0,
-    Number(params.baselineGraceMs ?? Math.min(1200, maxFlushWaitMs))
+    Number(params.baselineGraceMs ?? Math.min(isStorefrontUri ? quietSettleMs : 1200, maxFlushWaitMs))
   );
   const pollIntervalMs = Math.max(15, Number(params.pollIntervalMs ?? opts.pollIntervalMs ?? 150));
   const signal = params.signal || opts.signal;
@@ -767,42 +982,172 @@ async function waitForGogPostExitFlush(params = {}) {
     platform: params.platform || opts.platform,
     bottlePath: params.bottlePath,
     homedir: params.homedir || opts.homedir,
+    gogCommunicationLogPath: params.gogCommunicationLogPath,
     options: opts,
   });
 
   const startedAt = Date.now();
-  if (!commLogPath || !fs.existsSync(commLogPath)) {
+  const peerClosedRegex = /\[GameplayLogicManager\]\s+destructor|Socket has been closed by peer/i;
+
+  if (!isStorefrontUri) {
+    if (!commLogPath || !fs.existsSync(commLogPath)) {
+      await sleepUnref(baselineGraceMs, signal);
+      return { flushed: true, waitedMs: Date.now() - startedAt, reason: 'baseline_grace' };
+    }
+
+    let baseOffset = 0;
+    if (typeof params.preExitOffset === 'number' && params.preExitOffset >= 0) {
+      baseOffset = params.preExitOffset;
+    } else {
+      try {
+        const st = await fs.promises.stat(commLogPath);
+        baseOffset = Math.max(0, st.size);
+      } catch {
+        baseOffset = 0;
+      }
+    }
+
+    do {
+      if (signal?.aborted) break;
+      const logRead = await readLogTailBytesAsync(commLogPath, baseOffset, 65536);
+      if (logRead && logRead.text && peerClosedRegex.test(logRead.text)) {
+        if (settleMs > 0) {
+          await sleepUnref(settleMs, signal);
+        }
+        return {
+          flushed: true,
+          waitedMs: Date.now() - startedAt,
+          reason: 'destructor_settled',
+        };
+      }
+      const remaining = maxFlushWaitMs - (Date.now() - startedAt);
+      if (remaining <= 0) break;
+      await sleepUnref(Math.min(pollIntervalMs, remaining), signal);
+    } while (Date.now() - startedAt < maxFlushWaitMs);
+
+    return {
+      flushed: true,
+      waitedMs: Date.now() - startedAt,
+      reason: 'baseline_grace',
+    };
+  }
+
+  // `isStorefrontUri === true`: monitor both `CommunicationService.log` and `GalaxyClient.log`
+  const clientLogPath = resolveGogClientLogPath({
+    platform: params.platform || opts.platform,
+    bottlePath: params.bottlePath,
+    homedir: params.homedir || opts.homedir,
+    gogClientLogPath: params.gogClientLogPath,
+    gogCommunicationLogPath: params.gogCommunicationLogPath,
+    options: opts,
+  });
+
+  const commExistsInitially = Boolean(commLogPath && fs.existsSync(commLogPath));
+  const clientExistsInitially = Boolean(clientLogPath && fs.existsSync(clientLogPath));
+  if (!commExistsInitially && !clientExistsInitially) {
     await sleepUnref(baselineGraceMs, signal);
     return { flushed: true, waitedMs: Date.now() - startedAt, reason: 'baseline_grace' };
   }
 
-  let baseOffset = 0;
+  let commBaseOffset = 0;
   if (typeof params.preExitOffset === 'number' && params.preExitOffset >= 0) {
-    baseOffset = params.preExitOffset;
-  } else {
+    commBaseOffset = params.preExitOffset;
+  } else if (commExistsInitially) {
     try {
       const st = await fs.promises.stat(commLogPath);
-      baseOffset = Math.max(0, st.size);
+      commBaseOffset = Math.max(0, st.size);
     } catch {
-      baseOffset = 0;
+      commBaseOffset = 0;
     }
   }
 
-  const peerClosedRegex = /\[GameplayLogicManager\]\s+destructor|Socket has been closed by peer/i;
+  let clientBaseOffset = 0;
+  if (typeof params.preExitClientOffset === 'number' && params.preExitClientOffset >= 0) {
+    clientBaseOffset = params.preExitClientOffset;
+  } else if (clientExistsInitially) {
+    try {
+      const st = await fs.promises.stat(clientLogPath);
+      clientBaseOffset = Math.max(0, st.size);
+    } catch {
+      clientBaseOffset = 0;
+    }
+  }
+
+  let destructorSeenAt = 0;
+  let lastLogActivityAt = startedAt;
+  let lastCommSize = -1;
+  let lastClientSize = -1;
 
   do {
-    if (signal?.aborted) break;
-    const logRead = await readLogTailBytesAsync(commLogPath, baseOffset, 65536);
-    if (logRead && logRead.text && peerClosedRegex.test(logRead.text)) {
+    if (signal?.aborted) {
+      return { flushed: false, waitedMs: Date.now() - startedAt, reason: 'aborted' };
+    }
+
+    const [commRead, clientRead] = await Promise.all([
+      commLogPath ? readLogTailBytesAsync(commLogPath, commBaseOffset, 65536) : Promise.resolve(null),
+      clientLogPath
+        ? readLogTailBytesAsync(clientLogPath, clientBaseOffset, 65536)
+        : Promise.resolve(null),
+    ]);
+
+    const now = Date.now();
+    if (commRead && commRead.size !== lastCommSize) {
+      if (lastCommSize !== -1) {
+        lastLogActivityAt = now;
+      }
+      lastCommSize = commRead.size;
+    }
+    if (clientRead && clientRead.size !== lastClientSize) {
+      if (lastClientSize !== -1) {
+        lastLogActivityAt = now;
+      }
+      lastClientSize = clientRead.size;
+    }
+
+    const commText = commRead?.text || '';
+    const clientText = clientRead?.text || '';
+
+    if (!destructorSeenAt && commText && peerClosedRegex.test(commText)) {
+      destructorSeenAt = now;
+    }
+
+    const commSync = inspectGogCloudSyncLogState(commText);
+    const clientSync = inspectGogCloudSyncLogState(clientText);
+    const anyInFlight = commSync.inFlight || clientSync.inFlight;
+    const anyCompleted = commSync.completedObserved || clientSync.completedObserved;
+    const anyActivity = commSync.activitySeen || clientSync.activitySeen;
+
+    if (anyCompleted && !anyInFlight) {
       if (settleMs > 0) {
-        await sleepUnref(settleMs, signal);
+        await sleepUnref(Math.min(settleMs, 250), signal);
       }
       return {
         flushed: true,
         waitedMs: Date.now() - startedAt,
-        reason: 'destructor_settled',
+        reason: 'cloud_sync_completed',
       };
     }
+
+    if (
+      destructorSeenAt > 0 &&
+      !anyInFlight &&
+      now - Math.max(destructorSeenAt, lastLogActivityAt) >= quietSettleMs
+    ) {
+      return {
+        flushed: true,
+        waitedMs: Date.now() - startedAt,
+        reason: 'destructor_quiet_settled',
+      };
+    }
+
+    if (!anyInFlight && !anyActivity && now - lastLogActivityAt >= quietSettleMs) {
+      return {
+        flushed: true,
+        waitedMs: Date.now() - startedAt,
+        reason: 'quiet_settled',
+      };
+    }
+
     const remaining = maxFlushWaitMs - (Date.now() - startedAt);
     if (remaining <= 0) break;
     await sleepUnref(Math.min(pollIntervalMs, remaining), signal);
@@ -983,6 +1328,292 @@ async function waitForBottleEpicPortalReady(params = {}) {
 }
 
 /**
+ * Inspect appended `EpicGamesLauncher.log` text line-by-line for `CloudSync` / `SaveSync`
+ * upload activity and completion markers.
+ *
+ * @param {string} text
+ * @returns {{ activitySeen: boolean, inFlight: boolean, completedObserved: boolean }}
+ */
+function inspectEpicCloudSyncLogState(text) {
+  let activitySeen = false;
+  let inFlight = false;
+  let completedObserved = false;
+  if (!text) return { activitySeen, inFlight, completedObserved };
+
+  const doneRegex =
+    /(?:CloudSync|SaveSync|FCloudSave|CloudSave)[^\r\n]*(?:Complete|Completed|Finished|Succeeded|Done|UpToDate|Up\s+to\s+date|NoChanges|Skipped)/i;
+  const activeRegex = /(?:CloudSync|SaveSync|FCloudSave|CloudSave)/i;
+
+  for (const line of text.split(/\r?\n/)) {
+    if (!line) continue;
+    if (doneRegex.test(line)) {
+      activitySeen = true;
+      inFlight = false;
+      completedObserved = true;
+    } else if (activeRegex.test(line)) {
+      activitySeen = true;
+      inFlight = true;
+    }
+  }
+  return { activitySeen, inFlight, completedObserved };
+}
+
+/**
+ * Discover candidate host or bottle `EpicGamesLauncher.log` paths asynchronously.
+ *
+ * @param {Record<string, any>} params
+ * @param {Record<string, any>} opts
+ * @returns {Promise<string[]>}
+ */
+async function resolveEpicLauncherLogCandidatesAsync(params, opts) {
+  const explicitRaw =
+    params.epicLogPath ||
+    opts.epicLogPath ||
+    params.epicBottleLogPath ||
+    opts.epicBottleLogPath;
+  if (typeof explicitRaw === 'string' && explicitRaw.trim()) {
+    return [explicitRaw.trim()];
+  }
+  if (Array.isArray(explicitRaw) && explicitRaw.length > 0) {
+    return explicitRaw.map((p) => String(p || '').trim()).filter(Boolean);
+  }
+
+  /** @type {string[]} */
+  const out = [];
+  const bottlePath = String(params.bottlePath || opts.bottlePath || '').trim();
+  if (bottlePath) {
+    try {
+      await fs.promises.access(bottlePath);
+      const driveC = path.join(bottlePath, 'drive_c');
+      const usersDir = resolveDriveCPathCaseInsensitive(driveC, ['users']);
+      const dirents = await fs.promises.readdir(usersDir, { withFileTypes: true });
+      const users = dirents
+        .filter((d) => d.isDirectory() && !d.name.startsWith('.') && d.name.toLowerCase() !== 'public')
+        .map((d) => d.name);
+      for (const u of users) {
+        out.push(
+          resolveDriveCPathCaseInsensitive(driveC, [
+            'users',
+            u,
+            'Local Settings',
+            'Application Data',
+            'EpicGamesLauncher',
+            'Saved',
+            'Logs',
+            'EpicGamesLauncher.log',
+          ]),
+          resolveDriveCPathCaseInsensitive(driveC, [
+            'users',
+            u,
+            'AppData',
+            'Local',
+            'EpicGamesLauncher',
+            'Saved',
+            'Logs',
+            'EpicGamesLauncher.log',
+          ])
+        );
+      }
+    } catch {}
+    return Array.from(new Set(out));
+  }
+
+  const targetPlatform = params.platform || opts.platform || process.platform;
+  const homedir = String(params.homedir || opts.homedir || os.homedir());
+  if (targetPlatform === 'win32') {
+    const localAppData = String(
+      params.localAppDataDir ||
+        opts.localAppDataDir ||
+        process.env.LOCALAPPDATA ||
+        path.join(homedir, 'AppData', 'Local')
+    );
+    if (localAppData.startsWith('/')) {
+      out.push(
+        path.join(localAppData, 'EpicGamesLauncher', 'Saved', 'Logs', 'EpicGamesLauncher.log')
+      );
+    } else {
+      out.push(
+        path.win32.join(localAppData, 'EpicGamesLauncher', 'Saved', 'Logs', 'EpicGamesLauncher.log')
+      );
+    }
+    return out;
+  }
+
+  out.push(
+    path.join(homedir, 'Library', 'Logs', 'Unreal Engine', 'EpicGamesLauncher', 'EpicGamesLauncher.log'),
+    path.join(
+      homedir,
+      'Library',
+      'Application Support',
+      'Epic',
+      'EpicGamesLauncher',
+      'Saved',
+      'Logs',
+      'EpicGamesLauncher.log'
+    )
+  );
+  return out;
+}
+
+/**
+ * Post-exit cloud-sync barrier for Epic Games Launcher (`storefront_uri` exits) watching host or
+ * bottle `EpicGamesLauncher.log` up to `15000 ms` (`0 ms` in tests unless explicitly configured)
+ * for `CloudSync`/`SaveSync` completion or a `4000 ms` quiet settle.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ completed: boolean, waitedMs: number, timedOut?: boolean, aborted?: boolean, offlineSkipped?: boolean, reason: string }>}
+ */
+async function waitForEpicLauncherCloudSyncCompletion(options = {}) {
+  const params = options && typeof options === 'object' ? options : {};
+  const opts = params.options && typeof params.options === 'object' ? params.options : params;
+  const isTestEnv = isSyntheticTestBarrierEnv(params, opts);
+  const hasExplicitWait =
+    opts.epicCloudSyncWaitMs !== undefined ||
+    params.maxWaitMs !== undefined ||
+    opts.maxWaitMs !== undefined;
+
+  if (
+    isTestEnv &&
+    opts.enableEpicCloudSyncWaitInTest !== true &&
+    params.enableEpicCloudSyncWaitInTest !== true &&
+    opts.enableUriCloudFlushWaitInTest !== true &&
+    params.enableUriCloudFlushWaitInTest !== true &&
+    opts.enableStorefrontReadinessBarrier !== true &&
+    params.enableStorefrontReadinessBarrier !== true &&
+    !hasExplicitWait
+  ) {
+    return { completed: true, waitedMs: 0, reason: 'skipped_in_test' };
+  }
+
+  if (!isNetworkOnlineForLaunch(opts) || !isNetworkOnlineForLaunch(params)) {
+    return { completed: true, waitedMs: 0, offlineSkipped: true, reason: 'offline_skipped' };
+  }
+
+  const maxWaitMs = Math.max(
+    0,
+    Number(params.maxWaitMs ?? opts.maxWaitMs ?? opts.epicCloudSyncWaitMs ?? 15000)
+  );
+  if (maxWaitMs === 0) {
+    return { completed: true, waitedMs: 0, reason: 'zero_wait' };
+  }
+
+  const quietSettleMs = Math.max(
+    0,
+    Number(params.quietSettleMs ?? opts.epicCloudSyncQuietSettleMs ?? 4000)
+  );
+  const pollIntervalMs = Math.max(15, Number(params.pollIntervalMs ?? opts.pollIntervalMs ?? 200));
+  const signal = params.signal || opts.signal;
+
+  const logCandidates = await resolveEpicLauncherLogCandidatesAsync(params, opts);
+  /** @type {Map<string, number>} */
+  const preOffsets = new Map();
+  /** @type {Map<string, number>} */
+  const lastSizes = new Map();
+
+  const explicitPreOffset =
+    typeof params.preExitOffset === 'number' && params.preExitOffset >= 0
+      ? params.preExitOffset
+      : typeof params.preExitLogOffset === 'number' && params.preExitLogOffset >= 0
+        ? params.preExitLogOffset
+        : undefined;
+
+  let anyLogExists = false;
+  for (const logPath of logCandidates) {
+    try {
+      const st = await fs.promises.stat(logPath);
+      if (st.isFile()) {
+        anyLogExists = true;
+        preOffsets.set(logPath, typeof explicitPreOffset === 'number' ? explicitPreOffset : st.size);
+        lastSizes.set(logPath, st.size);
+      }
+    } catch {
+      if (typeof explicitPreOffset === 'number') {
+        preOffsets.set(logPath, explicitPreOffset);
+      }
+    }
+  }
+
+  const startedAt = Date.now();
+  let lastActivityAt = startedAt;
+
+  if (!anyLogExists && logCandidates.length === 0) {
+    await sleepUnref(Math.min(quietSettleMs, maxWaitMs), signal);
+    return {
+      completed: true,
+      waitedMs: Date.now() - startedAt,
+      reason: 'no_log_quiet_settled',
+    };
+  }
+
+  let anyInFlight = false;
+  do {
+    if (signal?.aborted) {
+      return {
+        completed: false,
+        aborted: true,
+        waitedMs: Date.now() - startedAt,
+        reason: 'aborted',
+      };
+    }
+
+    const now = Date.now();
+    anyInFlight = false;
+    let anyCompleted = false;
+
+    for (const logPath of logCandidates) {
+      const baseOff = preOffsets.has(logPath) ? Number(preOffsets.get(logPath) || 0) : 0;
+      const logRead = await readLogTailBytesAsync(logPath, baseOff, 131072);
+      if (!logRead) continue;
+
+      const prevSize = lastSizes.get(logPath);
+      if (prevSize === undefined || logRead.size !== prevSize) {
+        if (prevSize !== undefined) {
+          lastActivityAt = now;
+        }
+        lastSizes.set(logPath, logRead.size);
+      }
+
+      if (logRead.text) {
+        const state = inspectEpicCloudSyncLogState(logRead.text);
+        if (state.inFlight) {
+          anyInFlight = true;
+        }
+        if (state.completedObserved) {
+          anyCompleted = true;
+        }
+      }
+    }
+
+    if (anyCompleted && !anyInFlight) {
+      return {
+        completed: true,
+        waitedMs: Date.now() - startedAt,
+        reason: 'cloud_sync_completed',
+      };
+    }
+
+    if (!anyInFlight && now - lastActivityAt >= quietSettleMs) {
+      return {
+        completed: true,
+        waitedMs: Date.now() - startedAt,
+        reason: 'quiet_settled',
+      };
+    }
+
+    const remaining = maxWaitMs - (Date.now() - startedAt);
+    if (remaining <= 0) break;
+    await sleepUnref(Math.min(pollIntervalMs, remaining), signal);
+  } while (Date.now() - startedAt < maxWaitMs);
+
+  return {
+    completed: !anyInFlight,
+    timedOut: true,
+    waitedMs: Date.now() - startedAt,
+    reason: anyInFlight ? 'timeout_in_flight' : 'timeout_settled',
+  };
+}
+
+/**
  * Parse `<steamRoot>/logs/gameprocess_log.txt` (from `minFileOffset`) to locate the active
  * tracked PID for `AppID <appId>` that has not been marked `no longer tracking PID <pid>` and is alive.
  *
@@ -1090,12 +1721,16 @@ module.exports = {
   doesProcessListHaveHostGogGalaxy,
   isHostGogGalaxyRunning,
   reapOrphanedGogOverlayProcesses,
+  lineMatchesBottlePrefix,
   isBottleWinExeRunning,
+  inspectRunningBottleSteam,
   probeLocalTcpPort,
   resolveGogCommunicationLogPath,
+  resolveGogClientLogPath,
   hasActiveGogAuthSessionInLog,
   waitForGogCommunicationServiceReady,
   waitForGogPostExitFlush,
   waitForBottleEpicPortalReady,
+  waitForEpicLauncherCloudSyncCompletion,
   extractTrackedPidFromSteamGameProcessLog,
 };

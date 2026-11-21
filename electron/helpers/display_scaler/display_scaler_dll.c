@@ -382,7 +382,8 @@ DS_ALWAYS_INLINE bool ds_should_ignore_current_process(void)
 {
     static const char k_ignored_msz[] =
         ONE_DENYLIST_WINE_SYSTEM_MSZ
-        ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ;
+        ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ
+        ONE_DENYLIST_INSTALLERS_MSZ;
     return ds_current_exe_in_multisz(k_ignored_msz, true);
 }
 

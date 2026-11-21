@@ -113,6 +113,23 @@ function createTrayAndDaemonLifecycle({
   /** @type {ReturnType<typeof setInterval> | null} */
   let macBottleFocusTimer = null;
   /**
+   * Track active/pending macOS cooperative focus handoff state so Bottle Steam sessions
+   * without an initial PID can extend polling to 90 s (450 ticks) and update/re-arm `rootPid`
+   * when a subsequent `session_updated` / `running` event latches the real game PID.
+   *
+   * @type {{
+   *   gameId: string,
+   *   sessionInfo: any,
+   *   effectivePolicy: any,
+   *   coopActivateOpts: { rootPid: number, targetExeNames: string[], bottlePath?: string },
+   *   activated: boolean,
+   *   running: boolean,
+   *   maxTicks: number,
+   *   ticks: number,
+   * } | null}
+   */
+  let activeMacBottleFocusState = null;
+  /**
    * @type {{
    *   pollAndActivateBottledGame?: (opts?: { rootPid?: number; targetExeNames?: string[]; bottlePath?: string }) => number,
    *   restorePresentationOptions?: () => boolean,
@@ -454,10 +471,17 @@ function createTrayAndDaemonLifecycle({
     return null;
   }
 
-  function stopMacBottleFocusHelper(/** @type {{ restorePresentation?: boolean }} */ opts = {}) {
+  function stopMacBottleFocusHelper(
+    /** @type {{ restorePresentation?: boolean, clearState?: boolean }} */ opts = {}
+  ) {
     if (macBottleFocusTimer) {
       clearInterval(macBottleFocusTimer);
       macBottleFocusTimer = null;
+    }
+    if (opts.clearState === true) {
+      activeMacBottleFocusState = null;
+    } else if (activeMacBottleFocusState) {
+      activeMacBottleFocusState.running = false;
     }
     if (opts.restorePresentation === true) {
       restoreMacPresentationOptions();
@@ -501,11 +525,16 @@ function createTrayAndDaemonLifecycle({
       return;
     }
 
+    const initialPid = Number(sessionInfo && sessionInfo.pid) || 0;
+    const isBottledWithoutInitialPid =
+      (sessionInfo && sessionInfo.pid === undefined) || !(initialPid > 0);
+    const maxFocusTicks = isBottledWithoutInitialPid && isBottledWindowsLaunch ? 450 : 200;
+
     const bottlePath = String(
       (sessionInfo && (sessionInfo.winePrefix || sessionInfo.bottlePath)) || ''
     ).trim();
     const coopActivateOpts = {
-      rootPid: Number(sessionInfo && sessionInfo.pid) || 0,
+      rootPid: initialPid,
       targetExeNames: Array.from(
         new Set(
           [
@@ -520,6 +549,21 @@ function createTrayAndDaemonLifecycle({
       ),
       ...(bottlePath ? { bottlePath } : {}),
     };
+
+    const sessionGameId = String(
+      (sessionInfo && sessionInfo.gameId) || (eventPayload && eventPayload.gameId) || ''
+    ).trim();
+    const focusState = {
+      gameId: sessionGameId,
+      sessionInfo,
+      effectivePolicy,
+      coopActivateOpts,
+      activated: false,
+      running: true,
+      maxTicks: maxFocusTicks,
+      ticks: 0,
+    };
+    activeMacBottleFocusState = focusState;
 
     const shouldHideAppAfterActivation =
       effectivePolicy?.inGameLauncherBehavior === 'hide_tray_hibernate';
@@ -550,15 +594,20 @@ function createTrayAndDaemonLifecycle({
 
     const timer = setInterval(() => {
       ticks += 1;
-      if (ticks > 200) {
+      focusState.ticks = ticks;
+      if (ticks > focusState.maxTicks) {
         if ((launcherEngine.getRunningGames() || []).length > 0) {
           hideLauncherAppOnce();
         }
         stopMacBottleFocusHelper({ restorePresentation: didHideAppForSession });
         return;
       }
+      if (ticks > 200 && (launcherEngine.getRunningGames() || []).length === 0) {
+        stopMacBottleFocusHelper({ restorePresentation: didHideAppForSession });
+        return;
+      }
       try {
-        const encoded = Number(helper.pollAndActivateBottledGame(coopActivateOpts) || 0);
+        const encoded = Number(helper.pollAndActivateBottledGame(focusState.coopActivateOpts) || 0);
         if ((encoded & 1) === 0) {
           return;
         }
@@ -580,6 +629,7 @@ function createTrayAndDaemonLifecycle({
         if (isActive && layer >= 25) {
           activeLayerTicks += 1;
           if (activeLayerTicks >= 3) {
+            focusState.activated = true;
             stopMacBottleFocusHelper({ restorePresentation: didHideAppForSession });
             return;
           }
@@ -589,6 +639,7 @@ function createTrayAndDaemonLifecycle({
         if (isActive) {
           activeTicks += 1;
           if (activeTicks >= 3) {
+            focusState.activated = true;
             stopMacBottleFocusHelper({ restorePresentation: didHideAppForSession });
           }
         }
@@ -732,8 +783,53 @@ function createTrayAndDaemonLifecycle({
                 }
               }
             }
+          } else if (eventType === 'session_updated' || eventType === 'running') {
+            const sessionInfo =
+              eventPayload && eventPayload.session ? eventPayload.session : eventPayload;
+            const latchedPid = Number(sessionInfo && sessionInfo.pid) || 0;
+            const eventGameId = String(
+              (sessionInfo && sessionInfo.gameId) || gameId || ''
+            ).trim();
+            if (
+              latchedPid > 0 &&
+              activeMacBottleFocusState &&
+              !activeMacBottleFocusState.activated &&
+              (!activeMacBottleFocusState.gameId ||
+                !eventGameId ||
+                activeMacBottleFocusState.gameId === eventGameId)
+            ) {
+              const updatedBottlePath = String(
+                (sessionInfo && (sessionInfo.winePrefix || sessionInfo.bottlePath)) || ''
+              ).trim();
+              if (updatedBottlePath && !activeMacBottleFocusState.coopActivateOpts.bottlePath) {
+                activeMacBottleFocusState.coopActivateOpts.bottlePath = updatedBottlePath;
+              }
+              if (Array.isArray(sessionInfo && sessionInfo.targetExeBasenamesLower)) {
+                activeMacBottleFocusState.coopActivateOpts.targetExeNames = Array.from(
+                  new Set([
+                    ...activeMacBottleFocusState.coopActivateOpts.targetExeNames,
+                    ...sessionInfo.targetExeBasenamesLower
+                      .map((/** @type {any} */ n) => String(n || '').trim())
+                      .filter(Boolean),
+                  ])
+                );
+              }
+              if (macBottleFocusTimer && activeMacBottleFocusState.running) {
+                activeMacBottleFocusState.coopActivateOpts.rootPid = latchedPid;
+              } else {
+                const mergedSession = {
+                  ...(activeMacBottleFocusState.sessionInfo || {}),
+                  ...(sessionInfo || {}),
+                  pid: latchedPid,
+                };
+                activateMacBottleGameWindowOnLaunch(
+                  { ...(eventPayload || {}), session: mergedSession },
+                  effectivePolicy || activeMacBottleFocusState.effectivePolicy
+                );
+              }
+            }
           } else if (eventType === 'stopped') {
-            stopMacBottleFocusHelper({ restorePresentation: true });
+            stopMacBottleFocusHelper({ restorePresentation: true, clearState: true });
             const remainingGames = launcherEngine.getRunningGames() || [];
             if (remainingGames.length > 0) return;
 
@@ -870,7 +966,7 @@ function createTrayAndDaemonLifecycle({
 
   function runSubsystemShutdownOnce() {
     clearAllLifecycleTimers();
-    stopMacBottleFocusHelper({ restorePresentation: true });
+    stopMacBottleFocusHelper({ restorePresentation: true, clearState: true });
     destroyAppTray();
     if (hasCompletedSubsystemShutdown) return;
     hasCompletedSubsystemShutdown = true;

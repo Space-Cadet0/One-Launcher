@@ -28,6 +28,7 @@ const {
 } = require('../wineAndCrossOverManager.cjs');
 const { inspectPeCapabilities } = require('../binaryAndManifestInspectors.cjs');
 const {
+  extractBottleRootFromPath,
   inspectBottleConfMetadata,
   assertRunnerBottleArchCompatible,
   isValidBottleDirectory,
@@ -2602,76 +2603,147 @@ async function provisionCrossOverBottleViaCxbottle(
 }
 
 /**
- * Pure, side-effect-free prediction of the target Wine/CrossOver prefix path that
- * `ensureCompatibilityLayerReady` will operate on, so `launchGame` can acquire
- * `pendingBottleLaunches` and await `inFlightPostSessionByBottle` BEFORE mutating the bottle.
+ * Compare two directory paths for equivalence, accounting for normalized slashes,
+ * case-insensitivity on macOS/Windows, and symlinked temp/parent roots (`realpathSync`).
+ *
+ * @param {string} dirA
+ * @param {string} dirB
+ * @returns {boolean}
+ */
+function areSameNormalizedDirPath(dirA, dirB) {
+  if (!dirA || !dirB) return false;
+  const norm = (/** @type {string} */ p) =>
+    path.resolve(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  if (norm(dirA) === norm(dirB)) {
+    return true;
+  }
+  try {
+    if (fs.existsSync(dirA) && fs.existsSync(dirB)) {
+      return norm(fs.realpathSync(dirA)) === norm(fs.realpathSync(dirB));
+    }
+  } catch {}
+  return false;
+}
+
+/**
+ * Shared internal CrossOver bottle resolution used by `resolveCrossOverTargetBottleName`,
+ * `predictTargetBottlePrefix`, and `ensureCompatibilityLayerReady` so lock prediction and
+ * actual bottle provisioning/launching can never diverge.
  *
  * @param {any} chosenLayer
  * @param {any} [launchConfig]
  * @param {any} [options]
- * @returns {string | null}
+ * @returns {{
+ *   isArm64Runner: boolean,
+ *   sharedBottlesDir: string,
+ *   bottlesDir: string,
+ *   availableBottles: string[],
+ *   compatibleBottles: string[],
+ *   targetBottle: string | null,
+ *   invalidExplicitBottleName: string | null,
+ * } | null}
  */
-function predictTargetBottlePrefix(chosenLayer, launchConfig = {}, options = {}) {
-  if (!chosenLayer || typeof chosenLayer !== 'object') return null;
-  if (launchConfig && typeof launchConfig.winePrefixPath === 'string' && launchConfig.winePrefixPath.trim()) {
-    return path.resolve(launchConfig.winePrefixPath.trim());
+function resolveCrossOverBottlesDirAndTarget(chosenLayer, launchConfig = {}, options = {}) {
+  if (
+    !chosenLayer ||
+    typeof chosenLayer !== 'object' ||
+    (chosenLayer.type !== 'crossover' &&
+      chosenLayer.type !== 'crossover_preview' &&
+      chosenLayer.type !== 'crossover_preview_arm64')
+  ) {
+    return null;
   }
+
   const homedir = options.homedir || os.homedir();
   const isMockHomedir = Boolean(options.homedir || options.customApplicationsDir);
+  const isArm64Runner = chosenLayer.type === 'crossover_preview_arm64';
+  const sharedBottlesDir = path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
+  const previewBottlesDir = path.join(
+    homedir,
+    'Library/Application Support/CrossOver Preview/Bottles'
+  );
+  const previewArm64BottlesDir = path.join(
+    homedir,
+    'Library/Application Support/CrossOver Preview arm64/Bottles'
+  );
+  const effectivePreviewBottlesDir = hasValidInitializedBottles(previewBottlesDir, false)
+    ? previewBottlesDir
+    : hasValidInitializedBottles(sharedBottlesDir, false)
+      ? sharedBottlesDir
+      : isMockHomedir && hasValidInitializedBottles(previewBottlesDir, true)
+        ? previewBottlesDir
+        : !isMockHomedir && fs.existsSync(sharedBottlesDir)
+          ? sharedBottlesDir
+          : previewBottlesDir;
+  const defaultBottlesDir =
+    chosenLayer.type === 'crossover'
+      ? sharedBottlesDir
+      : isArm64Runner
+        ? hasValidInitializedBottles(previewArm64BottlesDir, false)
+          ? previewArm64BottlesDir
+          : effectivePreviewBottlesDir
+        : effectivePreviewBottlesDir;
 
-  if (
-    chosenLayer.type === 'crossover' ||
-    chosenLayer.type === 'crossover_preview' ||
-    chosenLayer.type === 'crossover_preview_arm64'
-  ) {
-    const isArm64Runner = chosenLayer.type === 'crossover_preview_arm64';
-    const sharedBottlesDir = path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
-    const previewBottlesDir = path.join(
-      homedir,
-      'Library/Application Support/CrossOver Preview/Bottles'
-    );
-    const previewArm64BottlesDir = path.join(
-      homedir,
-      'Library/Application Support/CrossOver Preview arm64/Bottles'
-    );
-    const effectivePreviewBottlesDir = hasValidInitializedBottles(previewBottlesDir, false)
-      ? previewBottlesDir
-      : hasValidInitializedBottles(sharedBottlesDir, false)
-        ? sharedBottlesDir
-        : isMockHomedir && hasValidInitializedBottles(previewBottlesDir, true)
-          ? previewBottlesDir
-          : !isMockHomedir && fs.existsSync(sharedBottlesDir)
-            ? sharedBottlesDir
-            : previewBottlesDir;
-    const defaultBottlesDir =
-      chosenLayer.type === 'crossover'
-        ? sharedBottlesDir
-        : isArm64Runner
-          ? hasValidInitializedBottles(previewArm64BottlesDir, false)
-            ? previewArm64BottlesDir
-            : effectivePreviewBottlesDir
-          : effectivePreviewBottlesDir;
+  const bottlesDir = chosenLayer.bottlesDir || defaultBottlesDir;
+  const availableBottles = listBottleSubdirectories(bottlesDir, options);
+  const compatibleBottles = availableBottles.filter((bName) => {
+    const detailArch = chosenLayer.bottleDetails?.[bName]?.wineArch;
+    const metaArch =
+      detailArch || inspectBottleConfMetadata(path.join(bottlesDir, bName)).wineArch;
+    return isArm64Runner ? metaArch === 'arm64' : metaArch !== 'arm64';
+  });
 
-    const bottlesDir = chosenLayer.bottlesDir || defaultBottlesDir;
-    const availableBottles = listBottleSubdirectories(bottlesDir, options);
-    const compatibleBottles = availableBottles.filter((bName) => {
-      const detailArch = chosenLayer.bottleDetails?.[bName]?.wineArch;
-      const metaArch =
-        detailArch || inspectBottleConfMetadata(path.join(bottlesDir, bName)).wineArch;
-      return isArm64Runner ? metaArch === 'arm64' : metaArch !== 'arm64';
-    });
+  const explicitBottleName =
+    launchConfig && typeof launchConfig.wineBottleName === 'string'
+      ? launchConfig.wineBottleName.trim()
+      : '';
+  if (explicitBottleName) {
+    if (!safeIsBottleSlug(explicitBottleName)) {
+      return {
+        isArm64Runner,
+        sharedBottlesDir,
+        bottlesDir,
+        availableBottles,
+        compatibleBottles,
+        targetBottle: null,
+        invalidExplicitBottleName: explicitBottleName,
+      };
+    }
+    return {
+      isArm64Runner,
+      sharedBottlesDir,
+      bottlesDir,
+      availableBottles,
+      compatibleBottles,
+      targetBottle: explicitBottleName,
+      invalidExplicitBottleName: null,
+    };
+  }
 
-    let targetBottle = '';
-    const explicitBottleName =
-      launchConfig && typeof launchConfig.wineBottleName === 'string'
-        ? launchConfig.wineBottleName.trim()
-        : '';
-    if (explicitBottleName) {
-      if (!safeIsBottleSlug(explicitBottleName)) {
-        return null;
+  let targetBottle = '';
+  const installPathHint = String(
+    options?.installDir || options?.installPath || options?.executablePath || ''
+  ).trim();
+  const installBottleRoot = installPathHint ? extractBottleRootFromPath(installPathHint) : null;
+  if (installBottleRoot) {
+    const installParentDir = path.dirname(installBottleRoot);
+    const installBottleName = path.basename(installBottleRoot);
+    if (
+      installBottleName &&
+      safeIsBottleSlug(installBottleName) &&
+      areSameNormalizedDirPath(installParentDir, bottlesDir)
+    ) {
+      const matchedCompatBottle = compatibleBottles.find(
+        (bName) => bName.toLowerCase() === installBottleName.toLowerCase()
+      );
+      if (matchedCompatBottle) {
+        targetBottle = matchedCompatBottle;
       }
-      targetBottle = explicitBottleName;
-    } else if (isArm64Runner) {
+    }
+  }
+
+  if (!targetBottle) {
+    if (isArm64Runner) {
       targetBottle = compatibleBottles.includes('OneLauncher-arm64')
         ? 'OneLauncher-arm64'
         : compatibleBottles.length > 0 && safeIsBottleSlug(compatibleBottles[0])
@@ -2686,10 +2758,98 @@ function predictTargetBottlePrefix(chosenLayer, launchConfig = {}, options = {})
     } else {
       targetBottle = 'OneLauncher';
     }
-    return path.resolve(path.join(bottlesDir, targetBottle));
   }
 
+  return {
+    isArm64Runner,
+    sharedBottlesDir,
+    bottlesDir,
+    availableBottles,
+    compatibleBottles,
+    targetBottle,
+    invalidExplicitBottleName: null,
+  };
+}
+
+/**
+ * Shared target CrossOver bottle name resolver honoring:
+ *   1. Explicit `launchConfig.wineBottleName`
+ *   2. Install-bottle affinity when `options.installDir || options.installPath || options.executablePath`
+ *      resides inside `bottlesDir` in a compatible bottle
+ *   3. Canonical runner defaults (`OneLauncher` / `default` / `OneLauncher-arm64` / first compatible)
+ *
+ * @param {any} chosenLayer
+ * @param {any} [launchConfig]
+ * @param {any} [options]
+ * @returns {string | null}
+ */
+function resolveCrossOverTargetBottleName(chosenLayer, launchConfig = {}, options = {}) {
+  const resolved = resolveCrossOverBottlesDirAndTarget(chosenLayer, launchConfig, options);
+  return resolved ? resolved.targetBottle : null;
+}
+
+/**
+ * Resolve the target Wine prefix for standalone `wine` / `gptk` runners, honoring explicit
+ * `launchConfig.winePrefixPath` first and non-CrossOver install-prefix affinity second.
+ *
+ * @param {any} [launchConfig]
+ * @param {any} [options]
+ * @returns {string}
+ */
+function resolveStandaloneWineTargetPrefix(launchConfig = {}, options = {}) {
+  if (
+    launchConfig &&
+    typeof launchConfig.winePrefixPath === 'string' &&
+    launchConfig.winePrefixPath.trim()
+  ) {
+    return path.resolve(launchConfig.winePrefixPath.trim());
+  }
+  const installPathHint = String(
+    options?.installDir || options?.installPath || options?.executablePath || ''
+  ).trim();
+  const installBottleRoot = installPathHint ? extractBottleRootFromPath(installPathHint) : null;
+  if (installBottleRoot && fs.existsSync(installBottleRoot)) {
+    const resolvedRoot = path.resolve(installBottleRoot);
+    const hasDriveC = fs.existsSync(path.join(resolvedRoot, 'drive_c'));
+    const hasCxConf = fs.existsSync(path.join(resolvedRoot, 'cxbottle.conf'));
+    const meta = hasCxConf ? inspectBottleConfMetadata(resolvedRoot) : {};
+    if (hasDriveC && !hasCxConf && meta.wineArch !== 'arm64') {
+      return resolvedRoot;
+    }
+  }
+  const homedir = options.homedir || os.homedir();
   return path.resolve(path.join(homedir, 'Games/OneLauncher/Prefixes/default'));
+}
+
+/**
+ * Pure, side-effect-free prediction of the target Wine/CrossOver prefix path that
+ * `ensureCompatibilityLayerReady` will operate on, so `launchGame` can acquire
+ * `pendingBottleLaunches` and await `inFlightPostSessionByBottle` BEFORE mutating the bottle.
+ *
+ * @param {any} chosenLayer
+ * @param {any} [launchConfig]
+ * @param {any} [options]
+ * @returns {string | null}
+ */
+function predictTargetBottlePrefix(chosenLayer, launchConfig = {}, options = {}) {
+  if (!chosenLayer || typeof chosenLayer !== 'object') return null;
+  if (
+    launchConfig &&
+    typeof launchConfig.winePrefixPath === 'string' &&
+    launchConfig.winePrefixPath.trim()
+  ) {
+    return path.resolve(launchConfig.winePrefixPath.trim());
+  }
+
+  const cxResolved = resolveCrossOverBottlesDirAndTarget(chosenLayer, launchConfig, options);
+  if (cxResolved) {
+    if (!cxResolved.targetBottle) {
+      return null;
+    }
+    return path.resolve(path.join(cxResolved.bottlesDir, cxResolved.targetBottle));
+  }
+
+  return resolveStandaloneWineTargetPrefix(launchConfig, options);
 }
 
 async function ensureCompatibilityLayerReady(
@@ -2699,7 +2859,6 @@ async function ensureCompatibilityLayerReady(
   /** @type {any} */ options = {}
 ) {
   if (!chosenLayer) return {};
-  const homedir = options.homedir || os.homedir();
   const isMockHomedir = Boolean(options.homedir || options.customApplicationsDir);
   const platform = options.platform || process.platform;
   const hostArch = String(
@@ -2716,75 +2875,13 @@ async function ensureCompatibilityLayerReady(
     );
   }
 
-  if (
-    chosenLayer.type === 'crossover' ||
-    chosenLayer.type === 'crossover_preview' ||
-    chosenLayer.type === 'crossover_preview_arm64'
-  ) {
-    const isArm64Runner = chosenLayer.type === 'crossover_preview_arm64';
-    const sharedBottlesDir = path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
-    const previewBottlesDir = path.join(
-      homedir,
-      'Library/Application Support/CrossOver Preview/Bottles'
-    );
-    const previewArm64BottlesDir = path.join(
-      homedir,
-      'Library/Application Support/CrossOver Preview arm64/Bottles'
-    );
-    const effectivePreviewBottlesDir = hasValidInitializedBottles(previewBottlesDir, false)
-      ? previewBottlesDir
-      : hasValidInitializedBottles(sharedBottlesDir, false)
-        ? sharedBottlesDir
-        : isMockHomedir && hasValidInitializedBottles(previewBottlesDir, true)
-          ? previewBottlesDir
-          : !isMockHomedir && fs.existsSync(sharedBottlesDir)
-            ? sharedBottlesDir
-            : previewBottlesDir;
-    const defaultBottlesDir =
-      chosenLayer.type === 'crossover'
-        ? sharedBottlesDir
-        : isArm64Runner
-          ? hasValidInitializedBottles(previewArm64BottlesDir, false)
-            ? previewArm64BottlesDir
-            : effectivePreviewBottlesDir
-          : effectivePreviewBottlesDir;
-
-    const bottlesDir = chosenLayer.bottlesDir || defaultBottlesDir;
-    const availableBottles = listBottleSubdirectories(bottlesDir, options);
-    const compatibleBottles = availableBottles.filter((bName) => {
-      const detailArch = chosenLayer.bottleDetails?.[bName]?.wineArch;
-      const metaArch =
-        detailArch || inspectBottleConfMetadata(path.join(bottlesDir, bName)).wineArch;
-      return isArm64Runner ? metaArch === 'arm64' : metaArch !== 'arm64';
-    });
-
-    let targetBottle;
-    const explicitBottleName =
-      launchConfig && typeof launchConfig.wineBottleName === 'string'
-        ? launchConfig.wineBottleName.trim()
-        : '';
-    if (explicitBottleName) {
-      if (!safeIsBottleSlug(explicitBottleName)) {
-        throw new Error(`Invalid CrossOver bottle name "${explicitBottleName}".`);
-      }
-      targetBottle = explicitBottleName;
-    } else if (isArm64Runner) {
-      if (compatibleBottles.includes('OneLauncher-arm64')) {
-        targetBottle = 'OneLauncher-arm64';
-      } else if (compatibleBottles.length > 0 && safeIsBottleSlug(compatibleBottles[0])) {
-        targetBottle = compatibleBottles[0];
-      } else {
-        targetBottle = 'OneLauncher-arm64';
-      }
-    } else if (compatibleBottles.includes('OneLauncher')) {
-      targetBottle = 'OneLauncher';
-    } else if (compatibleBottles.includes('default')) {
-      targetBottle = 'default';
-    } else if (compatibleBottles.length > 0 && safeIsBottleSlug(compatibleBottles[0])) {
-      targetBottle = compatibleBottles[0];
-    } else {
-      targetBottle = 'OneLauncher';
+  const cxResolved = resolveCrossOverBottlesDirAndTarget(chosenLayer, launchConfig, options);
+  if (cxResolved) {
+    if (cxResolved.invalidExplicitBottleName) {
+      throw new Error(`Invalid CrossOver bottle name "${cxResolved.invalidExplicitBottleName}".`);
     }
+    const { isArm64Runner, sharedBottlesDir, bottlesDir } = cxResolved;
+    const targetBottle = String(cxResolved.targetBottle || 'OneLauncher');
 
     const bottlePath = path.join(bottlesDir, targetBottle);
     const effectiveBottleCheckPath =
@@ -2869,10 +2966,7 @@ async function ensureCompatibilityLayerReady(
     };
   }
 
-  const targetPrefix =
-    launchConfig && launchConfig.winePrefixPath
-      ? launchConfig.winePrefixPath
-      : path.join(homedir, 'Games/OneLauncher/Prefixes/default');
+  const targetPrefix = resolveStandaloneWineTargetPrefix(launchConfig, options);
 
   try {
     if (targetPrefix && !fs.existsSync(targetPrefix)) {
@@ -2969,6 +3063,7 @@ module.exports = {
   cleanNonApfsAppleDoubleTwins,
   applyCrossOverPerGameSettings,
   provisionCrossOverBottleViaCxbottle,
+  resolveCrossOverTargetBottleName,
   predictTargetBottlePrefix,
   ensureCompatibilityLayerReady,
 };
