@@ -373,7 +373,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   };
 
   const handlePlayClick = async () => {
-    if (isLaunchPending || isRunning) return;
+    if (isLaunchPending || isRunning || bottleSteamQuickFixActiveRef.current) return;
     setBottleSteamLaunchError(null);
     setIsLaunchPending(true);
     try {
@@ -721,8 +721,13 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
               <div className="flex items-center gap-1.5 flex-wrap">
                 <button
                   type="button"
+                  disabled={bottleSteamQuickFix.active}
                   onClick={handlePlayClick}
-                  className="inline-flex items-center justify-center gap-1.5 xl:gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 active:scale-[0.99] shrink-0 cursor-pointer"
+                  className={`inline-flex items-center justify-center gap-1.5 xl:gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md shrink-0 ${
+                    bottleSteamQuickFix.active
+                      ? 'opacity-55 cursor-not-allowed'
+                      : 'hover:brightness-110 active:scale-[0.99] cursor-pointer'
+                  }`}
                   style={{
                     background: isXboxSubscriptionExpired
                       ? 'linear-gradient(to right, #475569 5%, #334155 95%)'
@@ -833,8 +838,10 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                 />
                 <select
                   aria-label="Target Storefront"
+                  disabled={bottleSteamQuickFix.active}
                   value={selectedPlatformId}
                   onChange={(e) => {
+                    if (bottleSteamQuickFixActiveRef.current) return;
                     const nextPlat = e.target.value as StorefrontId;
                     userManuallySelectedPlatformRef.current = true;
                     setBottleSteamLaunchError(null);
@@ -842,7 +849,9 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                     launcherService.setSelectedStorefrontForGame(game.id, nextPlat);
                   }}
                   title={`Active Storefront: ${getStorefrontDisplayName(selectedPlatformId)} (Click to switch)`}
-                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                  className={`absolute inset-0 w-full h-full opacity-0 ${
+                    bottleSteamQuickFix.active ? 'cursor-not-allowed' : 'cursor-pointer'
+                  }`}
                 >
                   {game.platforms.map((plat) => {
                     const platInstalled =
