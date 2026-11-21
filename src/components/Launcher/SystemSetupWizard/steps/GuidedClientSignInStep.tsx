@@ -540,6 +540,17 @@ export const GuidedClientSignInStep: React.FC<GuidedClientSignInStepProps> = ({
           const isOtherWaiting =
             activeGuidedLoginTarget !== null && activeGuidedLoginTarget !== targetId;
           const hasMismatch = probe.installed && probe.accountMatchesOneLauncher === false;
+          const isSignedInClean = Boolean(probe.authenticated && !hasMismatch);
+          const trimmedSummary = (probe.statusSummary || '').trim();
+          const signedInStatusLabel = probe.detectedAccountLabel
+            ? `Signed in as ${probe.detectedAccountLabel}`
+            : /^signed in\b/i.test(trimmedSummary)
+              ? trimmedSummary.replace(/\s*\(remember me off\)\s*$/i, '').trim()
+              : 'Signed in';
+          const showSecondarySummary =
+            !isSignedInClean ||
+            (trimmedSummary.length > 0 &&
+              !/^signed in(?:\s+as\b.*|\s*\(.*\))?\.?$/i.test(trimmedSummary));
           const lastRes = lastResults[targetId];
 
           return (
@@ -572,21 +583,26 @@ export const GuidedClientSignInStep: React.FC<GuidedClientSignInStepProps> = ({
                         </span>
                       )}
                     </div>
-                    <p className="text-[11px] text-slate-300 mt-0.5">{probe.statusSummary}</p>
+                    {showSecondarySummary && (
+                      <p className="text-[11px] text-slate-300 mt-0.5">{probe.statusSummary}</p>
+                    )}
                   </div>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2 shrink-0">
-                  {probe.authenticated && !hasMismatch ? (
-                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-[10px] font-bold text-emerald-300">
+                  {isSignedInClean ? (
+                    <span
+                      data-testid={`guided-login-status-${targetId}`}
+                      className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-[10px] font-bold text-emerald-300"
+                    >
                       <CheckCircle2 className="w-3 h-3 text-emerald-400" aria-hidden="true" />
-                      <span>
-                        Signed in
-                        {probe.detectedAccountLabel ? ` (${probe.detectedAccountLabel})` : ''}
-                      </span>
+                      <span>{signedInStatusLabel}</span>
                     </span>
                   ) : (
-                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-[10px] font-bold text-amber-200">
+                    <span
+                      data-testid={`guided-login-status-${targetId}`}
+                      className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-[10px] font-bold text-amber-200"
+                    >
                       <AlertTriangle className="w-3 h-3 text-amber-400" aria-hidden="true" />
                       <span>{hasMismatch ? 'Different account' : 'Needs sign-in'}</span>
                     </span>

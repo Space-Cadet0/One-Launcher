@@ -278,13 +278,13 @@ export function renderCompatGraphicsControls({
             <option value="auto_fullscreen">Auto Fullscreen (Recommended)</option>
             <option value="windowed">Windowed</option>
             {effectiveDisplayScalingMode === 'force_fullscreen' && (
-              <option value="force_fullscreen">Force Fullscreen (Advanced Override)</option>
+              <option value="force_fullscreen">Force Fullscreen (Advanced)</option>
             )}
             {effectiveDisplayScalingMode === 'virtual_desktop' && (
-              <option value="virtual_desktop">Wine Virtual Desktop (Advanced Override)</option>
+              <option value="virtual_desktop">Virtual Desktop (Advanced)</option>
             )}
             {effectiveDisplayScalingMode === 'native_driver' && (
-              <option value="native_driver">Native Wine Driver (Legacy Override)</option>
+              <option value="native_driver">Native Driver (Legacy)</option>
             )}
           </LaunchSelect>
           <p id={displayScalingHintId} className="text-[10px] text-steam-subtext leading-snug">

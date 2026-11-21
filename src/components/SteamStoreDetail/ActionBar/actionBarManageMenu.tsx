@@ -24,6 +24,8 @@ export interface RenderManageGameDropdownArgs {
   isWindowsHost: boolean;
   hasLocalFilesPath: boolean;
   activeDownload: DownloadTaskState | undefined;
+  dropdownRef?: React.Ref<HTMLDivElement>;
+  onMenuKeyDown?: (e: React.KeyboardEvent<HTMLDivElement>) => void;
   onCloseMenu: () => void;
   onOpenInstallModal: () => void;
   onPrefetchInstallModal: () => void;
@@ -42,6 +44,8 @@ export function renderManageGameDropdown({
   isWindowsHost,
   hasLocalFilesPath,
   activeDownload,
+  dropdownRef,
+  onMenuKeyDown,
   onCloseMenu,
   onOpenInstallModal,
   onPrefetchInstallModal,
@@ -52,12 +56,26 @@ export function renderManageGameDropdown({
   onHideGame,
   showTempFeedback,
 }: RenderManageGameDropdownArgs): React.ReactElement {
+  const menuItemClass =
+    'w-full min-h-6 flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:text-white focus-visible:bg-[#1f2d40] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent';
+  const destructiveRoseItemClass =
+    'w-full min-h-6 flex items-center gap-2.5 px-3.5 py-2 text-xs text-rose-300 hover:text-white hover:bg-rose-950/50 transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:text-white focus-visible:bg-rose-950/50 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent';
+  const destructiveRedItemClass =
+    'w-full min-h-6 flex items-center gap-2.5 px-3.5 py-2 text-xs text-red-300 hover:text-red-200 hover:bg-red-950/50 transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:text-red-200 focus-visible:bg-red-950/50 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent';
+
   return (
     <div
       id="manage-game-dropdown"
+      ref={dropdownRef}
+      role="menu"
+      aria-label="Manage Game"
+      onKeyDown={onMenuKeyDown}
       className="absolute left-0 top-full mt-2 w-64 rounded-lg bg-[#151f2d] border border-[#2a475e] shadow-2xl z-50 py-1.5"
     >
-      <div className="px-3.5 py-1.5 border-b border-[#2a475e]/60 mb-1 flex items-center justify-between">
+      <div
+        aria-hidden="true"
+        className="px-3.5 py-1.5 border-b border-[#2a475e]/60 mb-1 flex items-center justify-between"
+      >
         <span className="text-[10px] font-bold uppercase tracking-wider text-sky-400">
           Manage Game
         </span>
@@ -67,7 +85,10 @@ export function renderManageGameDropdown({
       </div>
 
       {/* Group 1: Local Files & Installation */}
-      <div className="px-3.5 pt-1 pb-0.5 text-[9px] font-bold uppercase tracking-wider text-steam-subtext/75">
+      <div
+        aria-hidden="true"
+        className="px-3.5 pt-1 pb-0.5 text-[9px] font-bold uppercase tracking-wider text-steam-subtext/75"
+      >
         Local Files &amp; Installation
       </div>
 
@@ -75,7 +96,10 @@ export function renderManageGameDropdown({
         <>
           <button
             type="button"
+            role="menuitem"
+            tabIndex={-1}
             disabled={!hasLocalFilesPath}
+            aria-disabled={!hasLocalFilesPath || undefined}
             onClick={async () => {
               onCloseMenu();
               const ok = await launcherService.browseLocalFiles(game, selectedPlatformId);
@@ -83,7 +107,7 @@ export function renderManageGameDropdown({
                 showTempFeedback('Could not open local game folder.');
               }
             }}
-            className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] disabled:opacity-40 disabled:pointer-events-none transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
+            className={`${menuItemClass} disabled:opacity-40 disabled:pointer-events-none`}
           >
             <FolderOpen className="w-4 h-4 text-sky-400 shrink-0" aria-hidden="true" />
             <span>Browse Local Files</span>
@@ -91,12 +115,14 @@ export function renderManageGameDropdown({
 
           <button
             type="button"
+            role="menuitem"
+            tabIndex={-1}
             onClick={async () => {
               onCloseMenu();
               const res = await launcherService.verifyGameFiles(game, selectedPlatformId);
               showTempFeedback(res.message || res.error || 'Verification triggered.');
             }}
-            className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
+            className={menuItemClass}
           >
             <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" aria-hidden="true" />
             <span>Verify / Repair Game Files</span>
@@ -105,13 +131,15 @@ export function renderManageGameDropdown({
       ) : (
         <button
           type="button"
+          role="menuitem"
+          tabIndex={-1}
           onPointerEnter={onPrefetchInstallModal}
           onFocus={onPrefetchInstallModal}
           onClick={() => {
             onCloseMenu();
             onOpenInstallModal();
           }}
-          className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
+          className={menuItemClass}
         >
           <Download className="w-4 h-4 text-sky-400 shrink-0" aria-hidden="true" />
           <span>Install Game...</span>
@@ -120,6 +148,8 @@ export function renderManageGameDropdown({
 
       <button
         type="button"
+        role="menuitem"
+        tabIndex={-1}
         onClick={async () => {
           onCloseMenu();
           const exe = await launcherService.locateInstalledGame(game, selectedPlatformId);
@@ -127,7 +157,7 @@ export function renderManageGameDropdown({
             showTempFeedback(`Linked local executable: ${exe}`);
           }
         }}
-        className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
+        className={menuItemClass}
       >
         <FileSearch className="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
         <span>Locate Installed Game...</span>
@@ -135,6 +165,8 @@ export function renderManageGameDropdown({
 
       <button
         type="button"
+        role="menuitem"
+        tabIndex={-1}
         onClick={async () => {
           onCloseMenu();
           const nextState = !isInstalled;
@@ -144,7 +176,7 @@ export function renderManageGameDropdown({
             nextState ? 'Marked as manually installed.' : 'Marked as uninstalled (cloud only).'
           );
         }}
-        className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
+        className={menuItemClass}
       >
         <HardDrive
           className={`w-4 h-4 shrink-0 ${isInstalled ? 'text-emerald-400' : 'text-sky-400'}`}
@@ -156,66 +188,77 @@ export function renderManageGameDropdown({
       </button>
 
       {/* Group 2: Metadata & Launch Configuration */}
-      <div className="mt-1 pt-1.5 border-t border-[#2a475e]/50">
-        <div className="px-3.5 pb-0.5 text-[9px] font-bold uppercase tracking-wider text-steam-subtext/75">
-          Metadata &amp; Settings
-        </div>
+      <hr role="separator" className="my-1 border-0 border-t border-[#2a475e]/50" />
+      <div
+        aria-hidden="true"
+        className="px-3.5 pt-0.5 pb-0.5 text-[9px] font-bold uppercase tracking-wider text-steam-subtext/75"
+      >
+        Metadata &amp; Settings
+      </div>
 
-        {onFixMatch && (
-          <button
-            type="button"
-            onClick={() => {
-              onCloseMenu();
-              onFixMatch();
-            }}
-            className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
-          >
-            <Wand className="w-4 h-4 text-sky-400 shrink-0" aria-hidden="true" />
-            <span>Match &amp; Metadata Wizard...</span>
-          </button>
-        )}
-
+      {onFixMatch && (
         <button
           type="button"
-          onPointerEnter={onPrefetchLaunchConfigModal}
-          onFocus={onPrefetchLaunchConfigModal}
+          role="menuitem"
+          tabIndex={-1}
           onClick={() => {
             onCloseMenu();
-            onOpenLaunchConfigModal();
+            onFixMatch();
           }}
-          className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
+          className={menuItemClass}
         >
-          <Cpu className="w-4 h-4 text-purple-400 shrink-0" aria-hidden="true" />
-          <span>
-            {isWindowsHost ? 'Launch Settings...' : 'Launch & Compatibility Settings...'}
-          </span>
+          <Wand className="w-4 h-4 text-sky-400 shrink-0" aria-hidden="true" />
+          <span>Match &amp; Metadata Wizard...</span>
         </button>
-      </div>
+      )}
+
+      <button
+        type="button"
+        role="menuitem"
+        tabIndex={-1}
+        onPointerEnter={onPrefetchLaunchConfigModal}
+        onFocus={onPrefetchLaunchConfigModal}
+        onClick={() => {
+          onCloseMenu();
+          onOpenLaunchConfigModal();
+        }}
+        className={menuItemClass}
+      >
+        <Cpu className="w-4 h-4 text-purple-400 shrink-0" aria-hidden="true" />
+        <span>
+          {isWindowsHost ? 'Launch Settings...' : 'Launch & Compatibility Settings...'}
+        </span>
+      </button>
 
       {/* Group 3: Visibility & Removal */}
       {(onHideGame || activeDownload || isInstalled) && (
-        <div className="mt-1 pt-1 border-t border-[#2a475e]/50">
+        <>
+          <hr role="separator" className="my-1 border-0 border-t border-[#2a475e]/50" />
           {onHideGame &&
             (game.platforms.length > 1 ? (
               <>
                 <button
                   type="button"
+                  role="menuitem"
+                  tabIndex={-1}
                   onClick={() => {
                     onCloseMenu();
                     onHideGame(game, selectedPlatformId);
                   }}
-                  className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-rose-300 hover:text-white hover:bg-rose-950/50 transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
+                  className={destructiveRoseItemClass}
                 >
                   <EyeOff className="w-4 h-4 text-rose-400 shrink-0" aria-hidden="true" />
                   <span>Hide {getStorefrontDisplayName(selectedPlatformId)} Entry</span>
                 </button>
                 <button
                   type="button"
+                  role="menuitem"
+                  tabIndex={-1}
                   onClick={() => {
                     onCloseMenu();
                     onHideGame(game);
                   }}
-                  className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-rose-300 hover:text-white hover:bg-rose-950/50 transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
+                  className={destructiveRoseItemClass}
                 >
                   <EyeOff className="w-4 h-4 text-rose-400 shrink-0" aria-hidden="true" />
                   <span>Hide Entire Game from Library</span>
@@ -224,11 +267,13 @@ export function renderManageGameDropdown({
             ) : (
               <button
                 type="button"
+                role="menuitem"
+                tabIndex={-1}
                 onClick={() => {
                   onCloseMenu();
                   onHideGame(game);
                 }}
-                className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-rose-300 hover:text-white hover:bg-rose-950/50 transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
+                className={destructiveRoseItemClass}
               >
                 <EyeOff className="w-4 h-4 text-rose-400 shrink-0" aria-hidden="true" />
                 <span>Hide / Suppress Game from Library</span>
@@ -238,12 +283,14 @@ export function renderManageGameDropdown({
           {activeDownload && (
             <button
               type="button"
+              role="menuitem"
+              tabIndex={-1}
               onClick={async () => {
                 onCloseMenu();
                 await launcherService.cancelDownload(activeDownload.taskId);
                 showTempFeedback('Installation cancelled.');
               }}
-              className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-red-300 hover:text-red-200 hover:bg-red-950/50 transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
+              className={destructiveRedItemClass}
             >
               <X className="w-4 h-4 text-red-400 shrink-0" aria-hidden="true" />
               <span>Cancel Install</span>
@@ -253,18 +300,20 @@ export function renderManageGameDropdown({
           {isInstalled && (
             <button
               type="button"
+              role="menuitem"
+              tabIndex={-1}
               onClick={async () => {
                 onCloseMenu();
                 const res = await launcherService.uninstallGame(game, selectedPlatformId);
                 showTempFeedback(res.message || res.error || 'Game uninstalled.');
               }}
-              className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-red-300 hover:text-red-200 hover:bg-red-950/50 transition-colors text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-steam-accent"
+              className={destructiveRedItemClass}
             >
               <Trash2 className="w-4 h-4 text-red-400 shrink-0" aria-hidden="true" />
               <span>Uninstall Game...</span>
             </button>
           )}
-        </div>
+        </>
       )}
     </div>
   );

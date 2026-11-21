@@ -22,6 +22,7 @@ import {
   updateRoutedMetadataSnapshot,
 } from '../../../services/storage/userOverrideStorage';
 import type { VaultCriticAdoptionController } from './useGameDetailCritic';
+import { hasMeaningfulRequirementSpec } from '../SystemRequirements';
 import {
   buildEnrichedTopLevelFields,
   buildVaultCriticSignature,
@@ -472,12 +473,15 @@ export function useGameDetailMetadata({
             browseAssets,
           });
 
+        const ownsOnSteam =
+          Array.isArray(game.platforms) && game.platforms.some((p) => p.platformId === 'steam');
+
         // Case A: User explicitly routed Step 4 metadata to GOG, Epic, or Xbox
         if (isRoutedToNonSteamStore) {
           const crossSteamAppId = game.steamAppId || route?.steamAppId;
           const [rawFallbackData, liveAchs] = await Promise.all([
             fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game, currentOverride),
-            game.steamAppId
+            ownsOnSteam && game.steamAppId
               ? steamAchievementsService.fetchPlayerGameAchievements(game.steamAppId)
               : Promise.resolve(null),
           ]);
@@ -594,7 +598,9 @@ export function useGameDetailMetadata({
             steamApi.fetchGameMetadata(targetAppId, RequestPriority.P0_INTERACTIVE, {
               expectMacRequirements: activeStoreSupportsMacRef.current,
             }),
-            steamAchievementsService.fetchPlayerGameAchievements(targetAppId),
+            ownsOnSteam
+              ? steamAchievementsService.fetchPlayerGameAchievements(targetAppId)
+              : Promise.resolve(null),
           ]);
 
           const BROWSE_PENDING = Symbol('browse-pending');
@@ -727,14 +733,10 @@ export function useGameDetailMetadata({
 
             const gainedOsRequirements = Boolean(
               resolvedMetadata &&
-                ((!game.enrichedMetadata?.macRequirements?.minimum &&
-                  !game.enrichedMetadata?.macRequirements?.recommended &&
-                  (resolvedMetadata.macRequirements?.minimum ||
-                    resolvedMetadata.macRequirements?.recommended)) ||
-                  (!game.enrichedMetadata?.linuxRequirements?.minimum &&
-                    !game.enrichedMetadata?.linuxRequirements?.recommended &&
-                    (resolvedMetadata.linuxRequirements?.minimum ||
-                      resolvedMetadata.linuxRequirements?.recommended)))
+                ((!hasMeaningfulRequirementSpec(game.enrichedMetadata?.macRequirements) &&
+                  hasMeaningfulRequirementSpec(resolvedMetadata.macRequirements)) ||
+                  (!hasMeaningfulRequirementSpec(game.enrichedMetadata?.linuxRequirements) &&
+                    hasMeaningfulRequirementSpec(resolvedMetadata.linuxRequirements)))
             );
 
             if (

@@ -211,14 +211,14 @@ export function formatGlobalBottleDisplayModeLabel(
     case 'force_fullscreen':
       return 'Force Fullscreen';
     case 'native_driver':
-      return 'Native Wine Driver';
+      return 'Native Driver';
     case 'windowed':
       return 'Windowed';
     case 'virtual_desktop':
-      return 'Wine Virtual Desktop';
+      return 'Virtual Desktop';
     case 'auto_fullscreen':
     default:
-      return 'Auto Fullscreen & Upscale';
+      return 'Auto Fullscreen';
   }
 }
 

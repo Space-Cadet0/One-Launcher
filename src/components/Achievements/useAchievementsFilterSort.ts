@@ -153,6 +153,11 @@ export function useAchievementsFilterSort(
         return timeB - timeA;
       }
       if (sortOption === 'name') {
+        const aMasked = Boolean(a.isSecret && !a.unlocked && !revealedSecrets.has(a.id));
+        const bMasked = Boolean(b.isSecret && !b.unlocked && !revealedSecrets.has(b.id));
+        if (aMasked && !bMasked) return 1;
+        if (!aMasked && bMasked) return -1;
+        if (aMasked && bMasked) return 0;
         return a.name.localeCompare(b.name);
       }
       if (a.unlocked && !b.unlocked) return -1;

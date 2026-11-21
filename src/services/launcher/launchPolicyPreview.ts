@@ -1575,24 +1575,28 @@ interface ExecutableArchitectureProbeSource {
   is32BitExecutable?: boolean;
   peCapabilities?: {
     is32Bit?: boolean;
+    is64Bit?: boolean;
     effectiveMachine?: string;
     machine?: string;
+    arch?: string;
   };
 }
 
 function normalizeExecutableArchitectureMetadata(
   rawArch?: string,
-  rawIs32Bit?: boolean
+  rawIs32Bit?: boolean,
+  rawIs64Bit?: boolean,
+  assumeWindows64OnFalse = false
 ): { executableArchitecture?: string; is32BitExecutable?: boolean } {
   const trimmed = typeof rawArch === 'string' ? rawArch.trim().toLowerCase() : '';
-  if (trimmed) {
+  if (trimmed && trimmed !== 'unknown') {
     if (/^(x86|ia32|i386|i686|win32|pe32|32-bit|32bit)$/.test(trimmed)) {
       return { executableArchitecture: 'x86', is32BitExecutable: true };
     }
     if (/^(x64|amd64|x86_64|win64|pe32\+|64-bit|64bit)$/.test(trimmed)) {
       return { executableArchitecture: 'x64', is32BitExecutable: false };
     }
-    if (/^(arm64|aarch64)$/.test(trimmed)) {
+    if (/^(arm64|aarch64|arm64ec)$/.test(trimmed)) {
       return { executableArchitecture: 'arm64', is32BitExecutable: false };
     }
     return {
@@ -1602,16 +1606,25 @@ function normalizeExecutableArchitectureMetadata(
   }
   if (typeof rawIs32Bit === 'boolean') {
     return {
-      executableArchitecture: rawIs32Bit ? 'x86' : undefined,
+      executableArchitecture: rawIs32Bit ? 'x86' : assumeWindows64OnFalse ? 'x64' : undefined,
       is32BitExecutable: rawIs32Bit,
+    };
+  }
+  if (rawIs64Bit === true) {
+    return {
+      executableArchitecture: 'x64',
+      is32BitExecutable: false,
     };
   }
   return {};
 }
 
 function resolvePreviewExecutableArchitecture(
-  sources: Array<ExecutableArchitectureProbeSource | undefined>
+  sources: Array<ExecutableArchitectureProbeSource | undefined>,
+  assumeWindows64OnFalse = false
 ): { executableArchitecture?: string; is32BitExecutable?: boolean } {
+  let fallbackIs32BitOnly: { executableArchitecture?: string; is32BitExecutable?: boolean } | null =
+    null;
   for (const src of sources) {
     if (!src) continue;
     const candidateArch =
@@ -1620,20 +1633,27 @@ function resolvePreviewExecutableArchitecture(
       src.binaryArchitecture ||
       src.binaryArch ||
       src.peCapabilities?.effectiveMachine ||
-      src.peCapabilities?.machine;
+      src.peCapabilities?.machine ||
+      src.peCapabilities?.arch;
     const candidateIs32Bit =
       typeof src.is32BitExecutable === 'boolean'
         ? src.is32BitExecutable
         : src.peCapabilities?.is32Bit;
-    const normalized = normalizeExecutableArchitectureMetadata(candidateArch, candidateIs32Bit);
-    if (
-      normalized.executableArchitecture !== undefined ||
-      normalized.is32BitExecutable !== undefined
-    ) {
+    const candidateIs64Bit = src.peCapabilities?.is64Bit;
+    const normalized = normalizeExecutableArchitectureMetadata(
+      candidateArch,
+      candidateIs32Bit,
+      candidateIs64Bit,
+      assumeWindows64OnFalse
+    );
+    if (normalized.executableArchitecture !== undefined) {
       return normalized;
     }
+    if (normalized.is32BitExecutable !== undefined && !fallbackIs32BitOnly) {
+      fallbackIs32BitOnly = normalized;
+    }
   }
-  return {};
+  return fallbackIs32BitOnly || {};
 }
 
 export function buildEffectiveLaunchModePreview(
@@ -2111,23 +2131,36 @@ export function buildEffectiveLaunchModePreview(
     return `Spawns ${targetSubject} directly${viaClause} with minimal footprint.`;
   };
 
-  const matchedGamePlatform =
-    effPlatform || game?.platforms?.find((p) => p?.platformId === platformId);
+  const directGamePlatform = game?.platforms?.find((p) => p?.platformId === platformId);
+  const matchedGamePlatform = effPlatform || directGamePlatform;
+  const normalizeExePathForCompare = (raw?: string) =>
+    typeof raw === 'string' ? raw.trim().replace(/[\\/]+$/, '').toLowerCase() : '';
+  const normCustomExecPath = normalizeExePathForCompare(customExecPath);
   const canUseDiscoveredBinaryMetadata =
-    !customExecPath ||
-    customExecPath === installedRecord?.executablePath ||
-    customExecPath === matchedGamePlatform?.executablePath;
-  const resolvedExecArch = resolvePreviewExecutableArchitecture([
-    draftConfig as ExecutableArchitectureProbeSource | undefined,
-    ...(canUseDiscoveredBinaryMetadata
-      ? [
-          installedRecord as ExecutableArchitectureProbeSource | undefined,
-          matchedGamePlatform as ExecutableArchitectureProbeSource | undefined,
-          cachedInstallInfo as ExecutableArchitectureProbeSource | undefined,
-          game as ExecutableArchitectureProbeSource | undefined,
-        ]
-      : []),
-  ]);
+    !normCustomExecPath ||
+    normCustomExecPath === normalizeExePathForCompare(installedRecord?.executablePath) ||
+    normCustomExecPath === normalizeExePathForCompare(matchedGamePlatform?.executablePath) ||
+    normCustomExecPath === normalizeExePathForCompare(directGamePlatform?.executablePath);
+  const isWindowsExecutableBuild =
+    detectedBuildType === 'windows_exe_on_mac' || detectedBuildType === 'windows_native';
+  const resolvedExecArch = resolvePreviewExecutableArchitecture(
+    [
+      draftConfig as ExecutableArchitectureProbeSource | undefined,
+      savedConfig as ExecutableArchitectureProbeSource | undefined,
+      ...(canUseDiscoveredBinaryMetadata
+        ? [
+            installedRecord as ExecutableArchitectureProbeSource | undefined,
+            matchedGamePlatform as ExecutableArchitectureProbeSource | undefined,
+            directGamePlatform !== matchedGamePlatform
+              ? (directGamePlatform as ExecutableArchitectureProbeSource | undefined)
+              : undefined,
+            cachedInstallInfo as ExecutableArchitectureProbeSource | undefined,
+            game as ExecutableArchitectureProbeSource | undefined,
+          ]
+        : []),
+    ],
+    isWindowsExecutableBuild
+  );
   const previewExecArchFields: Pick<
     ResolvedLaunchModePreview,
     'executableArchitecture' | 'is32BitExecutable'

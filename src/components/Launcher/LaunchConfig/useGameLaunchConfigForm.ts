@@ -485,14 +485,27 @@ export function useGameLaunchConfigForm({
     };
   }, [isOpen, game.id, initialPlatformId]);
 
-  // Keep read-only global defaults synchronized if the user edits SettingsModal while open
+  // Keep read-only global defaults & discovered binary metadata synchronized while open
   useEffect(() => {
     if (!isOpen || typeof launcherService.subscribe !== 'function') return;
+    const readInstallMetaSig = () => {
+      const rec =
+        typeof launcherService.getInstalledRecordForGame === 'function'
+          ? launcherService.getInstalledRecordForGame(game, preferredPlatformId)
+          : undefined;
+      return `${rec?.installPath || ''}|${rec?.executablePath || ''}|${rec?.executableArchitecture || ''}|${rec?.is32BitExecutable ?? ''}`;
+    };
+    let prevInstallSig = readInstallMetaSig();
     return launcherService.subscribe(() => {
       const next = launcherService.getPerformanceSettings();
       setPerfSettings((prev) => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
+      const nextInstallSig = readInstallMetaSig();
+      if (nextInstallSig !== prevInstallSig) {
+        prevInstallSig = nextInstallSig;
+        setInstallInfoTick((t) => t + 1);
+      }
     });
-  }, [isOpen]);
+  }, [isOpen, game, preferredPlatformId]);
 
   const wineSyncMode: WineSyncMode = resolveWineSyncMode(wineMsync, wineEsync);
 
