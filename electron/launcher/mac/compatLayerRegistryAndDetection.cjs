@@ -11,12 +11,14 @@ const {
   resolvePlatformLaunchConfig,
   setBoundedMapEntry,
   registerExternalCacheInvalidator,
+  toLocalFsPath,
 } = require('../engineStateRegistry.cjs');
 const { atomicWriteFileSync } = require('../securityAndPathUtils.cjs');
 const {
   resolveDriveCPathCaseInsensitive,
   resolveBottleSteamExe,
 } = require('../wineAndCrossOverManager.cjs');
+const { parseSteamLibraryFoldersVdf } = require('../binaryAndManifestInspectors.cjs');
 const { compareSemver } = require('../../utils/semverUtils.cjs');
 
 /** @type {Array<[string, string, number]>} */
@@ -103,6 +105,243 @@ function extractRunnerPreviewDate(target, options = undefined) {
     }
   }
   return null;
+}
+
+const MAX_LOGINUSERS_VDF_BYTES = 128 * 1024;
+const MAX_LIBRARYFOLDERS_VDF_BYTES = 512 * 1024;
+
+/**
+ * Read up to `maxBytes` of a UTF-8 text file safely (strictly read-only).
+ *
+ * @param {string} filePath
+ * @param {number} maxBytes
+ * @returns {string | null}
+ */
+function readBoundedUtf8FileSync(filePath, maxBytes) {
+  let fd = null;
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return null;
+    const st = fs.statSync(filePath);
+    if (!st.isFile() || st.size <= 0) return '';
+    const readLen = Math.min(st.size, maxBytes);
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(readLen);
+    const bytesRead = fs.readSync(fd, buf, 0, readLen, 0);
+    return buf.subarray(0, bytesRead).toString('utf8');
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+/**
+ * Inspect `<steamRoot>/config/loginusers.vdf` (bounded <= 128 KiB, read-only) to determine
+ * whether a Steam account is signed in / configured for remembered auto-login inside the bottle.
+ *
+ * @param {string} steamRoot
+ * @returns {boolean}
+ */
+function hasSignedInSteamUserInLoginUsersVdf(steamRoot) {
+  if (!steamRoot || typeof steamRoot !== 'string') return false;
+  const candidates = [
+    path.join(steamRoot, 'config', 'loginusers.vdf'),
+    path.join(steamRoot, 'Config', 'loginusers.vdf'),
+  ];
+  for (const vdfPath of candidates) {
+    const text = readBoundedUtf8FileSync(vdfPath, MAX_LOGINUSERS_VDF_BYTES);
+    if (!text) continue;
+    if (
+      /"[^"\r\n]+"[ \t\r\n]*\{[^{}]*"(?:MostRecent|RememberPassword|AllowAutoLogin)"\s*"1"/i.test(
+        text
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Resolve a Windows/Wine path from a bottle's `libraryfolders.vdf` into candidate local host
+ * filesystem paths (supporting `C:\...` -> `bottlePath/drive_c/...`, arbitrary `dosdevices/<drive>:`
+ * symlinks such as `Y:\...` or `D:\...`, `Z:\...` -> host root `/...`, and POSIX paths).
+ *
+ * @param {string} bottlePath
+ * @param {string} driveCRoot
+ * @param {string} rawLibPath
+ * @returns {string[]}
+ */
+function resolveWineLibraryPathInBottle(bottlePath, driveCRoot, rawLibPath) {
+  if (!rawLibPath || typeof rawLibPath !== 'string') return [];
+  const trimmed = rawLibPath.trim();
+  if (!trimmed) return [];
+
+  /** @type {string[]} */
+  const candidates = [];
+  const addCandidate = (/** @type {string | null | undefined} */ p) => {
+    if (!p || typeof p !== 'string') return;
+    const resolved = path.resolve(p);
+    if (!candidates.includes(resolved)) {
+      candidates.push(resolved);
+    }
+  };
+
+  if (trimmed.startsWith('/')) {
+    addCandidate(trimmed);
+  }
+
+  const normalizedSlashes = trimmed.replace(/\\\\/g, '/').replace(/\\/g, '/');
+  const driveMatch = /^([A-Za-z]):\/(.*)$/.exec(normalizedSlashes);
+  if (driveMatch) {
+    const driveLower = driveMatch[1].toLowerCase();
+    const relSegments = driveMatch[2]
+      .replace(/^\/+/, '')
+      .split('/')
+      .filter((seg) => seg && seg !== '.');
+
+    // 1. Check `<bottlePath>/dosdevices/<drive>:` symlink or directory first (handles C:, D:, Y:, Z:, etc.)
+    const dosdevicesDir =
+      resolveDriveCPathCaseInsensitive(bottlePath, ['dosdevices']) ||
+      path.join(bottlePath, 'dosdevices');
+    const dosDriveEntries = [
+      path.join(dosdevicesDir, `${driveLower}:`),
+      path.join(dosdevicesDir, `${driveLower.toUpperCase()}:`),
+    ];
+    for (const dosDrive of dosDriveEntries) {
+      try {
+        if (fs.existsSync(dosDrive)) {
+          const driveTarget = fs.realpathSync(dosDrive);
+          addCandidate(
+            relSegments.length > 0
+              ? resolveDriveCPathCaseInsensitive(driveTarget, relSegments)
+              : driveTarget
+          );
+          addCandidate(path.join(driveTarget, ...relSegments));
+          break;
+        }
+      } catch {}
+    }
+
+    // 2. Canonical `C:\...` -> `<bottlePath>/drive_c/...`
+    if (driveLower === 'c' && driveCRoot) {
+      addCandidate(
+        relSegments.length > 0
+          ? resolveDriveCPathCaseInsensitive(driveCRoot, relSegments)
+          : driveCRoot
+      );
+      addCandidate(path.join(driveCRoot, ...relSegments));
+    }
+
+    // 3. Canonical `Z:\...` -> host root `/...`
+    if (driveLower === 'z') {
+      addCandidate('/' + relSegments.join('/'));
+    }
+  }
+
+  // 4. Shared fallback via `toLocalFsPath`
+  try {
+    const fallbackLocal = toLocalFsPath(trimmed, driveCRoot ? [driveCRoot] : []);
+    if (fallbackLocal) {
+      addCandidate(fallbackLocal);
+    }
+  } catch {}
+
+  return candidates;
+}
+
+/**
+ * Strictly read-only check verifying whether Steam inside `bottlePath` recognizes `appId` as
+ * installed via `<bottleSteamRoot>/steamapps/appmanifest_<appId>.acf` OR any library folder
+ * already listed in `<bottleSteamRoot>/steamapps/libraryfolders.vdf`.
+ *
+ * @param {string} bottlePath
+ * @param {string | number} appId
+ * @returns {boolean}
+ */
+function hasBottleSteamAppManifest(bottlePath, appId) {
+  if (!bottlePath || typeof bottlePath !== 'string' || !bottlePath.trim()) {
+    return false;
+  }
+  const cleanAppId = String(appId ?? '')
+    .replace(/^steam[-_]/i, '')
+    .trim();
+  if (!/^\d+$/.test(cleanAppId)) {
+    return false;
+  }
+
+  let resolvedBottle = bottlePath.trim();
+  try {
+    if (!fs.existsSync(resolvedBottle)) return false;
+    resolvedBottle = path.resolve(resolvedBottle);
+  } catch {
+    return false;
+  }
+
+  const bottleSteamExe = resolveBottleSteamExe(resolvedBottle);
+  if (!bottleSteamExe) {
+    return false;
+  }
+
+  const bottleSteamRoot = path.dirname(bottleSteamExe);
+  const driveCRoot =
+    resolveDriveCPathCaseInsensitive(resolvedBottle, ['drive_c']) ||
+    path.join(resolvedBottle, 'drive_c');
+  const acfFileName = `appmanifest_${cleanAppId}.acf`;
+
+  /** @param {string} candidateDir */
+  const hasAcfInLibraryRoot = (candidateDir) => {
+    if (!candidateDir) return false;
+    const acfCandidates = [
+      path.join(candidateDir, 'steamapps', acfFileName),
+      path.join(candidateDir, 'SteamApps', acfFileName),
+      path.join(candidateDir, acfFileName),
+    ];
+    for (const acfPath of acfCandidates) {
+      try {
+        if (fs.existsSync(acfPath) && fs.statSync(acfPath).isFile()) {
+          return true;
+        }
+      } catch {}
+    }
+    return false;
+  };
+
+  // 1. Check primary bottle Steam root (`<bottleSteamRoot>/steamapps/appmanifest_<appId>.acf`)
+  if (hasAcfInLibraryRoot(bottleSteamRoot)) {
+    return true;
+  }
+
+  // 2. Inspect `<bottleSteamRoot>/steamapps/libraryfolders.vdf` (and `config/libraryfolders.vdf`)
+  const vdfCandidates = [
+    path.join(bottleSteamRoot, 'steamapps', 'libraryfolders.vdf'),
+    path.join(bottleSteamRoot, 'SteamApps', 'libraryfolders.vdf'),
+    path.join(bottleSteamRoot, 'config', 'libraryfolders.vdf'),
+  ];
+  const checkedRoots = new Set([path.resolve(bottleSteamRoot).toLowerCase()]);
+
+  for (const vdfPath of vdfCandidates) {
+    const vdfContent = readBoundedUtf8FileSync(vdfPath, MAX_LIBRARYFOLDERS_VDF_BYTES);
+    if (!vdfContent) continue;
+    const libPaths = parseSteamLibraryFoldersVdf(vdfContent);
+    for (const lp of libPaths) {
+      const resolvedHosts = resolveWineLibraryPathInBottle(resolvedBottle, driveCRoot, lp);
+      for (const hostRoot of resolvedHosts) {
+        const key = hostRoot.toLowerCase();
+        if (checkedRoots.has(key)) continue;
+        checkedRoots.add(key);
+        if (hasAcfInLibraryRoot(hostRoot)) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
 }
 
 function resolveBottleGogGalaxyExe(winePrefix) {
@@ -1497,14 +1736,37 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
               : effectivePreviewBottlesDir;
 
         const availableBottles = listBottleSubdirectories(variantBottlesDir, options);
-        /** @type {Record<string, { wineArch?: 'win64' | 'arm64'; previewEnabled?: boolean; timestamp?: string }>} */
+        /**
+         * @type {Record<string, {
+         *   wineArch?: 'win64' | 'arm64';
+         *   previewEnabled?: boolean;
+         *   timestamp?: string;
+         *   hasSteam?: boolean;
+         *   steamSignedIn?: boolean;
+         *   hasGogGalaxy?: boolean;
+         *   hasEpicLauncher?: boolean;
+         * }>}
+         */
         const bottleDetails = {};
         for (const bName of availableBottles) {
-          const meta = inspectBottleConfMetadata(path.join(variantBottlesDir, bName));
+          const bPath = path.join(variantBottlesDir, bName);
+          const meta = inspectBottleConfMetadata(bPath);
+          const bottleSteamExe = resolveBottleSteamExe(bPath);
+          const hasSteam = Boolean(bottleSteamExe);
+          const steamSignedIn =
+            hasSteam && bottleSteamExe
+              ? hasSignedInSteamUserInLoginUsersVdf(path.dirname(bottleSteamExe))
+              : false;
+          const hasGogGalaxy = Boolean(resolveBottleGogGalaxyExe(bPath));
+          const hasEpicLauncher = Boolean(resolveBottleEpicLauncherExe(bPath));
           bottleDetails[bName] = {
             ...(meta.wineArch ? { wineArch: meta.wineArch } : {}),
             ...(meta.previewEnabled !== undefined ? { previewEnabled: meta.previewEnabled } : {}),
             ...(meta.timestamp ? { timestamp: meta.timestamp } : {}),
+            hasSteam,
+            steamSignedIn,
+            hasGogGalaxy,
+            hasEpicLauncher,
           };
         }
 
@@ -1992,6 +2254,7 @@ module.exports = {
   configureExternalWineManagerSpecs,
   extractBottleRootFromPath,
   extractRunnerPreviewDate,
+  hasBottleSteamAppManifest,
   resolveBottleGogGalaxyExe,
   resolveBottleEpicLauncherExe,
   inspectBottleConfMetadata,

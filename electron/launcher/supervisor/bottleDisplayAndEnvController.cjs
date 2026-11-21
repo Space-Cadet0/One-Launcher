@@ -366,9 +366,89 @@ function normalizeWineArgumentBackslashes(rawArg, winePrefix = '') {
 /** @type {Map<string, string>} */
 const liveBottleDaemonEnvContractByPrefix = new Map();
 
+/** @type {Map<string, 'silent' | 'standard'>} */
+const liveBottleSteamUiModeByPrefix = new Map();
+
+const DISPLAY_SCALER_ENV_KEYS = Object.freeze([
+  'ONE_LAUNCHER_DISPLAY_SCALING_MODE',
+  'ONE_LAUNCHER_DISPLAY_ASPECT',
+  'ONE_LAUNCHER_SAFE_INSET_TOP',
+  'ONE_LAUNCHER_FULLSCREEN_HOTKEY',
+  'ONE_LAUNCHER_SCALER_DLL_X86',
+  'ONE_LAUNCHER_SCALER_DLL_X64',
+  'ONE_LAUNCHER_LAUNCHER_EXE_X86',
+  'ONE_LAUNCHER_LAUNCHER_EXE_X64',
+  'ONE_LAUNCHER_DISPLAY_CONTROL_FILE',
+  'ONE_LAUNCHER_DISPLAY_STATUS_FILE',
+]);
+
+const CONTRACT_EXCLUDED_CUSTOM_ENV_KEYS = new Set([
+  ...DISPLAY_SCALER_ENV_KEYS,
+  'WINEPREFIX',
+  'CX_BOTTLE',
+  'SteamAppId',
+  'SteamGameId',
+]);
+
 const DISPLAY_MODE_CHANGED_ERR_TOKEN = 'err:system:display_mode_changed';
 const DISPLAY_MODE_EMULATION_RECOMMENDATION =
   'Enable Display Mode Emulation (EmulateModeset) in Launch Configuration';
+
+/**
+ * Extract a single key's unquoted value from a CrossOver shellword-encoded `CX_ENV` string.
+ *
+ * @param {unknown} rawCxEnv
+ * @param {string} targetKey
+ * @returns {string}
+ */
+function extractKeyFromCxEnv(rawCxEnv, targetKey) {
+  const str = String(rawCxEnv || '').trim();
+  if (!str || !targetKey) return '';
+  let i = 0;
+  let foundValue = '';
+  while (i < str.length) {
+    while (i < str.length && /\s/.test(str[i])) i += 1;
+    if (i >= str.length) break;
+    let unquoted = '';
+    let quoteChar = '';
+    while (i < str.length) {
+      const ch = str[i];
+      if (quoteChar) {
+        if (ch === '\\' && quoteChar === '"' && i + 1 < str.length) {
+          unquoted += str[i + 1];
+          i += 2;
+          continue;
+        }
+        if (ch === quoteChar) {
+          quoteChar = '';
+          i += 1;
+          continue;
+        }
+        unquoted += ch;
+        i += 1;
+      } else {
+        if (/\s/.test(ch)) break;
+        if (ch === '"' || ch === "'") {
+          quoteChar = ch;
+          i += 1;
+          continue;
+        }
+        if (ch === '\\' && i + 1 < str.length) {
+          unquoted += str[i + 1];
+          i += 2;
+          continue;
+        }
+        unquoted += ch;
+        i += 1;
+      }
+    }
+    const eqIdx = unquoted.indexOf('=');
+    if (eqIdx > 0 && unquoted.slice(0, eqIdx).trim() === targetKey) {
+      foundValue = unquoted.slice(eqIdx + 1).trim();
+    }
+  }
+  return foundValue;
+}
 
 /**
  * Normalize a Wine/CrossOver bottle prefix path into a canonical lookup key.
@@ -388,7 +468,7 @@ function normalizeBottlePrefixContractKey(bottlePath) {
 }
 
 /**
- * Clear any recorded warm bottle daemon graphics contract for `bottlePath`.
+ * Clear any recorded warm bottle daemon graphics contract and Steam UI mode for `bottlePath`.
  *
  * @param {any} bottlePath
  */
@@ -396,6 +476,7 @@ function deleteBottleDaemonEnvContract(bottlePath) {
   const key = normalizeBottlePrefixContractKey(bottlePath);
   if (key) {
     liveBottleDaemonEnvContractByPrefix.delete(key);
+    liveBottleSteamUiModeByPrefix.delete(key);
   }
   if (bottlePath && typeof bottlePath === 'string' && bottlePath.trim()) {
     const rawNorm = path
@@ -404,20 +485,64 @@ function deleteBottleDaemonEnvContract(bottlePath) {
       .replace(/\/+$/, '')
       .toLowerCase();
     liveBottleDaemonEnvContractByPrefix.delete(rawNorm);
+    liveBottleSteamUiModeByPrefix.delete(rawNorm);
   }
 }
 
 /**
- * Compute canonical graphics & sync environment contract for a bottled session so warm daemons
- * (`Steam.exe`) booted under an incompatible translation backend or sync mode can be recycled cleanly.
+ * Inspect the currently recorded warm Bottle Steam UI mode (`'silent' | 'standard'`) for `prefix`.
+ *
+ * @param {string} prefix
+ * @returns {'silent' | 'standard' | undefined}
+ */
+function getLiveBottleSteamUiMode(prefix) {
+  const key = normalizeBottlePrefixContractKey(prefix);
+  return key ? liveBottleSteamUiModeByPrefix.get(key) : undefined;
+}
+
+/**
+ * Record the warm Bottle Steam UI visibility mode (`'silent' | 'standard'`) for `prefix`.
+ *
+ * @param {string} prefix
+ * @param {'silent' | 'standard' | null | undefined} mode
+ */
+function setLiveBottleSteamUiMode(prefix, mode) {
+  const key = normalizeBottlePrefixContractKey(prefix);
+  if (!key) return;
+  if (mode === 'silent' || mode === 'standard') {
+    liveBottleSteamUiModeByPrefix.set(key, mode);
+  } else {
+    liveBottleSteamUiModeByPrefix.delete(key);
+  }
+}
+
+/**
+ * Compute canonical graphics, HUD, sync, DLL override, preload & custom-env contract for a
+ * bottled session so warm daemons (`Steam.exe`) booted under an incompatible environment can
+ * be recycled cleanly when and only when inherited game settings actually change.
  *
  * @param {Record<string, any> | null | undefined} envObj
+ * @param {Record<string, any> | null | undefined} [customUserEnv]
  * @returns {string}
  */
-function computeBottleGraphicsEnvContract(envObj) {
+function computeBottleGraphicsEnvContract(envObj, customUserEnv = null) {
   const src = envObj && typeof envObj === 'object' ? envObj : {};
+  const dyldFromEnv =
+    String(src.DYLD_INSERT_LIBRARIES || '').trim() ||
+    extractKeyFromCxEnv(src.CX_ENV, 'DYLD_INSERT_LIBRARIES');
+  /** @type {Record<string, string>} */
+  const sortedCustomEnv = {};
+  if (customUserEnv && typeof customUserEnv === 'object') {
+    for (const k of Object.keys(customUserEnv).sort()) {
+      if (!k || CONTRACT_EXCLUDED_CUSTOM_ENV_KEYS.has(k)) {
+        continue;
+      }
+      sortedCustomEnv[k] = String(customUserEnv[k] ?? '').trim();
+    }
+  }
   return JSON.stringify({
     backend: String(src.CX_GRAPHICS_BACKEND || 'auto').trim().toLowerCase(),
+    backendVer: String(src.CX_GRAPHICS_BACKEND_VERSION || '').trim(),
     d3dmMetalFx: String(src.D3DM_ENABLE_METALFX || '0').trim(),
     dxmtNvext: String(src.DXMT_ENABLE_NVEXT || '0').trim(),
     spatial: String(src.DXMT_METALFX_SPATIAL_SWAPCHAIN || '0').trim(),
@@ -426,6 +551,14 @@ function computeBottleGraphicsEnvContract(envObj) {
     avx: src.ROSETTA_ADVERTISE_AVX ?? 'unset',
     msync: String(src.WINEMSYNC || '1').trim(),
     fexX87: String(src.FEX_X87REDUCEDPRECISION || 'unset').trim(),
+    mtlHud: String(src.MTL_HUD_ENABLED || '0').trim(),
+    dxvkHud: String(src.DXVK_HUD || '').trim(),
+    dxvkFps: String(src.DXVK_FRAME_RATE || '').trim(),
+    d3dmFps: String(src.D3DM_MAX_FPS || '').trim(),
+    wineDll: String(src.WINEDLLOVERRIDES || '').trim(),
+    dyldPreload: dyldFromEnv,
+    audioClamp: String(src.ONE_LAUNCHER_AUDIO_BUFFER_CLAMP || '').trim(),
+    customEnv: sortedCustomEnv,
   });
 }
 
@@ -441,30 +574,50 @@ function getLiveBottleDaemonEnvContract(bottlePath) {
 }
 
 /**
+ * Reset bottle display controller warm daemon contract & Steam UI mode maps.
+ */
+function resetBottleDisplayControllerState() {
+  liveBottleDaemonEnvContractByPrefix.clear();
+  liveBottleSteamUiModeByPrefix.clear();
+}
+
+/**
  * Reset in-memory supervisor daemon contract tracking for deterministic isolated tests.
  */
 /** @type {Set<{ record: Record<string, any>, options: Record<string, any> }>} */
 const activePostExitCloudUploadJobs = new Set();
 
 function resetSupervisorStateForTests() {
-  liveBottleDaemonEnvContractByPrefix.clear();
+  resetBottleDisplayControllerState();
   inFlightLaunchesByGameId.clear();
   inFlightLaunchAbortControllers.clear();
   activePostExitCloudUploadJobs.clear();
 }
 
-const DISPLAY_SCALER_ENV_KEYS = Object.freeze([
-  'ONE_LAUNCHER_DISPLAY_SCALING_MODE',
-  'ONE_LAUNCHER_DISPLAY_ASPECT',
-  'ONE_LAUNCHER_SAFE_INSET_TOP',
-  'ONE_LAUNCHER_FULLSCREEN_HOTKEY',
-  'ONE_LAUNCHER_SCALER_DLL_X86',
-  'ONE_LAUNCHER_SCALER_DLL_X64',
-  'ONE_LAUNCHER_LAUNCHER_EXE_X86',
-  'ONE_LAUNCHER_LAUNCHER_EXE_X64',
-  'ONE_LAUNCHER_DISPLAY_CONTROL_FILE',
-  'ONE_LAUNCHER_DISPLAY_STATUS_FILE',
-]);
+/**
+ * Strip ONLY `DISPLAY_SCALER_ENV_KEYS` from a storefront client env (`steam.exe` Stage 1 / Stage 2)
+ * and its `CX_ENV` string, preserving HUD (`MTL_HUD_ENABLED`, `DXVK_HUD`), graphics backend
+ * (`CX_GRAPHICS_BACKEND`), and `DYLD_INSERT_LIBRARIES` (`libone_metal_preload.dylib`) so child
+ * games inherit them cleanly while `--watch-dir` + `active_session.ini` manages Display Scaler.
+ *
+ * @param {Record<string, any> | null | undefined} envObj
+ * @returns {Record<string, any> | null | undefined}
+ */
+function stripDisplayScalerEnvFromClientEnv(envObj) {
+  if (!envObj || typeof envObj !== 'object') return envObj;
+  for (const dispKey of DISPLAY_SCALER_ENV_KEYS) {
+    delete envObj[dispKey];
+  }
+  if (typeof envObj.CX_ENV === 'string' && envObj.CX_ENV) {
+    const cleaned = stripKeysFromCxEnv(envObj.CX_ENV, [...DISPLAY_SCALER_ENV_KEYS]);
+    if (cleaned) {
+      envObj.CX_ENV = cleaned;
+    } else {
+      delete envObj.CX_ENV;
+    }
+  }
+  return envObj;
+}
 
 const VALID_DISPLAY_ASPECT_MODES = new Set(['preserve_aspect', 'stretch', 'integer']);
 
@@ -1303,15 +1456,20 @@ module.exports = {
   normalizeRequestedCompatibilityLayerType,
   normalizeWineArgumentBackslashes,
   liveBottleDaemonEnvContractByPrefix,
+  liveBottleSteamUiModeByPrefix,
   activePostExitCloudUploadJobs,
   DISPLAY_MODE_CHANGED_ERR_TOKEN,
   DISPLAY_MODE_EMULATION_RECOMMENDATION,
   normalizeBottlePrefixContractKey,
   deleteBottleDaemonEnvContract,
+  getLiveBottleSteamUiMode,
+  setLiveBottleSteamUiMode,
   computeBottleGraphicsEnvContract,
   getLiveBottleDaemonEnvContract,
+  resetBottleDisplayControllerState,
   resetSupervisorStateForTests,
   DISPLAY_SCALER_ENV_KEYS,
+  stripDisplayScalerEnvFromClientEnv,
   VALID_DISPLAY_ASPECT_MODES,
   resolveBundledDisplayScalerBinPath,
   stageBottleDisplayScalerBinaries,

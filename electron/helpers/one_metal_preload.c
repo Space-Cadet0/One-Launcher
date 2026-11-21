@@ -336,9 +336,12 @@ static void promote_current_thread_to_audio_realtime(void) {
     }
 }
 
+/* Set by constructor when current process is a Wine helper/storefront client/installer */
+static int g_skip_preload_for_process = 0;
+
 static int one_launcher_pthread_setname_np(const char *name) {
     int rc = pthread_setname_np(name);
-    if (name && strcmp(name, "audio_client_timer") == 0) {
+    if (!g_skip_preload_for_process && name && strcmp(name, "audio_client_timer") == 0) {
         promote_current_thread_to_audio_realtime();
     }
     return rc;
@@ -386,11 +389,22 @@ static int arg_basename_matches_ci(const char *arg, const char *target_lower) {
  * Guard non-GUI Wine daemon/helper processes (reg.exe, wineboot.exe, conhost.exe,
  * services.exe, plugplay.exe, rpcss.exe, svchost.exe, winedevice.exe, tabtip.exe,
  * steamwebhelper.exe, steamservice.exe, crashhandler.exe, galaxyclient.exe,
- * one_display_launcher_x86.exe, one_display_launcher_x64.exe, etc. via
- * common_process_denylist.h) so preloading via CX_ENV never initializes Metal HUD /
- * CFRunLoopRun or touches CoreAudio inside background helpers.
+ * steam.exe, dxsetup.exe, one_display_launcher_x86.exe, one_display_launcher_x64.exe,
+ * etc. via common_process_denylist.h) so preloading via CX_ENV never initializes
+ * Metal HUD / CFRunLoopRun or touches CoreAudio inside background helpers, storefront
+ * clients, or redistributable installers.
+ *
+ * Leaf storefront UI/web daemons (steamwebhelper.exe, gameoverlayui.exe,
+ * gameoverlayui64.exe, epicwebhelper.exe, cefprocess.exe, qtwebengineprocess.exe, ...)
+ * never spawn games, so the constructor also unsets MTL_HUD_ENABLED and DXVK_HUD
+ * for those leaf processes while parent storefront clients (steam.exe) retain HUD and
+ * DYLD_INSERT_LIBRARIES in their environment for child game processes to inherit.
  */
-static int is_non_gui_wine_helper_process(void) {
+static int classify_wine_helper_process(int *out_is_leaf_daemon) {
+    if (out_is_leaf_daemon) {
+        *out_is_leaf_daemon = 0;
+    }
+
     const char *suppress = getenv("ONE_LAUNCHER_SUPPRESS_PRELOAD");
     if (suppress && suppress[0] == '1') {
         return 1;
@@ -406,6 +420,9 @@ static int is_non_gui_wine_helper_process(void) {
         "wine",
         "wine64",
         "wine32on64",
+        "wineloader",
+        "wineloader64",
+        "wineloader32on64",
         "wine-preloader",
         "wine64-preloader",
         "wine32on64-preloader",
@@ -414,17 +431,38 @@ static int is_non_gui_wine_helper_process(void) {
         "start",
     };
 
+    static const char k_leaf_storefront_daemons_msz[] =
+        ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ
+        "gameoverlayui64.exe\0"
+        "cefprocess.exe\0";
+
     static const char k_helper_exes_msz[] =
         ONE_DENYLIST_UNIX_WINE_MSZ
         ONE_DENYLIST_WINE_SYSTEM_MSZ
         ONE_DENYLIST_SHELL_MSZ
         ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ
-        ONE_DENYLIST_GALAXY_CHAIN_MSZ;
+        "gameoverlayui64.exe\0"
+        "cefprocess.exe\0"
+        ONE_DENYLIST_GALAXY_CHAIN_MSZ
+        ONE_DENYLIST_STOREFRONT_CLIENTS_MSZ
+        ONE_DENYLIST_INSTALLERS_MSZ;
 
     const int argc = *argc_ptr < 32 ? *argc_ptr : 32;
     char **argv = *argv_ptr;
-    if (argv[0] && arg_basename_matches_ci(argv[0], "wineserver")) {
-        return 1;
+    if (argv[0]) {
+        const char *argv0_base = arg_basename_ptr(argv[0]);
+        if (arg_basename_matches_ci(argv[0], "wineserver")) {
+            return 1;
+        }
+        if (one_denylist_match_ascii_msz(argv0_base, k_leaf_storefront_daemons_msz)) {
+            if (out_is_leaf_daemon) {
+                *out_is_leaf_daemon = 1;
+            }
+            return 1;
+        }
+        if (one_denylist_match_ascii_msz(argv0_base, k_helper_exes_msz)) {
+            return 1;
+        }
     }
 
     for (int i = 1; i < argc; ++i) {
@@ -448,13 +486,25 @@ static int is_non_gui_wine_helper_process(void) {
             continue;
         }
 
-        if (one_denylist_match_ascii_msz(arg_basename_ptr(arg), k_helper_exes_msz)) {
+        const char *base = arg_basename_ptr(arg);
+        if (one_denylist_match_ascii_msz(base, k_leaf_storefront_daemons_msz)) {
+            if (out_is_leaf_daemon) {
+                *out_is_leaf_daemon = 1;
+            }
+            return 1;
+        }
+        if (one_denylist_match_ascii_msz(base, k_helper_exes_msz)) {
             return 1;
         }
         /* First real target executable token inspected: if it is not a helper daemon, allow preload */
         break;
     }
     return 0;
+}
+
+__attribute__((unused))
+static int is_non_gui_wine_helper_process(void) {
+    return classify_wine_helper_process(NULL);
 }
 
 static int is_validated_absolute_dylib_path(const char *path) {
@@ -469,7 +519,13 @@ static int is_validated_absolute_dylib_path(const char *path) {
 
 __attribute__((constructor))
 static void preload_metal_and_moltenvk(void) {
-    if (is_non_gui_wine_helper_process()) {
+    int is_leaf_daemon = 0;
+    if (classify_wine_helper_process(&is_leaf_daemon)) {
+        if (is_leaf_daemon) {
+            unsetenv("MTL_HUD_ENABLED");
+            unsetenv("DXVK_HUD");
+        }
+        g_skip_preload_for_process = 1;
         return;
     }
 
