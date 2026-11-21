@@ -44,6 +44,10 @@ const {
   updateDownloadTask,
   isTaskCancelledOrPaused,
 } = require('./downloadQueueStore.cjs');
+const {
+  VENDOR_AUTHENTICODE_SUBJECT_PATTERNS,
+  verifyPeAuthenticodeBuffer,
+} = require('../provisioner/artifactSignatureVerifier.cjs');
 
 const STEAM_SETUP_DEFAULT_URL =
   'https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe';
@@ -132,77 +136,27 @@ async function hasAuthenticatedSteamSessionInVdfCandidates(vdfPaths, expectedSte
 }
 
 /**
- * Self-contained pure-Buffer PE32 / PE32+ verification checking:
- * - DOS `'MZ'` header + valid `e_lfanew`
- * - NT `'PE\0\0'` signature
- * - OptionalHeader `DataDirectory[4]` (`IMAGE_DIRECTORY_ENTRY_SECURITY`)
- * - Embedded Authenticode `WIN_CERTIFICATE` PKCS#7 SignedData block (`0x0002`)
+ * Pure-Buffer PE32 / PE32+ Authenticode verification delegating to `artifactSignatureVerifier.cjs`:
+ * - DOS `'MZ'` + NT `'PE\0\0'` + `OptionalHeader.DataDirectory[4]` (`IMAGE_DIRECTORY_ENTRY_SECURITY`)
+ * - Embedded `WIN_CERTIFICATE` PKCS#7 SignedData ASN.1 structure
+ * - Microsoft Authenticode `SpcIndirectDataContent` OID (`1.3.6.1.4.1.311.2.1.4`)
+ * - Embedded X.509 signing certificate pinned to Valve (`VENDOR_AUTHENTICODE_SUBJECT_PATTERNS.bottle_steam`)
  *
  * @param {Buffer} buf
+ * @param {{ expectedVendorSubjectPattern?: RegExp }} [options]
  * @returns {boolean}
  */
-function hasEmbeddedPeAuthenticodeCertificateBuffer(buf) {
-  if (!Buffer.isBuffer(buf) || buf.length < 256) return false;
-  // 'MZ'
-  if (buf[0] !== 0x4d || buf[1] !== 0x5a) return false;
-
-  const peOffset = buf.readUInt32LE(0x3c);
-  if (peOffset < 0x40 || peOffset + 200 > buf.length) return false;
-
-  // 'PE\0\0'
-  if (
-    buf[peOffset] !== 0x50 ||
-    buf[peOffset + 1] !== 0x45 ||
-    buf[peOffset + 2] !== 0x00 ||
-    buf[peOffset + 3] !== 0x00
-  ) {
-    return false;
-  }
-
-  const sizeOfOptionalHeader = buf.readUInt16LE(peOffset + 20);
-  if (sizeOfOptionalHeader < 128) return false;
-
-  const optOffset = peOffset + 24;
-  if (optOffset + 2 > buf.length) return false;
-  const magic = buf.readUInt16LE(optOffset);
-  let numRvaOffset = 0;
-  let secDirOffset = 0;
-
-  if (magic === 0x010b) {
-    // PE32 (32-bit)
-    numRvaOffset = optOffset + 92;
-    secDirOffset = optOffset + 96 + 4 * 8;
-  } else if (magic === 0x020b) {
-    // PE32+ (64-bit)
-    numRvaOffset = optOffset + 108;
-    secDirOffset = optOffset + 112 + 4 * 8;
-  } else {
-    return false;
-  }
-
-  if (secDirOffset + 8 > buf.length) return false;
-  const numberOfRvaAndSizes = buf.readUInt32LE(numRvaOffset);
-  if (numberOfRvaAndSizes < 5) return false;
-
-  const certFileOffset = buf.readUInt32LE(secDirOffset);
-  const certTableSize = buf.readUInt32LE(secDirOffset + 4);
-  if (
-    certFileOffset === 0 ||
-    certTableSize < 8 ||
-    certFileOffset + certTableSize > buf.length
-  ) {
-    return false;
-  }
-
-  const dwLength = buf.readUInt32LE(certFileOffset);
-  const wRevision = buf.readUInt16LE(certFileOffset + 4);
-  const wCertificateType = buf.readUInt16LE(certFileOffset + 6);
-
-  if (dwLength < 8 || dwLength > certTableSize) return false;
-  if (wRevision !== 0x0100 && wRevision !== 0x0200) return false;
-  if (wCertificateType !== 0x0002) return false; // WIN_CERT_TYPE_PKCS_SIGNED_DATA
-
-  return true;
+function hasEmbeddedPeAuthenticodeCertificateBuffer(buf, options = {}) {
+  const result = verifyPeAuthenticodeBuffer(buf, {
+    componentId: 'bottle_steam',
+    expectedVendorSubjectPattern:
+      options.expectedVendorSubjectPattern instanceof RegExp
+        ? options.expectedVendorSubjectPattern
+        : VENDOR_AUTHENTICODE_SUBJECT_PATTERNS.bottle_steam,
+    requireAuthenticodeOid: true,
+    allowSyntheticTestStub: false,
+  });
+  return result.valid;
 }
 
 /**
@@ -224,7 +178,8 @@ function resolvePinnedSteamSetupSha256(options = {}) {
 /**
  * Verify a candidate `SteamSetup.exe` buffer against:
  * 1) bounded size (`256 B .. 16 MiB`)
- * 2) PE header (`MZ` + `PE\0\0`) + embedded Authenticode `WIN_CERTIFICATE`
+ * 2) PE header (`MZ` + `PE\0\0`) + embedded Authenticode PKCS#7 SignedData + Authenticode OID +
+ *    Valve X.509 signer subject (`VENDOR_AUTHENTICODE_SUBJECT_PATTERNS.bottle_steam`)
  * 3) optional pinned SHA-256 (`ONE_LAUNCHER_STEAM_SETUP_SHA256` / `options.steamSetupSha256`)
  *
  * @param {Buffer} buf
@@ -235,7 +190,13 @@ function verifySteamSetupBuffer(buf, options = {}) {
   if (!Buffer.isBuffer(buf) || buf.length < 256 || buf.length > MAX_STEAM_SETUP_BYTES) {
     return false;
   }
-  if (!hasEmbeddedPeAuthenticodeCertificateBuffer(buf)) {
+  const authCheck = verifyPeAuthenticodeBuffer(buf, {
+    componentId: 'bottle_steam',
+    expectedVendorSubjectPattern: VENDOR_AUTHENTICODE_SUBJECT_PATTERNS.bottle_steam,
+    requireAuthenticodeOid: true,
+    allowSyntheticTestStub: false,
+  });
+  if (!authCheck.valid) {
     return false;
   }
   const pinnedSha = resolvePinnedSteamSetupSha256(options);

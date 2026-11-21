@@ -134,14 +134,14 @@ export const DisconnectedStorePanel: React.FC<DisconnectedStorePanelProps> = ({
           <button
             type="button"
             onClick={() => onLaunchSignIn(selectedTab)}
-            className={`w-full max-w-xs py-3 px-5 rounded font-bold text-xs text-white transition-all shadow-lg flex items-center justify-center gap-2.5 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${
+            className={`w-full max-w-xs py-3 px-5 rounded font-bold text-xs transition-all shadow-lg flex items-center justify-center gap-2.5 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-[#16202d] ${
               selectedTab === 'gog'
-                ? 'bg-purple-600 hover:bg-purple-500 shadow-purple-900/30'
+                ? 'bg-purple-600 hover:bg-purple-500 text-white shadow-purple-900/30'
                 : selectedTab === 'steam'
-                  ? 'bg-steam-accent hover:bg-steam-accentHover shadow-sky-900/30'
+                  ? 'bg-steam-accent hover:bg-sky-300 text-black shadow-sky-900/30'
                   : selectedTab === 'epic'
-                    ? 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/30'
-                    : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-900/30'
+                    ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-blue-900/30'
+                    : 'bg-emerald-700 hover:bg-emerald-600 text-white shadow-emerald-900/30'
             }`}
           >
             <Lock aria-hidden="true" className="w-4 h-4" />

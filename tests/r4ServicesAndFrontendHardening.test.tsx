@@ -9,6 +9,7 @@ import { makeCanonicalGame, makeSteamEnrichedMetadata, makeUserGameOverride } fr
 import { TestDOMParser, ParsedDomElementNode, ParsedDomTextNode } from './helpers/domParserHelper';
 
 import type { CanonicalGame, StoreAchievementSummary } from '../src/contracts/game';
+import type { StorefrontIntegration } from '../src/contracts/integration';
 import type { CriticScoreData } from '../src/contracts/critic';
 import type { GameCollection } from '../src/contracts/collection';
 import type { StorefrontId } from '../src/contracts/platform';
@@ -261,6 +262,9 @@ import {
 import { MediaGallery } from '../src/components/SteamStoreDetail/MediaGallery';
 import { SteamStorePage } from '../src/components/SteamStoreDetail/SteamStorePage';
 import { ManageCollectionsModal } from '../src/components/Library/ManageCollectionsModal';
+import { DisconnectedStorePanel } from '../src/components/Navigation/integrations/DisconnectedStorePanel';
+import { AuthenticatingStorePanel } from '../src/components/Navigation/integrations/AuthenticatingStorePanel';
+import { ConnectedStorePanel } from '../src/components/Navigation/integrations/ConnectedStorePanel';
 import { useCatalogOverrideSync } from '../src/hooks/useCatalogOverrideSync';
 import { steamApi } from '../src/services/steam/steamApi';
 import { steamMatcher } from '../src/services/steam/steamMatcher';
@@ -2309,6 +2313,274 @@ describe('R4 Services & React 19 Frontend Ground-Up Refactor Hardening Suite', (
       expect(onCatalogPersisted).toHaveBeenCalledTimes(1);
 
       hookHarness.unmount();
+    });
+
+    it('P1-2: DisconnectedStorePanel, AuthenticatingStorePanel, ConnectedStorePanel, and all src/**/*.tsx enforce >= 4.5:1 WCAG AA contrast on Steam/Xbox CTAs (zero bg-steam-accent + text-white)', () => {
+      // Quantitative WCAG 2.1 contrast assertions:
+      // Steam CTA: #000000 on #66c0f4 (bg-steam-accent) and #7dd3fc (sky-300)
+      expect(contrastRatio('#000000', '#66c0f4')).toBeGreaterThanOrEqual(10.0);
+      expect(contrastRatio('#000000', '#7dd3fc')).toBeGreaterThanOrEqual(12.0);
+      // Xbox CTA: #ffffff on #047857 (emerald-700) >= 4.5:1 AA
+      expect(contrastRatio('#ffffff', '#047857')).toBeGreaterThanOrEqual(5.4);
+
+      const makeIntegration = (storefrontId: StorefrontId): StorefrontIntegration => ({
+        storefrontId,
+        name: storefrontId.toUpperCase(),
+        isConnected: false,
+        gamesCount: 0,
+      });
+
+      const baseDisconnectedProps = {
+        showAdvancedInputs: false,
+        isSubmitting: false,
+        steamIdFieldId: 'steam-id',
+        steamKeyFieldId: 'steam-key',
+        gogUserFieldId: 'gog-user',
+        gogTokenFieldId: 'gog-token',
+        epicIdFieldId: 'epic-id',
+        epicTokenFieldId: 'epic-token',
+        xboxTagFieldId: 'xbox-tag',
+        steamInput: '',
+        steamApiKey: '',
+        gogInput: '',
+        gogToken: '',
+        epicInput: '',
+        epicToken: '',
+        xboxInput: '',
+        onChangeSteamInput: vi.fn(),
+        onChangeSteamApiKey: vi.fn(),
+        onChangeGogInput: vi.fn(),
+        onChangeGogToken: vi.fn(),
+        onChangeEpicInput: vi.fn(),
+        onChangeEpicToken: vi.fn(),
+        onChangeXboxInput: vi.fn(),
+        onToggleAdvancedInputs: vi.fn(),
+        onRequestDisconnect: vi.fn(),
+        onLaunchSignIn: vi.fn(),
+        onQuickConnect: vi.fn(),
+        onCompleteManualAuth: vi.fn(),
+      };
+
+      // 1. DisconnectedStorePanel across Steam & Xbox
+      const steamDisconnectedHtml = renderToString(
+        <DisconnectedStorePanel
+          {...baseDisconnectedProps}
+          selectedTab="steam"
+          currentIntegration={makeIntegration('steam')}
+        />
+      );
+      const steamDoc = new TestDOMParser().parseFromString(steamDisconnectedHtml, 'text/html');
+      const steamBtn = steamDoc
+        .querySelectorAll('button')
+        .find((b) => (b.getAttribute('class') || '').includes('bg-steam-accent'));
+      expect(steamBtn).toBeDefined();
+      const steamBtnClass = steamBtn?.getAttribute('class') || '';
+      expect(steamBtnClass).toContain('text-black');
+      expect(steamBtnClass).toContain('hover:bg-sky-300');
+      expect(steamBtnClass).not.toContain('text-white');
+      expect(steamBtnClass).not.toContain('hover:bg-steam-accentHover');
+
+      const xboxDisconnectedHtml = renderToString(
+        <DisconnectedStorePanel
+          {...baseDisconnectedProps}
+          selectedTab="xbox"
+          currentIntegration={makeIntegration('xbox')}
+        />
+      );
+      const xboxDoc = new TestDOMParser().parseFromString(xboxDisconnectedHtml, 'text/html');
+      const xboxBtn = xboxDoc
+        .querySelectorAll('button')
+        .find((b) => (b.getAttribute('class') || '').includes('bg-emerald-700'));
+      expect(xboxBtn).toBeDefined();
+      const xboxBtnTokens = (xboxBtn?.getAttribute('class') || '').split(/\s+/);
+      expect(xboxBtnTokens).toContain('bg-emerald-700');
+      expect(xboxBtnTokens).toContain('text-white');
+      expect(xboxBtnTokens).not.toContain('bg-emerald-600');
+
+      // 2. AuthenticatingStorePanel primary CTA
+      const authHtml = renderToString(
+        <AuthenticatingStorePanel
+          selectedTab="steam"
+          authRedirectFieldId="auth-redirect"
+          authRedirectInput=""
+          isSubmitting={false}
+          onChangeAuthRedirectInput={vi.fn()}
+          onCompleteAuth={vi.fn()}
+          onRelaunchSignIn={vi.fn()}
+          onCancelAuth={vi.fn()}
+        />
+      );
+      const authDoc = new TestDOMParser().parseFromString(authHtml, 'text/html');
+      const authBtn = authDoc
+        .querySelectorAll('button')
+        .find((b) => (b.getAttribute('class') || '').includes('bg-steam-accent'));
+      expect(authBtn).toBeDefined();
+      const authBtnClass = authBtn?.getAttribute('class') || '';
+      expect(authBtnClass).toContain('text-black');
+      expect(authBtnClass).toContain('hover:bg-sky-300');
+      expect(authBtnClass).not.toContain('text-white');
+      expect(authBtnClass).not.toContain('hover:bg-steam-accentHover');
+
+      // 3. ConnectedStorePanel Re-sync CTA
+      const connectedHtml = renderToString(
+        <ConnectedStorePanel
+          selectedTab="steam"
+          currentIntegration={{
+            ...makeIntegration('steam'),
+            isConnected: true,
+            accountName: 'TestAccount',
+          }}
+          xboxProfile={null}
+          avatarImgError={false}
+          onAvatarImgError={vi.fn()}
+          isSubmitting={false}
+          isUpdatingXboxMode={false}
+          xboxModePlayedId="xbox-played"
+          xboxModePlayedDescId="xbox-played-desc"
+          xboxModeFullId="xbox-full"
+          xboxModeFullDescId="xbox-full-desc"
+          xboxModeOwnedId="xbox-owned"
+          xboxModeOwnedDescId="xbox-owned-desc"
+          onRequestDisconnect={vi.fn()}
+          onXboxSyncModeChange={vi.fn()}
+          onResync={vi.fn()}
+        />
+      );
+      const connectedDoc = new TestDOMParser().parseFromString(connectedHtml, 'text/html');
+      const connectedBtn = connectedDoc
+        .querySelectorAll('button')
+        .find((b) => (b.getAttribute('class') || '').includes('bg-steam-accent'));
+      expect(connectedBtn).toBeDefined();
+      const connectedBtnClass = connectedBtn?.getAttribute('class') || '';
+      expect(connectedBtnClass).toContain('text-black');
+      expect(connectedBtnClass).toContain('hover:bg-sky-300');
+      expect(connectedBtnClass).not.toContain('text-white');
+      expect(connectedBtnClass).not.toContain('hover:bg-steam-accentHover');
+
+      // 4. Repo-wide static scan across all src/**/*.tsx: zero solid bg-steam-accent paired with text-white or bg-steam-accentHover
+      const collectTsxFiles = (dir: string, acc: string[] = []): string[] => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) collectTsxFiles(full, acc);
+          else if (entry.name.endsWith('.tsx')) acc.push(full);
+        }
+        return acc;
+      };
+      const violations: string[] = [];
+      for (const filePath of collectTsxFiles(path.join(REPO_ROOT, 'src'))) {
+        const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
+        lines.forEach((line, idx) => {
+          const hasSolidSteamAccent = /\bbg-steam-accent(?![/-])/.test(line);
+          if (hasSolidSteamAccent && (/\btext-white\b/.test(line) || /\bhover:bg-steam-accentHover\b/.test(line))) {
+            violations.push(`${path.relative(REPO_ROOT, filePath)}:${idx + 1}`);
+          }
+        });
+      }
+      expect(violations).toEqual([]);
+    });
+
+    it('P2-3: App.tsx passes handleExternalCatalogPersisted into useCatalogOverrideSync and handleHideGame/handleUnhideEntry eagerly sync gamesRef.current', () => {
+      // 1. Verify App.tsx hoists handleExternalCatalogPersisted above useCatalogOverrideSync and wires onCatalogPersisted
+      const appSrc = fs.readFileSync(path.join(REPO_ROOT, 'src', 'App.tsx'), 'utf8');
+      const handlerDeclIdx = appSrc.indexOf('const handleExternalCatalogPersisted = useCallback');
+      const hookCallIdx = appSrc.indexOf('} = useCatalogOverrideSync({');
+      expect(handlerDeclIdx).toBeGreaterThan(-1);
+      expect(hookCallIdx).toBeGreaterThan(handlerDeclIdx);
+      expect(appSrc).toContain('if (!isCatalogVaultHydrated)');
+
+      const hookCallSlice = appSrc.slice(hookCallIdx, hookCallIdx + 450);
+      expect(hookCallSlice).toContain('onCatalogPersisted: handleExternalCatalogPersisted');
+
+      // 2. Verify handleHideGame & handleUnhideEntry eagerly update gamesRef.current synchronously
+      // even when React 19 batched setGames updaters have not flushed yet
+      const gameA = makeCanonicalGame({
+        id: 'gog-7001',
+        title: 'Eager Hide Target',
+        isVerifiedEntitlement: true,
+        platforms: [{ platformId: 'gog', platformGameId: '7001', installed: false }],
+      });
+      const gameB = makeCanonicalGame({
+        id: 'steam-7002',
+        title: 'Remaining Visible Game',
+        isVerifiedEntitlement: true,
+        platforms: [{ platformId: 'steam', platformGameId: '7002', installed: false }],
+      });
+
+      const gamesRef = { current: [gameA, gameB] as CanonicalGame[] };
+      const pendingUpdaters: Array<React.SetStateAction<CanonicalGame[]>> = [];
+      const batchedSetGames: React.Dispatch<React.SetStateAction<CanonicalGame[]>> = vi.fn(
+        (updater) => {
+          pendingUpdaters.push(updater);
+        }
+      );
+
+      const hookHarness = createHookHarness(() =>
+        useCatalogOverrideSync({
+          selectedGame: gameA,
+          isGridView: true,
+          navigateHome: vi.fn(),
+          setGames: batchedSetGames,
+          gamesRef,
+          setGameRefreshKey: vi.fn(),
+          onCatalogPersisted: vi.fn(),
+          showSyncNotice: vi.fn(),
+        })
+      );
+
+      // Hide gameA -> gamesRef.current MUST drop gameA synchronously before pendingUpdaters execute
+      hookHarness.current.handleHideGame(gameA, 'gog');
+      expect(pendingUpdaters.length).toBeGreaterThanOrEqual(1);
+      expect(gamesRef.current.map((g) => g.id)).toEqual(['steam-7002']);
+
+      // Unhide gameA -> gamesRef.current MUST restore gameA synchronously before pendingUpdaters execute
+      hookHarness.current.handleUnhideEntry({
+        id: 'gog-7001',
+        platformId: 'gog',
+        platformGameId: '7001',
+        rawTitle: 'Eager Hide Target',
+        reason: 'Hidden by user',
+        reasonCategory: 'user_hidden',
+        rawGame: gameA,
+      });
+      expect(gamesRef.current.some((g) => g.id === 'gog-7001')).toBe(true);
+
+      hookHarness.unmount();
+    });
+
+    it('P1-1: vite.config.ts isolates shared UI primitives into ui-common without forcing SteamStoreDetail into a statically imported chunk', () => {
+      const viteConfigSrc = fs.readFileSync(path.join(REPO_ROOT, 'vite.config.ts'), 'utf8');
+
+      // Shared primitives & tag resolver routed to ui-common, pure leaf utils in services-foundation
+      expect(viteConfigSrc).toContain("return 'services-foundation'");
+      expect(viteConfigSrc).toContain("return 'services-catalog'");
+      expect(viteConfigSrc).toContain("return 'services-launcher'");
+      expect(viteConfigSrc).toContain("return 'ui-common'");
+      expect(viteConfigSrc).toContain("normalizedId.includes('/src/components/Common/')");
+      expect(viteConfigSrc).toContain("normalizedId.includes('/src/utils/')");
+      expect(viteConfigSrc).toContain("normalizedId.includes('/src/services/tags/')");
+
+      // Must NOT force SteamStoreDetail into a manual chunk (lets Rollup split cleanly at React.lazy boundary)
+      expect(viteConfigSrc).not.toContain("return 'ui-store-detail'");
+      expect(viteConfigSrc).not.toContain('readdirSync');
+      expect(viteConfigSrc).not.toContain('readFileSync');
+
+      // When production dist/assets exists, empirically assert index-*.js and all lazy modals
+      // have ZERO static ES imports of SteamStorePage-* or ui-store-detail-*
+      const distAssetsDir = path.join(REPO_ROOT, 'dist', 'assets');
+      if (fs.existsSync(distAssetsDir)) {
+        const jsChunks = fs.readdirSync(distAssetsDir).filter((f) => f.endsWith('.js'));
+        const indexChunks = jsChunks.filter((f) => /^index-.*\.js$/.test(f));
+        expect(indexChunks.length).toBeGreaterThanOrEqual(1);
+        for (const chunkFile of jsChunks) {
+          if (/^SteamStorePage-.*\.js$/.test(chunkFile)) continue;
+          const content = fs.readFileSync(path.join(distAssetsDir, chunkFile), 'utf8');
+          expect(content, `${chunkFile} must not statically import SteamStorePage`).not.toMatch(
+            /\bfrom\s*["']\.\/(?:SteamStorePage|ui-store-detail)-[^"']+["']/
+          );
+        }
+        const indexContent = fs.readFileSync(path.join(distAssetsDir, indexChunks[0]), 'utf8');
+        expect(indexContent).toMatch(/import\s*\(\s*["']\.\/SteamStorePage-[^"']+\.js["']\s*\)/);
+      }
     });
   });
 });

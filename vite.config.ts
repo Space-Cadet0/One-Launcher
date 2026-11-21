@@ -164,8 +164,9 @@ function localSystemScannerPlugin(): Plugin {
   };
 }
 
+// Keep directives in 1:1 parity with APP_CSP_PACKAGED in electron/ipc/webRequestHeaderGuards.cjs.
 const PACKAGED_CSP_META_TAG =
-  '<meta http-equiv="Content-Security-Policy" content="default-src \'self\'; script-src \'self\'; style-src \'self\' \'unsafe-inline\'; img-src \'self\' data: blob: ol-media: https:; media-src \'self\' data: blob: ol-media: https:; connect-src \'self\' ol-media: https:; font-src \'self\' data:; frame-src https://www.youtube-nocookie.com https://www.youtube.com; object-src \'none\'; base-uri \'self\'; form-action \'none\';">';
+  '<meta http-equiv="Content-Security-Policy" content="default-src \'self\'; script-src \'self\'; style-src \'self\' \'unsafe-inline\' https://fonts.googleapis.com; font-src \'self\' data: https://fonts.gstatic.com; img-src \'self\' data: blob: ol-media: https:; media-src \'self\' data: blob: ol-media: https:; connect-src \'self\' ol-media: https:; frame-src https://www.youtube-nocookie.com https://www.youtube.com https://youtube.com https://youtube-nocookie.com https://*.wistia.net https://*.fast.wistia.net; object-src \'none\'; base-uri \'self\'; form-action \'none\'">';
 
 function packagedCspPlugin(): Plugin {
   return {
@@ -227,7 +228,11 @@ export default defineConfig({
             normalizedId.includes('/src/services/storage/stagedCacheService') ||
             normalizedId.includes('/src/services/storage/userOverrideStorage') ||
             normalizedId.includes('/src/services/storage/knownGameAchievements') ||
-            normalizedId.includes('/src/services/storage/achievementReconciliation')
+            normalizedId.includes('/src/services/storage/achievementReconciliation') ||
+            normalizedId.includes('/src/utils/formatBytes') ||
+            normalizedId.includes('/src/utils/scrollActivityTracker') ||
+            normalizedId.includes('/src/utils/modalOverlayLock') ||
+            normalizedId.includes('/src/utils/asyncUtils')
           ) {
             return 'services-foundation';
           }
@@ -252,8 +257,15 @@ export default defineConfig({
             return 'services-launcher';
           }
 
-          if (normalizedId.includes('/src/components/SteamStoreDetail/')) {
-            return 'ui-store-detail';
+          // Layer 3 (Shared UI Primitives, UI Utilities & Tag Resolver):
+          // Explicitly isolated from lazy route/modal boundaries so Rollup never folds
+          // shared primitives into lazy chunks (such as SteamStorePage).
+          if (
+            normalizedId.includes('/src/components/Common/') ||
+            normalizedId.includes('/src/utils/') ||
+            normalizedId.includes('/src/services/tags/')
+          ) {
+            return 'ui-common';
           }
 
           return undefined;

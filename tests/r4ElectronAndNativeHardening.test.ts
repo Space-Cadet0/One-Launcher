@@ -386,6 +386,76 @@ interface WineAndCrossOverManagerModule {
   ) => Promise<{ buf: Buffer | null; sha256: string; sidecarVerified: boolean }>;
 }
 
+interface SteamDownloadMonitorModule {
+  hasEmbeddedPeAuthenticodeCertificateBuffer: (
+    buf: Buffer,
+    options?: { expectedVendorSubjectPattern?: RegExp }
+  ) => boolean;
+  verifySteamSetupBuffer: (buf: Buffer, options?: Record<string, unknown>) => boolean;
+}
+
+interface ArtifactSignatureVerifierModule {
+  VENDOR_AUTHENTICODE_SUBJECT_PATTERNS: Readonly<Record<string, RegExp>>;
+  verifyPeAuthenticodeBuffer: (
+    buf: Buffer,
+    options?: {
+      filePath?: string;
+      componentId?: string;
+      expectedVendorSubjectPattern?: RegExp | null;
+      requireAuthenticodeOid?: boolean;
+      allowSyntheticTestStub?: boolean;
+    }
+  ) => {
+    valid: boolean;
+    hasSignedDataOid: boolean;
+    hasAuthenticodeOid: boolean;
+    certificateSubjects: string[];
+    reason?: string;
+  };
+}
+
+interface VaultMetadataLatticeModule {
+  carryForwardVaultRequirements: (
+    incomingObj: Record<string, unknown>,
+    existingObj: Record<string, unknown>
+  ) => void;
+  carryForwardVaultCriticAndReviewFields: (
+    incomingObj: Record<string, unknown>,
+    existingObj: Record<string, unknown>
+  ) => void;
+  inferVaultMetadataQuality: (
+    game: Record<string, unknown>,
+    enriched: Record<string, unknown> | null
+  ) => string;
+}
+
+interface WebRequestHeaderGuardsModule {
+  APP_CSP_PACKAGED: string;
+  APP_CSP_DEV: string;
+  HEADERS_RECEIVED_FILTERS: readonly string[];
+  registerWebRequestHeaderGuards: (deps: {
+    session: {
+      defaultSession: {
+        webRequest: {
+          onBeforeSendHeaders: (
+            filter: { urls: string[] },
+            listener: (details: Record<string, unknown>, cb: (res: Record<string, unknown>) => void) => void
+          ) => void;
+          onHeadersReceived: (
+            filter: { urls: string[] },
+            listener: (details: Record<string, unknown>, cb: (res: Record<string, unknown>) => void) => void
+          ) => void;
+        };
+      };
+    };
+    app: { isPackaged: boolean; getVersion: () => string };
+    getMainWindow: () => {
+      isDestroyed: () => boolean;
+      webContents: { id: number; mainFrame: Record<string, unknown> };
+    };
+  }) => void;
+}
+
 const cjsConfigSanitizers = nodeRequire(
   '../electron/launcher/policy/configSanitizers.cjs'
 ) as CjsConfigSanitizersModule;
@@ -453,6 +523,18 @@ const manifestParsers = nodeRequire(
 const wineAndCrossOverManager = nodeRequire(
   '../electron/launcher/wineAndCrossOverManager.cjs'
 ) as WineAndCrossOverManagerModule;
+const steamDownloadMonitor = nodeRequire(
+  '../electron/launcher/downloads/steamDownloadMonitor.cjs'
+) as SteamDownloadMonitorModule;
+const artifactSignatureVerifier = nodeRequire(
+  '../electron/launcher/provisioner/artifactSignatureVerifier.cjs'
+) as ArtifactSignatureVerifierModule;
+const vaultMetadataLattice = nodeRequire(
+  '../electron/launcher/vault/vaultMetadataLattice.cjs'
+) as VaultMetadataLatticeModule;
+const webRequestHeaderGuards = nodeRequire(
+  '../electron/ipc/webRequestHeaderGuards.cjs'
+) as WebRequestHeaderGuardsModule;
 
 // ============================================================================
 // Hermetic Test Helpers (Temp Sandboxes, Raw TCP Helper, Mach-O / PE Parsers)
@@ -2217,7 +2299,299 @@ describe('6. GOG Script, Cloud Save, Downloads, Offline Vault, Readiness Barrier
     expect(xgrPe.exceptionDirSize).toBeGreaterThan(400);
   });
 
-  it('6h. Self-checks PII hygiene on this regression suite via piiHygieneGuard', () => {
+  it('6h. P2-1: steamDownloadMonitor.verifySteamSetupBuffer enforces PKCS#7 SignedData + Authenticode OID + Valve X.509 subject and optional SHA-256 pin', () => {
+    const derLen = (n: number): Buffer => {
+      if (n < 0x80) return Buffer.from([n]);
+      const bytes: number[] = [];
+      let v = n;
+      while (v > 0) {
+        bytes.unshift(v & 0xff);
+        v >>= 8;
+      }
+      return Buffer.from([0x80 | bytes.length, ...bytes]);
+    };
+    const derTlv = (tag: number, body: Buffer): Buffer =>
+      Buffer.concat([Buffer.from([tag]), derLen(body.length), body]);
+    const derSeq = (...parts: Buffer[]): Buffer => derTlv(0x30, Buffer.concat(parts));
+    const derSet = (...parts: Buffer[]): Buffer => derTlv(0x31, Buffer.concat(parts));
+    const derInt = (val: number): Buffer => derTlv(0x02, Buffer.from([val]));
+    const derOid = (bytes: number[]): Buffer => derTlv(0x06, Buffer.from(bytes));
+    const derUtf8 = (str: string): Buffer => derTlv(0x0c, Buffer.from(str, 'utf8'));
+    const derUtcTime = (str: string): Buffer => derTlv(0x17, Buffer.from(str, 'ascii'));
+    const derBitString = (buf: Buffer): Buffer =>
+      derTlv(0x03, Buffer.concat([Buffer.from([0x00]), buf]));
+
+    const buildSelfSignedX509Der = (orgName: string, cnName: string): Buffer => {
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+      const spki = publicKey.export({ format: 'der', type: 'spki' });
+      const ed25519AlgId = derSeq(derOid([0x2b, 0x65, 0x70]));
+      const rdnO = derSet(derSeq(derOid([0x55, 0x04, 0x0a]), derUtf8(orgName)));
+      const rdnCN = derSet(derSeq(derOid([0x55, 0x04, 0x03]), derUtf8(cnName)));
+      const name = derSeq(rdnO, rdnCN);
+      const validity = derSeq(derUtcTime('250101000000Z'), derUtcTime('350101000000Z'));
+      const tbs = derSeq(derTlv(0xa0, derInt(2)), derInt(1), ed25519AlgId, name, validity, name, spki);
+      const sig = crypto.sign(null, tbs, privateKey);
+      return derSeq(tbs, ed25519AlgId, derBitString(sig));
+    };
+
+    const buildPkcs7SignedData = (certDer: Buffer, includeAuthenticodeOid: boolean): Buffer => {
+      const signedDataOid = derOid([0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02]);
+      const contentOid = includeAuthenticodeOid
+        ? derOid([0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x04])
+        : derOid([0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01]);
+      const signedData = derSeq(
+        derInt(1),
+        derSet(),
+        derSeq(contentOid),
+        derTlv(0xa0, certDer),
+        derSet()
+      );
+      return derSeq(signedDataOid, derTlv(0xa0, signedData));
+    };
+
+    const buildPeWithWinCert = (pkcs7Buf: Buffer): Buffer => {
+      const peOffset = 0x80;
+      const optOffset = peOffset + 24;
+      const certFileOffset = 0x400;
+      const alignedDwLen = Math.ceil((8 + pkcs7Buf.length) / 8) * 8;
+      const buf = Buffer.alloc(certFileOffset + alignedDwLen, 0);
+      buf[0] = 0x4d;
+      buf[1] = 0x5a;
+      buf.writeUInt32LE(peOffset, 0x3c);
+      buf.write('PE\0\0', peOffset, 'ascii');
+      buf.writeUInt16LE(0x8664, peOffset + 4);
+      buf.writeUInt16LE(240, peOffset + 20);
+      buf.writeUInt16LE(0x020b, optOffset);
+      buf.writeUInt32LE(16, optOffset + 108);
+      const secDirOffset = optOffset + 112 + 4 * 8;
+      buf.writeUInt32LE(certFileOffset, secDirOffset);
+      buf.writeUInt32LE(alignedDwLen, secDirOffset + 4);
+      buf.writeUInt32LE(alignedDwLen, certFileOffset);
+      buf.writeUInt16LE(0x0200, certFileOffset + 4);
+      buf.writeUInt16LE(0x0002, certFileOffset + 6);
+      pkcs7Buf.copy(buf, certFileOffset + 8);
+      return buf;
+    };
+
+    const valveCertDer = buildSelfSignedX509Der('Valve Corp.', 'Valve');
+    const nonValveCertDer = buildSelfSignedX509Der('Untrusted Publisher LLC', 'Untrusted Publisher');
+
+    const validValvePe = buildPeWithWinCert(buildPkcs7SignedData(valveCertDer, true));
+    const nonValvePe = buildPeWithWinCert(buildPkcs7SignedData(nonValveCertDer, true));
+    const missingAuthOidPe = buildPeWithWinCert(buildPkcs7SignedData(valveCertDer, false));
+    const syntheticStubPe = buildPeWithWinCert(
+      Buffer.concat([Buffer.from([0x30, 0x20]), Buffer.alloc(32, 0)])
+    );
+
+    // Non-Valve signer, missing Authenticode OID, and zero-filled stub MUST all be rejected
+    expect(steamDownloadMonitor.verifySteamSetupBuffer(nonValvePe)).toBe(false);
+    expect(steamDownloadMonitor.hasEmbeddedPeAuthenticodeCertificateBuffer(nonValvePe)).toBe(false);
+    expect(steamDownloadMonitor.verifySteamSetupBuffer(missingAuthOidPe)).toBe(false);
+    expect(steamDownloadMonitor.verifySteamSetupBuffer(syntheticStubPe)).toBe(false);
+
+    const directNonValve = artifactSignatureVerifier.verifyPeAuthenticodeBuffer(nonValvePe, {
+      componentId: 'bottle_steam',
+      expectedVendorSubjectPattern:
+        artifactSignatureVerifier.VENDOR_AUTHENTICODE_SUBJECT_PATTERNS.bottle_steam,
+      requireAuthenticodeOid: true,
+    });
+    expect(directNonValve.valid).toBe(false);
+    expect(directNonValve.reason).toMatch(/did not match expected publisher/i);
+
+    // Valid Valve PKCS#7 SignedData + Authenticode OID + O=Valve Corp. X.509 subject MUST pass
+    expect(steamDownloadMonitor.verifySteamSetupBuffer(validValvePe)).toBe(true);
+    expect(steamDownloadMonitor.hasEmbeddedPeAuthenticodeCertificateBuffer(validValvePe)).toBe(true);
+
+    // Optional timing-safe SHA-256 pin still enforced cleanly
+    const actualSha = crypto.createHash('sha256').update(validValvePe).digest('hex');
+    const wrongSha = '0'.repeat(64);
+    expect(
+      steamDownloadMonitor.verifySteamSetupBuffer(validValvePe, { steamSetupSha256: actualSha })
+    ).toBe(true);
+    expect(
+      steamDownloadMonitor.verifySteamSetupBuffer(validValvePe, { steamSetupSha256: wrongSha })
+    ).toBe(false);
+    expect(
+      steamDownloadMonitor.verifySteamSetupBuffer(validValvePe, { steamSetupSha256: 'not-hex' })
+    ).toBe(false);
+  });
+
+  it('6i. P2-2: vaultMetadataLattice and OfflineVaultService treat __digestOnly === true as Rank 0 (skeleton_fallback)', () => {
+    const richExisting: Record<string, unknown> = {
+      appId: 1091500,
+      metadataQuality: 'authoritative',
+      systemRequirements: { minimum: 'Intel i7 / 16 GB RAM', recommended: 'RTX 4070' },
+      pcRequirementsHtml: '<p>Minimum: Intel i7</p>',
+      metacritic: { score: 86, url: 'https://www.metacritic.com/game/cyberpunk-2077/' },
+      reviewSummary: { totalReviews: 500000, reviewScore: 9, positivePercent: 90 },
+    };
+
+    // 1. inferVaultMetadataQuality forces __digestOnly: true -> 'skeleton_fallback' even if labeled 'authoritative'
+    const digestEnriched: Record<string, unknown> = {
+      appId: 1091500,
+      metadataQuality: 'authoritative',
+      __digestOnly: true,
+    };
+    expect(
+      vaultMetadataLattice.inferVaultMetadataQuality(
+        { id: 'steam-1091500', metadataQuality: 'authoritative' },
+        digestEnriched
+      )
+    ).toBe('skeleton_fallback');
+
+    // 2. carryForwardVaultRequirements skips when incoming OR existing has __digestOnly: true
+    const incomingDigestReq: Record<string, unknown> = { appId: 1091500, __digestOnly: true };
+    vaultMetadataLattice.carryForwardVaultRequirements(incomingDigestReq, richExisting);
+    expect(incomingDigestReq.systemRequirements).toBeUndefined();
+    expect(incomingDigestReq.pcRequirementsHtml).toBeUndefined();
+
+    const incomingNormalReq: Record<string, unknown> = { appId: 1091500 };
+    vaultMetadataLattice.carryForwardVaultRequirements(incomingNormalReq, {
+      ...richExisting,
+      __digestOnly: true,
+    });
+    expect(incomingNormalReq.systemRequirements).toBeUndefined();
+
+    // 3. carryForwardVaultCriticAndReviewFields skips when incoming OR existing has __digestOnly: true
+    const incomingDigestCritic: Record<string, unknown> = { appId: 1091500, __digestOnly: true };
+    vaultMetadataLattice.carryForwardVaultCriticAndReviewFields(incomingDigestCritic, richExisting);
+    expect(incomingDigestCritic.metacritic).toBeUndefined();
+    expect(incomingDigestCritic.reviewSummary).toBeUndefined();
+
+    const incomingNormalCritic: Record<string, unknown> = { appId: 1091500 };
+    vaultMetadataLattice.carryForwardVaultCriticAndReviewFields(incomingNormalCritic, {
+      ...richExisting,
+      __digestOnly: true,
+    });
+    expect(incomingNormalCritic.metacritic).toBeUndefined();
+    expect(incomingNormalCritic.reviewSummary).toBeUndefined();
+
+    // 4. End-to-end OfflineVaultService upsert preserves authoritative metadata against incoming __digestOnly projection
+    const sandbox = createSandboxDir('ol-r4-digest-rank0-');
+    const vault = new offlineVaultMod.OfflineVaultService({
+      dbPath: path.join(sandbox, 'vault.sqlite'),
+    }).init();
+    trackedVaults.push(vault);
+
+    vault.upsertGames([
+      {
+        id: 'steam-570',
+        title: 'Authoritative Title',
+        steamAppId: 570,
+        shortDescription: 'Full authoritative synopsis',
+        developers: ['Valve'],
+        publishers: ['Valve'],
+        platforms: [{ platformId: 'steam', platformGameId: '570', installed: false }],
+        enrichedMetadata: {
+          appId: 570,
+          metadataQuality: 'authoritative',
+          shortDescription: 'Full authoritative synopsis',
+          detailedDescription: '<p>Rich authoritative description</p>',
+          screenshots: [{ id: 1, pathThumbnail: 'https://cdn.example/t.jpg', pathFull: 'https://cdn.example/f.jpg' }],
+        },
+      },
+    ]);
+
+    vault.upsertGames([
+      {
+        id: 'steam-570',
+        title: 'Authoritative Title',
+        steamAppId: 570,
+        shortDescription: '',
+        developers: ['Unknown Developer'],
+        publishers: ['Unknown Publisher'],
+        platforms: [{ platformId: 'steam', platformGameId: '570', installed: false }],
+        enrichedMetadata: {
+          appId: 570,
+          metadataQuality: 'authoritative',
+          __digestOnly: true,
+          shortDescription: '',
+          screenshots: [],
+        },
+      },
+    ]);
+
+    const detail = vault.getGameDetail('steam-570') as {
+      enrichedMetadata?: { detailedDescription?: string; __digestOnly?: boolean };
+      metadataQuality?: string;
+    } | null;
+    expect(detail).not.toBeNull();
+    expect(detail?.metadataQuality).toBe('authoritative');
+    expect(detail?.enrichedMetadata?.detailedDescription).toBe('<p>Rich authoritative description</p>');
+    expect(detail?.enrichedMetadata?.__digestOnly).toBeUndefined();
+  });
+
+  it('6j. P2-4: PACKAGED_CSP_META_TAG in vite.config.ts maintains 1:1 directive parity with APP_CSP_PACKAGED and dead file:// CSP branch is removed', () => {
+    const viteConfigSrc = fs.readFileSync(path.join(REPO_ROOT, 'vite.config.ts'), 'utf8');
+    const metaConstMatch = viteConfigSrc.match(
+      /const\s+PACKAGED_CSP_META_TAG\s*=\s*'((?:\\'|[^'])+)'/
+    );
+    expect(metaConstMatch).not.toBeNull();
+    const unescapedTag = metaConstMatch![1].replace(/\\'/g, "'");
+    const contentMatch = unescapedTag.match(/content="([^"]+)"/);
+    expect(contentMatch).not.toBeNull();
+
+    // Exact 1:1 parity between vite.config.ts PACKAGED_CSP_META_TAG and electron/ipc/webRequestHeaderGuards.cjs APP_CSP_PACKAGED
+    const viteCspDirectives = contentMatch![1].replace(/;\s*$/, '').trim();
+    expect(viteCspDirectives).toBe(webRequestHeaderGuards.APP_CSP_PACKAGED);
+
+    // Explicitly verify Wistia, YouTube, and Google Fonts directives are allowed in packaged builds
+    expect(viteCspDirectives).toContain('https://*.wistia.net');
+    expect(viteCspDirectives).toContain('https://*.fast.wistia.net');
+    expect(viteCspDirectives).toContain('https://youtube.com');
+    expect(viteCspDirectives).toContain('https://youtube-nocookie.com');
+    expect(viteCspDirectives).toContain('https://fonts.googleapis.com');
+    expect(viteCspDirectives).toContain('https://fonts.gstatic.com');
+
+    // Verify dead file:// branch is removed from onHeadersReceived while unpackaged loopback dev CSP still works
+    const guardsSrc = fs.readFileSync(
+      path.join(REPO_ROOT, 'electron', 'ipc', 'webRequestHeaderGuards.cjs'),
+      'utf8'
+    );
+    expect(guardsSrc).not.toContain("url.startsWith('file://')");
+    expect(webRequestHeaderGuards.HEADERS_RECEIVED_FILTERS).toEqual(['http://*/*', 'https://*/*']);
+
+    let headersListener:
+      | ((details: Record<string, unknown>, cb: (res: Record<string, unknown>) => void) => void)
+      | null = null;
+    const mockMainWindow = {
+      isDestroyed: () => false,
+      webContents: { id: 42, mainFrame: {} },
+    };
+    webRequestHeaderGuards.registerWebRequestHeaderGuards({
+      session: {
+        defaultSession: {
+          webRequest: {
+            onBeforeSendHeaders: () => {},
+            onHeadersReceived: (_filter, listener) => {
+              headersListener = listener;
+            },
+          },
+        },
+      },
+      app: { isPackaged: false, getVersion: () => '0.2.8' },
+      getMainWindow: () => mockMainWindow,
+    });
+    expect(headersListener).not.toBeNull();
+
+    let devResponseHeaders: Record<string, unknown> = {};
+    headersListener!(
+      {
+        webContentsId: 42,
+        resourceType: 'mainFrame',
+        url: 'http://localhost:3000/',
+        responseHeaders: {},
+      },
+      (res) => {
+        devResponseHeaders = (res.responseHeaders as Record<string, unknown>) || {};
+      }
+    );
+    expect(devResponseHeaders['Content-Security-Policy']).toEqual([
+      webRequestHeaderGuards.APP_CSP_DEV,
+    ]);
+  });
+
+  it('6k. Self-checks PII hygiene on this regression suite via piiHygieneGuard', () => {
     const selfContent = fs.readFileSync(__filename, 'utf8');
     expect(
       scanContentForPiiViolations(selfContent, 'tests/r4ElectronAndNativeHardening.test.ts')

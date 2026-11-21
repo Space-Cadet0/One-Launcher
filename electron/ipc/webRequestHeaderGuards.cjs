@@ -354,14 +354,12 @@ function registerWebRequestHeaderGuards({
       const url = String(details.url || '');
       const responseHeaders = { ...(details.responseHeaders || {}) };
 
-      if (
-        details.resourceType === 'mainFrame' &&
-        (url.startsWith('file://') || (!isPackaged && isLoopbackDevMainFrameUrl(url)))
-      ) {
+      // Packaged `file://` documents enforce `APP_CSP_PACKAGED` via `PACKAGED_CSP_META_TAG`
+      // injected into `dist/index.html` by `vite.config.ts` (`HEADERS_RECEIVED_FILTERS`
+      // scopes `onHeadersReceived` strictly to `http(s)://*/*` so `ol-media://` stays zero-overhead).
+      if (details.resourceType === 'mainFrame' && !isPackaged && isLoopbackDevMainFrameUrl(url)) {
         deleteHeaderCaseInsensitive(responseHeaders, 'content-security-policy');
-        responseHeaders['Content-Security-Policy'] = [
-          url.startsWith('file://') ? APP_CSP_PACKAGED : APP_CSP_DEV,
-        ];
+        responseHeaders['Content-Security-Policy'] = [APP_CSP_DEV];
         callback({ responseHeaders });
         return;
       }

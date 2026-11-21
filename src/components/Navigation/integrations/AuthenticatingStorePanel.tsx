@@ -200,7 +200,7 @@ export const AuthenticatingStorePanel: React.FC<AuthenticatingStorePanelProps> =
             onCompleteAuth(selectedTab, extractCodeFromInput(authRedirectInput) || undefined)
           }
           disabled={isSubmitting}
-          className="px-5 py-2.5 rounded bg-steam-accent hover:bg-steam-accentHover text-white text-xs font-bold transition-all shadow-md flex items-center gap-2 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+          className="px-5 py-2.5 rounded bg-steam-accent hover:bg-sky-300 text-black text-xs font-bold transition-all shadow-md flex items-center gap-2 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-[#16202d]"
         >
           {isSubmitting ? (
             <RefreshCw aria-hidden="true" className="w-4 h-4 animate-spin" />

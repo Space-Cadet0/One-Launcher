@@ -341,7 +341,7 @@ export const ConnectedStorePanel: React.FC<ConnectedStorePanelProps> = ({
           type="button"
           onClick={() => onResync(selectedTab)}
           disabled={isSubmitting || isUpdatingXboxMode}
-          className="px-3 py-1.5 rounded bg-steam-accent hover:bg-steam-accentHover text-white text-xs font-semibold transition-all flex items-center gap-1.5 shadow-md disabled:opacity-50 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+          className="px-3 py-1.5 rounded bg-steam-accent hover:bg-sky-300 text-black text-xs font-semibold transition-all flex items-center gap-1.5 shadow-md disabled:opacity-50 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-[#16202d]"
         >
           <RefreshCw
             aria-hidden="true"

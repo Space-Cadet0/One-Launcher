@@ -437,8 +437,12 @@ function upsertGames(service, games) {
                 ? existing.steam_app_id
                 : null;
 
-      const incomingIsSlimmed = Boolean(incomingEnrichedPreview?.__quotaSlimmed);
-      const existingIsSlimmed = Boolean(existingEnrichedObj?.__quotaSlimmed);
+      const incomingIsSlimmed = Boolean(
+        incomingEnrichedPreview?.__quotaSlimmed || incomingEnrichedPreview?.__digestOnly
+      );
+      const existingIsSlimmed = Boolean(
+        existingEnrichedObj?.__quotaSlimmed || existingEnrichedObj?.__digestOnly
+      );
       const existingSummaryStr =
         existing && existing.summary_json !== null && existing.summary_json !== undefined
           ? decompressVaultJsonString(existing.summary_json)
@@ -1257,8 +1261,12 @@ function saveGameDetail(service, payload = {}) {
 
     const existingEnrichedObj =
       existing && existing.enriched_json ? parseVaultJson(existing.enriched_json) : null;
-    const incomingIsSlimmed = Boolean(incomingEnrichedObj?.__quotaSlimmed);
-    const existingIsSlimmed = Boolean(existingEnrichedObj?.__quotaSlimmed);
+    const incomingIsSlimmed = Boolean(
+      incomingEnrichedObj?.__quotaSlimmed || incomingEnrichedObj?.__digestOnly
+    );
+    const existingIsSlimmed = Boolean(
+      existingEnrichedObj?.__quotaSlimmed || existingEnrichedObj?.__digestOnly
+    );
 
     if (
       incomingEnrichedObj &&

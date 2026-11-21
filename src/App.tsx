@@ -525,6 +525,14 @@ export function App() {
     wasHibernatingRef.current = isHibernating;
   }, [isHibernating]);
 
+  const lastExplicitlySavedCatalogRef = useRef<CanonicalGame[] | null>(games);
+  const prevCommittedCatalogRef = useRef<CanonicalGame[]>(games);
+
+  const handleExternalCatalogPersisted = useCallback((catalog: CanonicalGame[]) => {
+    lastExplicitlySavedCatalogRef.current = catalog;
+    prevCommittedCatalogRef.current = catalog;
+  }, []);
+
   const {
     isFixMatchModalOpen,
     setIsFixMatchModalOpen,
@@ -544,6 +552,7 @@ export function App() {
     gamesRef: gamesLatestRef,
     setGames,
     setGameRefreshKey,
+    onCatalogPersisted: handleExternalCatalogPersisted,
     showSyncNotice,
   });
 
@@ -589,14 +598,6 @@ export function App() {
     isManageCollectionsOpen,
     onSetupStateChanged: handleSetupStateChanged,
   });
-
-  const lastExplicitlySavedCatalogRef = useRef<CanonicalGame[] | null>(games);
-  const prevCommittedCatalogRef = useRef<CanonicalGame[]>(games);
-
-  const handleExternalCatalogPersisted = useCallback((catalog: CanonicalGame[]) => {
-    lastExplicitlySavedCatalogRef.current = catalog;
-    prevCommittedCatalogRef.current = catalog;
-  }, []);
 
   // Persist catalog state in commit phase (never inside pure setGames updaters),
   // strictly gated behind isCatalogVaultHydrated to eliminate cold-boot slim-overwrites-rich races.

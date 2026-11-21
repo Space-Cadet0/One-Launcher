@@ -398,6 +398,163 @@ function inspectPkcs7SignedDataBuffer(pkcs7Buf, opts = {}) {
 }
 
 /**
+ * Pure-Buffer PE32 / PE32+ `OptionalHeader.DataDirectory[4]` (`IMAGE_DIRECTORY_ENTRY_SECURITY`)
+ * + `WIN_CERTIFICATE` PKCS#7 SignedData ASN.1 + X.509 vendor subject verification.
+ *
+ * Strictly validates:
+ * - DOS `'MZ'` header + valid `e_lfanew`
+ * - NT `'PE\0\0'` signature + valid PE32 (`0x010b`) / PE32+ (`0x020b`) OptionalHeader
+ * - `DataDirectory[4]` (`IMAGE_DIRECTORY_ENTRY_SECURITY`) bounds past PE headers
+ * - `WIN_CERTIFICATE` header (`wRevision` 0x0100/0x0200, `wCertificateType === 0x0002`, bounded `dwLength`)
+ * - Embedded PKCS#7 SignedData ASN.1 payload (`inspectPkcs7SignedDataBuffer`) including optional
+ *   Authenticode `SpcIndirectDataContent` OID requirement (`requireAuthenticodeOid`) and X.509 vendor
+ *   subject pinning (`expectedVendorSubjectPattern` / `componentId` / `filePath`).
+ *
+ * Never permits synthetic stubs unless explicitly requested via `allowSyntheticTestStub: true`.
+ *
+ * @param {Buffer} buf
+ * @param {{
+ *   filePath?: string,
+ *   componentId?: string,
+ *   _componentId?: string,
+ *   expectedVendorSubjectPattern?: RegExp | null,
+ *   requireAuthenticodeOid?: boolean,
+ *   allowSyntheticTestStub?: boolean,
+ * }} [options]
+ * @returns {{
+ *   valid: boolean,
+ *   hasSignedDataOid: boolean,
+ *   hasAuthenticodeOid: boolean,
+ *   certificateSubjects: string[],
+ *   reason?: string,
+ * }}
+ */
+function verifyPeAuthenticodeBuffer(buf, options = {}) {
+  const fail = (/** @type {string} */ reason) => ({
+    valid: false,
+    hasSignedDataOid: false,
+    hasAuthenticodeOid: false,
+    certificateSubjects: /** @type {string[]} */ ([]),
+    reason,
+  });
+
+  if (!Buffer.isBuffer(buf) || buf.length < 256) {
+    return fail('PE executable buffer is too small to contain an Authenticode signature.');
+  }
+  if (buf[0] !== 0x4d || buf[1] !== 0x5a) {
+    return fail('Missing MZ DOS header.');
+  }
+
+  const peOffset = buf.readUInt32LE(0x3c);
+  if (peOffset < 0x40 || peOffset + 200 > buf.length) {
+    return fail('PE header offset out of bounds.');
+  }
+
+  if (
+    buf[peOffset] !== 0x50 ||
+    buf[peOffset + 1] !== 0x45 ||
+    buf[peOffset + 2] !== 0x00 ||
+    buf[peOffset + 3] !== 0x00
+  ) {
+    return fail('Invalid PE signature.');
+  }
+
+  const sizeOfOptionalHeader = buf.readUInt16LE(peOffset + 20);
+  if (sizeOfOptionalHeader < 128) {
+    return fail('OptionalHeader size too small.');
+  }
+
+  const optOffset = peOffset + 24;
+  if (optOffset + 2 > buf.length) {
+    return fail('Truncated PE OptionalHeader.');
+  }
+
+  const magic = buf.readUInt16LE(optOffset);
+  let numRvaOffset = 0;
+  let secDirOffset = 0;
+  if (magic === 0x010b) {
+    // PE32 (32-bit)
+    numRvaOffset = optOffset + 92;
+    secDirOffset = optOffset + 96 + 4 * 8;
+  } else if (magic === 0x020b) {
+    // PE32+ (64-bit)
+    numRvaOffset = optOffset + 108;
+    secDirOffset = optOffset + 112 + 4 * 8;
+  } else {
+    return fail('Unsupported PE OptionalHeader magic.');
+  }
+
+  if (secDirOffset + 8 > buf.length || buf.readUInt32LE(numRvaOffset) < 5) {
+    return fail('PE executable is missing an embedded Authenticode WIN_CERTIFICATE signature.');
+  }
+
+  const certFileOffset = buf.readUInt32LE(secDirOffset);
+  const certTableSize = buf.readUInt32LE(secDirOffset + 4);
+  const peHeadersEnd = peOffset + 24 + sizeOfOptionalHeader;
+  if (
+    certFileOffset === 0 ||
+    certFileOffset < peHeadersEnd ||
+    certTableSize < 16 ||
+    certFileOffset + certTableSize > buf.length
+  ) {
+    return fail('PE executable is missing an embedded Authenticode WIN_CERTIFICATE signature.');
+  }
+
+  const dwLength = buf.readUInt32LE(certFileOffset);
+  const wRevision = buf.readUInt16LE(certFileOffset + 4);
+  const wCertificateType = buf.readUInt16LE(certFileOffset + 6);
+  if (
+    dwLength < 16 ||
+    dwLength > certTableSize ||
+    certFileOffset + dwLength > buf.length ||
+    (wRevision !== 0x0100 && wRevision !== 0x0200) ||
+    wCertificateType !== 0x0002
+  ) {
+    return fail('Invalid WIN_CERTIFICATE Authenticode header fields.');
+  }
+
+  const pkcs7Len = dwLength - 8;
+  if (pkcs7Len < 8 || pkcs7Len > MAX_WIN_CERT_INSPECT_BYTES) {
+    return fail('WIN_CERTIFICATE PKCS#7 block size is out of allowed bounds.');
+  }
+
+  const pkcs7Buf = buf.subarray(certFileOffset + 8, certFileOffset + dwLength);
+  const expectedVendorPattern = resolveExpectedVendorSubjectPattern(options.filePath || '', options);
+  const pkcs7Check = inspectPkcs7SignedDataBuffer(pkcs7Buf, {
+    allowSyntheticTestStub: options.allowSyntheticTestStub === true,
+    expectedVendorSubjectPattern: expectedVendorPattern,
+  });
+
+  if (!pkcs7Check.valid) {
+    return {
+      valid: false,
+      hasSignedDataOid: pkcs7Check.hasSignedDataOid,
+      hasAuthenticodeOid: pkcs7Check.hasAuthenticodeOid,
+      certificateSubjects: pkcs7Check.certificateSubjects,
+      reason: pkcs7Check.reason || 'PE WIN_CERTIFICATE PKCS#7 ASN.1 validation failed.',
+    };
+  }
+
+  if (options.requireAuthenticodeOid === true && !pkcs7Check.hasAuthenticodeOid) {
+    return {
+      valid: false,
+      hasSignedDataOid: pkcs7Check.hasSignedDataOid,
+      hasAuthenticodeOid: false,
+      certificateSubjects: pkcs7Check.certificateSubjects,
+      reason:
+        'PKCS#7 SignedData is missing required Authenticode SpcIndirectDataContent OID (1.3.6.1.4.1.311.2.1.4).',
+    };
+  }
+
+  return {
+    valid: true,
+    hasSignedDataOid: pkcs7Check.hasSignedDataOid,
+    hasAuthenticodeOid: pkcs7Check.hasAuthenticodeOid,
+    certificateSubjects: pkcs7Check.certificateSubjects,
+  };
+}
+
+/**
  * Pure Node Buffer inspection of PE32 / PE32+ `OptionalHeader.DataDirectory[4]`
  * (`IMAGE_DIRECTORY_ENTRY_SECURITY`) verifying an embedded Authenticode `WIN_CERTIFICATE`
  * PKCS#7 SignedData block exists and passes ASN.1 structural & bounds validation.
@@ -1494,6 +1651,7 @@ module.exports = {
   VENDOR_AUTHENTICODE_SUBJECT_PATTERNS,
   resolveExpectedVendorSubjectPattern,
   inspectPkcs7SignedDataBuffer,
+  verifyPeAuthenticodeBuffer,
   hasEmbeddedPeAuthenticodeCertificate,
   verifyPeAuthenticodeAsync,
   hasValidMsiCompoundHeader,

@@ -618,9 +618,27 @@ export function useCatalogOverrideSync({
         internalMutationDepthRef.current = Math.max(0, internalMutationDepthRef.current - 1);
       }
 
-      setGames((prevGames) =>
-        hideStorefrontEntryFromCatalog(prevGames, gameToHide, targetPlatformId)
-      );
+      if (gamesRef) {
+        const baseCatalog = gamesRef.current;
+        const nextCatalog = hideStorefrontEntryFromCatalog(
+          baseCatalog,
+          gameToHide,
+          targetPlatformId
+        );
+        gamesRef.current = nextCatalog;
+        setGames((prevGames) => {
+          const next =
+            prevGames === baseCatalog
+              ? nextCatalog
+              : hideStorefrontEntryFromCatalog(prevGames, gameToHide, targetPlatformId);
+          gamesRef.current = next;
+          return next;
+        });
+      } else {
+        setGames((prevGames) =>
+          hideStorefrontEntryFromCatalog(prevGames, gameToHide, targetPlatformId)
+        );
+      }
 
       if (
         !isGridView &&
@@ -638,7 +656,7 @@ export function useCatalogOverrideSync({
         5000
       );
     },
-    [isGridView, selectedGame, navigateHome, setGames, setGameRefreshKey, showSyncNotice]
+    [gamesRef, isGridView, selectedGame, navigateHome, setGames, setGameRefreshKey, showSyncNotice]
   );
 
   const handleUnhideEntry = useCallback(
@@ -661,17 +679,35 @@ export function useCatalogOverrideSync({
         isVerifiedEntitlement: true,
       };
 
-      setGames((prevGames) =>
-        sanitizeGameCatalog([...prevGames, candidateGame], {
+      if (gamesRef) {
+        const baseCatalog = gamesRef.current;
+        const nextCatalog = sanitizeGameCatalog([...baseCatalog, candidateGame], {
           allowNewPurchases: true,
-        })
-      );
+        });
+        gamesRef.current = nextCatalog;
+        setGames((prevGames) => {
+          const next =
+            prevGames === baseCatalog
+              ? nextCatalog
+              : sanitizeGameCatalog([...prevGames, candidateGame], {
+                  allowNewPurchases: true,
+                });
+          gamesRef.current = next;
+          return next;
+        });
+      } else {
+        setGames((prevGames) =>
+          sanitizeGameCatalog([...prevGames, candidateGame], {
+            allowNewPurchases: true,
+          })
+        );
+      }
 
       setGameRefreshKey((prev) => prev + 1);
       const displayTitle = entry.rawTitle || baseStub.title || entry.id;
       showSyncNotice(`Restored "${displayTitle}" back to your library!`, 5000);
     },
-    [setGames, setGameRefreshKey, showSyncNotice]
+    [gamesRef, setGames, setGameRefreshKey, showSyncNotice]
   );
 
   return {

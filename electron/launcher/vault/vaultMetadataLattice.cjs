@@ -404,7 +404,9 @@ function carryForwardVaultRequirements(incomingObj, existingObj) {
     !existingObj ||
     typeof existingObj !== 'object' ||
     incomingObj.__quotaSlimmed === true ||
-    existingObj.__quotaSlimmed === true
+    incomingObj.__digestOnly === true ||
+    existingObj.__quotaSlimmed === true ||
+    existingObj.__digestOnly === true
   ) {
     return;
   }
@@ -686,7 +688,9 @@ function carryForwardVaultCriticAndReviewFields(incomingObj, existingObj) {
     !existingObj ||
     typeof existingObj !== 'object' ||
     incomingObj.__quotaSlimmed === true ||
-    existingObj.__quotaSlimmed === true
+    incomingObj.__digestOnly === true ||
+    existingObj.__quotaSlimmed === true ||
+    existingObj.__digestOnly === true
   ) {
     return;
   }
@@ -743,8 +747,8 @@ function inferVaultMetadataQuality(game, enriched) {
     return 'skeleton_fallback';
   }
 
-  // Universal C8 Lattice Invariant: __quotaSlimmed projections are ALWAYS Rank 0 (`skeleton_fallback`)
-  if (enriched.__quotaSlimmed === true) {
+  // Universal C8 Lattice Invariant: __quotaSlimmed and __digestOnly projections are ALWAYS Rank 0 (`skeleton_fallback`)
+  if (enriched.__quotaSlimmed === true || enriched.__digestOnly === true) {
     return 'skeleton_fallback';
   }
 
