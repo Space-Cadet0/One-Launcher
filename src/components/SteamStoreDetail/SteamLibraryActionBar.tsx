@@ -1,6 +1,7 @@
 import React, { Suspense, useState, useEffect, useRef, useMemo } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { SteamEnrichedMetadata } from '../../contracts/steam';
+import { CriticScoreData } from '../../contracts/critic';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
 import { STOREFRONT_REGISTRY, StorefrontId } from '../../contracts/platform';
 import {
@@ -33,9 +34,8 @@ import {
   Maximize2,
   Minimize2,
 } from 'lucide-react';
-import { getOpenCriticData } from '../../services/critic/criticScoreService';
-import { getTierColor } from '../../services/critic/criticUtils';
-import { steamMatcher } from '../../services/steam/steamMatcher';
+import { getReviewSourceDisplayMeta, getTierColor } from '../../services/critic/criticUtils';
+import { resolveGameReviewScore } from '../../services/critic/reviewScoreResolver';
 import { parseTimestampMs, formatLastPlayedDate, formatPlaytime } from '../../utils/dateUtils';
 import {
   getKnownAchievementTotal,
@@ -90,16 +90,6 @@ interface PlatformAchievementSummary {
   conflictDetails?: string;
 }
 
-function isXboxStoreHost(rawUrl?: string | null): boolean {
-  if (!rawUrl) return false;
-  try {
-    const host = new URL(rawUrl).hostname.toLowerCase();
-    return host === 'xbox.com' || host.endsWith('.xbox.com');
-  } catch {
-    return false;
-  }
-}
-
 function resolvePublisherHandoffLabel(handoffKey?: string | null, explicitName?: string | null): string {
   if (explicitName && explicitName.trim()) return explicitName.trim();
   const norm = String(handoffKey || '').trim().toLowerCase();
@@ -114,6 +104,7 @@ function resolvePublisherHandoffLabel(handoffKey?: string | null, explicitName?:
 interface SteamLibraryActionBarProps {
   game: CanonicalGame;
   metadata?: SteamEnrichedMetadata | null;
+  openCriticData?: CriticScoreData | null;
   collections?: GameCollection[];
   onManageCollections?: () => void;
   onToggleInstallStatus?: (platformId?: StorefrontId) => void;
@@ -128,6 +119,7 @@ interface SteamLibraryActionBarProps {
 export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   game,
   metadata,
+  openCriticData,
   collections,
   onManageCollections,
   onToggleInstallStatus,
@@ -161,6 +153,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   const [isStopPending, setIsStopPending] = useState(false);
   const [isFullscreenTogglePending, setIsFullscreenTogglePending] = useState(false);
   const [collectionStorageTick, setCollectionStorageTick] = useState(0);
+  const [standaloneCriticTick, setStandaloneCriticTick] = useState(0);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [fetchedInstallSize, setFetchedInstallSize] = useState<number | undefined>(undefined);
   const manageMenuRef = useRef<HTMLDivElement | null>(null);
@@ -696,15 +689,40 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
   const isAnyMastered = platformAchievements.some((p) => p.isMastered || p.percentage >= 100);
 
-  // Critic consensus rating
-  const targetSteamId = steamMatcher.getEffectiveSteamAppId(game);
-  const openCritic = getOpenCriticData(
-    targetSteamId || undefined,
-    game.title,
-    game.reviewSummary?.positivePercent,
-    game.releaseDate
-  );
+  const hasControlledCriticData = openCriticData !== undefined;
+
+  useEffect(() => {
+    if (
+      hasControlledCriticData ||
+      typeof window === 'undefined' ||
+      typeof window.addEventListener !== 'function'
+    ) {
+      return undefined;
+    }
+    const handleCriticEvent = () => setStandaloneCriticTick((t) => t + 1);
+    window.addEventListener('antigravity_critic_updated', handleCriticEvent);
+    window.addEventListener('antigravity:user-override-updated', handleCriticEvent);
+    window.addEventListener('antigravity:user-override-removed', handleCriticEvent);
+    return () => {
+      window.removeEventListener('antigravity_critic_updated', handleCriticEvent);
+      window.removeEventListener('antigravity:user-override-updated', handleCriticEvent);
+      window.removeEventListener('antigravity:user-override-removed', handleCriticEvent);
+    };
+  }, [hasControlledCriticData]);
+
+  // Critic consensus rating: prefer reactive prop from SteamStorePage; fall back to unified resolver in standalone renders
+  const openCritic = useMemo<CriticScoreData | null>(() => {
+    if (openCriticData !== undefined) {
+      return openCriticData;
+    }
+    return resolveGameReviewScore(game, {
+      liveMetadata: metadata,
+      liveReviewSummary: metadata?.reviewSummary ?? game.reviewSummary,
+      skipBackgroundTrigger: true,
+    });
+  }, [openCriticData, game, metadata, standaloneCriticTick]);
   const ocColors = openCritic ? getTierColor(openCritic.tier) : null;
+  const ocMeta = openCritic ? getReviewSourceDisplayMeta(openCritic) : null;
 
   const isXboxSubscriptionExpired =
     activePlatform?.platformId === 'xbox' &&
@@ -1566,34 +1584,25 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
           })()}
 
           {/* Critic Score */}
-          {openCritic && ocColors && (
-            <div className="flex flex-col min-w-0 shrink-0">
+          {openCritic && ocColors && ocMeta && (
+            <div
+              role="group"
+              aria-label={ocMeta.ariaLabel}
+              data-critic-source={ocMeta.shortTag}
+              className="flex flex-col min-w-0 shrink-0"
+            >
               <span className="text-[10px] font-semibold uppercase tracking-wider text-[#94a3b8] flex items-center gap-1 whitespace-nowrap">
-                <Award className="w-3 h-3 text-purple-400" />
-                {openCritic.source === 'metacritic'
-                  ? 'Metacritic'
-                  : openCritic.source === 'metacritic_user'
-                  ? 'MC User Score'
-                  : openCritic.source === 'steam'
-                  ? 'Steam Community'
-                  : openCritic.source === 'gog'
-                  ? 'GOG Rating'
-                  : openCritic.source === 'epic'
-                  ? 'Epic Rating'
-                  : String(openCritic.id || '').toLowerCase().startsWith('xbox-') ||
-                    isXboxStoreHost(openCritic.url)
-                  ? 'Xbox Rating'
-                  : 'OpenCritic'}
+                <Award className="w-3 h-3 text-purple-400" aria-hidden="true" />
+                <span>{ocMeta.shortLabel}</span>
+                <span className="text-[9px] font-mono px-1 py-0.2 rounded bg-white/5 border border-white/10 text-[#cbd5e1]">
+                  {ocMeta.shortTag}
+                </span>
               </span>
               <div className="flex items-center gap-1.5 mt-0.5 whitespace-nowrap">
                 <span className={`text-sm font-black ${ocColors.accentText}`}>
-                  {openCritic.source === 'metacritic_user' && openCritic.userScoreRaw !== undefined
+                  {ocMeta.shortTag === 'MCU' && openCritic.userScoreRaw !== undefined
                     ? `${openCritic.userScoreRaw}/10`
-                    : (openCritic.source === 'gog' ||
-                        openCritic.source === 'epic' ||
-                        String(openCritic.id || '').toLowerCase().startsWith('xbox-') ||
-                        isXboxStoreHost(openCritic.url)) &&
-                      openCritic.starRatingRaw !== undefined
+                    : ocMeta.isStoreRating && openCritic.starRatingRaw !== undefined
                     ? `${openCritic.starRatingRaw}★ (${openCritic.score})`
                     : openCritic.score}
                 </span>
@@ -1606,54 +1615,47 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                       value: openCritic.tier,
                     })
                   }
+                  aria-label={`Filter library for ${openCritic.tier} games (${ocMeta.ariaLabel})`}
                   className={`text-[10px] font-bold px-1.5 py-0.2 min-h-6 inline-flex items-center rounded border hover:underline hover:brightness-125 cursor-pointer ${ocColors.badgeBg} ${ocColors.badgeBorder} ${ocColors.badgeText}`}
                   title={`Filter library for ${openCritic.tier} games`}
                 >
                   {openCritic.tier}
                 </button>
-                <a
-                  href={openCritic.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
-                      window.electronAPI.openExternal(openCritic.url);
-                    } else {
-                      window.open(openCritic.url, '_blank', 'noreferrer,noopener');
-                    }
-                  }}
-                  className="inline-flex items-center justify-center min-w-6 min-h-6 text-steam-subtext hover:text-white transition-colors cursor-pointer"
-                  title={
-                    openCritic.source === 'metacritic'
-                      ? `View ${game.title} on Metacritic.com`
-                      : openCritic.source === 'metacritic_user'
-                      ? `View ${game.title} User Reviews on Metacritic.com`
-                      : openCritic.source === 'steam'
-                      ? `View ${game.title} on Steam Store`
-                      : openCritic.source === 'gog'
-                      ? `View ${game.title} on GOG.com`
-                      : openCritic.source === 'epic'
-                      ? `View ${game.title} on Epic Games Store`
-                      : String(openCritic.id || '').toLowerCase().startsWith('xbox-') ||
-                        isXboxStoreHost(openCritic.url)
-                      ? `View ${game.title} on Xbox Store`
-                      : `View ${game.title} on OpenCritic.com`
-                  }
-                >
-                  <ExternalLink className="w-2.5 h-2.5" />
-                </a>
+                {openCritic.url && (
+                  <a
+                    href={openCritic.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+                        window.electronAPI.openExternal(openCritic.url);
+                      } else {
+                        window.open(openCritic.url, '_blank', 'noreferrer,noopener');
+                      }
+                    }}
+                    className="inline-flex items-center justify-center min-w-6 min-h-6 text-steam-subtext hover:text-white transition-colors cursor-pointer"
+                    aria-label={`${ocMeta.externalLinkPrefix} ${game.title}`}
+                    title={`${ocMeta.externalLinkPrefix} ${game.title}`}
+                  >
+                    <ExternalLink className="w-2.5 h-2.5" aria-hidden="true" />
+                  </a>
+                )}
               </div>
               <span className="text-[10px] text-[#94a3b8] mt-0.5 truncate">
                 {openCritic.percentRecommended !== undefined
-                  ? `${openCritic.percentRecommended}% ${openCritic.source === 'steam' ? 'Positive' : 'Recommended'}`
-                  : (openCritic.source === 'gog' ||
-                      openCritic.source === 'epic' ||
-                      String(openCritic.id || '').toLowerCase().startsWith('xbox-') ||
-                      isXboxStoreHost(openCritic.url)) &&
-                    openCritic.starRatingRaw !== undefined
-                  ? `${openCritic.starRatingRaw}/5 Stars (${openCritic.numReviews ? openCritic.numReviews.toLocaleString() : ''} ratings)`
+                  ? `${openCritic.percentRecommended}% ${
+                      ocMeta.shortTag === 'STM' ? 'Positive' : 'Recommended'
+                    }`
+                  : ocMeta.isStoreRating && openCritic.starRatingRaw !== undefined
+                  ? `${openCritic.starRatingRaw}/5 Stars${
+                      openCritic.numReviews
+                        ? ` (${openCritic.numReviews.toLocaleString()} ratings)`
+                        : ''
+                    }`
+                  : ocMeta.shortTag === 'CST'
+                  ? 'Custom Override'
                   : `${openCritic.tier} Consensus`}
               </span>
             </div>

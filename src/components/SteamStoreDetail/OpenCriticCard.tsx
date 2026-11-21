@@ -1,5 +1,6 @@
 import React from 'react';
 import { OpenCriticData, getTierColor } from '../../services/opencritic/openCritic';
+import { getReviewSourceDisplayMeta } from '../../services/critic/criticUtils';
 import { ExternalLink, Award, ThumbsUp, Sparkles, Newspaper, ShieldCheck, HelpCircle } from 'lucide-react';
 
 interface OpenCriticCardProps {
@@ -26,7 +27,7 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <div className="w-7 h-7 rounded flex items-center justify-center font-bold text-xs bg-slate-800 text-slate-400 border border-slate-700">
-              <HelpCircle className="w-4 h-4 text-slate-400" />
+              <HelpCircle className="w-4 h-4 text-slate-400" aria-hidden="true" />
             </div>
             <div>
               <div className="flex items-center gap-2">
@@ -49,71 +50,70 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
             rel="noopener noreferrer"
             onClick={(e) => handleOpenExternal(unratedSearchUrl, e)}
             className="inline-flex items-center gap-1.5 min-h-6 text-xs text-steam-accent hover:text-white hover:underline transition-colors group cursor-pointer"
+            aria-label={`Search reviews for ${gameTitle}`}
             title={`Search reviews for ${gameTitle}`}
           >
             <span>Search Reviews</span>
-            <ExternalLink className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
+            <ExternalLink
+              className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform"
+              aria-hidden="true"
+            />
           </a>
         </div>
       </div>
     );
   }
 
-  const isMetacriticCritic = openCritic.source === 'metacritic';
-  const isMetacriticUser = openCritic.source === 'metacritic_user';
-  const isMetacritic = isMetacriticCritic || isMetacriticUser;
-  const isSteam = openCritic.source === 'steam';
-  const isGog = openCritic.source === 'gog';
-  const isEpic = openCritic.source === 'epic';
+  const meta = getReviewSourceDisplayMeta(openCritic);
+  const isMetacriticCritic = meta.shortTag === 'MC';
+  const isMetacriticUser = meta.shortTag === 'MCU';
+  const isSteam = meta.shortTag === 'STM';
+  const isGog = meta.shortTag === 'GOG';
+  const isEpic = meta.shortTag === 'EGS';
+  const isXbox = meta.shortTag === 'XBX';
+  const isCustom = meta.shortTag === 'CST';
+  const isStoreRating = meta.isStoreRating;
+  const showFiveStarScale = isStoreRating && openCritic.starRatingRaw !== undefined;
+  const showTenPointScale = isMetacriticUser && openCritic.userScoreRaw !== undefined;
+  const primaryScaleSuffix = showFiveStarScale ? '/ 5' : showTenPointScale ? '/ 10' : '/ 100';
   const colors = getTierColor(openCritic.tier);
 
+  const badgeToneClass = isMetacriticCritic
+    ? 'bg-gradient-to-br from-[#ffd500] to-[#cca700] text-black font-extrabold shadow-[0_0_12px_rgba(255,213,0,0.35)]'
+    : isMetacriticUser
+    ? 'bg-gradient-to-br from-[#00ce7a] to-[#009b5a] text-[#121923] font-black shadow-[0_0_12px_rgba(0,206,122,0.35)]'
+    : isSteam
+    ? 'bg-gradient-to-br from-[#1b2838] to-[#2a475e] text-[#66c0f4] font-extrabold border border-[#66c0f4]/50 shadow-[0_0_12px_rgba(102,192,244,0.35)]'
+    : isGog
+    ? 'bg-gradient-to-br from-[#8a2be2] to-[#4b0082] text-white font-extrabold shadow-[0_0_12px_rgba(138,43,226,0.35)]'
+    : isEpic
+    ? 'bg-gradient-to-br from-[#313131] to-[#121212] text-white font-extrabold border border-white/20 shadow-[0_0_12px_rgba(255,255,255,0.2)]'
+    : isXbox
+    ? 'bg-gradient-to-br from-[#107c10] to-[#0b5a0b] text-white font-extrabold border border-[#52d652]/40 shadow-[0_0_12px_rgba(16,124,16,0.35)]'
+    : isCustom
+    ? 'bg-gradient-to-br from-[#334155] to-[#1e293b] text-sky-200 font-extrabold border border-sky-400/40 shadow-[0_0_12px_rgba(56,189,248,0.25)]'
+    : `${colors.scoreBg} ${colors.glow} text-white`;
+
   return (
-    <div className="bg-[#121923] border border-[#2a475e] rounded p-4 shadow-lg text-steam-text select-none">
+    <div
+      data-critic-source={meta.shortTag}
+      className="bg-[#121923] border border-[#2a475e] rounded p-4 shadow-lg text-steam-text select-none"
+    >
       {/* Header Bar */}
       <div className="flex items-center justify-between pb-3 mb-3 border-b border-[#2a475e]/60">
         <div className="flex items-center gap-2.5">
           {/* Logo / Badge Icon */}
           <div
-            className={`w-7 h-7 rounded flex items-center justify-center font-black text-xs ${
-              isMetacriticCritic
-                ? 'bg-gradient-to-br from-[#ffd500] to-[#cca700] text-black font-extrabold shadow-[0_0_12px_rgba(255,213,0,0.35)]'
-                : isMetacriticUser
-                ? 'bg-gradient-to-br from-[#00ce7a] to-[#009b5a] text-[#121923] font-black shadow-[0_0_12px_rgba(0,206,122,0.35)]'
-                : isSteam
-                ? 'bg-gradient-to-br from-[#1b2838] to-[#2a475e] text-[#66c0f4] font-extrabold border border-[#66c0f4]/50 shadow-[0_0_12px_rgba(102,192,244,0.35)] text-white'
-                : isGog
-                ? 'bg-gradient-to-br from-[#8a2be2] to-[#4b0082] text-white font-extrabold shadow-[0_0_12px_rgba(138,43,226,0.35)]'
-                : isEpic
-                ? 'bg-gradient-to-br from-[#313131] to-[#121212] text-white font-extrabold border border-white/20 shadow-[0_0_12px_rgba(255,255,255,0.2)]'
-                : `${colors.scoreBg} ${colors.glow} text-white`
-            }`}
+            role="img"
+            aria-label={meta.ariaLabel}
+            className={`w-7 h-7 rounded flex items-center justify-center font-black text-xs ${badgeToneClass}`}
           >
-            {isMetacriticCritic
-              ? 'MC'
-              : isMetacriticUser
-              ? 'MCU'
-              : isSteam
-              ? 'STM'
-              : isGog
-              ? 'GOG'
-              : isEpic
-              ? 'EGS'
-              : 'OC'}
+            {meta.shortTag}
           </div>
           <div>
             <div className="flex items-center gap-2">
               <span className="text-xs font-bold uppercase tracking-wider text-white">
-                {isMetacriticCritic
-                  ? 'Metacritic Reviews'
-                  : isMetacriticUser
-                  ? 'Metacritic User Score'
-                  : isSteam
-                  ? 'Steam Community Score'
-                  : isGog
-                  ? 'GOG Player Rating'
-                  : isEpic
-                  ? 'Epic Store Rating'
-                  : 'OpenCritic Reviews'}
+                {meta.cardHeading}
               </span>
               <span
                 className={`text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded border ${colors.badgeBg} ${colors.badgeBorder} ${colors.badgeText}`}
@@ -125,9 +125,14 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
                   User Score
                 </span>
               )}
-              {(isGog || isEpic) && (
+              {isStoreRating && (
                 <span className="text-[9px] uppercase font-semibold px-1.5 py-0.5 rounded bg-purple-950/70 border border-purple-500/40 text-purple-300">
                   Store Rating
+                </span>
+              )}
+              {isCustom && (
+                <span className="text-[9px] uppercase font-semibold px-1.5 py-0.5 rounded bg-sky-950/70 border border-sky-500/40 text-sky-300">
+                  Custom Override
                 </span>
               )}
               {openCritic.isSynthetic && (
@@ -147,46 +152,32 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
                 ? 'Aggregated player ratings from GOG player community (converted out of 100)'
                 : isEpic
                 ? 'Aggregated player ratings from Epic Games Store (converted out of 100)'
+                : isXbox
+                ? 'Aggregated player ratings from Xbox Store community (converted out of 100)'
+                : isCustom
+                ? 'Manually assigned custom review score override'
                 : 'Aggregated critical consensus from top industry publications'}
             </div>
           </div>
         </div>
 
-        <a
-          href={openCritic.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e) => handleOpenExternal(openCritic.url, e)}
-          className="inline-flex items-center gap-1.5 min-h-6 text-xs text-steam-accent hover:text-white hover:underline transition-colors group cursor-pointer"
-          title={
-            isMetacriticCritic
-              ? `View full ${gameTitle} Metascore breakdown on Metacritic`
-              : isMetacriticUser
-              ? `View full ${gameTitle} user reviews on Metacritic`
-              : isSteam
-              ? `View ${gameTitle} on Steam Store`
-              : isGog
-              ? `View ${gameTitle} on GOG.com`
-              : isEpic
-              ? `View ${gameTitle} on Epic Games Store`
-              : `View full ${gameTitle} breakdown on OpenCritic`
-          }
-        >
-          <span>
-            {isMetacriticCritic
-              ? 'View on Metacritic'
-              : isMetacriticUser
-              ? 'View Metacritic User Reviews'
-              : isSteam
-              ? 'View on Steam Store'
-              : isGog
-              ? 'View on GOG'
-              : isEpic
-              ? 'View on Epic Store'
-              : 'View on OpenCritic'}
-          </span>
-          <ExternalLink className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
-        </a>
+        {openCritic.url && (
+          <a
+            href={openCritic.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => handleOpenExternal(openCritic.url, e)}
+            className="inline-flex items-center gap-1.5 min-h-6 text-xs text-steam-accent hover:text-white hover:underline transition-colors group cursor-pointer"
+            aria-label={`${meta.externalLinkPrefix} ${gameTitle}`}
+            title={`${meta.externalLinkPrefix} ${gameTitle}`}
+          >
+            <span>{meta.actionLabel}</span>
+            <ExternalLink
+              className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform"
+              aria-hidden="true"
+            />
+          </a>
+        )}
       </div>
 
       {/* 4 Metrics Pillars Grid */}
@@ -195,10 +186,10 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
         <div className="bg-[#182330] p-3 rounded border border-[#25394b] flex flex-col justify-between group hover:border-[#3d6385] transition-colors relative overflow-hidden">
           <div className="flex items-center justify-between text-[11px] text-steam-subtext mb-1">
             <span className="font-semibold uppercase tracking-wider flex items-center gap-1 text-sky-400">
-              <Award className="w-3.5 h-3.5 text-sky-400" />
+              <Award className="w-3.5 h-3.5 text-sky-400" aria-hidden="true" />
               {isGog
                 ? 'Star Rating'
-                : isEpic
+                : isEpic || isXbox
                 ? 'Store Rating'
                 : isMetacriticCritic
                 ? 'Metascore'
@@ -206,30 +197,26 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
                 ? 'User Score'
                 : isSteam
                 ? 'Community Score'
+                : isCustom
+                ? 'Custom Score'
                 : 'Top Critic Avg'}
             </span>
-            <span className="text-[10px] text-steam-subtext/70">
-              {isGog || isEpic ? '/ 5' : isMetacriticUser ? '/ 10' : '/ 100'}
-            </span>
+            <span className="text-[10px] text-steam-subtext/70">{primaryScaleSuffix}</span>
           </div>
           <div className="flex items-baseline gap-1 my-1">
             <span className={`text-2xl font-black tracking-tight ${colors.accentText}`}>
-              {(isGog || isEpic) && openCritic.starRatingRaw !== undefined
+              {showFiveStarScale
                 ? `${openCritic.starRatingRaw} ★`
-                : isMetacriticUser && openCritic.userScoreRaw !== undefined
+                : showTenPointScale
                 ? openCritic.userScoreRaw
                 : openCritic.score}
             </span>
-            <span className="text-xs text-steam-subtext font-medium">
-              {isGog || isEpic ? '/ 5' : isMetacriticUser ? '/ 10' : '/ 100'}
-            </span>
+            <span className="text-xs text-steam-subtext font-medium">{primaryScaleSuffix}</span>
           </div>
           <div className="text-[10px] text-steam-subtext mt-1 flex items-center gap-1">
-            <ShieldCheck className="w-3 h-3 text-emerald-400" />
+            <ShieldCheck className="w-3 h-3 text-emerald-400" aria-hidden="true" />
             <span>
-              {isGog
-                ? `${openCritic.score}/100 Equivalent`
-                : isEpic
+              {isStoreRating
                 ? `${openCritic.score}/100 Equivalent`
                 : isMetacriticCritic
                 ? 'Metacritic Metascore'
@@ -237,6 +224,8 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
                 ? 'Metacritic User Rating'
                 : isSteam
                 ? 'Synthetic Steam Rating'
+                : isCustom
+                ? 'Manual Score Override'
                 : 'Top Critic Average'}
             </span>
           </div>
@@ -246,8 +235,8 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
         <div className="bg-[#182330] p-3 rounded border border-[#25394b] flex flex-col justify-between group hover:border-[#3d6385] transition-colors">
           <div className="flex items-center justify-between text-[11px] text-steam-subtext mb-1">
             <span className="font-semibold uppercase tracking-wider flex items-center gap-1 text-emerald-400">
-              <ThumbsUp className="w-3.5 h-3.5 text-emerald-400" />
-              {isGog || isEpic
+              <ThumbsUp className="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
+              {isStoreRating
                 ? 'Score (0-100)'
                 : openCritic.percentRecommended !== undefined
                 ? isSteam
@@ -256,7 +245,7 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
                 : 'Consensus'}
             </span>
             <span className="text-[10px] text-steam-subtext/70">
-              {isGog || isEpic
+              {isStoreRating
                 ? 'Score'
                 : openCritic.percentRecommended !== undefined
                 ? 'Ratio'
@@ -265,7 +254,7 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
           </div>
           <div className="flex items-baseline gap-1 my-1">
             <span className="text-2xl font-black text-emerald-400 tracking-tight">
-              {isGog || isEpic
+              {isStoreRating
                 ? `${openCritic.score}/100`
                 : openCritic.percentRecommended !== undefined
                 ? `${openCritic.percentRecommended}%`
@@ -273,7 +262,7 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
             </span>
           </div>
           <div className="text-[10px] text-steam-subtext mt-1">
-            {isGog || isEpic
+            {isStoreRating
               ? 'Converted 5-Star Rating'
               : openCritic.percentRecommended !== undefined
               ? isSteam
@@ -281,6 +270,8 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
                 : 'Critics Recommended'
               : isMetacriticUser
               ? 'Player Sentiment Tier'
+              : isCustom
+              ? 'Custom Rating Tier'
               : 'Critical Acclaim'}
           </div>
         </div>
@@ -289,7 +280,7 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
         <div className="bg-[#182330] p-3 rounded border border-[#25394b] flex flex-col justify-between group hover:border-[#3d6385] transition-colors">
           <div className="flex items-center justify-between text-[11px] text-steam-subtext mb-1">
             <span className={`font-semibold uppercase tracking-wider flex items-center gap-1 ${colors.accentText}`}>
-              <Sparkles className="w-3.5 h-3.5" />
+              <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
               Tier Rating
             </span>
           </div>
@@ -309,7 +300,13 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
               ? 'GOG Player Tier'
               : isEpic
               ? 'Epic Player Tier'
-              : `${isMetacritic ? 'Metacritic' : 'OpenCritic'} Rating`}
+              : isXbox
+              ? 'Xbox Store Tier'
+              : isCustom
+              ? 'Custom Score Tier'
+              : isMetacriticCritic
+              ? 'Metacritic Rating'
+              : 'OpenCritic Rating'}
           </div>
         </div>
 
@@ -317,15 +314,19 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
         <div className="bg-[#182330] p-3 rounded border border-[#25394b] flex flex-col justify-between group hover:border-[#3d6385] transition-colors">
           <div className="flex items-center justify-between text-[11px] text-steam-subtext mb-1">
             <span className="font-semibold uppercase tracking-wider flex items-center gap-1 text-amber-400">
-              <Newspaper className="w-3.5 h-3.5 text-amber-400" />
+              <Newspaper className="w-3.5 h-3.5 text-amber-400" aria-hidden="true" />
               {isSteam
                 ? 'Steam Players'
                 : isGog
                 ? 'GOG Players'
                 : isEpic
                 ? 'Epic Players'
+                : isXbox
+                ? 'Xbox Players'
                 : isMetacriticUser
                 ? 'User Reviews'
+                : isCustom
+                ? 'Custom Source'
                 : 'Publications'}
             </span>
           </div>
@@ -344,8 +345,12 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
               ? 'GOG Player Ratings'
               : isEpic
               ? 'Epic Store Ratings'
+              : isXbox
+              ? 'Xbox Store Ratings'
               : isMetacriticUser
               ? 'Metacritic Users'
+              : isCustom
+              ? 'User-Specified Rating'
               : 'Aggregated Reviews'}
           </div>
         </div>
