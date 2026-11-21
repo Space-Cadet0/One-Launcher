@@ -6,11 +6,8 @@ import type {
   SavedStoreTokensMap,
   StorefrontTokenSummary,
 } from '../../types/electron';
-
-export type XboxStatusSnapshot = Partial<
-  NonNullable<Awaited<ReturnType<NonNullable<ElectronAPI['getXboxStatus']>>>>
->;
 import {
+  getSuppressedCatalogEntries,
   registerSuppressedCatalogEntries,
   type SuppressedCatalogEntry,
 } from './catalogSanitizer';
@@ -24,6 +21,10 @@ import {
   saveXboxProfileState,
   type XboxCachedProfileState,
 } from './integrationStorage';
+
+export type XboxStatusSnapshot = Partial<
+  NonNullable<Awaited<ReturnType<NonNullable<ElectronAPI['getXboxStatus']>>>>
+>;
 
 export type ExtendedSavedStoreTokenSummary = StorefrontTokenSummary & {
   uhs?: string;
@@ -71,13 +72,10 @@ export function sanitizePublicCredentials(
   return next;
 }
 
-/**
- * Loads integrations from storage and scrubs any legacy secret tokens/keys if present.
- */
-export function scrubPersistedIntegrationSecrets(
-  sourceIntegrations?: StorefrontIntegration[]
-): StorefrontIntegration[] {
-  const loaded = sourceIntegrations ?? loadIntegrations();
+function scrubIntegrationListSecrets(loaded: StorefrontIntegration[]): {
+  cleaned: StorefrontIntegration[];
+  mutated: boolean;
+} {
   let mutated = false;
   const cleaned = loaded.map((integ) => {
     const raw = integ.credentials;
@@ -97,6 +95,40 @@ export function scrubPersistedIntegrationSecrets(
     }
     return integ;
   });
+  return { cleaned, mutated };
+}
+
+function areXboxProfilesEqual(
+  prev: XboxCachedProfileState | null,
+  next: XboxCachedProfileState
+): boolean {
+  if (!prev) return false;
+  if (
+    prev.connected !== next.connected ||
+    prev.gamertag !== next.gamertag ||
+    prev.modernGamertag !== next.modernGamertag ||
+    prev.xuid !== next.xuid ||
+    prev.avatarUrl !== next.avatarUrl ||
+    prev.gamerscore !== next.gamerscore ||
+    prev.syncMode !== next.syncMode ||
+    prev.hasDeviceContext !== next.hasDeviceContext ||
+    prev.lastSyncedAt !== next.lastSyncedAt
+  ) {
+    return false;
+  }
+  if (prev.subscription === next.subscription) return true;
+  if (!prev.subscription || !next.subscription) return false;
+  return JSON.stringify(prev.subscription) === JSON.stringify(next.subscription);
+}
+
+/**
+ * Loads integrations from storage and scrubs any legacy secret tokens/keys if present.
+ */
+export function scrubPersistedIntegrationSecrets(
+  sourceIntegrations?: StorefrontIntegration[]
+): StorefrontIntegration[] {
+  const loaded = sourceIntegrations ?? loadIntegrations();
+  const { cleaned, mutated } = scrubIntegrationListSecrets(loaded);
   if (mutated && !sourceIntegrations) {
     saveIntegrations(cleaned);
   }
@@ -111,10 +143,14 @@ export function scrubPersistedIntegrationSecrets(
 export function reconcileNativeStorefrontAuthSessions(
   options: ReconcileStorefrontAuthOptions
 ): ReconcileStorefrontAuthResult {
+  const shouldPersist = options.persistIfChanged !== false;
   const savedTokens = options.savedTokens ?? null;
   const xboxStatus = options.xboxStatus ?? null;
-  let updatedIntegrations = scrubPersistedIntegrationSecrets(options.initialIntegrations);
-  let integrationsChanged = false;
+  const sourceIntegrations = options.initialIntegrations ?? loadIntegrations();
+  const { cleaned: scrubbedIntegrations, mutated: secretsScrubbed } =
+    scrubIntegrationListSecrets(sourceIntegrations);
+  let updatedIntegrations = scrubbedIntegrations;
+  let integrationsChanged = secretsScrubbed;
   let resolvedXboxProfile: XboxCachedProfileState | null = loadXboxProfileState();
 
   const getCatalog = (() => {
@@ -140,12 +176,14 @@ export function reconcileNativeStorefrontAuthSessions(
       steamSaved.steamId || steamInteg?.credentials?.steamId || steamInteg?.accountId;
     const accountName =
       steamSaved.accountName || steamInteg?.accountName || 'Steam User';
+    const resolvedSteamAvatar = steamSaved.avatarUrl || steamInteg?.avatarUrl;
     if (
       !steamInteg ||
       !steamInteg.isConnected ||
       !steamInteg.credentials?.steamId ||
       (steamId && steamInteg.credentials.steamId !== steamId) ||
-      steamInteg.accountName !== accountName
+      steamInteg.accountName !== accountName ||
+      (resolvedSteamAvatar && steamInteg.avatarUrl !== resolvedSteamAvatar)
     ) {
       const count =
         (Array.isArray(steamSaved.games) && steamSaved.games.length) ||
@@ -158,7 +196,7 @@ export function reconcileNativeStorefrontAuthSessions(
               isConnected: true,
               accountName,
               accountId: steamId,
-              avatarUrl: steamSaved.avatarUrl || i.avatarUrl,
+              avatarUrl: resolvedSteamAvatar || i.avatarUrl,
               gamesCount: count,
               lastSyncedAt: steamSaved.updatedAt || new Date().toISOString(),
               authMethod: 'oauth' as const,
@@ -352,11 +390,19 @@ export function reconcileNativeStorefrontAuthSessions(
         xboxInteg?.lastSyncedAt ||
         new Date().toISOString(),
     };
-    saveXboxProfileState(nextProfile);
     resolvedXboxProfile = nextProfile;
 
-    if (options.dispatchXboxProfileEvent && typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('ol:xbox-profile-updated'));
+    if (shouldPersist) {
+      if (!areXboxProfilesEqual(cachedProfile, nextProfile)) {
+        saveXboxProfileState(nextProfile);
+      } else if (
+        options.dispatchXboxProfileEvent &&
+        typeof window !== 'undefined' &&
+        typeof window.dispatchEvent === 'function' &&
+        typeof CustomEvent === 'function'
+      ) {
+        window.dispatchEvent(new CustomEvent('ol:xbox-profile-updated'));
+      }
     }
 
     const count =
@@ -403,20 +449,27 @@ export function reconcileNativeStorefrontAuthSessions(
     }
   }
 
-  if (Array.isArray(savedTokens?.suppressedItems)) {
+  let suppressedChanged = false;
+  if (
+    shouldPersist &&
+    Array.isArray(savedTokens?.suppressedItems) &&
+    savedTokens.suppressedItems.length > 0
+  ) {
+    const beforeSuppressed = getSuppressedCatalogEntries();
     registerSuppressedCatalogEntries(savedTokens.suppressedItems);
-    if (savedTokens.suppressedItems.length > 0) {
-      integrationsChanged = true;
+    const afterSuppressed = getSuppressedCatalogEntries();
+    if (afterSuppressed !== beforeSuppressed) {
+      suppressedChanged = true;
     }
   }
 
-  if (integrationsChanged && options.persistIfChanged !== false) {
+  if (integrationsChanged && shouldPersist) {
     saveIntegrations(updatedIntegrations);
   }
 
   return {
     integrations: updatedIntegrations,
-    changed: integrationsChanged,
+    changed: integrationsChanged || suppressedChanged,
     xboxProfile: resolvedXboxProfile,
   };
 }

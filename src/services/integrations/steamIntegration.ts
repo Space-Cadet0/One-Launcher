@@ -1,8 +1,12 @@
 import axios from 'axios';
 import { CanonicalGame } from '../../contracts/game';
 import { StorefrontCredentials } from '../../contracts/integration';
-import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
 import { steamAchievementsService } from '../steam/steamAchievementsService';
+import { getAlphabeticalTitleSortKey } from '../common/titleSortUtils';
+import { getDevProxyBaseForRoute } from '../network/browserDevProxy';
+
+const DEFAULT_STEAM_AVATAR_URL =
+  'https://avatars.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg';
 
 export interface SteamPlayerProfile {
   steamId: string;
@@ -12,19 +16,90 @@ export interface SteamPlayerProfile {
   gamesCount: number;
 }
 
+interface SteamResolveVanityResponse {
+  response?: {
+    success?: number;
+    steamid?: string;
+  };
+}
+
+interface SteamPlayerSummaryItem {
+  personaname?: string;
+  avatarfull?: string;
+  avatarmedium?: string;
+}
+
+interface SteamPlayerSummariesResponse {
+  response?: {
+    players?: SteamPlayerSummaryItem[];
+  };
+}
+
+interface SteamOwnedGameItem {
+  appid: number;
+  name?: string;
+  playtime_forever?: number;
+  rtime_last_played?: number;
+}
+
+interface SteamOwnedGamesResponse {
+  response?: {
+    games?: SteamOwnedGameItem[];
+  };
+}
+
+interface AxiosErrorLike {
+  message?: string;
+  code?: string;
+  response?: {
+    status?: number;
+  };
+}
+
+function redactSteamSecrets(input: string): string {
+  return input.replace(/([?&]key=)[^&\s"']+/gi, '$1[REDACTED]');
+}
+
+function formatSanitizedSteamError(err: unknown): string {
+  if (err && typeof err === 'object') {
+    const axErr = err as AxiosErrorLike;
+    const parts: string[] = [];
+    if (typeof axErr.response?.status === 'number') {
+      parts.push(`HTTP ${axErr.response.status}`);
+    }
+    if (typeof axErr.code === 'string' && axErr.code.trim()) {
+      parts.push(axErr.code.trim());
+    }
+    if (typeof axErr.message === 'string' && axErr.message.trim()) {
+      parts.push(redactSteamSecrets(axErr.message.trim()));
+    }
+    if (parts.length > 0) {
+      return parts.join(' - ');
+    }
+  }
+  if (typeof err === 'string' && err.trim()) {
+    return redactSteamSecrets(err.trim());
+  }
+  return 'Steam API request failed';
+}
+
+function formatSteamLastPlayedIso(rawLastPlayed: unknown): string | undefined {
+  const numeric = typeof rawLastPlayed === 'number' ? rawLastPlayed : Number(rawLastPlayed);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return undefined;
+  }
+  const epochMs = numeric < 1e12 ? numeric * 1000 : numeric;
+  const dt = new Date(epochMs);
+  return Number.isNaN(dt.getTime()) ? undefined : dt.toISOString();
+}
+
 export class SteamIntegrationService {
   private getApiBaseUrl(): string {
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      return '/api/steam-api';
-    }
-    return 'https://api.steampowered.com';
+    return getDevProxyBaseForRoute('steamApi');
   }
 
   private getCommunityBaseUrl(): string {
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      return '/api/steam-community';
-    }
-    return 'https://steamcommunity.com';
+    return getDevProxyBaseForRoute('steamCommunity');
   }
 
   /**
@@ -66,24 +141,28 @@ export class SteamIntegrationService {
     // If API key is provided, use official Steam API
     if (apiKey) {
       try {
-        const url = `${this.getApiBaseUrl()}/ISteamUser/ResolveVanityURL/v0001/?key=${apiKey}&vanityurl=${encodeURIComponent(vanityName)}`;
-        const res = await axios.get(url, { timeout: 6000 });
+        const url = `${this.getApiBaseUrl()}/ISteamUser/ResolveVanityURL/v0001/?key=${encodeURIComponent(apiKey)}&vanityurl=${encodeURIComponent(vanityName)}`;
+        const res = await axios.get<SteamResolveVanityResponse>(url, { timeout: 6000 });
         if (res.data?.response?.success === 1 && res.data.response.steamid) {
           return res.data.response.steamid;
         }
-      } catch (err) {
-        console.warn('Failed to resolve vanity URL via Web API:', err);
+      } catch (err: unknown) {
+        console.warn('Failed to resolve vanity URL via Web API:', formatSanitizedSteamError(err));
       }
     }
 
     // Fallback: check community XML
     try {
       const url = `${this.getCommunityBaseUrl()}/id/${encodeURIComponent(vanityName)}/?xml=1`;
-      const res = await axios.get(url, { timeout: 6000, responseType: 'text' });
-      const match = res.data.match(/<steamID64>(\d{17})<\/steamID64>/);
+      const res = await axios.get<string>(url, { timeout: 6000, responseType: 'text' });
+      const xml = typeof res.data === 'string' ? res.data : '';
+      const match = xml.match(/<steamID64>(\d{17})<\/steamID64>/);
       if (match) return match[1];
-    } catch {
-      // Fallback
+    } catch (err: unknown) {
+      console.warn(
+        'Failed to resolve vanity URL via Steam Community XML:',
+        formatSanitizedSteamError(err)
+      );
     }
 
     return null;
@@ -94,28 +173,32 @@ export class SteamIntegrationService {
    */
   async fetchPlayerProfile(steamId: string, apiKey?: string): Promise<SteamPlayerProfile> {
     let personaName = 'Steam User';
-    let avatarUrl = 'https://avatars.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg';
-    const profileUrl = `https://steamcommunity.com/profiles/${steamId}`;
+    let avatarUrl = DEFAULT_STEAM_AVATAR_URL;
+    const encodedSteamId = encodeURIComponent(steamId);
+    const profileUrl = `https://steamcommunity.com/profiles/${encodedSteamId}`;
 
     if (apiKey) {
       try {
-        const url = `${this.getApiBaseUrl()}/ISteamUser/GetPlayerSummaries/v0002/?key=${apiKey}&steamids=${steamId}`;
-        const res = await axios.get(url, { timeout: 6000 });
+        const url = `${this.getApiBaseUrl()}/ISteamUser/GetPlayerSummaries/v0002/?key=${encodeURIComponent(apiKey)}&steamids=${encodedSteamId}`;
+        const res = await axios.get<SteamPlayerSummariesResponse>(url, { timeout: 6000 });
         const player = res.data?.response?.players?.[0];
         if (player) {
           personaName = player.personaname || personaName;
           avatarUrl = player.avatarfull || player.avatarmedium || avatarUrl;
         }
-      } catch (err) {
-        console.warn('Failed to fetch player summaries from Steam API:', err);
+      } catch (err: unknown) {
+        console.warn(
+          'Failed to fetch player summaries from Steam API:',
+          formatSanitizedSteamError(err)
+        );
       }
     }
 
     if (personaName === 'Steam User') {
       try {
         const isNumeric = /^\d{17}$/.test(steamId);
-        const pathSeg = isNumeric ? `profiles/${steamId}` : `id/${encodeURIComponent(steamId)}`;
-        const xmlRes = await axios.get(`${this.getCommunityBaseUrl()}/${pathSeg}/?xml=1`, {
+        const pathSeg = isNumeric ? `profiles/${encodedSteamId}` : `id/${encodedSteamId}`;
+        const xmlRes = await axios.get<string>(`${this.getCommunityBaseUrl()}/${pathSeg}/?xml=1`, {
           timeout: 6000,
           responseType: 'text',
         });
@@ -124,7 +207,12 @@ export class SteamIntegrationService {
         const avatarMatch = xml.match(/<avatarFull><!\[CDATA\[([\s\S]*?)\]\]><\/avatarFull>/i);
         if (nameMatch?.[1]) personaName = nameMatch[1].trim();
         if (avatarMatch?.[1]) avatarUrl = avatarMatch[1].trim();
-      } catch {}
+      } catch (err: unknown) {
+        console.warn(
+          'Failed to fetch Steam Community XML profile summary:',
+          formatSanitizedSteamError(err)
+        );
+      }
     }
 
     return {
@@ -144,7 +232,9 @@ export class SteamIntegrationService {
   ): Promise<{ profile: SteamPlayerProfile; games: CanonicalGame[] }> {
     const { steamId, apiKey } = credentials;
     if (!steamId) {
-      throw new Error('Steam ID is required to connect to Steam. Click "Sign In with Steam" or enter your SteamID64.');
+      throw new Error(
+        'Steam ID is required to connect to Steam. Click "Sign In with Steam" or enter your SteamID64.'
+      );
     }
 
     const profile = await this.fetchPlayerProfile(steamId, apiKey);
@@ -153,8 +243,8 @@ export class SteamIntegrationService {
     // Attempt 1: If API key provided, use IPlayerService/GetOwnedGames
     if (apiKey) {
       try {
-        const url = `${this.getApiBaseUrl()}/IPlayerService/GetOwnedGames/v0001/?key=${apiKey}&steamid=${steamId}&include_appinfo=1&include_played_free_games=0&format=json`;
-        const res = await axios.get(url, { timeout: 10000 });
+        const url = `${this.getApiBaseUrl()}/IPlayerService/GetOwnedGames/v0001/?key=${encodeURIComponent(apiKey)}&steamid=${encodeURIComponent(steamId)}&include_appinfo=1&include_played_free_games=1&format=json`;
+        const res = await axios.get<SteamOwnedGamesResponse>(url, { timeout: 10000 });
         const owned = res.data?.response?.games;
 
         if (Array.isArray(owned) && owned.length > 0) {
@@ -162,14 +252,14 @@ export class SteamIntegrationService {
 
           for (const item of owned) {
             const appId = item.appid;
-            const title = item.name || `App ${appId}`;
+            const title = (item.name || `App ${appId}`).trim();
             const playtimeMins = item.playtime_forever || 0;
-            const lastPlayed = item.rtime_last_played ? String(item.rtime_last_played) : undefined;
+            const lastPlayed = formatSteamLastPlayedIso(item.rtime_last_played);
 
             games.push({
               id: `steam-${appId}`,
               title,
-              sortTitle: title,
+              sortTitle: getAlphabeticalTitleSortKey(title, true),
               steamAppId: appId,
               isVerifiedEntitlement: true,
               platforms: [
@@ -193,16 +283,12 @@ export class SteamIntegrationService {
           }
         }
       } catch (err: unknown) {
-        const errMsg = err instanceof Error ? err.message : err;
-        console.warn('Steam GetOwnedGames API call failed:', errMsg);
+        console.warn('Steam GetOwnedGames API call failed:', formatSanitizedSteamError(err));
       }
     }
 
     // Determine final games list
     let finalGames = games;
-    if (finalGames.length === 0 && FULL_USER_STEAM_GAMES.length > 0) {
-      finalGames = FULL_USER_STEAM_GAMES;
-    }
 
     if (finalGames.length === 0) {
       throw new Error(
@@ -225,8 +311,8 @@ export class SteamIntegrationService {
           return { ...g, platforms: updatedPlatforms };
         });
       }
-    } catch (e) {
-      console.warn('Steam live achievements sync warning:', e);
+    } catch (err: unknown) {
+      console.warn('Steam live achievements sync warning:', formatSanitizedSteamError(err));
     }
 
     return { profile, games: finalGames };
