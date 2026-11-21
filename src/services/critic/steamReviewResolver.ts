@@ -2,6 +2,7 @@ import { CriticScoreData } from '../../contracts/critic';
 import { classifyNetworkError, isWafOrChallengeResponse } from '../../contracts/network';
 import { calculateSyntheticSteamScore } from './criticUtils';
 import { steamMatcher } from '../steam/steamMatcher';
+import { LruMap, LruSet } from '../common/lruMap';
 import {
   isIntermediateNumeralSubtitleMatch,
   isSequelMismatch,
@@ -10,21 +11,10 @@ import {
   stripIntermediateSubtitleNumeral,
   stripPackagingEditionPhrases,
 } from '../common/titleUtils';
+import { isViteBrowserDev } from '../network/browserDevProxy';
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
-
-function isViteBrowserDev(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    typeof window.location !== 'undefined' &&
-    window.location.protocol?.startsWith('http') &&
-    (window.location.port === '3000' || window.location.port === '5173') &&
-    typeof navigator !== 'undefined' &&
-    !navigator.userAgent?.includes('jsdom') &&
-    !navigator.userAgent?.includes('Node')
-  );
-}
 
 const MAX_STEAM_REVIEW_CACHE_ENTRIES = 2000;
 const NEGATIVE_STEAM_REVIEW_TTL_MS = 15 * 60 * 1000; // 15 min bounded TTL for genuine misses
@@ -61,6 +51,7 @@ interface EnrichedSteamReviewRecord {
 }
 
 const STEAM_ENRICHED_REVIEWS_MAP: Record<string, EnrichedSteamReviewRecord> = steamEnrichedCache;
+const HAS_STEAM_ENRICHED_REVIEWS = Object.keys(STEAM_ENRICHED_REVIEWS_MAP).length > 0;
 
 function extractSteamReviewsFromHtml(html: string): { positivePercent: number; totalReviews: number } | null {
   if (typeof DOMParser !== 'undefined') {
@@ -107,8 +98,11 @@ function extractSteamReviewsFromHtml(html: string): { positivePercent: number; t
 }
 
 export class SteamReviewResolver {
-  private cache = new Map<string, SteamReviewCacheEntry>();
-  private transientErrorKeys = new Set<string>();
+  private cache = new LruMap<string, SteamReviewCacheEntry>(MAX_STEAM_REVIEW_CACHE_ENTRIES);
+  private transientErrorKeys = new LruSet<string>(MAX_STEAM_REVIEW_CACHE_ENTRIES);
+  private inFlight = new Map<string, Promise<CriticScoreData | null>>();
+  private cacheEpoch = 0;
+  private keyEpochs = new Map<string, number>();
 
   constructor() {
     try {
@@ -118,15 +112,45 @@ export class SteamReviewResolver {
     } catch {}
   }
 
-  private setCacheBounded(key: string, val: CriticScoreData | null): void {
-    if (this.cache.has(key)) {
-      this.cache.delete(key);
+  private isEpochCurrent(
+    capturedEpoch: number,
+    key: string,
+    capturedKeyEpoch: number
+  ): boolean {
+    return (
+      capturedEpoch === this.cacheEpoch &&
+      (this.keyEpochs.get(key) ?? 0) === capturedKeyEpoch
+    );
+  }
+
+  private setCacheBounded(
+    key: string,
+    val: CriticScoreData | null,
+    capturedEpoch?: number,
+    capturedKeyEpoch?: number
+  ): void {
+    if (
+      capturedEpoch !== undefined &&
+      capturedKeyEpoch !== undefined &&
+      !this.isEpochCurrent(capturedEpoch, key, capturedKeyEpoch)
+    ) {
+      return;
     }
     this.cache.set(key, { data: val, cachedAt: Date.now() });
-    while (this.cache.size > MAX_STEAM_REVIEW_CACHE_ENTRIES) {
-      const oldest = this.cache.keys().next().value;
-      if (oldest === undefined) break;
-      this.cache.delete(oldest);
+  }
+
+  private cachePositiveResult(
+    cacheKey: string,
+    targetAppId: number,
+    result: CriticScoreData,
+    capturedEpoch: number,
+    capturedKeyEpoch: number
+  ): void {
+    this.setCacheBounded(cacheKey, result, capturedEpoch, capturedKeyEpoch);
+    const idKey = `id:${targetAppId}`;
+    if (idKey !== cacheKey && capturedEpoch === this.cacheEpoch) {
+      this.cache.set(idKey, { data: result, cachedAt: Date.now() });
+      this.transientErrorKeys.delete(idKey);
     }
   }
 
@@ -146,8 +170,8 @@ export class SteamReviewResolver {
     if (!title && !steamAppId) return null;
 
     const cacheKey = steamAppId ? `id:${steamAppId}` : `title:${title.toLowerCase()}`;
-    if (this.cache.has(cacheKey)) {
-      const cachedEntry = this.cache.get(cacheKey)!;
+    const cachedEntry = this.cache.get(cacheKey);
+    if (cachedEntry !== undefined) {
       if (cachedEntry.data !== null) {
         return cachedEntry.data;
       }
@@ -155,6 +179,11 @@ export class SteamReviewResolver {
         return null;
       }
       this.cache.delete(cacheKey);
+    }
+
+    const existingInFlight = this.inFlight.get(cacheKey);
+    if (existingInFlight) {
+      return existingInFlight;
     }
 
     this.transientErrorKeys.delete(cacheKey);
@@ -165,7 +194,7 @@ export class SteamReviewResolver {
     }
 
     // Check local enriched cache first to bypass network rate-limits and 403 errors
-    if (targetAppId && STEAM_ENRICHED_REVIEWS_MAP) {
+    if (targetAppId && HAS_STEAM_ENRICHED_REVIEWS) {
       const enriched = STEAM_ENRICHED_REVIEWS_MAP[String(targetAppId)];
       if (enriched?.reviewSummary && enriched.reviewSummary.totalReviews >= 10) {
         const totalReviews = enriched.reviewSummary.totalReviews;
@@ -184,6 +213,10 @@ export class SteamReviewResolver {
           isSynthetic: true,
         };
         this.setCacheBounded(cacheKey, result);
+        const idKey = `id:${targetAppId}`;
+        if (idKey !== cacheKey) {
+          this.setCacheBounded(idKey, result);
+        }
         return result;
       }
     }
@@ -193,165 +226,352 @@ export class SteamReviewResolver {
       return null;
     }
 
-    let sawTransientError = false;
+    const capturedEpoch = this.cacheEpoch;
+    const capturedKeyEpoch = this.keyEpochs.get(cacheKey) ?? 0;
 
-    // 1. If no AppID is supplied, search Steam Store via fetch with disjoint token guard + sibling adjacency tie-breaking
-    if (!targetAppId && title) {
-      try {
-        const clean =
-          normalizeTitleForStoreSearch(title, { stripEditions: false }) ||
-          normalizeTitleKey(title) ||
-          title;
-        const cleanNorm = normalizeTitleKey(clean);
-        const intermediateStripped = stripIntermediateSubtitleNumeral(title);
-        const packagingStripped = stripPackagingEditionPhrases(title);
-        const packagingNorm =
-          packagingStripped && packagingStripped !== title
-            ? normalizeTitleKey(packagingStripped)
-            : '';
+    const run = (async (): Promise<CriticScoreData | null> => {
+      let sawTransientError = false;
+      let resolvedAppId = targetAppId;
 
-        const searchTerms: string[] = [];
-        const seenTerms = new Set<string>();
-        const pushTerm = (candidateTerm: string | null | undefined): void => {
-          const trimmed = (candidateTerm || '').trim();
-          if (!trimmed) return;
-          const lower = trimmed.toLowerCase();
-          if (seenTerms.has(lower)) return;
-          seenTerms.add(lower);
-          searchTerms.push(trimmed);
-        };
+      // 1. If no AppID is supplied, search Steam Store via fetch with disjoint token guard + sibling adjacency tie-breaking
+      if (!resolvedAppId && title) {
+        try {
+          const clean =
+            normalizeTitleForStoreSearch(title, { stripEditions: false }) ||
+            normalizeTitleKey(title) ||
+            title;
+          const cleanNorm = normalizeTitleKey(clean);
+          const intermediateStripped = stripIntermediateSubtitleNumeral(title);
+          const packagingStripped = stripPackagingEditionPhrases(title);
+          const packagingNorm =
+            packagingStripped && packagingStripped !== title
+              ? normalizeTitleKey(packagingStripped)
+              : '';
 
-        pushTerm(clean);
-        if (intermediateStripped) {
-          pushTerm(
-            normalizeTitleForStoreSearch(intermediateStripped, { stripEditions: false }) ||
-              intermediateStripped
-          );
-        }
-        if (packagingStripped && packagingStripped !== title) {
-          pushTerm(
-            normalizeTitleForStoreSearch(packagingStripped, { stripEditions: false }) ||
-              packagingStripped
-          );
-        }
+          const searchTerms: string[] = [];
+          const seenTerms = new Set<string>();
+          const pushTerm = (candidateTerm: string | null | undefined): void => {
+            const trimmed = (candidateTerm || '').trim();
+            if (!trimmed) return;
+            const lower = trimmed.toLowerCase();
+            if (seenTerms.has(lower)) return;
+            seenTerms.add(lower);
+            searchTerms.push(trimmed);
+          };
 
-        const searchUrls: string[] = [];
-        const viteDev = isViteBrowserDev();
-        for (const term of searchTerms) {
-          if (viteDev) {
-            searchUrls.push(`/api/steam-store/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`);
-            searchUrls.push(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`);
-          } else {
-            searchUrls.push(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`);
+          pushTerm(clean);
+          if (intermediateStripped) {
+            pushTerm(
+              normalizeTitleForStoreSearch(intermediateStripped, { stripEditions: false }) ||
+                intermediateStripped
+            );
           }
+          if (packagingStripped && packagingStripped !== title) {
+            pushTerm(
+              normalizeTitleForStoreSearch(packagingStripped, { stripEditions: false }) ||
+                packagingStripped
+            );
+          }
+
+          const searchUrls: string[] = [];
+          const viteDev = isViteBrowserDev();
+          for (const term of searchTerms) {
+            if (viteDev) {
+              searchUrls.push(`/api/steam-store/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`);
+              searchUrls.push(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`);
+            } else {
+              searchUrls.push(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`);
+            }
+          }
+
+          const stopWords = new Set(['the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'is', 'with', 'from', 'by']);
+          const queryVariants = [cleanNorm, ...(packagingNorm && packagingNorm !== cleanNorm ? [packagingNorm] : [])]
+            .filter(Boolean)
+            .map((norm) => ({
+              norm,
+              words: norm.split(' ').filter(Boolean),
+            }));
+
+          for (const searchUrl of searchUrls) {
+            try {
+              const res = await requestScheduler.schedule(
+                searchUrl,
+                () => fetch(searchUrl),
+                Priority.P1_VIEWPORT,
+                'store.steampowered.com'
+              );
+              const isWaf = isWafOrChallengeResponse(res.status, '', res.headers, true);
+              if (!res.ok || isWaf) {
+                if (isWaf || res.status === 429 || res.status >= 500) {
+                  sawTransientError = true;
+                }
+                continue;
+              }
+
+              const data: unknown = await res.json();
+              sawTransientError = false;
+              const items: Array<{ id: number; name: string }> =
+                data && typeof data === 'object' && Array.isArray((data as { items?: unknown }).items)
+                  ? ((data as { items: Array<{ id: number; name: string }> }).items)
+                  : [];
+
+              const preparedItems = items
+                .filter((item): item is { id: number; name: string } => Boolean(item?.id && item?.name))
+                .map((item) => {
+                  const itemNorm = normalizeTitleKey(item.name);
+                  return {
+                    id: Number(item.id),
+                    name: item.name,
+                    norm: itemNorm,
+                    words: itemNorm.split(' ').filter(Boolean),
+                  };
+                });
+
+              let bestScore = -1;
+
+              for (const item of preparedItems) {
+                if (isSequelMismatch(title, item.name)) continue;
+
+                const itemNorm = item.norm;
+                const itemWords = item.words;
+                const isIntermediateMatch = isIntermediateNumeralSubtitleMatch(title, item.name);
+
+                let candidateBaseScore = -1;
+                if (isIntermediateMatch) {
+                  candidateBaseScore = 105;
+                } else {
+                  for (let vIdx = 0; vIdx < queryVariants.length; vIdx++) {
+                    const variant = queryVariants[vIdx];
+                    const qWords = variant.words;
+                    const variantNorm = variant.norm;
+
+                    // Disjoint substantive token guard (e.g. 'Reckoning of New York' vs 'Coteries of New York')
+                    const qSub = qWords.filter((w) => !/^\d+$/.test(w) && !stopWords.has(w));
+                    const iSub = itemWords.filter((w) => !/^\d+$/.test(w) && !stopWords.has(w));
+                    const qDisjoint = qSub.filter((w) => !itemWords.includes(w));
+                    const iDisjoint = iSub.filter((w) => !qWords.includes(w));
+                    if (qDisjoint.length >= 1 && iDisjoint.length >= 1) {
+                      continue;
+                    }
+
+                    const matches = qWords.filter((w) => itemWords.includes(w));
+                    const ratio = qWords.length > 0 ? matches.length / qWords.length : 0;
+
+                    if (ratio >= 0.6 || (variantNorm && itemNorm.startsWith(variantNorm))) {
+                      const variantScore =
+                        ratio * 100 +
+                        (itemNorm === variantNorm ? 10 : variantNorm && itemNorm.startsWith(variantNorm) ? 5 : 0) -
+                        (vIdx > 0 ? 1 : 0);
+                      if (variantScore > candidateBaseScore) {
+                        candidateBaseScore = variantScore;
+                      }
+                    }
+                  }
+                }
+
+                if (candidateBaseScore >= 0) {
+                  let score = candidateBaseScore;
+                  const candId = item.id;
+                  const candNormKey = itemNorm;
+
+                  if (candNormKey.length >= 4 && Number.isFinite(candId)) {
+                    const hasAdjacentFranchiseSibling = preparedItems.some((other) => {
+                      if (other.id === candId || !Number.isFinite(other.id)) return false;
+                      if (Math.abs(other.id - candId) > 50) return false;
+                      return other.norm !== candNormKey && other.norm.startsWith(`${candNormKey} `);
+                    });
+                    if (hasAdjacentFranchiseSibling) {
+                      score += 15;
+                    }
+                  }
+
+                  if (score > bestScore) {
+                    bestScore = score;
+                    resolvedAppId = candId;
+                  }
+                }
+              }
+
+              if (resolvedAppId) break;
+            } catch (innerErr: unknown) {
+              if (isTransientParseOrNetworkError(innerErr)) {
+                sawTransientError = true;
+              }
+            }
+          }
+        } catch (err: unknown) {
+          if (isTransientParseOrNetworkError(err)) {
+            sawTransientError = true;
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[SteamReviewResolver] Search failed for "${title}":`, msg);
+        }
+      }
+
+      if (!resolvedAppId) {
+        if (sawTransientError || !onlineLifecycleManager.isOnline()) {
+          if (this.isEpochCurrent(capturedEpoch, cacheKey, capturedKeyEpoch)) {
+            this.transientErrorKeys.add(cacheKey);
+          }
+          return null;
+        }
+        this.setCacheBounded(cacheKey, null, capturedEpoch, capturedKeyEpoch);
+        return null;
+      }
+
+      // 2. Fetch live all-time reviews summary from Steam (filter=all avoids 30-day rolling window, num_per_page=0 cuts payload >100x)
+      try {
+        // 2a. Try appreviews JSON endpoint
+        const reviewsUrls: string[] = [];
+        const appreviewsQuery = 'json=1&filter=all&language=all&purchase_type=all&num_per_page=0';
+        if (isViteBrowserDev()) {
+          reviewsUrls.push(`/api/steam-store/appreviews/${resolvedAppId}?${appreviewsQuery}`);
+          reviewsUrls.push(`https://store.steampowered.com/appreviews/${resolvedAppId}?${appreviewsQuery}`);
+        } else {
+          reviewsUrls.push(`https://store.steampowered.com/appreviews/${resolvedAppId}?${appreviewsQuery}`);
         }
 
-        const stopWords = new Set(['the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'is', 'with', 'from', 'by']);
-        const queryVariants = [cleanNorm, ...(packagingNorm && packagingNorm !== cleanNorm ? [packagingNorm] : [])]
-          .filter(Boolean)
-          .map((norm) => ({
-            norm,
-            words: norm.split(' ').filter(Boolean),
-          }));
-
-        for (const searchUrl of searchUrls) {
+        let jsonSucceeded = false;
+        let hadJsonSyntaxError = false;
+        for (const reviewsUrl of reviewsUrls) {
           try {
             const res = await requestScheduler.schedule(
-              searchUrl,
-              () => fetch(searchUrl),
+              reviewsUrl,
+              () => fetch(reviewsUrl),
               Priority.P1_VIEWPORT,
               'store.steampowered.com'
             );
-            if (!res.ok || isWafOrChallengeResponse(res.status, '', res.headers, true)) {
-              if (
-                !res.ok &&
-                (res.status === 429 || res.status >= 500 || isWafOrChallengeResponse(res.status, '', res.headers, true))
-              ) {
-                sawTransientError = true;
-              } else if (isWafOrChallengeResponse(res.status, '', res.headers, true)) {
+            const isWaf = isWafOrChallengeResponse(res.status, '', res.headers, true);
+            if (!res.ok || isWaf) {
+              if (isWaf || res.status === 429 || res.status >= 500) {
                 sawTransientError = true;
               }
               continue;
             }
 
             const data: unknown = await res.json();
-            sawTransientError = false;
-            const items: Array<{ id: number; name: string }> =
-              data && typeof data === 'object' && Array.isArray((data as { items?: unknown }).items)
-                ? ((data as { items: Array<{ id: number; name: string }> }).items)
-                : [];
-            let bestScore = -1;
+            const summaryResp =
+              data && typeof data === 'object'
+                ? (data as {
+                    success?: number;
+                    query_summary?: { total_reviews?: number; total_positive?: number };
+                  })
+                : null;
+            if (summaryResp?.success === 1) {
+              jsonSucceeded = true;
+              sawTransientError = false;
+              const summary = summaryResp.query_summary;
 
-            for (const item of items) {
-              if (!item?.id || !item?.name) continue;
-              if (isSequelMismatch(title, item.name)) continue;
+              if (summary && typeof summary.total_reviews === 'number' && summary.total_reviews >= 10) {
+                const totalReviews = summary.total_reviews;
+                const positiveReviews = summary.total_positive || 0;
+                const positivePercent = Math.round((positiveReviews / totalReviews) * 100);
 
-              const itemNorm = normalizeTitleKey(item.name);
-              const itemWords = itemNorm.split(' ').filter(Boolean);
-              const isIntermediateMatch = isIntermediateNumeralSubtitleMatch(title, item.name);
+                const synthetic = calculateSyntheticSteamScore(positivePercent, totalReviews);
+                const result: CriticScoreData = {
+                  id: `steam-${resolvedAppId}`,
+                  source: 'steam',
+                  score: synthetic.score,
+                  percentRecommended: synthetic.percentRecommended,
+                  tier: synthetic.tier,
+                  numReviews: totalReviews,
+                  url: `https://store.steampowered.com/app/${resolvedAppId}`,
+                  summary: `Based on Steam community player reviews (${positivePercent}% positive across ${totalReviews.toLocaleString()} reviews).`,
+                  isVerified: false,
+                  isSynthetic: true,
+                };
 
-              let candidateBaseScore = -1;
-              if (isIntermediateMatch) {
-                candidateBaseScore = 105;
-              } else {
-                for (let vIdx = 0; vIdx < queryVariants.length; vIdx++) {
-                  const variant = queryVariants[vIdx];
-                  const qWords = variant.words;
-                  const variantNorm = variant.norm;
-
-                  // Disjoint substantive token guard (e.g. 'Reckoning of New York' vs 'Coteries of New York')
-                  const qSub = qWords.filter((w) => !/^\d+$/.test(w) && !stopWords.has(w));
-                  const iSub = itemWords.filter((w) => !/^\d+$/.test(w) && !stopWords.has(w));
-                  const qDisjoint = qSub.filter((w) => !itemWords.includes(w));
-                  const iDisjoint = iSub.filter((w) => !qWords.includes(w));
-                  if (qDisjoint.length >= 1 && iDisjoint.length >= 1) {
-                    continue;
-                  }
-
-                  const matches = qWords.filter((w) => itemWords.includes(w));
-                  const ratio = qWords.length > 0 ? matches.length / qWords.length : 0;
-
-                  if (ratio >= 0.6 || (variantNorm && itemNorm.startsWith(variantNorm))) {
-                    const variantScore =
-                      ratio * 100 +
-                      (itemNorm === variantNorm ? 10 : variantNorm && itemNorm.startsWith(variantNorm) ? 5 : 0) -
-                      (vIdx > 0 ? 1 : 0);
-                    if (variantScore > candidateBaseScore) {
-                      candidateBaseScore = variantScore;
-                    }
-                  }
-                }
+                this.cachePositiveResult(
+                  cacheKey,
+                  resolvedAppId,
+                  result,
+                  capturedEpoch,
+                  capturedKeyEpoch
+                );
+                return result;
               }
-
-              if (candidateBaseScore >= 0) {
-                let score = candidateBaseScore;
-                const candId = Number(item.id);
-                const candNormKey = itemNorm;
-
-                if (candNormKey.length >= 4 && Number.isFinite(candId)) {
-                  const hasAdjacentFranchiseSibling = items.some((other: { id?: number; name?: string }) => {
-                    if (!other?.id || !other?.name || Number(other.id) === candId) return false;
-                    const otherId = Number(other.id);
-                    if (!Number.isFinite(otherId) || Math.abs(otherId - candId) > 50) return false;
-                    const otherNormKey = normalizeTitleKey(other.name);
-                    return otherNormKey !== candNormKey && otherNormKey.startsWith(`${candNormKey} `);
-                  });
-                  if (hasAdjacentFranchiseSibling) {
-                    score += 15;
-                  }
-                }
-
-                if (score > bestScore) {
-                  bestScore = score;
-                  targetAppId = candId;
-                }
-              }
+              break;
             }
-
-            if (targetAppId) break;
           } catch (innerErr: unknown) {
-            if (isTransientParseOrNetworkError(innerErr)) {
+            if (isJsonSyntaxError(innerErr)) {
+              hadJsonSyntaxError = true;
               sawTransientError = true;
+            } else if (classifyNetworkError(innerErr).status === 'transient_error') {
+              sawTransientError = true;
+            }
+          }
+        }
+
+        // 2b. CDN-cached Store Page HTML fallback (only when appreviews JSON failed or was rate-limited)
+        if (!jsonSucceeded) {
+          const storeUrls: string[] = [];
+          if (isViteBrowserDev()) {
+            storeUrls.push(`/api/steam-store/app/${resolvedAppId}`);
+            storeUrls.push(`https://store.steampowered.com/app/${resolvedAppId}`);
+          } else {
+            storeUrls.push(`https://store.steampowered.com/app/${resolvedAppId}`);
+          }
+
+          for (const storeUrl of storeUrls) {
+            try {
+              const res = await requestScheduler.schedule(
+                storeUrl,
+                () =>
+                  fetch(storeUrl, {
+                    headers: {
+                      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    },
+                  }),
+                Priority.P1_VIEWPORT,
+                'store.steampowered.com'
+              );
+              if (!res.ok) {
+                if (res.status === 429 || res.status >= 500 || isWafOrChallengeResponse(res.status, '', res.headers)) {
+                  sawTransientError = true;
+                }
+                continue;
+              }
+
+              const html = await res.text();
+              if (isWafOrChallengeResponse(res.status, html, res.headers)) {
+                sawTransientError = true;
+                continue;
+              }
+
+              const extracted = extractSteamReviewsFromHtml(html);
+              if (extracted && extracted.totalReviews >= 10) {
+                sawTransientError = false;
+                const { positivePercent, totalReviews } = extracted;
+                const synthetic = calculateSyntheticSteamScore(positivePercent, totalReviews);
+                const result: CriticScoreData = {
+                  id: `steam-${resolvedAppId}`,
+                  source: 'steam',
+                  score: synthetic.score,
+                  percentRecommended: synthetic.percentRecommended,
+                  tier: synthetic.tier,
+                  numReviews: totalReviews,
+                  url: `https://store.steampowered.com/app/${resolvedAppId}`,
+                  summary: `Based on Steam community player reviews (${positivePercent}% positive across ${totalReviews.toLocaleString()} reviews).`,
+                  isVerified: false,
+                  isSynthetic: true,
+                };
+
+                this.cachePositiveResult(
+                  cacheKey,
+                  resolvedAppId,
+                  result,
+                  capturedEpoch,
+                  capturedKeyEpoch
+                );
+                return result;
+              }
+              if (!hadJsonSyntaxError) {
+                sawTransientError = false;
+              }
+            } catch (innerErr: unknown) {
+              if (isTransientParseOrNetworkError(innerErr)) {
+                sawTransientError = true;
+              }
             }
           }
         }
@@ -360,202 +580,53 @@ export class SteamReviewResolver {
           sawTransientError = true;
         }
         const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[SteamReviewResolver] Search failed for "${title}":`, msg);
+        console.warn(`[SteamReviewResolver] Reviews query failed for AppID ${resolvedAppId}:`, msg);
       }
-    }
 
-    if (!targetAppId) {
       if (sawTransientError || !onlineLifecycleManager.isOnline()) {
-        this.transientErrorKeys.add(cacheKey);
+        if (this.isEpochCurrent(capturedEpoch, cacheKey, capturedKeyEpoch)) {
+          this.transientErrorKeys.add(cacheKey);
+        }
         return null;
       }
-      this.setCacheBounded(cacheKey, null);
-      return null;
-    }
 
-    // 2. Fetch live all-time reviews summary from Steam (filter=all avoids 30-day rolling window, num_per_page=0 cuts payload >100x)
+      this.setCacheBounded(cacheKey, null, capturedEpoch, capturedKeyEpoch);
+      return null;
+    })();
+
+    this.inFlight.set(cacheKey, run);
     try {
-      // 2a. Try appreviews JSON endpoint
-      const reviewsUrls: string[] = [];
-      const appreviewsQuery = 'json=1&filter=all&language=all&purchase_type=all&num_per_page=0';
-      if (isViteBrowserDev()) {
-        reviewsUrls.push(`/api/steam-store/appreviews/${targetAppId}?${appreviewsQuery}`);
-        reviewsUrls.push(`https://store.steampowered.com/appreviews/${targetAppId}?${appreviewsQuery}`);
-      } else {
-        reviewsUrls.push(`https://store.steampowered.com/appreviews/${targetAppId}?${appreviewsQuery}`);
+      return await run;
+    } finally {
+      if (this.inFlight.get(cacheKey) === run) {
+        this.inFlight.delete(cacheKey);
       }
-
-      let jsonSucceeded = false;
-      let hadJsonSyntaxError = false;
-      for (const reviewsUrl of reviewsUrls) {
-        try {
-          const res = await requestScheduler.schedule(
-            reviewsUrl,
-            () => fetch(reviewsUrl),
-            Priority.P1_VIEWPORT,
-            'store.steampowered.com'
-          );
-          if (!res.ok || isWafOrChallengeResponse(res.status, '', res.headers, true)) {
-            if (
-              res.status === 429 ||
-              res.status >= 500 ||
-              isWafOrChallengeResponse(res.status, '', res.headers, true)
-            ) {
-              sawTransientError = true;
-            }
-            continue;
-          }
-
-          const data: unknown = await res.json();
-          const summaryResp =
-            data && typeof data === 'object'
-              ? (data as {
-                  success?: number;
-                  query_summary?: { total_reviews?: number; total_positive?: number };
-                })
-              : null;
-          if (summaryResp?.success === 1) {
-            jsonSucceeded = true;
-            sawTransientError = false;
-            const summary = summaryResp.query_summary;
-
-            if (summary && typeof summary.total_reviews === 'number' && summary.total_reviews >= 10) {
-              const totalReviews = summary.total_reviews;
-              const positiveReviews = summary.total_positive || 0;
-              const positivePercent = Math.round((positiveReviews / totalReviews) * 100);
-
-              const synthetic = calculateSyntheticSteamScore(positivePercent, totalReviews);
-              const result: CriticScoreData = {
-                id: `steam-${targetAppId}`,
-                source: 'steam',
-                score: synthetic.score,
-                percentRecommended: synthetic.percentRecommended,
-                tier: synthetic.tier,
-                numReviews: totalReviews,
-                url: `https://store.steampowered.com/app/${targetAppId}`,
-                summary: `Based on Steam community player reviews (${positivePercent}% positive across ${totalReviews.toLocaleString()} reviews).`,
-                isVerified: false,
-                isSynthetic: true,
-              };
-
-              this.setCacheBounded(cacheKey, result);
-              return result;
-            }
-            break;
-          }
-        } catch (innerErr: unknown) {
-          if (isJsonSyntaxError(innerErr)) {
-            hadJsonSyntaxError = true;
-            sawTransientError = true;
-          } else if (classifyNetworkError(innerErr).status === 'transient_error') {
-            sawTransientError = true;
-          }
-        }
-      }
-
-      // 2b. CDN-cached Store Page HTML fallback (only when appreviews JSON failed or was rate-limited)
-      if (!jsonSucceeded) {
-        const storeUrls: string[] = [];
-        if (isViteBrowserDev()) {
-          storeUrls.push(`/api/steam-store/app/${targetAppId}`);
-          storeUrls.push(`https://store.steampowered.com/app/${targetAppId}`);
-        } else {
-          storeUrls.push(`https://store.steampowered.com/app/${targetAppId}`);
-        }
-
-        for (const storeUrl of storeUrls) {
-          try {
-            const res = await requestScheduler.schedule(
-              storeUrl,
-              () =>
-                fetch(storeUrl, {
-                  headers: {
-                    Cookie: 'birthtime=568022401; mature_content=1',
-                    'User-Agent':
-                      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                  },
-                }),
-              Priority.P1_VIEWPORT,
-              'store.steampowered.com'
-            );
-            if (!res.ok) {
-              if (res.status === 429 || res.status >= 500 || isWafOrChallengeResponse(res.status, '', res.headers)) {
-                sawTransientError = true;
-              }
-              continue;
-            }
-
-            const html = await res.text();
-            if (isWafOrChallengeResponse(res.status, html, res.headers)) {
-              sawTransientError = true;
-              continue;
-            }
-
-            const extracted = extractSteamReviewsFromHtml(html);
-            if (extracted && extracted.totalReviews >= 10) {
-              sawTransientError = false;
-              const { positivePercent, totalReviews } = extracted;
-              const synthetic = calculateSyntheticSteamScore(positivePercent, totalReviews);
-              const result: CriticScoreData = {
-                id: `steam-${targetAppId}`,
-                source: 'steam',
-                score: synthetic.score,
-                percentRecommended: synthetic.percentRecommended,
-                tier: synthetic.tier,
-                numReviews: totalReviews,
-                url: `https://store.steampowered.com/app/${targetAppId}`,
-                summary: `Based on Steam community player reviews (${positivePercent}% positive across ${totalReviews.toLocaleString()} reviews).`,
-                isVerified: false,
-                isSynthetic: true,
-              };
-
-              this.setCacheBounded(cacheKey, result);
-              return result;
-            }
-            if (!hadJsonSyntaxError) {
-              sawTransientError = false;
-            }
-          } catch (innerErr: unknown) {
-            if (isTransientParseOrNetworkError(innerErr)) {
-              sawTransientError = true;
-            }
-          }
-        }
-      }
-    } catch (err: unknown) {
-      if (isTransientParseOrNetworkError(err)) {
-        sawTransientError = true;
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[SteamReviewResolver] Reviews query failed for AppID ${targetAppId}:`, msg);
     }
-
-    if (sawTransientError || !onlineLifecycleManager.isOnline()) {
-      this.transientErrorKeys.add(cacheKey);
-      return null;
-    }
-
-    this.setCacheBounded(cacheKey, null);
-    return null;
   }
 
   public evictForGame(rawTitle?: string | null, steamAppId?: number | null): void {
     if (typeof steamAppId === 'number' && steamAppId > 0) {
       const idKey = `id:${steamAppId}`;
+      this.keyEpochs.set(idKey, (this.keyEpochs.get(idKey) ?? 0) + 1);
       this.cache.delete(idKey);
+      this.inFlight.delete(idKey);
       this.transientErrorKeys.delete(idKey);
     }
     const lower = (rawTitle || '').trim().toLowerCase();
     if (lower) {
       const titleKey = `title:${lower}`;
+      this.keyEpochs.set(titleKey, (this.keyEpochs.get(titleKey) ?? 0) + 1);
       this.cache.delete(titleKey);
+      this.inFlight.delete(titleKey);
       this.transientErrorKeys.delete(titleKey);
     }
   }
 
   clearCache(): void {
+    this.cacheEpoch += 1;
+    this.keyEpochs.clear();
     this.cache.clear();
+    this.inFlight.clear();
     this.transientErrorKeys.clear();
   }
 }

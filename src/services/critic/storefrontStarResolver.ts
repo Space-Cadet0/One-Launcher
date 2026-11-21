@@ -2,14 +2,17 @@ import { CriticScoreData, CriticTier } from '../../contracts/critic';
 import { classifyNetworkError, isWafOrChallengeResponse } from '../../contracts/network';
 import { calculateTier, isSequelMismatch, normalizeCriticTitleKey } from './criticUtils';
 import type { CriticScoreContext } from './criticScoreService';
+import { LruSet } from '../common/lruMap';
+import { isTitleCompatible } from '../common/titleMatching';
 import {
   isIntermediateNumeralSubtitleMatch,
   normalizeTitleForStoreSearch,
   stripPackagingEditionPhrases,
 } from '../common/titleUtils';
-import { isTitleCompatible } from './metacriticResolver';
+import { getDevProxyBaseForRoute } from '../network/browserDevProxy';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
+import { createTimeoutSignal } from './stagedResolverCache';
 
 const MAX_STAR_CACHE_ENTRIES = 2000;
 const NEGATIVE_STAR_CACHE_TTL_MS = 15 * 60 * 1000; // 15 min bounded TTL for genuine misses
@@ -78,7 +81,6 @@ function resolveContextEntitlements(
   hasExplicitPlatforms: boolean;
   hasXboxPlatform: boolean;
   hasGogPlatform: boolean;
-  hasEpicPlatform: boolean;
 } {
   const inputObj = typeof input === 'object' && input !== null ? input : undefined;
   const rawTitle = (typeof input === 'string' ? input : inputObj?.title || '').trim();
@@ -91,7 +93,6 @@ function resolveContextEntitlements(
   let xboxProductId = inputObj?.xboxProductId?.trim() || undefined;
   let hasXboxPlatform = Boolean(xboxProductId);
   let hasGogPlatform = Boolean(gogId);
-  let hasEpicPlatform = Boolean(epicId);
 
   for (const plat of platforms) {
     const pid = String(plat.platformId || '').toLowerCase();
@@ -109,7 +110,6 @@ function resolveContextEntitlements(
         gogId = plat.platformGameId.trim();
       }
     } else if (pid === 'epic') {
-      hasEpicPlatform = true;
       if (!epicId && plat.platformGameId?.trim()) {
         epicId = plat.platformGameId.trim();
       }
@@ -125,7 +125,6 @@ function resolveContextEntitlements(
     hasExplicitPlatforms,
     hasXboxPlatform,
     hasGogPlatform,
-    hasEpicPlatform,
   };
 }
 
@@ -134,14 +133,54 @@ export class StorefrontStarResolver {
   private cacheKeysByTitle = new Map<string, Set<string>>();
   private cacheKeysByXboxId = new Map<string, Set<string>>();
   private inFlight = new Map<string, Promise<CriticScoreData | null>>();
-  private transientErrorKeys = new Set<string>();
+  private transientErrorKeys = new LruSet<string>(MAX_STAR_CACHE_ENTRIES);
+  private transientErrorKeysByTitle = new Map<string, Set<string>>();
+  private cacheEpoch = 0;
+  private keyEpochs = new Map<string, number>();
 
   constructor() {
     try {
       onlineLifecycleManager.onOnline(() => {
         this.transientErrorKeys.clear();
+        this.transientErrorKeysByTitle.clear();
       });
     } catch {}
+  }
+
+  private isEpochCurrent(
+    capturedEpoch: number,
+    cacheKey: string,
+    capturedKeyEpoch: number
+  ): boolean {
+    return (
+      capturedEpoch === this.cacheEpoch &&
+      (this.keyEpochs.get(cacheKey) ?? 0) === capturedKeyEpoch
+    );
+  }
+
+  private markTransientError(cacheKey: string, titleLower?: string): void {
+    this.transientErrorKeys.add(cacheKey);
+    if (titleLower) {
+      let set = this.transientErrorKeysByTitle.get(titleLower);
+      if (!set) {
+        set = new Set<string>();
+        this.transientErrorKeysByTitle.set(titleLower, set);
+      }
+      set.add(cacheKey);
+    }
+  }
+
+  private clearTransientError(cacheKey: string, titleLower?: string): void {
+    this.transientErrorKeys.delete(cacheKey);
+    if (titleLower) {
+      const set = this.transientErrorKeysByTitle.get(titleLower);
+      if (set) {
+        set.delete(cacheKey);
+        if (set.size === 0) {
+          this.transientErrorKeysByTitle.delete(titleLower);
+        }
+      }
+    }
   }
 
   private extractKeyParts(key: string): { titleLower?: string; xboxIdLower?: string } {
@@ -204,7 +243,19 @@ export class StorefrontStarResolver {
     }
   }
 
-  private setCacheBounded(key: string, val: CriticScoreData | null): void {
+  private setCacheBounded(
+    key: string,
+    val: CriticScoreData | null,
+    capturedEpoch?: number,
+    capturedKeyEpoch?: number
+  ): void {
+    if (
+      capturedEpoch !== undefined &&
+      capturedKeyEpoch !== undefined &&
+      !this.isEpochCurrent(capturedEpoch, key, capturedKeyEpoch)
+    ) {
+      return;
+    }
     if (this.cache.has(key)) {
       this.cache.delete(key);
     }
@@ -218,10 +269,24 @@ export class StorefrontStarResolver {
     }
   }
 
-  public hadRecentTransientFailure(title: string): boolean {
+  public hadRecentTransientFailure(title: string, cacheKey?: string): boolean {
+    if (cacheKey && this.transientErrorKeys.has(cacheKey)) {
+      return true;
+    }
     const rawTitle = (title || '').trim();
     if (!rawTitle) return false;
-    return this.transientErrorKeys.has(rawTitle.toLowerCase());
+    const titleLower = rawTitle.toLowerCase();
+    if (this.transientErrorKeys.has(titleLower)) {
+      return true;
+    }
+    const keysForTitle = this.transientErrorKeysByTitle.get(titleLower);
+    if (!keysForTitle) return false;
+    for (const k of keysForTitle) {
+      if (this.transientErrorKeys.has(k)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private async queryGogCatalogRating(
@@ -238,7 +303,7 @@ export class StorefrontStarResolver {
         normalizeTitleForStoreSearch(rawTitle);
 
       const cleanLike = cleanTitle.replace(/^like:/i, '').trim();
-      const queryUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(`like:${cleanLike}`)}&limit=5`;
+      const queryUrl = `${getDevProxyBaseForRoute('gogCatalog')}/v1/catalog?query=${encodeURIComponent(`like:${cleanLike}`)}&limit=5`;
       const res = await requestScheduler.schedule(
         queryUrl,
         () =>
@@ -246,10 +311,7 @@ export class StorefrontStarResolver {
             headers: {
               Accept: 'application/json',
             },
-            signal:
-              typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
-                ? AbortSignal.timeout(6000)
-                : undefined,
+            signal: createTimeoutSignal(6000),
           }),
         Priority.P1_VIEWPORT,
         'catalog.gog.com'
@@ -414,7 +476,7 @@ export class StorefrontStarResolver {
               meta.storeUrl ||
               (resolvedProductId
                 ? `https://www.xbox.com/games/store/-/${resolvedProductId}`
-                : `https://www.xbox.com/en-us/search?q=${encodeURIComponent(rawTitle)}`);
+                : '');
 
             const xboxResult: CriticScoreData = {
               id: `xbox-${resolvedProductId || rawTitle.toLowerCase()}`,
@@ -486,7 +548,7 @@ export class StorefrontStarResolver {
     }
 
     if (!onlineLifecycleManager.isOnline()) {
-      if (rawTitle) this.transientErrorKeys.add(titleLower);
+      this.markTransientError(cacheKey, titleLower || undefined);
       return null;
     }
 
@@ -494,9 +556,12 @@ export class StorefrontStarResolver {
       return this.inFlight.get(cacheKey)!;
     }
 
-    if (rawTitle) this.transientErrorKeys.delete(titleLower);
+    this.clearTransientError(cacheKey, titleLower || undefined);
+    const capturedEpoch = this.cacheEpoch;
+    const capturedKeyEpoch = this.keyEpochs.get(cacheKey) ?? 0;
 
-    const promise = (async (): Promise<CriticScoreData | null> => {
+    let promise!: Promise<CriticScoreData | null>;
+    promise = (async (): Promise<CriticScoreData | null> => {
       let sawTransientError = false;
       const allowXboxQuery = !hasExplicitPlatforms || hasXboxPlatform || Boolean(xboxProductId);
       const preferXboxFirst = Boolean(xboxProductId) && !hasGogPlatform;
@@ -505,7 +570,7 @@ export class StorefrontStarResolver {
         const xboxFirst = await this.queryXboxStoreRating(rawTitle, xboxProductId);
         if (xboxFirst.sawTransientError) sawTransientError = true;
         if (xboxFirst.result) {
-          this.setCacheBounded(cacheKey, xboxFirst.result);
+          this.setCacheBounded(cacheKey, xboxFirst.result, capturedEpoch, capturedKeyEpoch);
           return xboxFirst.result;
         }
       }
@@ -515,7 +580,7 @@ export class StorefrontStarResolver {
         const gogOutcome = await this.queryGogCatalogRating(rawTitle, gogId);
         if (gogOutcome.sawTransientError) sawTransientError = true;
         if (gogOutcome.result) {
-          this.setCacheBounded(cacheKey, gogOutcome.result);
+          this.setCacheBounded(cacheKey, gogOutcome.result, capturedEpoch, capturedKeyEpoch);
           return gogOutcome.result;
         }
       }
@@ -525,20 +590,24 @@ export class StorefrontStarResolver {
         const xboxOutcome = await this.queryXboxStoreRating(rawTitle, xboxProductId);
         if (xboxOutcome.sawTransientError) sawTransientError = true;
         if (xboxOutcome.result) {
-          this.setCacheBounded(cacheKey, xboxOutcome.result);
+          this.setCacheBounded(cacheKey, xboxOutcome.result, capturedEpoch, capturedKeyEpoch);
           return xboxOutcome.result;
         }
       }
 
       if (sawTransientError || !onlineLifecycleManager.isOnline()) {
-        if (rawTitle) this.transientErrorKeys.add(titleLower);
+        if (this.isEpochCurrent(capturedEpoch, cacheKey, capturedKeyEpoch)) {
+          this.markTransientError(cacheKey, titleLower || undefined);
+        }
         return null;
       }
 
-      this.setCacheBounded(cacheKey, null);
+      this.setCacheBounded(cacheKey, null, capturedEpoch, capturedKeyEpoch);
       return null;
     })().finally(() => {
-      this.inFlight.delete(cacheKey);
+      if (this.inFlight.get(cacheKey) === promise) {
+        this.inFlight.delete(cacheKey);
+      }
     });
 
     this.inFlight.set(cacheKey, promise);
@@ -559,6 +628,14 @@ export class StorefrontStarResolver {
 
     if (titleLower) {
       this.transientErrorKeys.delete(titleLower);
+      const transientForTitle = this.transientErrorKeysByTitle.get(titleLower);
+      if (transientForTitle) {
+        for (const k of transientForTitle) {
+          this.transientErrorKeys.delete(k);
+          keysToDelete.add(k);
+        }
+        this.transientErrorKeysByTitle.delete(titleLower);
+      }
       keysToDelete.add(titleLower);
       const indexedByTitle = this.cacheKeysByTitle.get(titleLower);
       if (indexedByTitle) {
@@ -567,6 +644,14 @@ export class StorefrontStarResolver {
       const normTitle = normalizeCriticTitleKey(titleLower);
       if (normTitle && normTitle !== titleLower) {
         this.transientErrorKeys.delete(normTitle);
+        const transientForNorm = this.transientErrorKeysByTitle.get(normTitle);
+        if (transientForNorm) {
+          for (const k of transientForNorm) {
+            this.transientErrorKeys.delete(k);
+            keysToDelete.add(k);
+          }
+          this.transientErrorKeysByTitle.delete(normTitle);
+        }
         keysToDelete.add(normTitle);
         const indexedByNorm = this.cacheKeysByTitle.get(normTitle);
         if (indexedByNorm) {
@@ -586,18 +671,23 @@ export class StorefrontStarResolver {
     }
 
     for (const k of keysToDelete) {
+      this.keyEpochs.set(k, (this.keyEpochs.get(k) ?? 0) + 1);
       this.cache.delete(k);
       this.inFlight.delete(k);
+      this.transientErrorKeys.delete(k);
       this.unindexCacheKey(k);
     }
   }
 
   clearCache(): void {
+    this.cacheEpoch += 1;
+    this.keyEpochs.clear();
     this.cache.clear();
     this.cacheKeysByTitle.clear();
     this.cacheKeysByXboxId.clear();
     this.inFlight.clear();
     this.transientErrorKeys.clear();
+    this.transientErrorKeysByTitle.clear();
   }
 }
 

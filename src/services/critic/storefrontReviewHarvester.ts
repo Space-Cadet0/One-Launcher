@@ -1,4 +1,3 @@
-import axios from 'axios';
 import { StorefrontReviewAnchor } from '../../contracts/critic';
 import { classifyNetworkError, isWafOrChallengeResponse } from '../../contracts/network';
 import { steamApi } from '../steam/steamApi';
@@ -6,7 +5,11 @@ import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 import gogEnrichedCache from '../storage/gogEnrichedCache.json';
 import { KNOWN_EPIC_APP_NAMES } from '../integrations/epicCodenames';
 import { KNOWN_CRITIC_SCORES } from './knownCriticScores';
-import { isAnchorSlugCompatible, isTitleCompatible } from './metacriticResolver';
+import { isAnchorSlugCompatible } from './metacritic/metacriticTitleMatching';
+import { LruSet } from '../common/lruMap';
+import { isValidMetacriticHostUrl } from '../common/storeUrlUtils';
+import { isTitleCompatible } from '../common/titleMatching';
+import { buildDevProxyUrlForRoute, getDevProxyBaseForRoute } from '../network/browserDevProxy';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 import { vaultGet } from '../storage/indexedDbVault';
@@ -16,40 +19,30 @@ import {
   STAGED_CACHE_PREFIX,
 } from '../storage/stagedCacheService';
 import { normalizeTitleForStoreSearch, normalizeTitleKey } from '../common/titleUtils';
+import { createTimeoutSignal } from './stagedResolverCache';
 
 const STEAM_APPDETAILS_404_KEY_PREFIX = `${STAGED_CACHE_PREFIX}steam_appdetails_404_v1_`;
 const STEAM_APPDETAILS_404_TTL_MS = 14 * 24 * 60 * 60 * 1000;
-
-const GOG_USER_AGENT =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const EPIC_LAUNCHER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher';
+const NEGATIVE_ANCHOR_TTL_MS = 15 * 60 * 1000; // 15 min bounded TTL for genuine misses
 
 function getGogWebBaseUrl(): string {
-  if (typeof window !== 'undefined' && window.location?.hostname === 'localhost') {
-    return '/api/gog-profile';
-  }
-  return 'https://www.gog.com';
+  return getDevProxyBaseForRoute('gogProfile');
 }
 
 function getGogApiBaseUrl(): string {
-  if (typeof window !== 'undefined' && window.location?.hostname === 'localhost') {
-    return '/api/gog-product';
-  }
-  return 'https://api.gog.com';
+  return getDevProxyBaseForRoute('gogProduct');
+}
+
+function getGogCatalogBaseUrl(): string {
+  return getDevProxyBaseForRoute('gogCatalog');
 }
 
 function getEpicGraphQLBaseUrl(): string {
-  if (typeof window !== 'undefined' && window.location?.hostname === 'localhost') {
-    return '/api/epic-graphql/graphql';
-  }
-  return 'https://launcher.store.epicgames.com/graphql';
+  return buildDevProxyUrlForRoute('epicGraphql', '/graphql');
 }
 
 function getEpicContentBaseUrl(): string {
-  if (typeof window !== 'undefined' && window.location?.hostname === 'localhost') {
-    return '/api/epic-content';
-  }
-  return 'https://store-content.ak.epicgames.com';
+  return getDevProxyBaseForRoute('epicContent');
 }
 
 /**
@@ -91,22 +84,6 @@ export interface EnrichedMetadataAnchorSource {
     score?: number;
     url?: string;
   };
-}
-
-function isValidMetacriticHostUrl(url?: string): boolean {
-  if (!url || typeof url !== 'string') return false;
-  const trimmed = url.trim();
-  if (!trimmed) return false;
-  try {
-    const parsed = new URL(trimmed);
-    const host = parsed.hostname.toLowerCase();
-    return (
-      (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
-      (host === 'metacritic.com' || host.endsWith('.metacritic.com'))
-    );
-  } catch {
-    return /^https?:\/\/(?:www\.)?metacritic\.com\/game\//i.test(trimmed);
-  }
 }
 
 function parseSteamAppIdValue(appId: string | number | null | undefined): number | null {
@@ -234,23 +211,18 @@ interface XboxProductMetadataRecord {
   results?: Array<Record<string, unknown>>;
 }
 
-function getHttpErrorResponse(err: unknown): {
-  status?: number;
-  data?: unknown;
-  headers?: Record<string, unknown>;
-} {
-  if (!err || typeof err !== 'object') return {};
-  const resp = (err as { response?: unknown }).response;
-  if (!resp || typeof resp !== 'object') return {};
-  const r = resp as { status?: unknown; data?: unknown; headers?: unknown };
-  return {
-    status: typeof r.status === 'number' ? r.status : undefined,
-    data: r.data,
-    headers:
-      r.headers && typeof r.headers === 'object'
-        ? (r.headers as Record<string, unknown>)
-        : undefined,
-  };
+interface AnchorCacheEntry {
+  value: StorefrontReviewAnchor | null;
+  cachedAt: number;
+}
+
+function hasAnyKeys(obj: Record<string, unknown> | Record<number, unknown>): boolean {
+  for (const key in obj) {
+    if (Object.prototype.hasOwnProperty.call(obj, key)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function extractGogPageReviewAnchors(html: string): {
@@ -361,9 +333,12 @@ const STEAM_ENRICHED_ANCHOR_MAP: Record<string, EnrichedSteamAnchorRecord> = ste
 const GOG_ENRICHED_ANCHOR_MAP: Record<string, EnrichedGogAnchorRecord> = gogEnrichedCache;
 
 export class StorefrontReviewHarvester {
-  private anchorCache = new Map<string, StorefrontReviewAnchor | null>();
+  private anchorCache = new Map<string, AnchorCacheEntry>();
   private inFlight = new Map<string, Promise<StorefrontReviewAnchor | null>>();
-  private transientErrorKeys = new Set<string>();
+  private storeInFlight = new Map<string, Promise<StorefrontReviewAnchor | null>>();
+  private transientErrorKeys = new LruSet<string>(MAX_ANCHOR_CACHE_ENTRIES);
+  private cacheEpoch = 0;
+  private keyEpochs = new Map<string, number>();
 
   constructor() {
     try {
@@ -373,11 +348,49 @@ export class StorefrontReviewHarvester {
     } catch {}
   }
 
-  private setAnchorCacheBounded(key: string, value: StorefrontReviewAnchor | null): void {
+  private isEpochCurrent(
+    capturedEpoch: number,
+    key: string,
+    capturedKeyEpoch: number
+  ): boolean {
+    return (
+      capturedEpoch === this.cacheEpoch &&
+      (this.keyEpochs.get(key) ?? 0) === capturedKeyEpoch
+    );
+  }
+
+  private readAnchorCache(
+    key: string
+  ): { hit: true; value: StorefrontReviewAnchor | null } | { hit: false } {
+    const entry = this.anchorCache.get(key);
+    if (!entry) return { hit: false };
+    if (entry.value !== null) {
+      return { hit: true, value: entry.value };
+    }
+    if (Date.now() - entry.cachedAt < NEGATIVE_ANCHOR_TTL_MS) {
+      return { hit: true, value: null };
+    }
+    this.anchorCache.delete(key);
+    return { hit: false };
+  }
+
+  private setAnchorCacheBounded(
+    key: string,
+    value: StorefrontReviewAnchor | null,
+    capturedEpoch?: number,
+    capturedKeyEpoch?: number
+  ): void {
+    if (
+      capturedEpoch !== undefined &&
+      capturedKeyEpoch !== undefined &&
+      !this.isEpochCurrent(capturedEpoch, key, capturedKeyEpoch)
+    ) {
+      return;
+    }
     if (this.anchorCache.has(key)) {
       this.anchorCache.delete(key);
     }
-    this.anchorCache.set(key, value);
+    this.anchorCache.set(key, { value, cachedAt: Date.now() });
     while (this.anchorCache.size > MAX_ANCHOR_CACHE_ENTRIES) {
       const oldest = this.anchorCache.keys().next().value;
       if (oldest === undefined) break;
@@ -401,10 +414,13 @@ export class StorefrontReviewHarvester {
     if (!steamAppId) return null;
 
     const cacheKey = `steam-${steamAppId}`;
-    const existing = this.anchorCache.get(cacheKey);
-    if (existing) {
-      return existing;
+    const existing = this.readAnchorCache(cacheKey);
+    if (existing.hit && existing.value) {
+      return existing.value;
     }
+
+    const capturedEpoch = this.cacheEpoch;
+    const capturedKeyEpoch = this.keyEpochs.get(cacheKey) ?? 0;
 
     try {
       const vaulted = await vaultGet<EnrichedMetadataAnchorSource>(`enriched_metadata:${steamAppId}`);
@@ -412,7 +428,7 @@ export class StorefrontReviewHarvester {
         requirePositiveScore: true,
       });
       if (anchor) {
-        this.setAnchorCacheBounded(cacheKey, anchor);
+        this.setAnchorCacheBounded(cacheKey, anchor, capturedEpoch, capturedKeyEpoch);
         return anchor;
       }
     } catch {
@@ -504,18 +520,26 @@ export class StorefrontReviewHarvester {
     }
 
     const cacheKey = `steam-${steamAppId}`;
-    if (this.anchorCache.has(cacheKey)) {
-      return this.anchorCache.get(cacheKey)!;
+    const cached = this.readAnchorCache(cacheKey);
+    if (cached.hit) {
+      return cached.value;
+    }
+
+    const existingInFlight = this.storeInFlight.get(cacheKey);
+    if (existingInFlight) {
+      return existingInFlight;
     }
 
     this.transientErrorKeys.delete(cacheKey);
 
     // 1. Check local steamEnrichedCache first
-    const preCached = STEAM_ENRICHED_ANCHOR_MAP[String(steamAppId)];
-    const preCachedAnchor = buildVerifiedSteamAnchorFromMetadata(steamAppId, preCached);
-    if (preCachedAnchor) {
-      this.setAnchorCacheBounded(cacheKey, preCachedAnchor);
-      return preCachedAnchor;
+    if (hasAnyKeys(STEAM_ENRICHED_ANCHOR_MAP)) {
+      const preCached = STEAM_ENRICHED_ANCHOR_MAP[String(steamAppId)];
+      const preCachedAnchor = buildVerifiedSteamAnchorFromMetadata(steamAppId, preCached);
+      if (preCachedAnchor) {
+        this.setAnchorCacheBounded(cacheKey, preCachedAnchor);
+        return preCachedAnchor;
+      }
     }
 
     // 2. Check steamApi in-memory cache (excluding legacy local_federated GOG star ratings)
@@ -526,128 +550,165 @@ export class StorefrontReviewHarvester {
       return cachedMetaAnchor;
     }
 
-    // 2.5. Recover verified Steam Metacritic anchor from IndexedDB vault (`enriched_metadata:<appId>`)
-    const vaultAnchor = await this.recoverSteamAnchorFromVault(steamAppId);
-    if (vaultAnchor) {
-      return vaultAnchor;
-    }
+    const capturedEpoch = this.cacheEpoch;
+    const capturedKeyEpoch = this.keyEpochs.get(cacheKey) ?? 0;
 
-    let sawTransientError = !onlineLifecycleManager.isOnline() || steamApi.isStoreRateLimited();
-    const neg404Key = `${STEAM_APPDETAILS_404_KEY_PREFIX}${steamAppId}`;
-    const isKnown404 = loadStagedCache<null>(neg404Key, false).valid;
+    let run!: Promise<StorefrontReviewAnchor | null>;
+    run = (async (): Promise<StorefrontReviewAnchor | null> => {
+      // 2.5. Recover verified Steam Metacritic anchor from IndexedDB vault (`enriched_metadata:<appId>`)
+      const vaultAnchor = await this.recoverSteamAnchorFromVault(steamAppId);
+      if (vaultAnchor) {
+        return vaultAnchor;
+      }
 
-    // 3. Query Steam Store API via steamApi (honoring the 14-day steam_appdetails_404_v1_ negative cache)
-    if (!isKnown404 && onlineLifecycleManager.isOnline() && !steamApi.isStoreRateLimited()) {
-      try {
-        const liveMeta = await steamApi.fetchGameMetadata(steamAppId);
-        const liveMetaAnchor = buildVerifiedSteamAnchorFromMetadata(steamAppId, liveMeta);
-        if (liveMetaAnchor) {
-          this.setAnchorCacheBounded(cacheKey, liveMetaAnchor);
-          return liveMetaAnchor;
-        }
+      let sawTransientError = !onlineLifecycleManager.isOnline() || steamApi.isStoreRateLimited();
+      const neg404Key = `${STEAM_APPDETAILS_404_KEY_PREFIX}${steamAppId}`;
+      const isKnown404 = loadStagedCache<null>(neg404Key, false).valid;
 
-        // Only fire fallback direct fetch if liveMeta was null AND steamApi did not record a 404/delisted AppID
-        if (!liveMeta && !loadStagedCache<null>(neg404Key, false).valid) {
-          if (steamApi.isStoreRateLimited() || !onlineLifecycleManager.isOnline()) {
-            sawTransientError = true;
-          } else {
-            const baseUrl = typeof window !== 'undefined' && window.location?.hostname === 'localhost'
-              ? '/api/steam-store'
-              : 'https://store.steampowered.com';
-            const appDetailsUrl = `${baseUrl}/api/appdetails?appids=${steamAppId}&l=english`;
-            const res = await requestScheduler.schedule(
-              appDetailsUrl,
-              () =>
-                axios.get(appDetailsUrl, {
-                  timeout: 6000,
-                  headers: {
-                    Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
-                  },
-                }),
-              Priority.P1_VIEWPORT,
-              'store.steampowered.com'
-            );
-            const respHeaders =
-              res.headers && typeof res.headers === 'object'
-                ? (res.headers as Record<string, unknown>)
-                : undefined;
-            if (isWafOrChallengeResponse(res.status, res.data, respHeaders, true)) {
+      // 3. Query Steam Store API via steamApi (honoring the 14-day steam_appdetails_404_v1_ negative cache)
+      if (!isKnown404 && onlineLifecycleManager.isOnline() && !steamApi.isStoreRateLimited()) {
+        try {
+          const liveMeta = await steamApi.fetchGameMetadata(steamAppId);
+          const liveMetaAnchor = buildVerifiedSteamAnchorFromMetadata(steamAppId, liveMeta);
+          if (liveMetaAnchor) {
+            this.setAnchorCacheBounded(cacheKey, liveMetaAnchor, capturedEpoch, capturedKeyEpoch);
+            return liveMetaAnchor;
+          }
+
+          // Only fire fallback direct fetch if liveMeta was null AND steamApi did not record a 404/delisted AppID
+          if (!liveMeta && !loadStagedCache<null>(neg404Key, false).valid) {
+            if (steamApi.isStoreRateLimited() || !onlineLifecycleManager.isOnline()) {
               sawTransientError = true;
             } else {
-              const entry = res.data?.[steamAppId];
-              if (entry && entry.success === false && onlineLifecycleManager.isOnline()) {
-                saveStagedCache<null>(neg404Key, null, 'negative', {
-                  failureReason: 'not_found',
-                  customTtlMs: STEAM_APPDETAILS_404_TTL_MS,
-                });
-              }
-              const appData = entry?.data;
-              if (appData?.metacritic) {
-                const score = typeof appData.metacritic.score === 'number' ? appData.metacritic.score : undefined;
-                const url = typeof appData.metacritic.url === 'string' ? appData.metacritic.url : undefined;
-                const slug = extractMetacriticSlugFromUrl(url);
+              const baseUrl = getDevProxyBaseForRoute('steamStore');
+              const appDetailsUrl = `${baseUrl}/api/appdetails?appids=${steamAppId}&l=english`;
+              const res = await requestScheduler.schedule(
+                appDetailsUrl,
+                () =>
+                  fetch(appDetailsUrl, {
+                    headers: { Accept: 'application/json' },
+                    signal: createTimeoutSignal(6000),
+                  }),
+                Priority.P1_VIEWPORT,
+                'store.steampowered.com'
+              );
+              const isWaf = isWafOrChallengeResponse(res.status, '', res.headers, true);
+              if (!res.ok || isWaf) {
+                if (res.status === 404 && onlineLifecycleManager.isOnline() && !isWaf) {
+                  saveStagedCache<null>(neg404Key, null, 'negative', {
+                    failureReason: 'not_found',
+                    customTtlMs: STEAM_APPDETAILS_404_TTL_MS,
+                  });
+                } else if (isWaf || res.status === 429 || res.status >= 500) {
+                  sawTransientError = true;
+                }
+              } else {
+                const rawJson: unknown = await res.json();
+                if (isWafOrChallengeResponse(res.status, rawJson, res.headers, true)) {
+                  sawTransientError = true;
+                } else {
+                  const dataRecord =
+                    rawJson && typeof rawJson === 'object'
+                      ? (rawJson as Record<
+                          string,
+                          {
+                            success?: boolean;
+                            data?: {
+                              name?: string;
+                              metacritic?: { score?: unknown; url?: unknown };
+                            };
+                          }
+                        >)
+                      : null;
+                  const entry = dataRecord?.[String(steamAppId)];
+                  if (entry && entry.success === false && onlineLifecycleManager.isOnline()) {
+                    saveStagedCache<null>(neg404Key, null, 'negative', {
+                      failureReason: 'not_found',
+                      customTtlMs: STEAM_APPDETAILS_404_TTL_MS,
+                    });
+                  }
+                  const appData = entry?.data;
+                  if (appData?.metacritic) {
+                    const score =
+                      typeof appData.metacritic.score === 'number'
+                        ? appData.metacritic.score
+                        : undefined;
+                    const url =
+                      typeof appData.metacritic.url === 'string'
+                        ? appData.metacritic.url
+                        : undefined;
+                    const slug = extractMetacriticSlugFromUrl(url);
 
-                if ((score !== undefined || url) && (!slug || !appData.name || isAnchorSlugCompatible(appData.name, slug))) {
-                  const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : url;
-                  const anchor: StorefrontReviewAnchor = {
-                    storefront: 'steam',
-                    metacriticUrl: canonicalMcUrl,
-                    metacriticScore: score,
-                    metacriticSlug: slug,
-                    rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
-                    isVerifiedGroundTruth: true,
-                  };
-                  this.setAnchorCacheBounded(cacheKey, anchor);
-                  return anchor;
+                    if (
+                      (score !== undefined || url) &&
+                      (!slug || !appData.name || isAnchorSlugCompatible(appData.name, slug))
+                    ) {
+                      const canonicalMcUrl = slug
+                        ? `https://www.metacritic.com/game/${slug}/critic-reviews/`
+                        : url;
+                      const anchor: StorefrontReviewAnchor = {
+                        storefront: 'steam',
+                        metacriticUrl: canonicalMcUrl,
+                        metacriticScore: score,
+                        metacriticSlug: slug,
+                        rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
+                        isVerifiedGroundTruth: true,
+                      };
+                      this.setAnchorCacheBounded(cacheKey, anchor, capturedEpoch, capturedKeyEpoch);
+                      return anchor;
+                    }
+                  }
                 }
               }
             }
           }
-        }
-      } catch (err: unknown) {
-        const resp = getHttpErrorResponse(err);
-        if (
-          resp.status === 404 &&
-          onlineLifecycleManager.isOnline() &&
-          !isWafOrChallengeResponse(resp.status, resp.data, resp.headers)
-        ) {
-          saveStagedCache<null>(neg404Key, null, 'negative', {
-            failureReason: 'not_found',
-            customTtlMs: STEAM_APPDETAILS_404_TTL_MS,
-          });
-        } else if (
-          classifyNetworkError(err).status === 'transient_error' ||
-          isWafOrChallengeResponse(resp.status, resp.data, resp.headers)
-        ) {
-          sawTransientError = true;
+        } catch (err: unknown) {
+          if (classifyNetworkError(err).status === 'transient_error') {
+            sawTransientError = true;
+          }
         }
       }
-    }
 
-    // 4. Check known verified master dataset
-    const known = KNOWN_CRITIC_SCORES[steamAppId];
-    if (known && known.source === 'metacritic' && known.url) {
-      const slug = extractMetacriticSlugFromUrl(known.url);
-      const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : (known.url?.startsWith('http://') ? known.url.replace(/^http:\/\//, 'https://') : known.url);
-      const anchor: StorefrontReviewAnchor = {
-        storefront: 'steam',
-        metacriticUrl: canonicalMcUrl,
-        metacriticScore: known.score,
-        metacriticSlug: slug,
-        rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
-        isVerifiedGroundTruth: true,
-      };
-      this.setAnchorCacheBounded(cacheKey, anchor);
-      return anchor;
-    }
+      // 4. Check known verified master dataset (O(1) guard when empty)
+      if (hasAnyKeys(KNOWN_CRITIC_SCORES)) {
+        const known = KNOWN_CRITIC_SCORES[steamAppId];
+        if (known && known.source === 'metacritic' && known.url) {
+          const slug = extractMetacriticSlugFromUrl(known.url);
+          const canonicalMcUrl = slug
+            ? `https://www.metacritic.com/game/${slug}/critic-reviews/`
+            : known.url.startsWith('http://')
+            ? known.url.replace(/^http:\/\//, 'https://')
+            : known.url;
+          const anchor: StorefrontReviewAnchor = {
+            storefront: 'steam',
+            metacriticUrl: canonicalMcUrl,
+            metacriticScore: known.score,
+            metacriticSlug: slug,
+            rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
+            isVerifiedGroundTruth: true,
+          };
+          this.setAnchorCacheBounded(cacheKey, anchor, capturedEpoch, capturedKeyEpoch);
+          return anchor;
+        }
+      }
 
-    if (sawTransientError || !onlineLifecycleManager.isOnline()) {
-      this.transientErrorKeys.add(cacheKey);
+      if (sawTransientError || !onlineLifecycleManager.isOnline()) {
+        if (this.isEpochCurrent(capturedEpoch, cacheKey, capturedKeyEpoch)) {
+          this.transientErrorKeys.add(cacheKey);
+        }
+        return null;
+      }
+
+      this.setAnchorCacheBounded(cacheKey, null, capturedEpoch, capturedKeyEpoch);
       return null;
-    }
+    })().finally(() => {
+      if (this.storeInFlight.get(cacheKey) === run) {
+        this.storeInFlight.delete(cacheKey);
+      }
+    });
 
-    this.setAnchorCacheBounded(cacheKey, null);
-    return null;
+    this.storeInFlight.set(cacheKey, run);
+    return run;
   }
 
   /**
@@ -662,28 +723,37 @@ export class StorefrontReviewHarvester {
     }
 
     const cacheKey = `gog-${rawTarget || rawTitle.toLowerCase()}`;
-    if (this.anchorCache.has(cacheKey)) {
-      return this.anchorCache.get(cacheKey)!;
+    const cached = this.readAnchorCache(cacheKey);
+    if (cached.hit) {
+      return cached.value;
+    }
+
+    const existingInFlight = this.storeInFlight.get(cacheKey);
+    if (existingInFlight) {
+      return existingInFlight;
     }
 
     this.transientErrorKeys.delete(cacheKey);
 
-    // 1. Check local gogEnrichedCache
-    let cachedGog: EnrichedGogAnchorRecord | undefined = GOG_ENRICHED_ANCHOR_MAP[rawTarget];
-    if (!cachedGog && rawTarget) {
-      for (const entry of Object.values(GOG_ENRICHED_ANCHOR_MAP)) {
-        if (entry.slug === rawTarget || String(entry.gogId) === rawTarget) {
-          cachedGog = entry;
-          break;
+    // 1. Check local gogEnrichedCache (O(1) empty guard)
+    let cachedGog: EnrichedGogAnchorRecord | undefined;
+    if (hasAnyKeys(GOG_ENRICHED_ANCHOR_MAP)) {
+      cachedGog = GOG_ENRICHED_ANCHOR_MAP[rawTarget];
+      if (!cachedGog && rawTarget) {
+        for (const entry of Object.values(GOG_ENRICHED_ANCHOR_MAP)) {
+          if (entry.slug === rawTarget || String(entry.gogId) === rawTarget) {
+            cachedGog = entry;
+            break;
+          }
         }
       }
-    }
-    if (!cachedGog && rawTitle) {
-      const normTitle = rawTitle.toLowerCase();
-      for (const entry of Object.values(GOG_ENRICHED_ANCHOR_MAP)) {
-        if (entry.title?.toLowerCase() === normTitle) {
-          cachedGog = entry;
-          break;
+      if (!cachedGog && rawTitle) {
+        const normTitle = rawTitle.toLowerCase();
+        for (const entry of Object.values(GOG_ENRICHED_ANCHOR_MAP)) {
+          if (entry.title?.toLowerCase() === normTitle) {
+            cachedGog = entry;
+            break;
+          }
         }
       }
     }
@@ -719,138 +789,174 @@ export class StorefrontReviewHarvester {
       return null;
     }
 
-    let sawTransientError = false;
+    const capturedEpoch = this.cacheEpoch;
+    const capturedKeyEpoch = this.keyEpochs.get(cacheKey) ?? 0;
 
-    // 2. Resolve GOG product slug if needed
-    let slug = cachedGog?.slug;
-    if (!slug) {
-      if (rawTarget && !/^\d+$/.test(rawTarget)) {
-        slug = rawTarget.toLowerCase();
-      } else if (rawTarget && /^\d+$/.test(rawTarget)) {
+    let run!: Promise<StorefrontReviewAnchor | null>;
+    run = (async (): Promise<StorefrontReviewAnchor | null> => {
+      let sawTransientError = false;
+
+      // 2. Resolve GOG product slug if needed
+      let slug = cachedGog?.slug;
+      if (!slug) {
+        if (rawTarget && !/^\d+$/.test(rawTarget)) {
+          slug = rawTarget.toLowerCase();
+        } else if (rawTarget && /^\d+$/.test(rawTarget)) {
+          try {
+            const prodApiUrl = `${getGogApiBaseUrl()}/products/${rawTarget}`;
+            const apiRes = await requestScheduler.schedule(
+              prodApiUrl,
+              () =>
+                fetch(prodApiUrl, {
+                  headers: { Accept: 'application/json' },
+                  signal: createTimeoutSignal(6000),
+                }),
+              Priority.P1_VIEWPORT,
+              'api.gog.com'
+            );
+            const isWaf = isWafOrChallengeResponse(apiRes.status, '', apiRes.headers, true);
+            if (!apiRes.ok || isWaf) {
+              if (isWaf || apiRes.status === 429 || apiRes.status >= 500) {
+                sawTransientError = true;
+              }
+            } else {
+              const apiData: unknown = await apiRes.json();
+              if (
+                apiData &&
+                typeof apiData === 'object' &&
+                typeof (apiData as { slug?: unknown }).slug === 'string' &&
+                (apiData as { slug: string }).slug
+              ) {
+                slug = (apiData as { slug: string }).slug;
+              }
+            }
+          } catch (err: unknown) {
+            if (classifyNetworkError(err).status === 'transient_error') {
+              sawTransientError = true;
+            }
+          }
+        }
+      }
+
+      if (!slug && rawTitle) {
+        const cleanTitle =
+          normalizeTitleForStoreSearch(rawTitle, { stripEditions: true }) ||
+          normalizeTitleForStoreSearch(rawTitle) ||
+          rawTitle;
         try {
-          const prodApiUrl = `${getGogApiBaseUrl()}/products/${rawTarget}`;
-          const apiRes = await requestScheduler.schedule(
-            prodApiUrl,
+          const cleanLike = cleanTitle.replace(/^like:/i, '').trim();
+          const catalogUrl = `${getGogCatalogBaseUrl()}/v1/catalog?query=${encodeURIComponent(`like:${cleanLike}`)}&limit=1`;
+          const catalogRes = await requestScheduler.schedule(
+            catalogUrl,
             () =>
-              axios.get(prodApiUrl, {
-                headers: { 'User-Agent': GOG_USER_AGENT },
-                timeout: 6000,
+              fetch(catalogUrl, {
+                headers: { Accept: 'application/json' },
+                signal: createTimeoutSignal(6000),
               }),
             Priority.P1_VIEWPORT,
-            'api.gog.com'
+            'catalog.gog.com'
           );
-          if (apiRes.data?.slug) {
-            slug = apiRes.data.slug;
+          const isWaf = isWafOrChallengeResponse(catalogRes.status, '', catalogRes.headers, true);
+          if (!catalogRes.ok || isWaf) {
+            if (isWaf || catalogRes.status === 429 || catalogRes.status >= 500) {
+              sawTransientError = true;
+            }
+          } else {
+            const catalogData: unknown = await catalogRes.json();
+            const parsedCatalog =
+              catalogData && typeof catalogData === 'object'
+                ? (catalogData as {
+                    productCount?: unknown;
+                    products?: Array<{ title?: string; slug?: string }>;
+                  })
+                : null;
+            const hasZeroMatches =
+              typeof parsedCatalog?.productCount === 'number' && parsedCatalog.productCount <= 0;
+            if (!hasZeroMatches && Array.isArray(parsedCatalog?.products) && parsedCatalog.products.length > 0) {
+              const prod = parsedCatalog.products[0];
+              const prodTitle = prod.title || prod.slug?.replace(/_/g, ' ') || '';
+              if (prod.slug && isTitleCompatible(cleanTitle, prodTitle)) {
+                slug = prod.slug;
+              }
+            }
           }
         } catch (err: unknown) {
-          const resp = getHttpErrorResponse(err);
-          if (
-            classifyNetworkError(err).status === 'transient_error' ||
-            isWafOrChallengeResponse(resp.status, resp.data, resp.headers)
-          ) {
+          if (classifyNetworkError(err).status === 'transient_error') {
             sawTransientError = true;
           }
         }
       }
-    }
 
-    if (!slug && rawTitle) {
-      const cleanTitle =
-        normalizeTitleForStoreSearch(rawTitle, { stripEditions: true }) ||
-        normalizeTitleForStoreSearch(rawTitle) ||
-        rawTitle;
-      try {
-        const cleanLike = cleanTitle.replace(/^like:/i, '').trim();
-        const catalogUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(`like:${cleanLike}`)}&limit=1`;
-        const catalogRes = await requestScheduler.schedule(
-          catalogUrl,
-          () =>
-            axios.get(catalogUrl, {
-              headers: { 'User-Agent': GOG_USER_AGENT },
-              timeout: 6000,
-            }),
-          Priority.P1_VIEWPORT,
-          'catalog.gog.com'
-        );
-        const hasZeroMatches =
-          typeof catalogRes.data?.productCount === 'number' && catalogRes.data.productCount <= 0;
-        if (!hasZeroMatches && Array.isArray(catalogRes.data?.products) && catalogRes.data.products.length > 0) {
-          const prod = catalogRes.data.products[0];
-          const prodTitle = prod.title || prod.slug?.replace(/_/g, ' ') || '';
-          if (isTitleCompatible(cleanTitle, prodTitle)) {
-            slug = prod.slug;
+      // 3. Inspect GOG product page HTML for embedded OpenCritic or Metacritic reviews via DOMParser
+      if (slug) {
+        try {
+          const productUrl = `${getGogWebBaseUrl()}/en/game/${slug}`;
+          const pageRes = await requestScheduler.schedule(
+            productUrl,
+            () =>
+              fetch(productUrl, {
+                headers: {
+                  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                },
+                signal: createTimeoutSignal(7000),
+              }),
+            Priority.P1_VIEWPORT,
+            'www.gog.com'
+          );
+          if (!pageRes.ok) {
+            if (
+              pageRes.status === 429 ||
+              pageRes.status >= 500 ||
+              isWafOrChallengeResponse(pageRes.status, '', pageRes.headers)
+            ) {
+              sawTransientError = true;
+            }
+          } else {
+            const html = await pageRes.text();
+            if (isWafOrChallengeResponse(pageRes.status, html, pageRes.headers)) {
+              sawTransientError = true;
+            } else {
+              const { ocScore, ocUrl, ocId, mcUrl, mcSlug } = extractGogPageReviewAnchors(html);
+              if (ocScore !== undefined || ocUrl || mcUrl) {
+                const anchor: StorefrontReviewAnchor = {
+                  storefront: 'gog',
+                  metacriticUrl: mcUrl,
+                  metacriticSlug: mcSlug,
+                  openCriticId: ocId,
+                  openCriticUrl: ocUrl,
+                  openCriticScore: ocScore,
+                  rawStoreUrl: `https://www.gog.com/en/game/${slug}`,
+                  isVerifiedGroundTruth: true,
+                };
+                this.setAnchorCacheBounded(cacheKey, anchor, capturedEpoch, capturedKeyEpoch);
+                return anchor;
+              }
+            }
+          }
+        } catch (err: unknown) {
+          if (classifyNetworkError(err).status === 'transient_error') {
+            sawTransientError = true;
           }
         }
-      } catch (err: unknown) {
-        const resp = getHttpErrorResponse(err);
-        if (
-          classifyNetworkError(err).status === 'transient_error' ||
-          isWafOrChallengeResponse(resp.status, resp.data, resp.headers)
-        ) {
-          sawTransientError = true;
-        }
       }
-    }
 
-    // 3. Inspect GOG product page HTML for embedded OpenCritic or Metacritic reviews via DOMParser
-    if (slug) {
-      try {
-        const productUrl = `${getGogWebBaseUrl()}/en/game/${slug}`;
-        const pageRes = await requestScheduler.schedule(
-          productUrl,
-          () =>
-            axios.get(productUrl, {
-              headers: { 'User-Agent': GOG_USER_AGENT },
-              timeout: 7000,
-            }),
-          Priority.P1_VIEWPORT,
-          'www.gog.com'
-        );
-        const html = typeof pageRes.data === 'string' ? pageRes.data : '';
-        const respHeaders =
-          pageRes.headers && typeof pageRes.headers === 'object'
-            ? (pageRes.headers as Record<string, unknown>)
-            : undefined;
-        if (isWafOrChallengeResponse(pageRes.status, html, respHeaders)) {
-          sawTransientError = true;
-        } else {
-          const { ocScore, ocUrl, ocId, mcUrl, mcSlug } = extractGogPageReviewAnchors(html);
-          let mcScore: number | undefined;
-
-          if (ocScore !== undefined || ocUrl || mcUrl || mcScore !== undefined) {
-            const anchor: StorefrontReviewAnchor = {
-              storefront: 'gog',
-              metacriticUrl: mcUrl,
-              metacriticScore: mcScore,
-              metacriticSlug: mcSlug,
-              openCriticId: ocId,
-              openCriticUrl: ocUrl,
-              openCriticScore: ocScore,
-              rawStoreUrl: `https://www.gog.com/en/game/${slug}`,
-              isVerifiedGroundTruth: true,
-            };
-            this.setAnchorCacheBounded(cacheKey, anchor);
-            return anchor;
-          }
+      if (sawTransientError || !onlineLifecycleManager.isOnline()) {
+        if (this.isEpochCurrent(capturedEpoch, cacheKey, capturedKeyEpoch)) {
+          this.transientErrorKeys.add(cacheKey);
         }
-      } catch (err: unknown) {
-        const resp = getHttpErrorResponse(err);
-        if (
-          classifyNetworkError(err).status === 'transient_error' ||
-          isWafOrChallengeResponse(resp.status, resp.data, resp.headers)
-        ) {
-          sawTransientError = true;
-        }
+        return null;
       }
-    }
 
-    if (sawTransientError || !onlineLifecycleManager.isOnline()) {
-      this.transientErrorKeys.add(cacheKey);
+      this.setAnchorCacheBounded(cacheKey, null, capturedEpoch, capturedKeyEpoch);
       return null;
-    }
+    })().finally(() => {
+      if (this.storeInFlight.get(cacheKey) === run) {
+        this.storeInFlight.delete(cacheKey);
+      }
+    });
 
-    this.setAnchorCacheBounded(cacheKey, null);
-    return null;
+    this.storeInFlight.set(cacheKey, run);
+    return run;
   }
 
   /**
@@ -865,8 +971,14 @@ export class StorefrontReviewHarvester {
     }
 
     const cacheKey = `epic-${rawTarget || effectiveTitle.toLowerCase()}`;
-    if (this.anchorCache.has(cacheKey)) {
-      return this.anchorCache.get(cacheKey)!;
+    const cached = this.readAnchorCache(cacheKey);
+    if (cached.hit) {
+      return cached.value;
+    }
+
+    const existingInFlight = this.storeInFlight.get(cacheKey);
+    if (existingInFlight) {
+      return existingInFlight;
     }
 
     this.transientErrorKeys.delete(cacheKey);
@@ -876,44 +988,49 @@ export class StorefrontReviewHarvester {
       return null;
     }
 
-    let sawTransientError = false;
+    const capturedEpoch = this.cacheEpoch;
+    const capturedKeyEpoch = this.keyEpochs.get(cacheKey) ?? 0;
 
-    // Resolve appName / codename mapping if applicable
-    if (rawTarget) {
-      const lowerTarget = rawTarget.toLowerCase();
-      if (KNOWN_EPIC_APP_NAMES[lowerTarget]?.title && !effectiveTitle) {
-        effectiveTitle = KNOWN_EPIC_APP_NAMES[lowerTarget].title;
+    let run!: Promise<StorefrontReviewAnchor | null>;
+    run = (async (): Promise<StorefrontReviewAnchor | null> => {
+      let sawTransientError = false;
+
+      // Resolve appName / codename mapping if applicable (O(1) empty guard)
+      if (rawTarget && hasAnyKeys(KNOWN_EPIC_APP_NAMES)) {
+        const lowerTarget = rawTarget.toLowerCase();
+        if (KNOWN_EPIC_APP_NAMES[lowerTarget]?.title && !effectiveTitle) {
+          effectiveTitle = KNOWN_EPIC_APP_NAMES[lowerTarget].title;
+        }
       }
-    }
 
-    // Build candidate SKUs
-    const candidateSkus: string[] = [];
-    if (rawTarget) {
-      if (rawTarget.startsWith('EPIC_')) {
-        candidateSkus.push(rawTarget);
-      } else if (!/^[0-9a-f]{32}$/i.test(rawTarget)) {
-        candidateSkus.push(`EPIC_${rawTarget}`);
-        candidateSkus.push(rawTarget);
+      // Build candidate SKUs
+      const candidateSkus: string[] = [];
+      if (rawTarget) {
+        if (rawTarget.startsWith('EPIC_')) {
+          candidateSkus.push(rawTarget);
+        } else if (!/^[0-9a-f]{32}$/i.test(rawTarget)) {
+          candidateSkus.push(`EPIC_${rawTarget}`);
+          candidateSkus.push(rawTarget);
+        }
       }
-    }
 
-    if (effectiveTitle) {
-      const cleanTitle =
-        normalizeTitleForStoreSearch(effectiveTitle, { stripEditions: true }) ||
-        normalizeTitleForStoreSearch(effectiveTitle) ||
-        effectiveTitle;
+      if (effectiveTitle) {
+        const cleanTitle =
+          normalizeTitleForStoreSearch(effectiveTitle, { stripEditions: true }) ||
+          normalizeTitleForStoreSearch(effectiveTitle) ||
+          effectiveTitle;
 
-      const titleSlug = normalizeTitleKey(cleanTitle).replace(/\s+/g, '-');
+        const titleSlug = normalizeTitleKey(cleanTitle).replace(/\s+/g, '-');
 
-      if (titleSlug) {
-        const withPrefix = `EPIC_${titleSlug}`;
-        if (!candidateSkus.includes(withPrefix)) candidateSkus.push(withPrefix);
-        if (!candidateSkus.includes(titleSlug)) candidateSkus.push(titleSlug);
+        if (titleSlug) {
+          const withPrefix = `EPIC_${titleSlug}`;
+          if (!candidateSkus.includes(withPrefix)) candidateSkus.push(withPrefix);
+          if (!candidateSkus.includes(titleSlug)) candidateSkus.push(titleSlug);
+        }
       }
-    }
 
-    // Query Epic Store GraphQL service for OpenCritic review anchor
-    const graphqlQuery = `query productReviewsQuery($sku: String!) {
+      // Query Epic Store GraphQL service for OpenCritic review anchor
+      const graphqlQuery = `query productReviewsQuery($sku: String!) {
       OpenCritic {
         productReviews(sku: $sku) {
           id
@@ -927,108 +1044,144 @@ export class StorefrontReviewHarvester {
       }
     }`;
 
-    for (const sku of candidateSkus) {
-      try {
-        const gqlUrl = getEpicGraphQLBaseUrl();
-        const res = await requestScheduler.schedule(
-          gqlUrl,
-          () =>
-            axios.post(
-              gqlUrl,
-              { query: graphqlQuery, variables: { sku } },
-              {
+      for (const sku of candidateSkus) {
+        try {
+          const gqlUrl = getEpicGraphQLBaseUrl();
+          const res = await requestScheduler.schedule(
+            gqlUrl,
+            () =>
+              fetch(gqlUrl, {
+                method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
-                  'User-Agent': EPIC_LAUNCHER_USER_AGENT,
+                  Accept: 'application/json',
                 },
-                timeout: 6000,
-              }
-            ),
-          Priority.P1_VIEWPORT,
-          'launcher.store.epicgames.com'
-        );
+                body: JSON.stringify({ query: graphqlQuery, variables: { sku } }),
+                signal: createTimeoutSignal(6000),
+              }),
+            Priority.P1_VIEWPORT,
+            'launcher.store.epicgames.com'
+          );
 
-        const rev = res.data?.data?.OpenCritic?.productReviews;
-        if (rev && (typeof rev.openCriticScore === 'number' || rev.openCriticUrl || typeof rev.id === 'number')) {
-          const ocId = typeof rev.id === 'number' ? rev.id : undefined;
-          const ocScore = typeof rev.openCriticScore === 'number' ? rev.openCriticScore : undefined;
-          const ocUrl =
-            rev.openCriticUrl ||
-            (ocId
-              ? `https://opencritic.com/game/${ocId}/${rev.name ? rev.name.toLowerCase().replace(/[^a-z0-9]+/g, '-') : 'game'}`
-              : undefined);
+          const isWaf = isWafOrChallengeResponse(res.status, '', res.headers, true);
+          if (!res.ok || isWaf) {
+            if (isWaf || res.status === 429 || res.status >= 500) {
+              sawTransientError = true;
+            }
+            continue;
+          }
 
-          const storeSlug = sku.replace(/^EPIC_/i, '');
-          const anchor: StorefrontReviewAnchor = {
-            storefront: 'epic',
-            openCriticId: ocId,
-            openCriticScore: ocScore,
-            openCriticUrl: ocUrl,
-            rawStoreUrl: `https://store.epicgames.com/p/${storeSlug}`,
-            isVerifiedGroundTruth: true,
-          };
-          this.setAnchorCacheBounded(cacheKey, anchor);
-          return anchor;
-        }
-      } catch (err: unknown) {
-        const resp = getHttpErrorResponse(err);
-        if (
-          classifyNetworkError(err).status === 'transient_error' ||
-          isWafOrChallengeResponse(resp.status, resp.data, resp.headers)
-        ) {
-          sawTransientError = true;
-        }
-      }
-    }
+          const rawJson: unknown = await res.json();
+          const rev = (
+            rawJson as {
+              data?: {
+                OpenCritic?: {
+                  productReviews?: {
+                    id?: unknown;
+                    name?: unknown;
+                    openCriticScore?: unknown;
+                    openCriticUrl?: unknown;
+                  };
+                };
+              };
+            } | null
+          )?.data?.OpenCritic?.productReviews;
 
-    // Inspect Epic Content API for external review links if not discovered via GraphQL
-    if (candidateSkus.length > 0) {
-      const primarySlug = candidateSkus[0].replace(/^EPIC_/i, '');
-      try {
-        const contentUrl = `${getEpicContentBaseUrl()}/api/en-US/content/products/${primarySlug}`;
-        const contentRes = await requestScheduler.schedule(
-          contentUrl,
-          () =>
-            axios.get(contentUrl, {
-              headers: { 'User-Agent': 'Mozilla/5.0' },
-              timeout: 6000,
-            }),
-          Priority.P1_VIEWPORT,
-          'store-content.ak.epicgames.com'
-        );
-        const contentStr = JSON.stringify(contentRes.data || '');
-        const mcMatch = contentStr.match(/https:\/\/(?:www\.)?metacritic\.com\/game\/[a-z0-9\/\-_]+/i);
-        if (mcMatch) {
-          const mcUrl = mcMatch[0];
-          const mcSlug = extractMetacriticSlugFromUrl(mcUrl);
-          const anchor: StorefrontReviewAnchor = {
-            storefront: 'epic',
-            metacriticUrl: mcUrl,
-            metacriticSlug: mcSlug,
-            rawStoreUrl: `https://store.epicgames.com/p/${primarySlug}`,
-            isVerifiedGroundTruth: true,
-          };
-          this.setAnchorCacheBounded(cacheKey, anchor);
-          return anchor;
-        }
-      } catch (err: unknown) {
-        const resp = getHttpErrorResponse(err);
-        if (
-          classifyNetworkError(err).status === 'transient_error' ||
-          isWafOrChallengeResponse(resp.status, resp.data, resp.headers)
-        ) {
-          sawTransientError = true;
+          if (
+            rev &&
+            (typeof rev.openCriticScore === 'number' ||
+              typeof rev.openCriticUrl === 'string' ||
+              typeof rev.id === 'number')
+          ) {
+            const ocId = typeof rev.id === 'number' ? rev.id : undefined;
+            const ocScore = typeof rev.openCriticScore === 'number' ? rev.openCriticScore : undefined;
+            const revName = typeof rev.name === 'string' ? rev.name : '';
+            const ocUrl =
+              (typeof rev.openCriticUrl === 'string' && rev.openCriticUrl) ||
+              (ocId
+                ? `https://opencritic.com/game/${ocId}/${revName ? revName.toLowerCase().replace(/[^a-z0-9]+/g, '-') : 'game'}`
+                : undefined);
+
+            const storeSlug = sku.replace(/^EPIC_/i, '');
+            const anchor: StorefrontReviewAnchor = {
+              storefront: 'epic',
+              openCriticId: ocId,
+              openCriticScore: ocScore,
+              openCriticUrl: ocUrl,
+              rawStoreUrl: `https://store.epicgames.com/p/${storeSlug}`,
+              isVerifiedGroundTruth: true,
+            };
+            this.setAnchorCacheBounded(cacheKey, anchor, capturedEpoch, capturedKeyEpoch);
+            return anchor;
+          }
+        } catch (err: unknown) {
+          if (classifyNetworkError(err).status === 'transient_error') {
+            sawTransientError = true;
+          }
         }
       }
-    }
 
-    if (sawTransientError || !onlineLifecycleManager.isOnline()) {
-      this.transientErrorKeys.add(cacheKey);
+      // Inspect Epic Content API for external review links if not discovered via GraphQL
+      if (candidateSkus.length > 0) {
+        const primarySlug = candidateSkus[0].replace(/^EPIC_/i, '');
+        try {
+          const contentUrl = `${getEpicContentBaseUrl()}/api/en-US/content/products/${primarySlug}`;
+          const contentRes = await requestScheduler.schedule(
+            contentUrl,
+            () =>
+              fetch(contentUrl, {
+                headers: { Accept: 'application/json' },
+                signal: createTimeoutSignal(6000),
+              }),
+            Priority.P1_VIEWPORT,
+            'store-content.ak.epicgames.com'
+          );
+          const isWaf = isWafOrChallengeResponse(contentRes.status, '', contentRes.headers, true);
+          if (!contentRes.ok || isWaf) {
+            if (isWaf || contentRes.status === 429 || contentRes.status >= 500) {
+              sawTransientError = true;
+            }
+          } else {
+            const contentText = await contentRes.text();
+            const mcMatch = contentText.match(/https:\/\/(?:www\.)?metacritic\.com\/game\/[a-z0-9\/\-_]+/i);
+            if (mcMatch) {
+              const mcUrl = mcMatch[0];
+              const mcSlug = extractMetacriticSlugFromUrl(mcUrl);
+              const anchor: StorefrontReviewAnchor = {
+                storefront: 'epic',
+                metacriticUrl: mcUrl,
+                metacriticSlug: mcSlug,
+                rawStoreUrl: `https://store.epicgames.com/p/${primarySlug}`,
+                isVerifiedGroundTruth: true,
+              };
+              this.setAnchorCacheBounded(cacheKey, anchor, capturedEpoch, capturedKeyEpoch);
+              return anchor;
+            }
+          }
+        } catch (err: unknown) {
+          if (classifyNetworkError(err).status === 'transient_error') {
+            sawTransientError = true;
+          }
+        }
+      }
+
+      if (sawTransientError || !onlineLifecycleManager.isOnline()) {
+        if (this.isEpochCurrent(capturedEpoch, cacheKey, capturedKeyEpoch)) {
+          this.transientErrorKeys.add(cacheKey);
+        }
+        return null;
+      }
+
+      this.setAnchorCacheBounded(cacheKey, null, capturedEpoch, capturedKeyEpoch);
       return null;
-    }
+    })().finally(() => {
+      if (this.storeInFlight.get(cacheKey) === run) {
+        this.storeInFlight.delete(cacheKey);
+      }
+    });
 
-    this.setAnchorCacheBounded(cacheKey, null);
-    return null;
+    this.storeInFlight.set(cacheKey, run);
+    return run;
   }
 
   /**
@@ -1043,8 +1196,14 @@ export class StorefrontReviewHarvester {
     const cacheKey = `xbox-${cleanId || cleanTitle.toLowerCase()}`;
     if (!cleanId && !cleanTitle) return null;
 
-    if (this.anchorCache.has(cacheKey)) {
-      return this.anchorCache.get(cacheKey)!;
+    const cached = this.readAnchorCache(cacheKey);
+    if (cached.hit) {
+      return cached.value;
+    }
+
+    const existingInFlight = this.storeInFlight.get(cacheKey);
+    if (existingInFlight) {
+      return existingInFlight;
     }
 
     if (typeof window === 'undefined' || !window.electronAPI?.fetchXboxProductMetadata) {
@@ -1058,63 +1217,77 @@ export class StorefrontReviewHarvester {
 
     this.transientErrorKeys.delete(cacheKey);
     const directBigId = /^[A-Z0-9]{12}$/i.test(cleanId) ? cleanId.toUpperCase() : undefined;
+    const capturedEpoch = this.cacheEpoch;
+    const capturedKeyEpoch = this.keyEpochs.get(cacheKey) ?? 0;
 
-    try {
-      const rawMetaUnknown: unknown = await window.electronAPI.fetchXboxProductMetadata({
-        xboxProductId: directBigId,
-        productId: directBigId,
-        title: cleanTitle || (!directBigId ? cleanId : undefined),
-      });
-      if (!rawMetaUnknown || typeof rawMetaUnknown !== 'object') {
-        return null;
+    let run!: Promise<StorefrontReviewAnchor | null>;
+    run = (async (): Promise<StorefrontReviewAnchor | null> => {
+      try {
+        const rawMetaUnknown: unknown = await window.electronAPI!.fetchXboxProductMetadata!({
+          xboxProductId: directBigId,
+          productId: directBigId,
+          title: cleanTitle || (!directBigId ? cleanId : undefined),
+        });
+        if (!rawMetaUnknown || typeof rawMetaUnknown !== 'object') {
+          return null;
+        }
+
+        const rawMeta = rawMetaUnknown as XboxProductMetadataRecord;
+        const meta: XboxProductMetadataRecord =
+          rawMeta.product && typeof rawMeta.product === 'object'
+            ? { ...rawMeta, ...(rawMeta.product as XboxProductMetadataRecord) }
+            : Array.isArray(rawMeta.results) && rawMeta.results[0]
+            ? { ...rawMeta, ...(rawMeta.results[0] as XboxProductMetadataRecord) }
+            : rawMeta;
+
+        const metaTitle = String(meta.title || meta.name || '').trim();
+        if (!directBigId && cleanTitle && metaTitle && !isTitleCompatible(cleanTitle, metaTitle)) {
+          return null;
+        }
+
+        const avgRating = Number(
+          meta.averageRating ?? meta.starRating ?? meta.reviewSummary?.averageRating ?? 0
+        );
+        const ratingCount = Number(
+          meta.ratingCount ?? meta.reviewCount ?? meta.reviewSummary?.totalReviews ?? 0
+        );
+        const mcUrl = typeof meta.metacriticUrl === 'string' ? meta.metacriticUrl : undefined;
+        const mcSlug = extractMetacriticSlugFromUrl(mcUrl);
+        const resolvedProdId = String(meta.xboxProductId || meta.productId || directBigId || '').trim();
+        const rawStoreUrl =
+          meta.storeUrl ||
+          (resolvedProdId ? `https://www.xbox.com/games/store/-/${resolvedProdId}` : undefined);
+
+        if ((ratingCount > 0 && avgRating > 0) || mcSlug) {
+          const anchor: StorefrontReviewAnchor = {
+            storefront: 'xbox',
+            metacriticSlug: mcSlug,
+            metacriticUrl: mcUrl,
+            rawStoreUrl,
+            isVerifiedGroundTruth: Boolean(mcSlug || directBigId),
+          };
+          this.setAnchorCacheBounded(cacheKey, anchor, capturedEpoch, capturedKeyEpoch);
+          return anchor;
+        }
+      } catch (err: unknown) {
+        if (classifyNetworkError(err).status === 'transient_error') {
+          if (this.isEpochCurrent(capturedEpoch, cacheKey, capturedKeyEpoch)) {
+            this.transientErrorKeys.add(cacheKey);
+          }
+          return null;
+        }
       }
 
-      const rawMeta = rawMetaUnknown as XboxProductMetadataRecord;
-      const meta: XboxProductMetadataRecord =
-        rawMeta.product && typeof rawMeta.product === 'object'
-          ? { ...rawMeta, ...(rawMeta.product as XboxProductMetadataRecord) }
-          : Array.isArray(rawMeta.results) && rawMeta.results[0]
-          ? { ...rawMeta, ...(rawMeta.results[0] as XboxProductMetadataRecord) }
-          : rawMeta;
-
-      const metaTitle = String(meta.title || meta.name || '').trim();
-      if (!directBigId && cleanTitle && metaTitle && !isTitleCompatible(cleanTitle, metaTitle)) {
-        return null;
+      this.setAnchorCacheBounded(cacheKey, null, capturedEpoch, capturedKeyEpoch);
+      return null;
+    })().finally(() => {
+      if (this.storeInFlight.get(cacheKey) === run) {
+        this.storeInFlight.delete(cacheKey);
       }
+    });
 
-      const avgRating = Number(
-        meta.averageRating ?? meta.starRating ?? meta.reviewSummary?.averageRating ?? 0
-      );
-      const ratingCount = Number(
-        meta.ratingCount ?? meta.reviewCount ?? meta.reviewSummary?.totalReviews ?? 0
-      );
-      const mcUrl = typeof meta.metacriticUrl === 'string' ? meta.metacriticUrl : undefined;
-      const mcSlug = extractMetacriticSlugFromUrl(mcUrl);
-      const resolvedProdId = String(meta.xboxProductId || meta.productId || directBigId || '').trim();
-      const rawStoreUrl =
-        meta.storeUrl ||
-        (resolvedProdId ? `https://www.xbox.com/games/store/-/${resolvedProdId}` : undefined);
-
-      if ((ratingCount > 0 && avgRating > 0) || mcSlug) {
-        const anchor: StorefrontReviewAnchor = {
-          storefront: 'xbox',
-          metacriticSlug: mcSlug,
-          metacriticUrl: mcUrl,
-          rawStoreUrl,
-          isVerifiedGroundTruth: Boolean(mcSlug || directBigId),
-        };
-        this.setAnchorCacheBounded(cacheKey, anchor);
-        return anchor;
-      }
-    } catch (err: unknown) {
-      if (classifyNetworkError(err).status === 'transient_error') {
-        this.transientErrorKeys.add(cacheKey);
-        return null;
-      }
-    }
-
-    this.setAnchorCacheBounded(cacheKey, null);
-    return null;
+    this.storeInFlight.set(cacheKey, run);
+    return run;
   }
 
   /**
@@ -1182,8 +1355,9 @@ export class StorefrontReviewHarvester {
       }
     }
 
-    if (this.anchorCache.has(cacheKey)) {
-      return this.anchorCache.get(cacheKey)!;
+    const cached = this.readAnchorCache(cacheKey);
+    if (cached.hit) {
+      return cached.value;
     }
 
     if (this.inFlight.has(cacheKey)) {
@@ -1191,8 +1365,11 @@ export class StorefrontReviewHarvester {
     }
 
     this.transientErrorKeys.delete(cacheKey);
+    const capturedEpoch = this.cacheEpoch;
+    const capturedKeyEpoch = this.keyEpochs.get(cacheKey) ?? 0;
 
-    const promise = (async (): Promise<StorefrontReviewAnchor | null> => {
+    let promise!: Promise<StorefrontReviewAnchor | null>;
+    promise = (async (): Promise<StorefrontReviewAnchor | null> => {
       let subTransient = !onlineLifecycleManager.isOnline();
 
       // 1. Prioritize Steam if steamAppId is known (fastest, most authoritative Metascore links)
@@ -1211,7 +1388,7 @@ export class StorefrontReviewHarvester {
       }
 
       // Check if Epic codename mapping links to a known Steam App ID
-      if (!effectiveSteamAppId) {
+      if (!effectiveSteamAppId && hasAnyKeys(KNOWN_EPIC_APP_NAMES)) {
         const epicPlat = game.platforms?.find((p) => p.platformId === 'epic' || p.platformId?.toLowerCase() === 'epic');
         const epicId = epicPlat?.platformGameId || (game.id?.startsWith('epic-') ? game.id.replace('epic-', '') : undefined);
         if (epicId && KNOWN_EPIC_APP_NAMES[epicId.toLowerCase()]?.steamAppId) {
@@ -1222,7 +1399,7 @@ export class StorefrontReviewHarvester {
       if (effectiveSteamAppId) {
         const steamAnchor = await this.getSteamAnchor(effectiveSteamAppId);
         if (steamAnchor) {
-          this.setAnchorCacheBounded(cacheKey, steamAnchor);
+          this.setAnchorCacheBounded(cacheKey, steamAnchor, capturedEpoch, capturedKeyEpoch);
           return steamAnchor;
         }
         if (this.transientErrorKeys.has(`steam-${effectiveSteamAppId}`)) {
@@ -1236,7 +1413,7 @@ export class StorefrontReviewHarvester {
       if (gogId) {
         const gogAnchor = await this.getGogAnchor(gogId, game.title);
         if (gogAnchor) {
-          this.setAnchorCacheBounded(cacheKey, gogAnchor);
+          this.setAnchorCacheBounded(cacheKey, gogAnchor, capturedEpoch, capturedKeyEpoch);
           return gogAnchor;
         }
         if (this.transientErrorKeys.has(`gog-${gogId.trim() || (game.title || '').trim().toLowerCase()}`)) {
@@ -1250,7 +1427,7 @@ export class StorefrontReviewHarvester {
       if (epicId) {
         const epicAnchor = await this.getEpicAnchor(epicId, game.title);
         if (epicAnchor) {
-          this.setAnchorCacheBounded(cacheKey, epicAnchor);
+          this.setAnchorCacheBounded(cacheKey, epicAnchor, capturedEpoch, capturedKeyEpoch);
           return epicAnchor;
         }
         if (this.transientErrorKeys.has(`epic-${epicId.trim() || (game.title || '').trim().toLowerCase()}`)) {
@@ -1263,7 +1440,7 @@ export class StorefrontReviewHarvester {
         if (!gogId) {
           const gogTitleAnchor = await this.getGogAnchor('', game.title);
           if (gogTitleAnchor) {
-            this.setAnchorCacheBounded(cacheKey, gogTitleAnchor);
+            this.setAnchorCacheBounded(cacheKey, gogTitleAnchor, capturedEpoch, capturedKeyEpoch);
             return gogTitleAnchor;
           }
           if (this.transientErrorKeys.has(`gog-${game.title.trim().toLowerCase()}`)) {
@@ -1274,7 +1451,7 @@ export class StorefrontReviewHarvester {
         if (!epicId) {
           const epicTitleAnchor = await this.getEpicAnchor('', game.title);
           if (epicTitleAnchor) {
-            this.setAnchorCacheBounded(cacheKey, epicTitleAnchor);
+            this.setAnchorCacheBounded(cacheKey, epicTitleAnchor, capturedEpoch, capturedKeyEpoch);
             return epicTitleAnchor;
           }
           if (this.transientErrorKeys.has(`epic-${game.title.trim().toLowerCase()}`)) {
@@ -1294,7 +1471,7 @@ export class StorefrontReviewHarvester {
       if (xboxId) {
         const xboxAnchor = await this.getXboxAnchor(xboxId, game.title);
         if (xboxAnchor) {
-          this.setAnchorCacheBounded(cacheKey, xboxAnchor);
+          this.setAnchorCacheBounded(cacheKey, xboxAnchor, capturedEpoch, capturedKeyEpoch);
           return xboxAnchor;
         }
         if (this.transientErrorKeys.has(`xbox-${xboxId.replace(/^xbox[-_]/i, '').trim() || (game.title || '').trim().toLowerCase()}`)) {
@@ -1303,14 +1480,18 @@ export class StorefrontReviewHarvester {
       }
 
       if (subTransient || !onlineLifecycleManager.isOnline()) {
-        this.transientErrorKeys.add(cacheKey);
+        if (this.isEpochCurrent(capturedEpoch, cacheKey, capturedKeyEpoch)) {
+          this.transientErrorKeys.add(cacheKey);
+        }
         return null;
       }
 
-      this.setAnchorCacheBounded(cacheKey, null);
+      this.setAnchorCacheBounded(cacheKey, null, capturedEpoch, capturedKeyEpoch);
       return null;
     })().finally(() => {
-      this.inFlight.delete(cacheKey);
+      if (this.inFlight.get(cacheKey) === promise) {
+        this.inFlight.delete(cacheKey);
+      }
     });
 
     this.inFlight.set(cacheKey, promise);
@@ -1353,8 +1534,10 @@ export class StorefrontReviewHarvester {
       }
     }
     for (const key of keys) {
+      this.keyEpochs.set(key, (this.keyEpochs.get(key) ?? 0) + 1);
       this.anchorCache.delete(key);
       this.inFlight.delete(key);
+      this.storeInFlight.delete(key);
       this.transientErrorKeys.delete(key);
     }
   }
@@ -1363,8 +1546,11 @@ export class StorefrontReviewHarvester {
    * Clears the in-memory anchor cache and any active in-flight requests.
    */
   clearCache(): void {
+    this.cacheEpoch += 1;
+    this.keyEpochs.clear();
     this.anchorCache.clear();
     this.inFlight.clear();
+    this.storeInFlight.clear();
     this.transientErrorKeys.clear();
   }
 }

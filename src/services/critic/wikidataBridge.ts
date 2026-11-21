@@ -4,6 +4,7 @@ import {
   ROMAN_TO_ARABIC,
   alignCompoundWordTokens,
   extractParentheticalReleaseYear,
+  extractTrailingDelimitedReleaseYear,
   isIntermediateNumeralSubtitleMatch,
   isSequelMismatch,
   isYearEditionToken,
@@ -12,16 +13,18 @@ import {
   sanitizeTitleForSearchQuery,
   stripIntermediateSubtitleNumeral,
   stripPackagingEditionPhrases,
+  stripTrailingDelimitedReleaseYear,
   stripYearEditionPhrases,
 } from '../common/titleUtils';
+import { buildDevProxyUrlForRoute } from '../network/browserDevProxy';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 import { Priority, requestScheduler } from '../network/requestScheduler';
+import { TIER_TTLS } from '../storage/stagedCacheService';
 import {
-  TIER_TTLS,
-  evictStagedCache,
-  loadStagedCache,
-  saveStagedCache,
-} from '../storage/stagedCacheService';
+  StagedResolverCache,
+  createTimeoutSignal,
+  parseValidReleaseYear,
+} from './stagedResolverCache';
 
 export interface WikidataGameLinks {
   qid?: string;
@@ -46,12 +49,6 @@ export interface WikidataResolveForGameParams {
   title?: string;
   releaseYear?: number | string | null;
   priority?: number;
-}
-
-interface WikidataCacheEntry {
-  value: WikidataGameLinks | null;
-  expiresAt: number;
-  mirroredInStorage: boolean;
 }
 
 interface SparqlBindingValue {
@@ -146,60 +143,12 @@ const REMASTER_OR_EDITION_RE =
 const LEGACY_METACRITIC_PLATFORM_PREFIX_RE =
   /^(?:pc|playstation-\d|ps\d|xbox(?:-[a-z0-9-]+)?|switch|nintendo-[a-z0-9-]+|wii(?:-u)?|3ds|ds|psp|vita|ios|android|stadia|dreamcast|gamecube|mac|linux)\//i;
 
-function isViteBrowserDev(): boolean {
-  const metaEnv = (
-    import.meta as ImportMeta & { env?: { DEV?: boolean; VITEST?: string | boolean } }
-  ).env;
-  if (!metaEnv?.DEV) return false;
-  if (metaEnv.VITEST) return false;
-  if (typeof process !== 'undefined' && Boolean(process.env?.VITEST)) return false;
-  if (typeof window === 'undefined' || typeof window.location === 'undefined') return false;
-  if (window.electronAPI) return false;
-  const protocol = window.location.protocol || '';
-  const port = window.location.port || '';
-  if (!protocol.startsWith('http') || (port !== '3000' && port !== '5173')) {
-    return false;
-  }
-  if (
-    typeof navigator !== 'undefined' &&
-    (navigator.userAgent?.includes('jsdom') || navigator.userAgent?.includes('Node'))
-  ) {
-    return false;
-  }
-  return true;
-}
-
 function getSparqlBaseUrl(): string {
-  return isViteBrowserDev()
-    ? '/api/wikidata-sparql/sparql'
-    : 'https://query.wikidata.org/sparql';
+  return buildDevProxyUrlForRoute('wikidataSparql', '/sparql');
 }
 
 function getActionApiBaseUrl(): string {
-  return isViteBrowserDev()
-    ? '/api/wikidata-api/w/api.php'
-    : 'https://www.wikidata.org/w/api.php';
-}
-
-function getStorageSafe(): Storage | null {
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      return window.localStorage;
-    }
-    if (typeof localStorage !== 'undefined') {
-      return localStorage;
-    }
-  } catch {
-    // Ignore restricted storage environments
-  }
-  return null;
-}
-
-function createTimeoutSignal(ms: number): AbortSignal | undefined {
-  if (typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal) {
-    return AbortSignal.timeout(ms);
-  }
-  return undefined;
+  return buildDevProxyUrlForRoute('wikidataApi', '/w/api.php');
 }
 
 function parsePositiveInt(raw?: number | string | null): number | undefined {
@@ -216,26 +165,7 @@ function parsePositiveInt(raw?: number | string | null): number | undefined {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-function parseValidYear(raw?: number | string | null): number | null {
-  if (raw === null || raw === undefined) return null;
-  const maxYear = new Date().getFullYear() + 2;
-  if (typeof raw === 'number') {
-    return Number.isInteger(raw) && raw >= 1975 && raw <= maxYear ? raw : null;
-  }
-  const str = String(raw).trim();
-  if (!str) return null;
-  const isoMatch = str.match(/^[+-]?((?:19|20)\d{2})(?:[-T/]|$)/);
-  if (isoMatch) {
-    const yr = Number.parseInt(isoMatch[1], 10);
-    return yr >= 1975 && yr <= maxYear ? yr : null;
-  }
-  const anyMatch = str.match(/\b((?:19|20)\d{2})\b/);
-  if (anyMatch) {
-    const yr = Number.parseInt(anyMatch[1], 10);
-    return yr >= 1975 && yr <= maxYear ? yr : null;
-  }
-  return null;
-}
+const parseValidYear = parseValidReleaseYear;
 
 function extractQid(raw?: string | null): string | undefined {
   if (!raw || typeof raw !== 'string') return undefined;
@@ -299,7 +229,11 @@ function escapeSparqlLiteral(val: string): string {
 function tokenizeForLabelMatch(raw: string): string[] {
   const parenYr = extractParentheticalReleaseYear(raw);
   const parenYrStr = parenYr !== null ? String(parenYr) : null;
-  let cleaned = stripPackagingEditionPhrases(stripYearEditionPhrases(raw));
+  const trailingYr = extractTrailingDelimitedReleaseYear(raw);
+  const trailingYrStr = trailingYr !== null ? String(trailingYr) : null;
+  let cleaned = stripPackagingEditionPhrases(
+    stripYearEditionPhrases(stripTrailingDelimitedReleaseYear(raw))
+  );
   cleaned = cleaned.replace(/[\(\[]\s*(?:[^)\]]*?[,\s-])?(?:19|20)\d{2}\s*[\)\]]/g, ' ');
   cleaned = cleaned.replace(/[\(\[]\s*(?:video\s+game|pc|windows|mac|linux)\s*[\)\]]/gi, ' ');
   const normalized = normalizeTitleKey(cleaned);
@@ -312,6 +246,7 @@ function tokenizeForLabelMatch(raw: string): string[] {
         !LABEL_STOP_WORDS.has(t) &&
         !EDITION_TOKENS.has(t) &&
         t !== parenYrStr &&
+        t !== trailingYrStr &&
         !isYearEditionToken(raw, t)
     );
   return filtered.length > 0 ? filtered : rawTokens.map((t) => ROMAN_TO_ARABIC[t] || t);
@@ -479,138 +414,57 @@ function mergeGameLinks(
 
 function hasAnyUsefulLink(links: WikidataGameLinks | null | undefined): boolean {
   if (!links) return false;
-  return Boolean(
-    links.openCriticId || links.metacriticSlug || links.steamAppId || links.gogSlug
-  );
+  return Boolean(links.openCriticId || links.metacriticSlug);
 }
 
 export class WikidataBridge {
-  private readonly inMemoryCache = new Map<string, WikidataCacheEntry>();
-  private readonly trackedStagedKeys = new Set<string>();
+  private readonly cache = new StagedResolverCache<string, WikidataGameLinks>({
+    stagedPrefix: STAGED_PREFIX,
+    sourceLabel: 'wikidata',
+    maxInMemoryEntries: MAX_IN_MEMORY_ENTRIES,
+    transientFailureWindowMs: TRANSIENT_FAILURE_WINDOW_MS,
+    defaultPositiveTtlMs: POSITIVE_TTL_MS,
+    negativeTtlMs: NEGATIVE_TTL_MS,
+  });
   private readonly inFlightLookups = new Map<string, Promise<WikidataGameLinks | null>>();
-  private readonly transientFailures = new Map<string, number>();
-  private lastGlobalTransientFailureAt = 0;
-
-  private makeStagedKey(cacheKey: string): string {
-    return `${STAGED_PREFIX}${cacheKey}`;
-  }
-
-  private setMemoryEntry(
-    cacheKey: string,
-    value: WikidataGameLinks | null,
-    ttlMs: number,
-    mirroredInStorage: boolean
-  ): void {
-    if (this.inMemoryCache.has(cacheKey)) {
-      this.inMemoryCache.delete(cacheKey);
-    }
-    this.inMemoryCache.set(cacheKey, {
-      value,
-      expiresAt: Date.now() + ttlMs,
-      mirroredInStorage,
-    });
-    while (this.inMemoryCache.size > MAX_IN_MEMORY_ENTRIES) {
-      const oldest = this.inMemoryCache.keys().next().value;
-      if (oldest === undefined) break;
-      this.inMemoryCache.delete(oldest);
-    }
-  }
 
   private readCacheEntry(cacheKey: string): { hit: boolean; value: WikidataGameLinks | null } {
-    const stagedKey = this.makeStagedKey(cacheKey);
-    const mem = this.inMemoryCache.get(cacheKey);
-    if (mem) {
-      if (mem.mirroredInStorage) {
-        const storage = getStorageSafe();
-        if (storage && storage.getItem(stagedKey) === null) {
-          this.inMemoryCache.delete(cacheKey);
-        } else if (Date.now() < mem.expiresAt) {
-          return { hit: true, value: mem.value };
-        } else {
-          this.inMemoryCache.delete(cacheKey);
-        }
-      } else if (Date.now() < mem.expiresAt) {
-        return { hit: true, value: mem.value };
-      } else {
-        this.inMemoryCache.delete(cacheKey);
-      }
-    }
-
-    const staged = loadStagedCache<WikidataGameLinks>(stagedKey, false);
-    if (staged.valid) {
-      const remainingMs =
-        staged.entry && typeof staged.entry.cachedAt === 'number' && typeof staged.entry.ttlMs === 'number'
-          ? Math.max(1000, staged.entry.cachedAt + staged.entry.ttlMs - Date.now())
-          : staged.data
-          ? POSITIVE_TTL_MS
-          : NEGATIVE_TTL_MS;
-      const storage = getStorageSafe();
-      const mirrored = Boolean(storage && storage.getItem(stagedKey) !== null);
-      this.setMemoryEntry(cacheKey, staged.data, remainingMs, mirrored);
-      this.trackedStagedKeys.add(stagedKey);
-      return { hit: true, value: staged.data };
-    }
-
-    return { hit: false, value: null };
+    return this.cache.read(cacheKey);
   }
 
-  private writePositiveCache(cacheKey: string, links: WikidataGameLinks): void {
-    const stagedKey = this.makeStagedKey(cacheKey);
-    this.trackedStagedKeys.add(stagedKey);
-    saveStagedCache<WikidataGameLinks>(stagedKey, links, 'mature', {
-      source: 'wikidata',
-      customTtlMs: POSITIVE_TTL_MS,
-      dynamicResolved: true,
+  private writePositiveCache(
+    cacheKey: string,
+    links: WikidataGameLinks,
+    capturedGlobalEpoch?: number,
+    capturedKeyEpoch?: number
+  ): void {
+    this.cache.writePositive(cacheKey, links, {
+      tier: 'mature',
+      ttlMs: POSITIVE_TTL_MS,
+      clearTransientKeys: [cacheKey],
+      capturedGlobalEpoch,
+      capturedKeyEpoch,
     });
-    const storage = getStorageSafe();
-    const mirrored = Boolean(storage && storage.getItem(stagedKey) !== null);
-    this.setMemoryEntry(cacheKey, links, POSITIVE_TTL_MS, mirrored);
-    this.transientFailures.delete(cacheKey);
   }
 
-  private writeNegativeCache(cacheKey: string): void {
-    const stagedKey = this.makeStagedKey(cacheKey);
-    this.trackedStagedKeys.add(stagedKey);
-    saveStagedCache<WikidataGameLinks>(stagedKey, null, 'negative', {
-      source: 'wikidata',
-      failureReason: 'not_found',
-      customTtlMs: NEGATIVE_TTL_MS,
-      dynamicResolved: true,
+  private writeNegativeCache(
+    cacheKey: string,
+    capturedGlobalEpoch?: number,
+    capturedKeyEpoch?: number
+  ): void {
+    this.cache.writeNegative(cacheKey, {
+      ttlMs: NEGATIVE_TTL_MS,
+      capturedGlobalEpoch,
+      capturedKeyEpoch,
     });
-    const storage = getStorageSafe();
-    const mirrored = Boolean(storage && storage.getItem(stagedKey) !== null);
-    this.setMemoryEntry(cacheKey, null, NEGATIVE_TTL_MS, mirrored);
   }
 
   private markTransientFailure(keys?: string[]): void {
-    const now = Date.now();
-    this.lastGlobalTransientFailureAt = now;
-    if (keys) {
-      for (const k of keys) {
-        if (k) {
-          this.transientFailures.set(k, now);
-        }
-      }
-      while (this.transientFailures.size > MAX_IN_MEMORY_ENTRIES) {
-        const oldest = this.transientFailures.keys().next().value;
-        if (oldest === undefined) break;
-        this.transientFailures.delete(oldest);
-      }
-    }
+    this.cache.markTransientFailure(keys);
   }
 
   public hadRecentTransientFailure(key?: string): boolean {
-    const now = Date.now();
-    if (!key) {
-      return now - this.lastGlobalTransientFailureAt < TRANSIENT_FAILURE_WINDOW_MS;
-    }
-    const ts = this.transientFailures.get(key);
-    if (ts === undefined) return false;
-    if (now - ts >= TRANSIENT_FAILURE_WINDOW_MS) {
-      this.transientFailures.delete(key);
-      return false;
-    }
-    return true;
+    return this.cache.hadRecentTransientFailure(key ? [key] : undefined);
   }
 
   private buildTitleCacheKey(title: string, targetYear: number | null): string {
@@ -655,29 +509,45 @@ export class WikidataBridge {
     return null;
   }
 
-  public clearCache(options?: { negativesOnly?: boolean }): void {
-    const negativesOnly = Boolean(options?.negativesOnly);
-    this.transientFailures.clear();
-    this.lastGlobalTransientFailureAt = 0;
-
-    if (negativesOnly) {
-      for (const [key, entry] of this.inMemoryCache.entries()) {
-        if (entry.value === null) {
-          this.inMemoryCache.delete(key);
-          const stagedKey = this.makeStagedKey(key);
-          evictStagedCache(stagedKey);
-          this.trackedStagedKeys.delete(stagedKey);
+  public evictForGame(params: {
+    steamAppId?: number | null;
+    gogSlug?: string | null;
+    title?: string;
+    releaseYear?: number | string | null;
+  }): void {
+    const steamAppId = parsePositiveInt(params.steamAppId);
+    if (steamAppId !== undefined) {
+      this.cache.evictKey(`steam:${steamAppId}`);
+    }
+    const gogSlug = normalizeWikidataGogSlug(params.gogSlug);
+    if (gogSlug) {
+      this.cache.evictKey(`gog:${gogSlug}`);
+    }
+    if (params.title && params.title.trim()) {
+      const cleanTitle = params.title.trim();
+      const titleYear = extractParentheticalReleaseYear(cleanTitle);
+      const paramYear = parseValidYear(params.releaseYear);
+      const targetYear = titleYear ?? paramYear;
+      const baseKey = this.buildTitleCacheKey(cleanTitle, null);
+      if (baseKey) {
+        this.cache.evictKey(baseKey);
+        this.inFlightLookups.delete(baseKey);
+      }
+      if (targetYear !== null) {
+        const yearKey = this.buildTitleCacheKey(cleanTitle, targetYear);
+        if (yearKey) {
+          this.cache.evictKey(yearKey);
+          this.inFlightLookups.delete(yearKey);
         }
       }
-      return;
     }
+  }
 
-    this.inMemoryCache.clear();
-    this.inFlightLookups.clear();
-    for (const stagedKey of this.trackedStagedKeys) {
-      evictStagedCache(stagedKey);
+  public clearCache(options?: { negativesOnly?: boolean }): void {
+    this.cache.clear(options);
+    if (!options?.negativesOnly) {
+      this.inFlightLookups.clear();
     }
-    this.trackedStagedKeys.clear();
   }
 
   private async executeSparqlQuery(
@@ -846,6 +716,10 @@ export class WikidataBridge {
         `}`;
 
       const failureKeys = chunk.map((id) => `steam:${id}`);
+      const capturedEpoch = this.cache.getGlobalEpoch();
+      const capturedKeyEpochs = new Map<number, number>(
+        chunk.map((id) => [id, this.cache.getKeyEpoch(`steam:${id}`)])
+      );
       const queryRes = await this.executeSparqlQuery(sparql, priority, failureKeys);
       if (!queryRes.ok) {
         continue;
@@ -861,17 +735,23 @@ export class WikidataBridge {
 
       for (const steamId of chunk) {
         const links = bySteamId.get(steamId);
+        const keyEpoch = capturedKeyEpochs.get(steamId) ?? 0;
         if (links && hasAnyUsefulLink(links)) {
-          this.writePositiveCache(`steam:${steamId}`, links);
+          this.writePositiveCache(`steam:${steamId}`, links, capturedEpoch, keyEpoch);
           if (links.gogSlug) {
-            this.writePositiveCache(`gog:${links.gogSlug}`, links);
+            this.writePositiveCache(
+              `gog:${links.gogSlug}`,
+              links,
+              capturedEpoch,
+              this.cache.getKeyEpoch(`gog:${links.gogSlug}`)
+            );
           }
           const itemKeys = steamIdToItemKeys.get(steamId) ?? [];
           for (const itemKey of itemKeys) {
             results.set(itemKey, links);
           }
         } else {
-          this.writeNegativeCache(`steam:${steamId}`);
+          this.writeNegativeCache(`steam:${steamId}`, capturedEpoch, keyEpoch);
         }
       }
     }
@@ -904,6 +784,10 @@ export class WikidataBridge {
         `}`;
 
       const failureKeys = chunk.map((slug) => `gog:${slug}`);
+      const capturedEpoch = this.cache.getGlobalEpoch();
+      const capturedKeyEpochs = new Map<string, number>(
+        chunk.map((slug) => [slug, this.cache.getKeyEpoch(`gog:${slug}`)])
+      );
       const queryRes = await this.executeSparqlQuery(sparql, priority, failureKeys);
       if (!queryRes.ok) {
         continue;
@@ -919,10 +803,16 @@ export class WikidataBridge {
 
       for (const slug of chunk) {
         const links = byGogSlug.get(slug);
+        const keyEpoch = capturedKeyEpochs.get(slug) ?? 0;
         if (links && hasAnyUsefulLink(links)) {
-          this.writePositiveCache(`gog:${slug}`, links);
+          this.writePositiveCache(`gog:${slug}`, links, capturedEpoch, keyEpoch);
           if (links.steamAppId !== undefined) {
-            this.writePositiveCache(`steam:${links.steamAppId}`, links);
+            this.writePositiveCache(
+              `steam:${links.steamAppId}`,
+              links,
+              capturedEpoch,
+              this.cache.getKeyEpoch(`steam:${links.steamAppId}`)
+            );
           }
           const itemKeys = gogSlugToItemKeys.get(slug) ?? [];
           for (const itemKey of itemKeys) {
@@ -931,7 +821,7 @@ export class WikidataBridge {
             }
           }
         } else {
-          this.writeNegativeCache(`gog:${slug}`);
+          this.writeNegativeCache(`gog:${slug}`, capturedEpoch, keyEpoch);
         }
       }
     }
@@ -1060,6 +950,14 @@ export class WikidataBridge {
       return existingInFlight;
     }
 
+    const capturedGlobalEpoch = this.cache.getGlobalEpoch();
+    const capturedCacheKeyEpoch = cacheKey ? this.cache.getKeyEpoch(cacheKey) : 0;
+    const capturedSteamKeyEpoch =
+      options.steamAppId !== undefined ? this.cache.getKeyEpoch(`steam:${options.steamAppId}`) : 0;
+    const capturedGogKeyEpoch = options.gogSlug
+      ? this.cache.getKeyEpoch(`gog:${options.gogSlug}`)
+      : 0;
+
     const run = (async (): Promise<WikidataGameLinks | null> => {
       const failureKeys = [cacheKey, baseCacheKey].filter(Boolean);
       const primaryQuery = sanitizeTitleForSearchQuery(cleanTitle) || cleanTitle;
@@ -1124,14 +1022,16 @@ export class WikidataBridge {
       }
 
       if (candidateQids.length === 0) {
-        if (cacheKey) this.writeNegativeCache(cacheKey);
+        if (cacheKey) {
+          this.writeNegativeCache(cacheKey, capturedGlobalEpoch, capturedCacheKeyEpoch);
+        }
         return null;
       }
 
       const entitiesRes = await this.fetchActionApiJson<WikidataGetEntitiesResponseBody>(
         {
           action: 'wbgetentities',
-          props: 'claims|labels',
+          props: 'claims|labels|descriptions',
           ids: candidateQids.join('|'),
         },
         options.priority,
@@ -1249,27 +1149,39 @@ export class WikidataBridge {
         }
       }
 
-      if (bestCandidate) {
+      if (bestCandidate && hasAnyUsefulLink(bestCandidate.links)) {
         if (cacheKey) {
-          this.writePositiveCache(cacheKey, bestCandidate.links);
-        }
-        if (baseCacheKey && baseCacheKey !== cacheKey && targetYear === null) {
-          this.writePositiveCache(baseCacheKey, bestCandidate.links);
+          this.writePositiveCache(
+            cacheKey,
+            bestCandidate.links,
+            capturedGlobalEpoch,
+            capturedCacheKeyEpoch
+          );
         }
         if (
           options.steamAppId !== undefined &&
           bestCandidate.links.steamAppId === options.steamAppId
         ) {
-          this.writePositiveCache(`steam:${options.steamAppId}`, bestCandidate.links);
+          this.writePositiveCache(
+            `steam:${options.steamAppId}`,
+            bestCandidate.links,
+            capturedGlobalEpoch,
+            capturedSteamKeyEpoch
+          );
         }
         if (options.gogSlug !== undefined && bestCandidate.links.gogSlug === options.gogSlug) {
-          this.writePositiveCache(`gog:${options.gogSlug}`, bestCandidate.links);
+          this.writePositiveCache(
+            `gog:${options.gogSlug}`,
+            bestCandidate.links,
+            capturedGlobalEpoch,
+            capturedGogKeyEpoch
+          );
         }
         return bestCandidate.links;
       }
 
       if (cacheKey) {
-        this.writeNegativeCache(cacheKey);
+        this.writeNegativeCache(cacheKey, capturedGlobalEpoch, capturedCacheKeyEpoch);
       }
       return null;
     })();
@@ -1278,7 +1190,9 @@ export class WikidataBridge {
     try {
       return await run;
     } finally {
-      this.inFlightLookups.delete(inFlightKey);
+      if (this.inFlightLookups.get(inFlightKey) === run) {
+        this.inFlightLookups.delete(inFlightKey);
+      }
     }
   }
 

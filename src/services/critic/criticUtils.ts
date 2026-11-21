@@ -103,6 +103,12 @@ import {
   isSequelMismatch as commonIsSequelMismatch,
   ROMAN_TO_ARABIC,
 } from '../common/titleUtils';
+import {
+  parseSafeHttpUrl,
+  isXboxStoreHostUrl,
+  isOpenCriticHostUrl,
+  isMetacriticHostUrl,
+} from '../common/storeUrlUtils';
 
 export { ROMAN_TO_ARABIC };
 
@@ -160,61 +166,68 @@ const VALID_CRITIC_TIERS: ReadonlySet<CriticTier> = new Set([
   'Weak',
 ]);
 
-function isXboxStoreHostUrl(url?: string): boolean {
-  if (!url || typeof url !== 'string') return false;
-  try {
-    const host = new URL(url.trim()).hostname.toLowerCase();
-    return host === 'xbox.com' || host.endsWith('.xbox.com');
-  } catch {
-    return false;
-  }
+function isMetacriticUserReviewsUrl(url?: string): boolean {
+  if (!isMetacriticHostUrl(url)) return false;
+  const parsed = parseSafeHttpUrl(url, { allowHttp: true });
+  return Boolean(parsed && /\/user-reviews(?:\/|$)/i.test(parsed.pathname || ''));
 }
 
-function isOpenCriticHostUrl(url?: string): boolean {
-  if (!url || typeof url !== 'string') return false;
-  try {
-    const host = new URL(url.trim()).hostname.toLowerCase();
-    return host === 'opencritic.com' || host.endsWith('.opencritic.com');
-  } catch {
-    return false;
-  }
+function sanitizeCriticHttpUrl(rawUrl: unknown): string {
+  if (typeof rawUrl !== 'string') return '';
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return '';
+  return parseSafeHttpUrl(trimmed, { allowHttp: true }) ? trimmed : '';
 }
 
-function isMetacriticHostUrl(url?: string): boolean {
-  if (!url || typeof url !== 'string') return false;
-  try {
-    const host = new URL(url.trim()).hostname.toLowerCase();
-    return host === 'metacritic.com' || host.endsWith('.metacritic.com');
-  } catch {
-    return false;
+function inferCanonicalCriticSource(input: {
+  source?: unknown;
+  id?: unknown;
+  url?: unknown;
+  userScoreRaw?: unknown;
+}): CriticSource {
+  const rawSource =
+    typeof input.source === 'string' ? input.source.trim().toLowerCase() : '';
+  if (VALID_CRITIC_SOURCES.has(rawSource as CriticSource)) {
+    return rawSource as CriticSource;
   }
+
+  const idLower = String(input.id ?? '').trim().toLowerCase();
+  const safeUrl = sanitizeCriticHttpUrl(input.url);
+
+  if (idLower.startsWith('xbox-') || isXboxStoreHostUrl(safeUrl)) {
+    return 'xbox';
+  }
+  if (isOpenCriticHostUrl(safeUrl)) {
+    return 'opencritic';
+  }
+
+  // Untagged Metacritic classification: `/user-reviews/`, `mc-user-` ID, or numeric `userScoreRaw`
+  // without press `/critic-reviews/` path MUST classify as `metacritic_user` (never press Metascore).
+  const hasUserScoreRaw =
+    typeof input.userScoreRaw === 'number' && Number.isFinite(input.userScoreRaw);
+  const parsedUrl = safeUrl ? parseSafeHttpUrl(safeUrl, { allowHttp: true }) : null;
+  const isMcHost = isMetacriticHostUrl(safeUrl);
+  const isMcCriticReviewsPath = Boolean(
+    isMcHost && parsedUrl && /\/critic-reviews(?:\/|$)/i.test(parsedUrl.pathname || '')
+  );
+
+  if (
+    idLower.startsWith('mc-user-') ||
+    isMetacriticUserReviewsUrl(safeUrl) ||
+    (hasUserScoreRaw && !isMcCriticReviewsPath)
+  ) {
+    return 'metacritic_user';
+  }
+
+  if (isMcHost) {
+    return 'metacritic';
+  }
+
+  return 'custom';
 }
 
 function resolveCanonicalCriticSource(score: CriticScoreData): CriticSource {
-  const rawSource =
-    typeof score.source === 'string' ? score.source.trim().toLowerCase() : '';
-  switch (rawSource) {
-    case 'metacritic':
-    case 'opencritic':
-    case 'metacritic_user':
-    case 'steam':
-    case 'gog':
-    case 'epic':
-    case 'xbox':
-    case 'custom':
-      return rawSource;
-    default:
-      if (
-        String(score.id || '').toLowerCase().startsWith('xbox-') ||
-        isXboxStoreHostUrl(score.url)
-      ) {
-        return 'xbox';
-      }
-      if (isOpenCriticHostUrl(score.url)) {
-        return 'opencritic';
-      }
-      return 'custom';
-  }
+  return inferCanonicalCriticSource(score);
 }
 
 /**
@@ -226,23 +239,23 @@ export function parseVaultCriticScore(raw: unknown): CriticScoreData | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const candidate = raw as Record<string, unknown>;
   const rawScore = candidate.score;
-  if (typeof rawScore !== 'number' || !Number.isFinite(rawScore) || rawScore <= 0) {
+  if (
+    typeof rawScore !== 'number' ||
+    !Number.isFinite(rawScore) ||
+    rawScore <= 0 ||
+    rawScore > 100
+  ) {
     return null;
   }
 
   const rawId = candidate.id;
-  const rawUrl = typeof candidate.url === 'string' ? candidate.url.trim() : '';
-  const rawSource =
-    typeof candidate.source === 'string' ? candidate.source.trim().toLowerCase() : '';
-  const resolvedSource: CriticSource = VALID_CRITIC_SOURCES.has(rawSource as CriticSource)
-    ? (rawSource as CriticSource)
-    : String(rawId || '').toLowerCase().startsWith('xbox-') || isXboxStoreHostUrl(rawUrl)
-    ? 'xbox'
-    : isOpenCriticHostUrl(rawUrl)
-    ? 'opencritic'
-    : isMetacriticHostUrl(rawUrl)
-    ? 'metacritic'
-    : 'custom';
+  const rawUrl = sanitizeCriticHttpUrl(candidate.url);
+  const resolvedSource = inferCanonicalCriticSource({
+    source: candidate.source,
+    id: rawId,
+    url: rawUrl,
+    userScoreRaw: candidate.userScoreRaw,
+  });
 
   const rawPercent = candidate.percentRecommended;
   const percentRecommended =
@@ -297,7 +310,7 @@ export function parseVaultCriticScore(raw: unknown): CriticScoreData | null {
  * - 3: Verified OpenCritic Top Critic Average ('opencritic')
  * - 2: High-sample community consensus ('metacritic_user' >= 25 reviews or 'steam' >= 10 reviews)
  * - 1: Storefront star ratings ('gog' / 'epic' / 'xbox'), 'custom', or low-sample 'metacritic_user'/'steam'
- * - 0: Missing / null / non-positive score
+ * - 0: Missing / null / non-positive / out-of-range (>100) score
  */
 export function getReviewSourceAuthorityRank(
   score: CriticScoreData | null | undefined,
@@ -309,7 +322,8 @@ export function getReviewSourceAuthorityRank(
     Array.isArray(score) ||
     typeof score.score !== 'number' ||
     !Number.isFinite(score.score) ||
-    score.score <= 0
+    score.score <= 0 ||
+    score.score > 100
   ) {
     return 0;
   }
