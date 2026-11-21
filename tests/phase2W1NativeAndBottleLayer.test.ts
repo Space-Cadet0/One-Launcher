@@ -75,7 +75,8 @@ interface ReadinessBarrierMod {
   lineMatchesBottlePrefix: (
     rawLine: string,
     normTargetPrefix: string,
-    normRealTargetPrefix?: string
+    normRealTargetPrefix?: string,
+    opts?: { allowUnscopedFallback?: boolean }
   ) => boolean;
   inspectRunningBottleSteam: (
     bottlePath?: string,
@@ -224,6 +225,13 @@ static char *g_argv_steam[] = { "/cx/wine64-preloader", "/cx/wineloader", "C:\\\
 static char *g_argv_webhelper[] = { "/cx/wine64-preloader", "/cx/wineloader64", "C:\\\\Program Files (x86)\\\\Steam\\\\bin\\\\cef\\\\steamwebhelper.exe", "--type=gpu-process", NULL };
 static char *g_argv_overlay64[] = { "/cx/wine32on64-preloader", "/cx/wineloader32on64", "C:\\\\Program Files (x86)\\\\Steam\\\\gameoverlayui64.exe", NULL };
 static char *g_argv_cef[] = { "/cx/wine64-preloader", "/cx/wineloader", "C:\\\\App\\\\cefprocess.exe", NULL };
+static char *g_argv_ea_cef[] = { "/cx/wine64-preloader", "/cx/wineloader", "C:\\\\Program Files\\\\Electronic Arts\\\\EA Desktop\\\\EACefSubProcess.exe", NULL };
+static char *g_argv_uplay_web[] = { "/cx/wine64-preloader", "/cx/wineloader", "C:\\\\Program Files (x86)\\\\Ubisoft\\\\UplayWebCore.exe", NULL };
+static char *g_argv_blizz_browser[] = { "/cx/wine64-preloader", "/cx/wineloader", "C:\\\\Program Files (x86)\\\\Battle.net\\\\BlizzardBrowser.exe", NULL };
+static char *g_argv_riot_render[] = { "/cx/wine64-preloader", "/cx/wineloader", "C:\\\\Riot Games\\\\Riot Client\\\\UX\\\\RiotClientUxRender.exe", NULL };
+static char *g_argv_bnet_client[] = { "/cx/wine64-preloader", "/cx/wineloader", "C:\\\\Program Files (x86)\\\\Battle.net\\\\Battle.net.exe", NULL };
+static char *g_argv_ea_launcher[] = { "/cx/wine64-preloader", "/cx/wineloader", "C:\\\\Program Files\\\\Electronic Arts\\\\EA Desktop\\\\EALauncher.exe", NULL };
+static char *g_argv_riot_client[] = { "/cx/wine64-preloader", "/cx/wineloader", "C:\\\\Riot Games\\\\Riot Client\\\\RiotClientServices.exe", NULL };
 static char *g_argv_installer[] = { "/cx/wine64-preloader", "/cx/wineloader", "C:\\\\Temp\\\\dxsetup.exe", NULL };
 static char *g_argv_game[] = { "/cx/wine64-preloader", "/cx/wineloader", "C:\\\\Games\\\\RealTitle\\\\game.exe", NULL };
 static char **g_active_argv = g_argv_game;
@@ -299,6 +307,30 @@ int main(void) {
   assert(g_skip_preload_for_process == 1);
   assert(getenv("MTL_HUD_ENABLED") == NULL);
   assert(getenv("DXVK_HUD") == NULL);
+
+  /* 3b. Chained publisher leaf CEF helpers (EA/Ubisoft/Battle.net/Riot) UNSET HUD env & skip preload */
+  char **leaf_publisher_argvs[] = { g_argv_ea_cef, g_argv_uplay_web, g_argv_blizz_browser, g_argv_riot_render };
+  for (size_t i = 0; i < sizeof(leaf_publisher_argvs) / sizeof(leaf_publisher_argvs[0]); ++i) {
+    reset_test_env();
+    g_mock_argc = 3;
+    g_active_argv = leaf_publisher_argvs[i];
+    preload_metal_and_moltenvk();
+    assert(g_skip_preload_for_process == 1);
+    assert(getenv("MTL_HUD_ENABLED") == NULL);
+    assert(getenv("DXVK_HUD") == NULL);
+  }
+
+  /* 3c. Chained publisher client binaries skip preload while preserving HUD env for child games */
+  char **client_publisher_argvs[] = { g_argv_bnet_client, g_argv_ea_launcher, g_argv_riot_client };
+  for (size_t i = 0; i < sizeof(client_publisher_argvs) / sizeof(client_publisher_argvs[0]); ++i) {
+    reset_test_env();
+    g_mock_argc = 3;
+    g_active_argv = client_publisher_argvs[i];
+    preload_metal_and_moltenvk();
+    assert(g_skip_preload_for_process == 1);
+    assert(getenv("MTL_HUD_ENABLED") != NULL && strcmp(getenv("MTL_HUD_ENABLED"), "1") == 0);
+    assert(getenv("DXVK_HUD") != NULL);
+  }
 
   /* 4. dxsetup.exe installer: skips preload & RT promotion */
   reset_test_env();
@@ -426,6 +458,7 @@ int main(void) {
   {
     "AccountName" "synthetic_user"
     "MostRecent" "1"
+    "RememberPassword" "1"
   }
 }
 `
@@ -451,7 +484,7 @@ int main(void) {
   "76561198000000002"
   {
     "AccountName" "logged_out_user"
-    "MostRecent" "0"
+    "MostRecent" "1"
     "RememberPassword" "0"
     "AllowAutoLogin" "0"
   }
@@ -728,10 +761,32 @@ int main(void) {
           normTarget
         )
       ).toBe(false);
+      // Unquoted WINEPREFIX= followed immediately by a Windows drive path (C:\...)
+      expect(
+        readinessBarrier.lineMatchesBottlePrefix(
+          `WINEPREFIX=${bottleWithSpaces} C:\\Program Files (x86)\\Steam\\steam.exe -silent`,
+          normTarget
+        )
+      ).toBe(true);
+      expect(
+        readinessBarrier.lineMatchesBottlePrefix(
+          `WINEPREFIX=${arm64Bottle} C:\\Program Files (x86)\\Steam\\steam.exe -silent`,
+          normTarget
+        )
+      ).toBe(false);
       // Synthetic fallback with no WINEPREFIX= and no /Bottles/...
       expect(
         readinessBarrier.lineMatchesBottlePrefix('C:\\Program Files (x86)\\Steam\\steam.exe', normTarget)
       ).toBe(true);
+      // Strict mode (allowUnscopedFallback: false) requires explicit WINEPREFIX= or /Bottles/ match
+      expect(
+        readinessBarrier.lineMatchesBottlePrefix(
+          'C:\\Program Files (x86)\\Steam\\steam.exe',
+          normTarget,
+          '',
+          { allowUnscopedFallback: false }
+        )
+      ).toBe(false);
 
       const probedSilent = await readinessBarrier.inspectRunningBottleSteam(bottleWithSpaces, {
         mockProcessListOutput: [
@@ -1002,7 +1057,39 @@ int main(void) {
       vi.advanceTimersByTime(10 * 100);
       expect(pollAndActivateSpy).not.toHaveBeenCalled();
 
+      // 5. Concurrent session safety (P2-5): stopping an unrelated game MUST NOT clear active focus polling for another booting game!
+      helperReturnValue = 0;
+      pollAndActivateSpy.mockClear();
+      runningGames = [
+        { gameId: 'steam-booting-2', title: 'Booting Bottle Game' },
+        { gameId: 'steam-unrelated-3', title: 'Unrelated Game' },
+      ];
+      hookFn!('steam-booting-2', {
+        event: 'started',
+        session: {
+          gameId: 'steam-booting-2',
+          pid: undefined,
+          launchMethod: 'compatibility_layer',
+          isBottledSession: true,
+          executablePath: '/Bottles/OneLauncher/drive_c/booting2.exe',
+          winePrefix: '/Bottles/OneLauncher',
+        },
+      });
+      vi.advanceTimersByTime(3 * 100);
+      expect(pollAndActivateSpy).toHaveBeenCalledTimes(3);
+
+      // Unrelated game stops while steam-booting-2 is still running -> focus poller MUST keep running!
+      runningGames = [{ gameId: 'steam-booting-2', title: 'Booting Bottle Game' }];
+      hookFn!('steam-unrelated-3', { event: 'stopped' });
+      vi.advanceTimersByTime(3 * 100);
+      expect(pollAndActivateSpy).toHaveBeenCalledTimes(6);
+
+      // Stopping steam-booting-2 itself DOES stop & clear the focus poller
       runningGames = [];
+      hookFn!('steam-booting-2', { event: 'stopped' });
+      vi.advanceTimersByTime(5 * 100);
+      expect(pollAndActivateSpy).toHaveBeenCalledTimes(6);
+
       lifecycle.runSubsystemShutdownOnce();
     });
   });

@@ -427,7 +427,11 @@ function StorefrontLifecycleSectionImpl({
                 id="storefront-client-lifecycle-select"
                 aria-label={resolvedPolicyView.cardHeading}
                 data-testid="storefront-client-lifecycle-select"
-                value={resolvedPolicyView.selectedDropdownValue}
+                value={
+                  supportsGlobalInheritance && storefrontClientLifecycle === 'default'
+                    ? 'default'
+                    : resolvedPolicyView.selectedDropdownValue
+                }
                 onChange={(e) =>
                   onChangeStorefrontClientLifecycle(
                     e.target.value as 'default' | StorefrontClientLifecyclePolicy

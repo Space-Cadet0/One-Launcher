@@ -1025,11 +1025,10 @@ describe('Bidirectional Cloud Save Matrix (Steam, GOG & Epic across macOS, Cross
       createFakePeBinary(gameExe);
 
       const cloudLogPath = path.join(cx.bottleSteamRoot, 'logs', 'cloud_log.txt');
-      // Active stuck upload that never logs Upload complete
+      // Pre-launch baseline cloud_log.txt (post-exit upload lines are appended after launchGame snapshots sessionStartOffset)
       fs.writeFileSync(
         cloudLogPath,
-        '[2026-10-23 12:30:00] [AppID 1145360] Starting sync (up,AC Exit,)\n' +
-          '[2026-10-23 12:30:00] [AppID 1145360] HTTP upload for file "Profile1.sav" beginning\n',
+        '[2026-10-23 12:00:00] Steam Cloud log initialized\n',
         'utf8'
       );
 
@@ -1080,6 +1079,14 @@ describe('Bidirectional Cloud Save Matrix (Steam, GOG & Epic across macOS, Cross
           }
         );
         expect(launchRes.success).toBe(true);
+
+        // Simulate an active stuck post-exit upload started after launch that never logs Upload complete
+        fs.appendFileSync(
+          cloudLogPath,
+          '[2026-10-23 12:30:00] [AppID 1145360] Starting sync (up,AC Exit,)\n' +
+            '[2026-10-23 12:30:00] [AppID 1145360] HTTP upload for file "Profile1.sav" beginning\n',
+          'utf8'
+        );
 
         await launcherEngine.stopGame(
           { gameId: 'steam-1145360' },

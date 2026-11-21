@@ -422,8 +422,9 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
         .map((opt) => opt.props.value);
       expect(gogOptions).toEqual(expectedOrder);
 
-      // Verify Bottle GOG defaults to minimal_and_close_if_started on fresh open before user override
-      expect(gogSelect().props.value).toBe('minimal_and_close_if_started');
+      // Verify Bottle GOG inherits global default ('default' -> Silent & Auto-Close) on fresh open before user override
+      expect(gogSelect().props.value).toBe('default');
+      expect(gogModal.html).toContain('Use Global Default (Silent &amp; Auto-Close)');
 
       // Select fast_direct_bypass on Bottle GOG -> orange warning info box (GOG Galaxy Achievements/Overlay disabled, gogdl Cloud Saves active)
       gogSelect().props.onChange({ target: { value: 'fast_direct_bypass' } });
@@ -536,7 +537,7 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
       expect(reopenedEpicSelect().props.value).toBe('fast_direct_bypass');
       reopenedEpicModal.unmount();
 
-      // 3. Bottle Steam still defaults to minimal_and_close_if_started on fresh open
+      // 3. Bottle Steam inherits global default ('default' -> Silent & Auto-Close) on fresh open
       const steamBottleGame = createBottleGame('steam', 'default-check');
       const steamModal = createStatefulRenderer(GameLaunchConfigModal, () => ({
         isOpen: true,
@@ -547,7 +548,8 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
       const steamSelect = steamModal.findElements(
         (el) => el.props?.['data-testid'] === 'storefront-client-lifecycle-select'
       )[0];
-      expect(steamSelect.props.value).toBe('minimal_and_close_if_started');
+      expect(steamSelect.props.value).toBe('default');
+      expect(steamModal.html).toContain('Use Global Default (Silent &amp; Auto-Close)');
       steamModal.unmount();
     });
 

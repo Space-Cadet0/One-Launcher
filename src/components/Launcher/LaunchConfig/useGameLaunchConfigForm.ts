@@ -22,7 +22,9 @@ import {
 import {
   extractBottleNameFromPath,
   findCompatibleRunnerForBottle,
+  isArm64NamedBottle,
   isBottleNameCompatibleWithRunner,
+  resolveBottleArchitectureFromLayers,
 } from '../../../services/launcher/bottleArchitectureUtils';
 import {
   launcherService,
@@ -61,6 +63,50 @@ export interface UseGameLaunchConfigFormParams {
   initialPlatformId?: StorefrontId;
   onClose: () => void;
   onSaved?: (config: GameLaunchConfig) => void;
+}
+
+function isLayerCompatibleWithInstallBottle(
+  layer: CompatibilityLayerInfo | undefined,
+  installBottleName: string | null,
+  allLayers: CompatibilityLayerInfo[]
+): boolean {
+  if (!layer || layer.available === false || !installBottleName) return false;
+  const trimmedBottle = installBottleName.trim();
+  if (!trimmedBottle) return false;
+
+  const detectedArch = resolveBottleArchitectureFromLayers(
+    trimmedBottle,
+    [layer, ...allLayers],
+    layer.type
+  );
+  const targetArch = detectedArch ?? (isArm64NamedBottle(trimmedBottle) ? 'arm64' : 'win64');
+
+  if (Array.isArray(layer.supportedBottleArches) && layer.supportedBottleArches.length > 0) {
+    if (!layer.supportedBottleArches.includes(targetArch)) {
+      return false;
+    }
+  } else if (
+    !isBottleNameCompatibleWithRunner(trimmedBottle, layer.type, {
+      bottleArch: targetArch,
+      layer,
+      allLayers,
+      strictArm64NameMatch: true,
+    })
+  ) {
+    return false;
+  }
+
+  const lower = trimmedBottle.toLowerCase();
+  const inAvailableBottles = (layer.availableBottles || []).some(
+    (b) => b.trim().toLowerCase() === lower
+  );
+  if (inAvailableBottles) {
+    return true;
+  }
+  if (layer.bottleDetails) {
+    return Object.keys(layer.bottleDetails).some((k) => k.trim().toLowerCase() === lower);
+  }
+  return false;
 }
 
 export function useGameLaunchConfigForm({
@@ -217,7 +263,7 @@ export function useGameLaunchConfigForm({
 
       let initialCompatibilityLayer = parsed.compatibilityLayer;
       let initialSignature = parsed.signature;
-      if (!source?.compatibilityLayer) {
+      if (!source?.compatibilityLayer || !isHostSupportedCompatRunner(source.compatibilityLayer, hostArch)) {
         const platRec = game.platforms.find((p) => p.platformId === targetPlatId);
         const instRec = launcherService.getInstalledRecordForGame(game, targetPlatId);
         const instBottle = extractBottleNameFromPath(
@@ -229,9 +275,11 @@ export function useGameLaunchConfigForm({
         const validInitLayers = rawLayers.filter(
           (l) => l.available !== false && isHostSupportedCompatRunner(l.type, hostArch)
         );
-        const affinityLayer = instBottle
-          ? findCompatibleRunnerForBottle(instBottle, validInitLayers, { hostArch })
-          : null;
+        const canonicalDefaultLayer = validInitLayers[0];
+        const affinityLayer =
+          instBottle && !isLayerCompatibleWithInstallBottle(canonicalDefaultLayer, instBottle, rawLayers)
+            ? findCompatibleRunnerForBottle(instBottle, validInitLayers, { hostArch })
+            : null;
         if (affinityLayer && affinityLayer.type !== initialCompatibilityLayer) {
           initialCompatibilityLayer = affinityLayer.type;
           initialSignature =
@@ -436,12 +484,15 @@ export function useGameLaunchConfigForm({
             activePlatRec?.installPath ||
             activePlatRec?.executablePath
         );
-        const affinityLayer = detectedInstallBottle
-          ? findCompatibleRunnerForBottle(detectedInstallBottle, validLayers, {
-              hostArch: currentHostArch,
-            })
-          : null;
-        const chosenAutoLayerInfo = affinityLayer || validLayers[0];
+        const canonicalDefaultLayer = validLayers[0];
+        const affinityLayer =
+          detectedInstallBottle &&
+          !isLayerCompatibleWithInstallBottle(canonicalDefaultLayer, detectedInstallBottle, layers)
+            ? findCompatibleRunnerForBottle(detectedInstallBottle, validLayers, {
+                hostArch: currentHostArch,
+              })
+            : null;
+        const chosenAutoLayerInfo = affinityLayer || canonicalDefaultLayer;
         const autoLayer = chosenAutoLayerInfo.type;
         setCompatibilityLayer((prev) => (prev === autoLayer ? prev : autoLayer));
         const rawSavedBottle = activeSource?.wineBottleName || '';
@@ -1176,13 +1227,16 @@ export function useGameLaunchConfigForm({
         resetPlatRec?.installPath ||
         resetPlatRec?.executablePath
     );
-    const resetAffinityLayer = resetInstallBottle
-      ? findCompatibleRunnerForBottle(resetInstallBottle, validLayers, {
-          hostArch: resetHostArch,
-        })
-      : null;
+    const resetDefaultLayer = validLayers[0];
+    const resetAffinityLayer =
+      resetInstallBottle &&
+      !isLayerCompatibleWithInstallBottle(resetDefaultLayer, resetInstallBottle, currentLayers)
+        ? findCompatibleRunnerForBottle(resetInstallBottle, validLayers, {
+            hostArch: resetHostArch,
+          })
+        : null;
     const resetLayer: CompatibilityLayerType =
-      resetAffinityLayer?.type || validLayers[0]?.type || 'crossover';
+      resetAffinityLayer?.type || resetDefaultLayer?.type || 'crossover';
     if (latestRef.current.preferredPlatformId !== targetPlatId) {
       return;
     }

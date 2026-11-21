@@ -112,7 +112,46 @@ async function syncXboxTitleStorage(options = {}) {
 
   const effectiveXgsUserDir = resolveEffectiveXgsUserDir(xgsUserDir, wgsUserDir);
 
+  if (mode === 'post_exit' || mode === 'in_session') {
+    await importXgsFolderIntoWgs(effectiveXgsUserDir, wgsUserDir, storePkgAumid);
+  } else if (mode === 'pre_launch' && effectiveXgsUserDir) {
+    const preXgsMeta = await loadXgsSyncSidecar(effectiveXgsUserDir);
+    if (
+      preXgsMeta.exists ||
+      preXgsMeta.active ||
+      preXgsMeta.knownContainers.length > 0 ||
+      preXgsMeta.deletedContainers.length > 0
+    ) {
+      await importXgsFolderIntoWgs(effectiveXgsUserDir, wgsUserDir, storePkgAumid);
+    }
+  }
+
+  const client = createTitleStorageClient({
+    xuid,
+    scid: normalizedScid || scid,
+    packageFamilyName,
+    msaAppId,
+    titleId,
+    titleStorageOrigin,
+    allowLoopbackOrigin: options.allowLoopbackOrigin,
+    authProvider,
+    authorizationHeader,
+    fetchImpl,
+  });
+
+  const hostWgsUserDir = path.resolve(toHostFilesystemPath(wgsUserDir));
+  let lockAcquired = Boolean(alreadyLocked);
+
   const retryWithCandidateScid = async () => {
+    if (lockAcquired) {
+      try {
+        await client.releaseLock(Boolean(priorHadWrites), signal);
+      } catch {
+        // Best-effort release of original SCID lock before switching to fallback SCID
+      } finally {
+        lockAcquired = false;
+      }
+    }
     let retryWgsUserDir = String(wgsUserDir);
     let retryXgsUserDir = effectiveXgsUserDir;
     const hasLocalWgsSaves =
@@ -151,41 +190,12 @@ async function syncXboxTitleStorage(options = {}) {
       ...options,
       scid: candidateFallbackScid,
       fallbackScid: undefined,
+      alreadyLocked: false,
       wgsUserDir: retryWgsUserDir,
       xgsUserDir: retryXgsUserDir,
       _isFallbackRetry: true,
     });
   };
-
-  if (mode === 'post_exit' || mode === 'in_session') {
-    await importXgsFolderIntoWgs(effectiveXgsUserDir, wgsUserDir, storePkgAumid);
-  } else if (mode === 'pre_launch' && effectiveXgsUserDir) {
-    const preXgsMeta = await loadXgsSyncSidecar(effectiveXgsUserDir);
-    if (
-      preXgsMeta.exists ||
-      preXgsMeta.active ||
-      preXgsMeta.knownContainers.length > 0 ||
-      preXgsMeta.deletedContainers.length > 0
-    ) {
-      await importXgsFolderIntoWgs(effectiveXgsUserDir, wgsUserDir, storePkgAumid);
-    }
-  }
-
-  const client = createTitleStorageClient({
-    xuid,
-    scid: normalizedScid || scid,
-    packageFamilyName,
-    msaAppId,
-    titleId,
-    titleStorageOrigin,
-    allowLoopbackOrigin: options.allowLoopbackOrigin,
-    authProvider,
-    authorizationHeader,
-    fetchImpl,
-  });
-
-  const hostWgsUserDir = path.resolve(toHostFilesystemPath(wgsUserDir));
-  let lockAcquired = Boolean(alreadyLocked);
   let reacquiredExpiredSessionLock = false;
   let sessionLockGeneration = 0;
   /** @type {Promise<any> | null} */
@@ -368,10 +378,6 @@ async function syncXboxTitleStorage(options = {}) {
           candidateFallbackScid &&
           (listErr?.status === 404 || listErr?.status === 403)
         ) {
-          if (lockAcquired && !keepLockHeld) {
-            await client.releaseLock(false, signal);
-            lockAcquired = false;
-          }
           return await retryWithCandidateScid();
         }
         if (
@@ -747,14 +753,45 @@ async function acquireXboxTitleStorageSessionLock(options = {}) {
 }
 
 /**
- * @param {Record<string, any>} [options]
+ * Releases an Xbox Title Storage session lock (`DELETE /lock`).
+ * Supports both single-object `releaseXboxTitleStorageSessionLock(options)` and
+ * two-argument `releaseXboxTitleStorageSessionLock(payload, options)` calling conventions.
+ *
+ * @param {Record<string, any>} [payloadOrOptions]
+ * @param {Record<string, any>} [extraOptions]
  * @returns {Promise<boolean>}
  */
-async function releaseXboxTitleStorageSessionLock(options = {}) {
-  const { xuid, scid } = options;
+async function releaseXboxTitleStorageSessionLock(payloadOrOptions = {}, extraOptions = undefined) {
+  const merged =
+    extraOptions && typeof extraOptions === 'object'
+      ? { ...(payloadOrOptions || {}), ...extraOptions }
+      : { ...(payloadOrOptions || {}) };
+  const xuid = merged.xuid || merged.xboxSession?.xuid || '';
+  const scid = String(
+    (extraOptions && typeof extraOptions === 'object'
+      ? extraOptions.resolvedScid || extraOptions.scid
+      : '') ||
+      merged.resolvedScid ||
+      merged.scid ||
+      ''
+  )
+    .trim()
+    .toLowerCase();
   if (!xuid || !scid) return false;
-  const client = createTitleStorageClient(options);
-  await client.releaseLock(Boolean(options.hadWrites), options.signal);
+  const packageFamilyName = merged.packageFamilyName || merged.pfn || '';
+  const titleStorageOrigin = merged.titleStorageOrigin || merged.baseUrl || merged.origin;
+  const authorizationHeader =
+    merged.authorizationHeader || merged.xboxSession?.authorizationHeader;
+  const client = createTitleStorageClient({
+    ...merged,
+    xuid,
+    scid,
+    packageFamilyName,
+    titleStorageOrigin,
+    allowLoopbackOrigin: merged.allowLoopbackOrigin,
+    authorizationHeader,
+  });
+  await client.releaseLock(Boolean(merged.hadWrites), merged.signal);
   return true;
 }
 

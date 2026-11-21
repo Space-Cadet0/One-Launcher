@@ -84,8 +84,8 @@ function layerKnowsBottle(layer: CompatibilityLayerInfo, bottleNameLower: string
 /**
  * Picks the best installed, host-supported compatibility runner for `bottleName`,
  * checking `bottleDetails[bottleName]?.wineArch` (falling back to bottle name suffix)
- * and preferring `crossover_preview` -> `crossover` for `win64` and
- * `crossover_preview_arm64` for `arm64`.
+ * and preferring `crossover` -> `crossover_preview` -> `gptk` -> `wine` for `win64`
+ * (matching `detectCompatibilityLayers` stability order) and `crossover_preview_arm64` for `arm64`.
  */
 export function findCompatibleRunnerForBottle(
   bottleName: string,
@@ -134,7 +134,7 @@ export function findCompatibleRunnerForBottle(
   const preferenceOrder: readonly CompatibilityLayerType[] =
     targetArch === 'arm64'
       ? ['crossover_preview_arm64']
-      : ['crossover_preview', 'crossover', 'gptk', 'wine'];
+      : ['crossover', 'crossover_preview', 'gptk', 'wine'];
 
   const rankOf = (type: CompatibilityLayerType): number => {
     const idx = preferenceOrder.indexOf(type);

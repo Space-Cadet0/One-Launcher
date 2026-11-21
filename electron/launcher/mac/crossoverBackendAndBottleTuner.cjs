@@ -2812,8 +2812,7 @@ function resolveStandaloneWineTargetPrefix(launchConfig = {}, options = {}) {
     const resolvedRoot = path.resolve(installBottleRoot);
     const hasDriveC = fs.existsSync(path.join(resolvedRoot, 'drive_c'));
     const hasCxConf = fs.existsSync(path.join(resolvedRoot, 'cxbottle.conf'));
-    const meta = hasCxConf ? inspectBottleConfMetadata(resolvedRoot) : {};
-    if (hasDriveC && !hasCxConf && meta.wineArch !== 'arm64') {
+    if (hasDriveC && !hasCxConf) {
       return resolvedRoot;
     }
   }

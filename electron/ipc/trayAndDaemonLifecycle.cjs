@@ -829,8 +829,14 @@ function createTrayAndDaemonLifecycle({
               }
             }
           } else if (eventType === 'stopped') {
-            stopMacBottleFocusHelper({ restorePresentation: true, clearState: true });
             const remainingGames = launcherEngine.getRunningGames() || [];
+            if (
+              remainingGames.length === 0 ||
+              !activeMacBottleFocusState?.gameId ||
+              activeMacBottleFocusState.gameId === gameId
+            ) {
+              stopMacBottleFocusHelper({ restorePresentation: true, clearState: true });
+            }
             if (remainingGames.length > 0) return;
 
             zeroRendererTeardownTimer = clearTrackedTimer(zeroRendererTeardownTimer);

@@ -329,16 +329,18 @@ describe('Phase 2 W5 — Frontend Launch Config UI, Policy Preview & ActionBar R
     const { previewWin64, stableWin64, previewArm64 } = makeMacLayers();
     const layers = [stableWin64, previewArm64, previewWin64];
 
-    // Prefers crossover_preview over crossover for win64
-    expect(findCompatibleRunnerForBottle('OneLauncher', layers)?.type).toBe('crossover_preview');
-    // Falls back to crossover when crossover_preview is unavailable
+    // Prefers stable crossover over crossover_preview for win64 when both own the bottle (matching detectCompatibilityLayers stability order)
+    expect(findCompatibleRunnerForBottle('OneLauncher', layers)?.type).toBe('crossover');
+    // Picks crossover_preview when a win64 bottle only exists in crossover_preview
+    expect(findCompatibleRunnerForBottle('SteamAlt', layers)?.type).toBe('crossover_preview');
+    // Falls back to crossover_preview when stable crossover is unavailable
     expect(
       findCompatibleRunnerForBottle('OneLauncher', [
-        stableWin64,
-        { ...previewWin64, available: false },
+        { ...stableWin64, available: false },
+        previewWin64,
         previewArm64,
       ])?.type
-    ).toBe('crossover');
+    ).toBe('crossover_preview');
     // Picks crossover_preview_arm64 for arm64 bottles
     expect(findCompatibleRunnerForBottle('OneLauncher-arm64', layers)?.type).toBe(
       'crossover_preview_arm64'
@@ -557,7 +559,7 @@ describe('Phase 2 W5 — Frontend Launch Config UI, Policy Preview & ActionBar R
     });
     vi.spyOn(launcherService, 'getInstalledRecordForGame').mockReturnValue(installedRec);
 
-    // 4a. Auto affinity (no saved runner pin) selects crossover_preview + OneLauncher even though arm64 layer is first in array!
+    // 4a. Auto affinity (no saved runner pin) redirects away from incompatible arm64 validLayers[0] to stable crossover + OneLauncher!
     vi.spyOn(launcherService, 'getLaunchConfig').mockReturnValue(undefined);
     const autoRenderer = createDomain12DeepRenderer(GameLaunchConfigModal, {
       isOpen: true,
@@ -568,7 +570,7 @@ describe('Phase 2 W5 — Frontend Launch Config UI, Policy Preview & ActionBar R
     autoRenderer.render();
     await Promise.resolve();
     const autoTree = autoRenderer.render();
-    expect(findByTestId(autoTree, 'compat-runner-select')?.props?.value).toBe('crossover_preview');
+    expect(findByTestId(autoTree, 'compat-runner-select')?.props?.value).toBe('crossover');
     expect(findByTestId(autoTree, 'compat-install-bottle-mismatch-warning')).toBeUndefined();
     expect(findByTestId(autoTree, 'compat-bottle-steam-missing-warning')).toBeUndefined();
     const readyChip = findByTestId(autoTree, 'compat-bottle-steam-readiness-chip');
@@ -584,6 +586,26 @@ describe('Phase 2 W5 — Frontend Launch Config UI, Policy Preview & ActionBar R
     expect(extractText(policyPill)).toBe('Silent & Auto-Close');
     expect(auditModernWebAndA11y(autoTree)).toEqual([]);
     autoRenderer.unmount();
+
+    // 4a2. P0-1A: When canonical default validLayers[0] is ALREADY compatible with installBottle, preserve validLayers[0] (never hijack!)
+    const previewFirstLayers = [previewWin64, stableWin64];
+    vi.spyOn(launcherService, 'getCompatibilityLayers').mockReturnValue(previewFirstLayers);
+    vi.spyOn(launcherService, 'detectCompatibilityLayers').mockResolvedValue(previewFirstLayers);
+    const keepDefaultRenderer = createDomain12DeepRenderer(GameLaunchConfigModal, {
+      isOpen: true,
+      game: bottledGame,
+      initialPlatformId: 'steam',
+      onClose: vi.fn(),
+    });
+    keepDefaultRenderer.render();
+    await Promise.resolve();
+    const keepDefaultTree = keepDefaultRenderer.render();
+    expect(findByTestId(keepDefaultTree, 'compat-runner-select')?.props?.value).toBe(
+      'crossover_preview'
+    );
+    keepDefaultRenderer.unmount();
+    vi.spyOn(launcherService, 'getCompatibilityLayers').mockReturnValue(layers);
+    vi.spyOn(launcherService, 'detectCompatibilityLayers').mockResolvedValue(layers);
 
     // 4b. Explicitly pinned arm64 runner (OneLauncher-arm64, hasSteam: false) -> renders BOTH banners + No Steam chip + truthful DetectedPipelineBanner
     const savedPinnedArm64: GameLaunchConfig = {
@@ -624,21 +646,26 @@ describe('Phase 2 W5 — Frontend Launch Config UI, Policy Preview & ActionBar R
     const pinnedHtml = renderToStaticMarkup(tree as React.ReactElement);
     expect(pinnedHtml).toContain('Windows Steam is NOT installed');
 
-    // 1-click button switches to CrossOver Preview (OneLauncher), clearing both warnings!
+    // 1-click button switches to CrossOver (OneLauncher), clearing both warnings!
     const alignBtn = findByTestId(tree, 'compat-align-install-bottle-btn');
     expect(alignBtn?.props?.type).toBe('button');
-    expect(extractText(alignBtn)).toContain('Switch to CrossOver Preview (OneLauncher)');
+    expect(extractText(alignBtn)).toContain('Switch to CrossOver (OneLauncher)');
     (alignBtn?.props?.onClick as () => void)();
     tree = pinnedRenderer.render();
 
-    expect(findByTestId(tree, 'compat-runner-select')?.props?.value).toBe('crossover_preview');
+    expect(findByTestId(tree, 'compat-runner-select')?.props?.value).toBe('crossover');
     expect(findByTestId(tree, 'compat-install-bottle-mismatch-warning')).toBeUndefined();
     expect(findByTestId(tree, 'compat-bottle-steam-missing-warning')).toBeUndefined();
     expect(findByTestId(tree, 'compat-bottle-steam-readiness-chip')?.props?.['data-steam-readiness']).toBe(
       'ready'
     );
 
-    // Switch bottle to SteamAlt (hasSteam: true, steamSignedIn: false) -> Steam Sign-In Needed chip
+    // Switch runner to CrossOver Preview and bottle to SteamAlt (hasSteam: true, steamSignedIn: false) -> Steam Sign-In Needed chip
+    const runnerSelectForPreview = findByTestId(tree, 'compat-runner-select');
+    (runnerSelectForPreview?.props?.onChange as (ev: { target: { value: string } }) => void)({
+      target: { value: 'crossover_preview' },
+    });
+    tree = pinnedRenderer.render();
     const bottleSelect = findVNodes(
       tree,
       (n) => n.type === 'select' && n.props?.id === 'compat-target-bottle-control'
@@ -652,10 +679,14 @@ describe('Phase 2 W5 — Frontend Launch Config UI, Policy Preview & ActionBar R
     expect(signInChip?.props?.['data-steam-readiness']).toBe('sign_in_needed');
     expect(extractText(signInChip)).toContain('Steam Sign-In Needed');
 
-    // StorefrontLifecycleSection: <label htmlFor> linked, has Use Global Default option,
-    // overriding updates Disclosure 3 pill, and selecting "default" resets to undefined on save!
+    // StorefrontLifecycleSection (P1-2): <label htmlFor> linked, binds value="default" when inheriting global default,
+    // allows pinning an explicit override equal to the global policy, updates Disclosure 3 pill, and selecting "default" resets to undefined on save!
     const lifecycleSelect = findByTestId(tree, 'storefront-client-lifecycle-select');
     expect(lifecycleSelect?.props?.id).toBe('storefront-client-lifecycle-select');
+    expect(lifecycleSelect?.props?.value).toBe('default');
+    expect(extractText(findByTestId(tree, 'storefront-lifecycle-inheritance-badge'))).toBe(
+      'Using Global Default'
+    );
     const lifecycleLabel = findVNodes(
       tree,
       (n) => n.type === 'label' && n.props?.htmlFor === 'storefront-client-lifecycle-select'
@@ -668,20 +699,43 @@ describe('Phase 2 W5 — Frontend Launch Config UI, Policy Preview & ActionBar R
     expect(defaultOption).toBeDefined();
     expect(extractText(defaultOption)).toContain('Use Global Default (Silent & Auto-Close)');
 
+    // Pinning explicit override equal to global default ('minimal_and_close_if_started') transitions select value & badge cleanly
     (lifecycleSelect?.props?.onChange as (ev: { target: { value: string } }) => void)({
+      target: { value: 'minimal_and_close_if_started' },
+    });
+    tree = pinnedRenderer.render();
+    expect(findByTestId(tree, 'storefront-client-lifecycle-select')?.props?.value).toBe(
+      'minimal_and_close_if_started'
+    );
+    expect(extractText(findByTestId(tree, 'storefront-lifecycle-inheritance-badge'))).toBe(
+      'Per-Game Override'
+    );
+
+    (
+      findByTestId(tree, 'storefront-client-lifecycle-select')?.props?.onChange as (ev: {
+        target: { value: string };
+      }) => void
+    )({
       target: { value: 'default_client' },
     });
     tree = pinnedRenderer.render();
+    expect(findByTestId(tree, 'storefront-client-lifecycle-select')?.props?.value).toBe(
+      'default_client'
+    );
     expect(extractText(findByTestId(tree, 'disclosure-lifecycle-policy-pill'))).toBe(
       'Standard Client'
     );
 
-    // Revert back to Global Default ('default') -> pill returns to Silent & Auto-Close and saves undefined!
+    // Revert back to Global Default ('default') -> select displays 'default', pill returns to Silent & Auto-Close and saves undefined!
     const updatedSelect = findByTestId(tree, 'storefront-client-lifecycle-select');
     (updatedSelect?.props?.onChange as (ev: { target: { value: string } }) => void)({
       target: { value: 'default' },
     });
     tree = pinnedRenderer.render();
+    expect(findByTestId(tree, 'storefront-client-lifecycle-select')?.props?.value).toBe('default');
+    expect(extractText(findByTestId(tree, 'storefront-lifecycle-inheritance-badge'))).toBe(
+      'Using Global Default'
+    );
     expect(extractText(findByTestId(tree, 'disclosure-lifecycle-policy-pill'))).toBe(
       'Silent & Auto-Close'
     );

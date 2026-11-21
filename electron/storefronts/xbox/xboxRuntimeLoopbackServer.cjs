@@ -600,6 +600,7 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
                     titleId: state.titleId,
                     authProvider,
                     titleStorageOrigin,
+                    allowLoopbackOrigin: options.allowLoopbackOrigin,
                     fetchImpl,
                     quotaBytes: seedQuota,
                   });
@@ -657,6 +658,7 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
                   titleId: state.titleId,
                   authProvider,
                   titleStorageOrigin,
+                  allowLoopbackOrigin: options.allowLoopbackOrigin,
                   fetchImpl,
                   keepLockHeld: true,
                 });
@@ -795,6 +797,7 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
                     titleId: state.titleId,
                     authProvider,
                     titleStorageOrigin,
+                    allowLoopbackOrigin: options.allowLoopbackOrigin,
                     fetchImpl,
                     alreadyLocked: Boolean(priorLock?.lockHeld),
                     keepLockHeld: true,
@@ -953,6 +956,7 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
               titleId: state.titleId,
               authProvider,
               titleStorageOrigin,
+              allowLoopbackOrigin: options.allowLoopbackOrigin,
               fetchImpl,
               hadWrites: Boolean(lockEntry.hadWrites),
               signal: buildXboxFetchSignal(undefined, 5_000),

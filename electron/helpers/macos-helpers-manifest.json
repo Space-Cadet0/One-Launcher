@@ -4,13 +4,13 @@
   "note": "Never verify this pre-signed manifest at runtime against packaged .app dylibs because build/afterPack.cjs re-signs bundled dylibs.",
   "sources": {
     "electron/helpers/common_process_denylist.h": "ddd821b310fe49c191a48943c0b9d95f089c181fa08db17e0f9d7d7f919953e7",
-    "electron/helpers/one_metal_preload.c": "5abcf4363f86d8ef0e25410ff45be6ce91a57c324476666df04169ecad82dcb6",
+    "electron/helpers/one_metal_preload.c": "e09bfd8805ccd0666f0e605cb17bbbdfe4ff71f75f8c582be03993e90813684d",
     "electron/helpers/one_coop_activate.c": "7a32473a79da9d375b9e003791582abf302fd804253dd73d6d126dcb998a4b0e",
     "scripts/build-macos-helpers.cjs": "114403a1acc6a8c0f1a56a0b5035191f98c742ff2f809d654dc6300d97c05ab6"
   },
   "outputs": {
     "libone_metal_preload.dylib": {
-      "sha256": "142682048699e5281e721da7371e3d38ea41db5deb5a78b3a41d643339c4821a",
+      "sha256": "dfb428ed01575ac6ff45807c21c9d6aa51d6d9ff5dc066e5f0c426e6c5f0f70e",
       "sizeBytes": 135360,
       "archs": [
         "arm64",

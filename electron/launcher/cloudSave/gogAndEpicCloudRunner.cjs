@@ -1207,7 +1207,7 @@ function createCloudSaveRunnerFactory(facadeDeps) {
       let excludePatterns = parseEpicCloudPatternList(options.cloudExcludeList);
 
       const legCfgDir = getLegendaryConfigDir(options);
-      if (!cloudSaveFolderTemplate || (!hasExplicitInclude && !hasExplicitExclude)) {
+      if (!cloudSaveFolderTemplate || !hasExplicitInclude || !hasExplicitExclude) {
         /** @type {Set<string>} */
         const candidateMetaFiles = new Set();
         if (legCfgDir) {
@@ -2452,7 +2452,11 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         'i'
       );
 
-      const exitUploadStartRegex =
+      // Genuine post-exit AutoCloud start markers (explicitly excluding AC Launch reconciliation)
+      const genuinePostExitSyncStartRegex =
+        /(?:Starting\s+sync\s*\((?![^)]*AC\s+Launch)[^)]*(?:up,|AC\s+Exit)|Running\s+AutoCloud\s+on\s+exit)/i;
+      // General upload activity markers (including launch-time or in-session uploads while in flight)
+      const uploadStartRegex =
         /(?:Starting\s+sync\s*\([^)]*(?:up,|AC\s+Exit)|Running\s+AutoCloud\s+on\s+exit|Need\s+to\s+upload\s+file|Upload\s+batch\s+initiated|HTTP\s+upload\s+.*\s+beginning|\bUploading\b)/i;
       const exitUploadCompletionRegex =
         /(?:Upload\s+complete|Sync\s+complete|Cloud\s+sync\s+complete|Syncing\s+to\s+Steam\s+Cloud\s+succeeded|AppCloudStateChange[^\n]*synced|Nothing\s+to\s+sync|0\s+files\s+to\s+upload|Job\s+complete|Job\s+Canceled|ReleaseAppLock)/i;
@@ -2475,7 +2479,7 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         let launchOrEvalActive = false;
         let downloadPending = false;
         let sawCompletion = false;
-        let sawExitUploadStart = false;
+        let sawGenuineExitSyncStart = false;
         let sawExitUploadCompleted = false;
 
         for (let i = 0; i < lines.length; i++) {
@@ -2488,17 +2492,23 @@ function createCloudSaveRunnerFactory(facadeDeps) {
           }
 
           if (exitUploadCompletionRegex.test(line)) {
-            if (sawExitUploadStart) {
+            if (sawGenuineExitSyncStart) {
               sawExitUploadCompleted = true;
             }
             exitOrUploadActive = false;
             launchOrEvalActive = false;
             downloadPending = false;
             sawCompletion = true;
-          } else if (exitUploadStartRegex.test(line)) {
+          } else if (genuinePostExitSyncStartRegex.test(line)) {
             exitOrUploadActive = true;
-            sawExitUploadStart = true;
+            sawGenuineExitSyncStart = true;
             sawExitUploadCompleted = false;
+          } else if (uploadStartRegex.test(line)) {
+            exitOrUploadActive = true;
+            if (/AC\s+Launch/i.test(line)) {
+              sawGenuineExitSyncStart = false;
+              sawExitUploadCompleted = false;
+            }
           } else if (downloadCompletionRegex.test(line)) {
             downloadPending = false;
             launchOrEvalActive = false;
