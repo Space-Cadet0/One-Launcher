@@ -5,14 +5,17 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { discoverWindowsSteamRegistryPaths } = require('../utils/windowsRegistryDiscovery.cjs');
+const { isContainedWithinRoot } = require('../launcher/securityAndPathUtils.cjs');
 
 const STEAM_LOCAL_SCAN_TTL_MS = 15000;
 const STEAM_ID64_BASE = 76561197960265728n;
 const STEAM_HTTP_TIMEOUT_MS = 20_000;
-const MAX_STEAM_SCANNER_CACHE_ENTRIES = 128;
+const MAX_STEAM_SCANNER_CACHE_ENTRIES = 4096;
+const MAX_BINARY_VDF_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_BINARY_VDF_RECURSION_DEPTH = 16;
 
 /**
- * Inserts an entry into a bounded LRU-order `Map` (`maxEntries = 128` by default).
+ * Inserts an entry into a bounded LRU-order `Map` (`maxEntries = 4096` by default).
  *
  * @template K, V
  * @param {Map<K, V>} map
@@ -78,6 +81,121 @@ function buildSteamFetchSignal(callerSignal, timeoutMs = STEAM_HTTP_TIMEOUT_MS) 
 }
 
 /**
+ * Pure-JS bounded parser for Steam Binary KeyValues (`.vdf` / `.bin` files such as
+ * `shortcuts.vdf` and `appcache/stats/UserGameStats*.bin`).
+ * Uses native `Buffer.indexOf(0)` slice decoding for UTF-8 C-strings, supports binary VDF types
+ * `0x00`..`0x0a` (`0x09` compiled zero int, `0x0a` signed 64-bit LE int) plus `0x08`/`0x0b`
+ * terminators, and enforces `<= 16 MB` buffer size and `<= 16` recursion depth.
+ *
+ * @param {Buffer | Uint8Array} input
+ * @param {{ maxBytes?: number, maxDepth?: number }} [options]
+ * @returns {Record<string, any>}
+ */
+function parseBinaryVdf(input, options = {}) {
+  const buf = Buffer.isBuffer(input) ? input : Buffer.from(input);
+  const maxBytes =
+    typeof options.maxBytes === 'number' && options.maxBytes > 0
+      ? options.maxBytes
+      : MAX_BINARY_VDF_FILE_BYTES;
+  const maxDepth =
+    typeof options.maxDepth === 'number' && options.maxDepth > 0
+      ? options.maxDepth
+      : MAX_BINARY_VDF_RECURSION_DEPTH;
+
+  if (buf.length > maxBytes) {
+    throw new Error(`Binary VDF exceeds safety cap (${buf.length} > ${maxBytes} bytes)`);
+  }
+
+  let offset = 0;
+
+  const readCString = () => {
+    if (offset >= buf.length) return '';
+    const zeroIdx = buf.indexOf(0, offset);
+    const end = zeroIdx === -1 ? buf.length : zeroIdx;
+    const str = buf.toString('utf8', offset, end);
+    offset = zeroIdx === -1 ? buf.length : zeroIdx + 1;
+    return str;
+  };
+
+  const readWideCString = () => {
+    const start = offset;
+    while (offset + 1 < buf.length && !(buf[offset] === 0 && buf[offset + 1] === 0)) {
+      offset += 2;
+    }
+    const str = buf.toString('utf16le', start, offset);
+    if (offset + 1 < buf.length && buf[offset] === 0 && buf[offset + 1] === 0) {
+      offset += 2;
+    }
+    return str;
+  };
+
+  /**
+   * @param {number} depth
+   * @returns {Record<string, any>}
+   */
+  const parseMap = (depth) => {
+    if (depth > maxDepth) {
+      throw new Error(`Binary VDF nesting depth exceeds limit (${maxDepth})`);
+    }
+    /** @type {Record<string, any>} */
+    const out = Object.create(null);
+
+    while (offset < buf.length) {
+      const type = buf[offset++];
+      if (type === 0x08 || type === 0x0b) {
+        break;
+      }
+      if (offset >= buf.length) break;
+      const key = readCString();
+
+      if (type === 0x00) {
+        out[key] = parseMap(depth + 1);
+      } else if (type === 0x01) {
+        out[key] = readCString();
+      } else if (type === 0x02) {
+        if (offset + 4 > buf.length) break;
+        out[key] = buf.readInt32LE(offset);
+        offset += 4;
+      } else if (type === 0x03) {
+        if (offset + 4 > buf.length) break;
+        out[key] = buf.readFloatLE(offset);
+        offset += 4;
+      } else if (type === 0x04 || type === 0x06) {
+        if (offset + 4 > buf.length) break;
+        out[key] = buf.readUInt32LE(offset);
+        offset += 4;
+      } else if (type === 0x05) {
+        out[key] = readWideCString();
+      } else if (type === 0x07) {
+        if (offset + 8 > buf.length) break;
+        const big = buf.readBigUInt64LE(offset);
+        offset += 8;
+        out[key] = big <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(big) : big.toString();
+      } else if (type === 0x09) {
+        // Valve Binary KeyValues `TYPE_COMPILED_INT_0` (zero payload bytes, integer value 0)
+        out[key] = 0;
+      } else if (type === 0x0a) {
+        // Steam Binary KeyValues `BIN_INT64` (8-byte signed little-endian integer)
+        if (offset + 8 > buf.length) break;
+        const big = buf.readBigInt64LE(offset);
+        offset += 8;
+        out[key] =
+          big >= BigInt(Number.MIN_SAFE_INTEGER) && big <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(big)
+            : big.toString();
+      } else {
+        // Unknown binary VDF type marker: halt cleanly to prevent desync loop
+        break;
+      }
+    }
+
+    return out;
+  };
+
+  return parseMap(0);
+}
+
+/**
  * Converts a 17-digit 64-bit `SteamID64` (`>= 76561197960265729`) into its 32-bit Steam
  * `userdata/<accountId32>` folder identifier (`String(BigInt(steamId64) - 76561197960265728n)`).
  *
@@ -100,8 +218,9 @@ function steamId64ToAccountId32(rawSteamId64) {
 }
 
 /**
- * Parses `Steam/config/loginusers.vdf` to extract the active Steam user (`MostRecent "1"`,
- * breaking ties via `Timestamp`) and converts their `SteamID64` to `<accountId32>`.
+ * Linear brace-depth VDF tokenizer for `Steam/config/loginusers.vdf` that safely handles
+ * quoted strings with `{`, `}`, and escaped `\"`, `//` line comments, and nested sub-blocks
+ * to extract the active Steam user (`MostRecent "1"`, breaking ties via `Timestamp`).
  *
  * @param {string} vdfText
  * @returns {string | null}
@@ -109,31 +228,144 @@ function steamId64ToAccountId32(rawSteamId64) {
 function parseActiveAccountIdFromLoginUsersVdf(vdfText) {
   if (!vdfText || typeof vdfText !== 'string') return null;
 
-  const userBlockRegex = /"(\d{17})"\s*\{([^{}]*)\}/g;
-  /** @type {{ accountId32: string, mostRecent: boolean, timestamp: number } | null} */
+  /** @type {Map<string, { mostRecent: boolean, timestamp: number }>} */
+  const usersByAccount32 = new Map();
+  /** @type {string[]} */
+  const sectionStack = [];
+  /** @type {string | null} */
+  let pendingKey = null;
+
+  const resolveActiveUserAccount32 = () => {
+    const depth = sectionStack.length;
+    if (depth === 0) return null;
+    const leaf = sectionStack[depth - 1];
+    if (!/^\d{17}$/.test(leaf)) return null;
+    if (depth >= 2) {
+      const parent = sectionStack[depth - 2].toLowerCase();
+      if (parent !== 'users') return null;
+    }
+    return steamId64ToAccountId32(leaf);
+  };
+
+  const len = vdfText.length;
+  let i = 0;
+  while (i < len) {
+    const ch = vdfText.charCodeAt(i);
+    if (ch <= 32) {
+      i += 1;
+      continue;
+    }
+    // Skip `//` line comments
+    if (ch === 47 && i + 1 < len && vdfText.charCodeAt(i + 1) === 47) {
+      i += 2;
+      while (i < len && vdfText.charCodeAt(i) !== 10 && vdfText.charCodeAt(i) !== 13) {
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === 123 /* '{' */) {
+      const sectionKey = pendingKey !== null ? pendingKey : '';
+      sectionStack.push(sectionKey);
+      pendingKey = null;
+      const acct32 = resolveActiveUserAccount32();
+      if (acct32 && !usersByAccount32.has(acct32)) {
+        usersByAccount32.set(acct32, { mostRecent: false, timestamp: 0 });
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === 125 /* '}' */) {
+      pendingKey = null;
+      if (sectionStack.length > 0) {
+        sectionStack.pop();
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === 34 /* '"' */) {
+      i += 1;
+      let token = '';
+      let chunkStart = i;
+      while (i < len) {
+        const c = vdfText.charCodeAt(i);
+        if (c === 92 /* '\\' */) {
+          if (i > chunkStart) {
+            token += vdfText.slice(chunkStart, i);
+          }
+          i += 1;
+          if (i < len) {
+            const esc = vdfText.charCodeAt(i);
+            if (esc === 110) token += '\n';
+            else if (esc === 116) token += '\t';
+            else if (esc === 114) token += '\r';
+            else token += vdfText[i];
+            i += 1;
+          }
+          chunkStart = i;
+          continue;
+        }
+        if (c === 34 /* '"' */) {
+          if (i > chunkStart) {
+            token += vdfText.slice(chunkStart, i);
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      if (pendingKey === null) {
+        pendingKey = token;
+      } else {
+        const keyLower = pendingKey.toLowerCase();
+        pendingKey = null;
+        if (keyLower === 'mostrecent' || keyLower === 'timestamp') {
+          const acct32 = resolveActiveUserAccount32();
+          if (acct32) {
+            let rec = usersByAccount32.get(acct32);
+            if (!rec) {
+              rec = { mostRecent: false, timestamp: 0 };
+              usersByAccount32.set(acct32, rec);
+            }
+            const trimmedVal = token.trim();
+            if (keyLower === 'mostrecent') {
+              rec.mostRecent = trimmedVal === '1';
+            } else if (/^\d+$/.test(trimmedVal)) {
+              rec.timestamp = Math.max(rec.timestamp, Number(trimmedVal) || 0);
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    // Unquoted VDF token fallback
+    const uStart = i;
+    while (i < len) {
+      const uc = vdfText.charCodeAt(i);
+      if (uc <= 32 || uc === 123 || uc === 125 || uc === 34) break;
+      i += 1;
+    }
+    const unquoted = vdfText.slice(uStart, i);
+    if (pendingKey === null) {
+      pendingKey = unquoted;
+    } else {
+      pendingKey = null;
+    }
+  }
+
+  /** @type {{ accountId32: string, timestamp: number } | null} */
   let bestMostRecent = null;
   /** @type {{ accountId32: string, timestamp: number } | null} */
   let bestByTimestamp = null;
 
-  let m;
-  while ((m = userBlockRegex.exec(vdfText)) !== null) {
-    const steamId64 = m[1];
-    const body = m[2] || '';
-    const accountId32 = steamId64ToAccountId32(steamId64);
-    if (!accountId32) continue;
-
-    const mrMatch = body.match(/"MostRecent"\s+"(\d+)"/i);
-    const tsMatch = body.match(/"Timestamp"\s+"(\d+)"/i);
-    const isMostRecent = Boolean(mrMatch && mrMatch[1] === '1');
-    const timestamp = tsMatch ? Number(tsMatch[1]) || 0 : 0;
-
-    if (isMostRecent) {
-      if (!bestMostRecent || timestamp >= bestMostRecent.timestamp) {
-        bestMostRecent = { accountId32, mostRecent: true, timestamp };
+  for (const [accountId32, rec] of usersByAccount32.entries()) {
+    if (rec.mostRecent) {
+      if (!bestMostRecent || rec.timestamp >= bestMostRecent.timestamp) {
+        bestMostRecent = { accountId32, timestamp: rec.timestamp };
       }
     }
-    if (!bestByTimestamp || timestamp > bestByTimestamp.timestamp) {
-      bestByTimestamp = { accountId32, timestamp };
+    if (!bestByTimestamp || rec.timestamp > bestByTimestamp.timestamp) {
+      bestByTimestamp = { accountId32, timestamp: rec.timestamp };
     }
   }
 
@@ -194,7 +426,7 @@ async function resolveActiveSteamAccountDirs(userdataBaseDir, options = {}) {
   }
 
   if (loginUsersPresent) {
-    // `loginusers.vdf` existed without any recognizable active user: pick newest single folder
+    // `loginusers.vdf` existed without any recognizable active user: pick single folder if unambiguous
     if (numericFolders.length === 1) return numericFolders;
   }
 
@@ -332,7 +564,8 @@ function parseSteamEaInstallerDataXml(xmlContent) {
 
 /**
  * Resolve all local Steam `steamapps` directories asynchronously (primary + `libraryfolders.vdf`
- * secondary drives + CrossOver/Wine bottles on macOS) with zero mutations.
+ * secondary drives + CrossOver/Wine bottles on macOS, including arbitrary `dosdevices/<letter>:`
+ * mappings `c:`..`z:`) with zero mutations.
  *
  * @param {Record<string, any>} [options]
  * @returns {Promise<string[]>}
@@ -356,6 +589,7 @@ async function resolveLocalSteamAppsDirs(options = {}) {
       const vdfContent = await fs.promises.readFile(libVdfPath, 'utf8');
       const isBottleDir = /(?:^|[\\/])drive_c(?:[\\/]|$)/i.test(saDir);
       const driveCMatch = isBottleDir ? saDir.match(/^(.*?[\\/]drive_c)(?:[\\/]|$)/i) : null;
+      const bottleRootDir = driveCMatch ? path.dirname(driveCMatch[1]) : '';
       const pathRe = /"path"\s+"([^"]+)"/gi;
       let pm;
       while ((pm = pathRe.exec(vdfContent)) !== null) {
@@ -364,7 +598,19 @@ async function resolveLocalSteamAppsDirs(options = {}) {
         if (driveCMatch && /^[a-zA-Z]:[\\/]/.test(rawLibPath)) {
           const driveLetter = rawLibPath[0].toLowerCase();
           const relWin = rawLibPath.slice(2).replace(/^[\\/]+/, '').replace(/\\/g, '/');
-          if (driveLetter === 'c') {
+          // First probe Wine `dosdevices/<letter>:` symlinks for arbitrary drive letters (`c:`..`z:`)
+          let mappedRoot = '';
+          if (bottleRootDir) {
+            const dosDeviceLink = path.join(bottleRootDir, 'dosdevices', `${driveLetter}:`);
+            try {
+              mappedRoot = await fs.promises.realpath(dosDeviceLink);
+            } catch {
+              mappedRoot = '';
+            }
+          }
+          if (mappedRoot) {
+            steamappsDirs.add(path.join(mappedRoot, relWin, 'steamapps'));
+          } else if (driveLetter === 'c') {
             steamappsDirs.add(path.join(driveCMatch[1], relWin, 'steamapps'));
           } else if (driveLetter === 'z') {
             steamappsDirs.add(path.join('/', relWin, 'steamapps'));
@@ -382,6 +628,7 @@ async function resolveLocalSteamAppsDirs(options = {}) {
 /**
  * Asynchronously scan installed Steam games for `<steamGameInstallDir>/__Installer/installerdata.xml`
  * to stamp EA `storefront_depot_uri` topology (`chainedLauncherHandoff: 'ea'`).
+ * Enforces strict `isContainedWithinRoot` on `.acf` `installdir` values.
  * Zero filesystem mutations (read-only).
  *
  * @param {Record<string, any>} [options]
@@ -406,6 +653,7 @@ async function scanLocalSteamEaChainedGames(options = {}) {
       } catch {
         continue;
       }
+      const commonRoot = path.resolve(saDir, 'common');
       for (const file of entries) {
         const acfMatch = file.match(/^appmanifest_(\d+)\.acf$/i);
         if (!acfMatch) continue;
@@ -416,8 +664,18 @@ async function scanLocalSteamEaChainedGames(options = {}) {
           const dirMatch = acfRaw.match(/"installdir"\s+"([^"]+)"/i);
           const appId = idMatch ? Number(idMatch[1]) : fallbackAppId;
           const installDirName = dirMatch ? String(dirMatch[1] || '').trim() : '';
-          if (!appId || !installDirName) continue;
-          const gameDir = path.join(saDir, 'common', installDirName);
+          if (
+            !appId ||
+            !installDirName ||
+            installDirName.includes('\0') ||
+            path.isAbsolute(installDirName)
+          ) {
+            continue;
+          }
+          const gameDir = path.resolve(commonRoot, installDirName);
+          if (!isContainedWithinRoot(commonRoot, gameDir, process.platform)) {
+            continue;
+          }
           let xmlContent = '';
           try {
             xmlContent = await fs.promises.readFile(
@@ -625,7 +883,7 @@ function parseLocalConfigPlaytime(vdfContent) {
     }
 
     // Unquoted VDF token fallback
-    let uStart = i;
+    const uStart = i;
     while (i < len) {
       const uc = vdfContent.charCodeAt(i);
       if (uc <= 32 || uc === 123 || uc === 125 || uc === 34) break;
@@ -707,8 +965,14 @@ async function readLocalSteamPlaytimes(options = {}) {
             const appIdNum = Number(appIdKey);
             const existingPt = playtimes[appIdNum];
             playtimes[appIdNum] = {
-              playtimeMinutes: Math.max(existingPt?.playtimeMinutes || 0, ptObj.playtimeMinutes || 0),
-              lastPlayedEpoch: Math.max(existingPt?.lastPlayedEpoch || 0, ptObj.lastPlayedEpoch || 0),
+              playtimeMinutes: Math.max(
+                existingPt?.playtimeMinutes || 0,
+                ptObj.playtimeMinutes || 0
+              ),
+              lastPlayedEpoch: Math.max(
+                existingPt?.lastPlayedEpoch || 0,
+                ptObj.lastPlayedEpoch || 0
+              ),
             };
           }
         } catch {}
@@ -721,6 +985,62 @@ async function readLocalSteamPlaytimes(options = {}) {
     data: playtimes,
   });
   return { ...playtimes };
+}
+
+/**
+ * Parses binary `shortcuts.vdf` buffers using the bounded binary VDF Buffer C-string reader,
+ * preserving multi-byte UTF-8 names and handling arbitrary field orderings.
+ *
+ * @param {Buffer | Uint8Array} buf
+ * @param {string} accountId32
+ * @returns {Array<{ appName: string, exe: string, startDir: string, accountId32: string }>}
+ */
+function parseBinarySteamShortcutsBuffer(buf, accountId32) {
+  /** @type {Array<{ appName: string, exe: string, startDir: string, accountId32: string }>} */
+  const out = [];
+  if (!buf || buf.length === 0) return out;
+
+  const parsed = parseBinaryVdf(buf);
+  /** @type {Record<string, any> | null} */
+  let shortcutsNode = null;
+  for (const [k, v] of Object.entries(parsed)) {
+    if (k.toLowerCase() === 'shortcuts' && v && typeof v === 'object') {
+      shortcutsNode = v;
+      break;
+    }
+  }
+  const container = shortcutsNode || parsed;
+
+  /** @param {Record<string, any>} rec */
+  const extractEntryFromObject = (rec) => {
+    if (!rec || typeof rec !== 'object') return;
+    let appName = '';
+    let exe = '';
+    let startDir = '';
+    for (const [k, v] of Object.entries(rec)) {
+      if (typeof v !== 'string') continue;
+      const lower = k.toLowerCase();
+      if (lower === 'appname') appName = v.trim();
+      else if (lower === 'exe') exe = v.replace(/^"+|"+$/g, '').trim();
+      else if (lower === 'startdir') startDir = v.replace(/^"+|"+$/g, '').trim();
+    }
+    if (appName && exe) {
+      out.push({ appName, exe, startDir, accountId32 });
+    }
+  };
+
+  for (const val of Object.values(container)) {
+    if (val && typeof val === 'object') {
+      extractEntryFromObject(val);
+    }
+  }
+
+  // Fallback for minimal snippet buffers where `AppName`/`Exe` are placed directly at root level
+  if (out.length === 0 && container === parsed) {
+    extractEntryFromObject(parsed);
+  }
+
+  return out;
 }
 
 /**
@@ -740,17 +1060,12 @@ async function readLocalSteamShortcuts(options = {}) {
       for (const u of userFolders) {
         const shortcutsPath = path.join(base, u, 'config', 'shortcuts.vdf');
         try {
+          const st = await fs.promises.stat(shortcutsPath);
+          if (!st.isFile() || st.size <= 0 || st.size > MAX_BINARY_VDF_FILE_BYTES) continue;
           const buf = await fs.promises.readFile(shortcutsPath);
-          const rawStr = buf.toString('utf8');
-          const entryRegex = /\x01AppName\x00([^\x00]*)\x00[\s\S]*?\x01Exe\x00([^\x00]*)\x00(?:\x01StartDir\x00([^\x00]*)\x00)?/gi;
-          let m;
-          while ((m = entryRegex.exec(rawStr)) !== null) {
-            const appName = String(m[1] || '').trim();
-            const exe = String(m[2] || '').replace(/^"+|"+$/g, '').trim();
-            const startDir = String(m[3] || '').replace(/^"+|"+$/g, '').trim();
-            if (appName && exe) {
-              shortcuts.push({ appName, exe, startDir, accountId32: u });
-            }
+          const parsedEntries = parseBinarySteamShortcutsBuffer(buf, u);
+          if (parsedEntries.length > 0) {
+            shortcuts.push(...parsedEntries);
           }
         } catch {}
       }
@@ -903,6 +1218,7 @@ async function fetchSteamBatchAchievements(webapiToken, steamId, appIds = [], op
   }
 
   const fetchImpl = options.customFetch || options.fetchImpl || globalThis.fetch;
+  const language = String(options.language || 'english').trim() || 'english';
   const cleanIds = Array.from(new Set(appIds.map((id) => Number(id)).filter((id) => id > 0)));
   const CHUNK_SIZE = 100;
   for (let i = 0; i < cleanIds.length; i += CHUNK_SIZE) {
@@ -912,7 +1228,7 @@ async function fetchSteamBatchAchievements(webapiToken, steamId, appIds = [], op
       .join('&');
     const url = `https://api.steampowered.com/IPlayerService/GetAchievementsProgress/v1/?access_token=${encodeURIComponent(
       webapiToken
-    )}&steamid=${encodeURIComponent(steamId)}&language=english&${appIdParams}`;
+    )}&steamid=${encodeURIComponent(steamId)}&language=${encodeURIComponent(language)}&${appIdParams}`;
     try {
       const res = await fetchImpl(url, { signal: buildSteamFetchSignal(options.signal) });
       if (res.ok) {
@@ -958,13 +1274,15 @@ async function fetchSteamStoreBrowseItemsMap(appIds = [], options = {}) {
   const storeItems = {};
   if (!Array.isArray(appIds) || appIds.length === 0) return storeItems;
   const fetchImpl = options.customFetch || options.fetchImpl || globalThis.fetch;
+  const language = String(options.language || 'english').trim() || 'english';
+  const countryCode = String(options.countryCode || options.country || 'US').trim().toUpperCase() || 'US';
   const cleanIds = Array.from(new Set(appIds.map((id) => Number(id)).filter((id) => id > 0)));
   const CHUNK_SIZE = 100;
   for (let i = 0; i < cleanIds.length; i += CHUNK_SIZE) {
     const chunk = cleanIds.slice(i, i + CHUNK_SIZE);
     const inputJson = JSON.stringify({
       ids: chunk.map((appid) => ({ appid })),
-      context: { language: 'english', country_code: 'US' },
+      context: { language, country_code: countryCode },
       data_request: { include_assets: true },
     });
     const url = `https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=${encodeURIComponent(
@@ -987,6 +1305,41 @@ async function fetchSteamStoreBrowseItemsMap(appIds = [], options = {}) {
     } catch {}
   }
   return storeItems;
+}
+
+/**
+ * Resolve a Steam icon field strictly requiring `https://` for remote icon URLs and validating
+ * relative CDN hashes before composing a Steam CDN URL.
+ *
+ * @param {number} appId
+ * @param {string} rawIconHash
+ * @param {string | undefined} fallbackIconUrl
+ * @returns {string | undefined}
+ */
+function resolveSafeSteamIconUrl(appId, rawIconHash, fallbackIconUrl) {
+  const clean = String(rawIconHash || '').trim();
+  if (!clean) return fallbackIconUrl;
+
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(clean) || clean.startsWith('//')) {
+    try {
+      const candidate = clean.startsWith('//') ? `https:${clean}` : clean;
+      const parsed = new URL(candidate);
+      if (parsed.protocol === 'https:' && parsed.hostname && !parsed.username && !parsed.password) {
+        return parsed.toString();
+      }
+    } catch {}
+    return fallbackIconUrl;
+  }
+
+  // Reject any unexpected scheme like `javascript:` / `data:` or path traversal
+  if (clean.includes(':') || clean.includes('..') || !/^[a-zA-Z0-9._/-]+$/.test(clean)) {
+    return fallbackIconUrl;
+  }
+
+  const normalizedRel = clean.replace(/^\/+/, '');
+  return `https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/${appId}/${
+    normalizedRel.endsWith('.jpg') ? normalizedRel : `${normalizedRel}.jpg`
+  }`;
 }
 
 /**
@@ -1074,7 +1427,7 @@ async function parseSteamGamesListJson(
     const assetFormat = (si && si.asset_url_format) || `steam/apps/${appId}/\${FILENAME}`;
     /** @param {string} filename */
     const buildAssetUrl = (filename) =>
-      `https://shared.akamai.steamstatic.com/store_item_assets/${assetFormat.replace('${FILENAME}', filename)}`;
+      `https://shared.akamai.steamstatic.com/store_item_assets/${assetFormat.replace('${FILENAME}', () => filename)}`;
 
     const headerFile = (si && si.header) || 'header.jpg';
     const capsuleFile =
@@ -1087,13 +1440,7 @@ async function parseSteamGamesListJson(
       (si && si.community_icon) ||
       (typeof g.img_icon_url === 'string' && g.img_icon_url.trim()) ||
       '';
-    const resolvedIconUrl = rawIconHash
-      ? rawIconHash.startsWith('http')
-        ? rawIconHash
-        : `https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/${appId}/${
-            rawIconHash.endsWith('.jpg') ? rawIconHash : `${rawIconHash}.jpg`
-          }`
-      : existingGame?.iconUrl;
+    const resolvedIconUrl = resolveSafeSteamIconUrl(appId, rawIconHash, existingGame?.iconUrl);
 
     const builtHeader = buildAssetUrl(headerFile);
     const builtCapsule = buildAssetUrl(capsuleFile);
@@ -1192,11 +1539,16 @@ async function parseSteamGamesListJson(
 
 module.exports = {
   MAX_STEAM_SCANNER_CACHE_ENTRIES,
+  MAX_BINARY_VDF_FILE_BYTES,
+  MAX_BINARY_VDF_RECURSION_DEPTH,
+  parseBinaryVdf,
+  parseBinarySteamShortcutsBuffer,
   steamId64ToAccountId32,
   parseActiveAccountIdFromLoginUsersVdf,
   parseLocalConfigPlaytime,
   resolveActiveSteamAccountDirs,
   resolveLocalSteamUserdataDirs,
+  resolveLocalSteamAppsDirs,
   readLocalSteamPlaytimes,
   readLocalSteamShortcuts,
   scanLocalSteamAchievements,

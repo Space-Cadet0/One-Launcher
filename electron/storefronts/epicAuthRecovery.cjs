@@ -1,11 +1,15 @@
 // @ts-check
 'use strict';
 
+const { getCanonicalChromeUserAgent } = require('../launcher/securityAndPathUtils.cjs');
+
 const GOG_OAUTH_CLIENT_ID =
   String(process.env.ONE_LAUNCHER_GOG_CLIENT_ID || '').trim() || '46899977096215655';
 const EPIC_OAUTH_CLIENT_ID =
   String(process.env.ONE_LAUNCHER_EPIC_CLIENT_ID || '').trim() ||
   '34a02cf8f4414e29b15921876da36f9a';
+const XBOX_OAUTH_CLIENT_ID =
+  String(process.env.ONE_LAUNCHER_XBOX_CLIENT_ID || '').trim() || '00000000402b5328';
 
 /** @type {Record<string, { url: string, successPrefix: string, width: number, height: number }>} */
 const STORE_OAUTH_URLS = {
@@ -28,7 +32,7 @@ const STORE_OAUTH_URLS = {
     height: 720,
   },
   xbox: {
-    url: 'https://login.live.com/oauth20_authorize.srf?client_id=00000000402b5328&response_type=code&approval_prompt=auto&scope=service%3A%3Auser.auth.xboxlive.com%3A%3AMBI_SSL&redirect_uri=https%3A%2F%2Flogin.live.com%2Foauth20_desktop.srf',
+    url: `https://login.live.com/oauth20_authorize.srf?client_id=${encodeURIComponent(XBOX_OAUTH_CLIENT_ID)}&response_type=code&approval_prompt=auto&scope=service%3A%3Auser.auth.xboxlive.com%3A%3AMBI_SSL&redirect_uri=https%3A%2F%2Flogin.live.com%2Foauth20_desktop.srf`,
     successPrefix: 'https://login.live.com/oauth20_desktop.srf',
     width: 520,
     height: 680,
@@ -36,19 +40,14 @@ const STORE_OAUTH_URLS = {
 };
 
 /**
- * Builds a platform-accurate browser User-Agent string from `process.platform`.
+ * Builds a platform-accurate canonical Chrome User-Agent string derived from Electron's bundled
+ * Chromium version (via `getCanonicalChromeUserAgent`).
  *
  * @param {string} [platformOverride]
  * @returns {string}
  */
 function buildPlatformBrowserUserAgent(platformOverride = process.platform) {
-  const osToken =
-    platformOverride === 'win32'
-      ? 'Windows NT 10.0; Win64; x64'
-      : platformOverride === 'darwin'
-        ? 'Macintosh; Intel Mac OS X 10_15_7'
-        : 'X11; Linux x86_64';
-  return `Mozilla/5.0 (${osToken}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36`;
+  return getCanonicalChromeUserAgent({ platform: platformOverride });
 }
 
 /**
@@ -71,6 +70,65 @@ function safeParseUrl(rawUrl) {
 function isEpicGamesHost(hostname) {
   const lower = String(hostname || '').toLowerCase();
   return lower === 'epicgames.com' || lower.endsWith('.epicgames.com');
+}
+
+/**
+ * Safely extracts a 32-hex Epic OAuth `authorizationCode` from `/id/api/redirect` body text,
+ * ensuring `EPIC_OAUTH_CLIENT_ID` (present inside `redirectUrl`) is NEVER mistaken for an auth
+ * code when `authorizationCode` is `null` or absent.
+ *
+ * @param {unknown} rawBodyText
+ * @param {string} [clientId]
+ * @returns {{ code: string | null, explicitNull: boolean }}
+ */
+function extractEpicAuthCodeFromRedirectBody(rawBodyText, clientId = EPIC_OAUTH_CLIENT_ID) {
+  const body = String(rawBodyText ?? '').trim();
+  if (!body) {
+    return { code: null, explicitNull: false };
+  }
+
+  const clientIdLower = String(clientId || EPIC_OAUTH_CLIENT_ID).trim().toLowerCase();
+  /** @param {string} candidate */
+  const isValidCode = (candidate) =>
+    /^[a-fA-F0-9]{32}$/.test(candidate) && candidate.toLowerCase() !== clientIdLower;
+
+  // 1. Prefer strict JSON parsing for `/id/api/redirect` responses
+  if (body.startsWith('{') && body.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.authorizationCode === 'string') {
+          const trimmedCode = parsed.authorizationCode.trim();
+          if (isValidCode(trimmedCode)) {
+            return { code: trimmedCode, explicitNull: false };
+          }
+          return { code: null, explicitNull: true };
+        }
+        if ('authorizationCode' in parsed) {
+          return { code: null, explicitNull: parsed.authorizationCode === null };
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Explicit `"authorizationCode": null` guard MUST execute BEFORE any regex fallback
+  if (/"authorizationCode"\s*:\s*null\b/i.test(body)) {
+    return { code: null, explicitNull: true };
+  }
+
+  // 3. Explicit `"authorizationCode": "<32-hex>"` match
+  const jsonFieldMatch = body.match(/"authorizationCode"\s*:\s*"([a-fA-F0-9]{32})"/i);
+  if (jsonFieldMatch && jsonFieldMatch[1] && isValidCode(jsonFieldMatch[1])) {
+    return { code: jsonFieldMatch[1], explicitNull: false };
+  }
+
+  // 4. Bare 32-hex body fallback ONLY when the entire response body is a single 32-hex token
+  //    (never scanning inside JSON/URLs where `clientId`, `sid`, or `accountId` appear)
+  if (isValidCode(body)) {
+    return { code: body, explicitNull: false };
+  }
+
+  return { code: null, explicitNull: false };
 }
 
 const STEAM_AUTH_PAGE_EXTRACTOR_SCRIPT = `
@@ -285,202 +343,210 @@ function createEpicAuthRecovery({ BrowserWindow, getMainWindow, storeSync, launc
    * @returns {Promise<any>}
    */
   const executeEpicRecoveryAttempt = async (allowInteractiveAuth) => {
-      const cleanUA = buildPlatformBrowserUserAgent();
-      const silentRedirectUrl = `https://www.epicgames.com/id/api/redirect?clientId=${encodeURIComponent(EPIC_OAUTH_CLIENT_ID)}&responseType=code`;
+    const cleanUA = getCanonicalChromeUserAgent();
+    const silentRedirectUrl = `https://www.epicgames.com/id/api/redirect?clientId=${encodeURIComponent(EPIC_OAUTH_CLIENT_ID)}&responseType=code`;
 
-      /**
-       * @param {any} win
-       * @param {string} targetUrl
-       * @param {number} timeoutMs
-       * @param {boolean} interactive
-       * @returns {Promise<string | null>}
-       */
-      const extractEpicAuthCodeFromWindow = (win, targetUrl, timeoutMs, interactive) =>
-        new Promise((resolveCode) => {
-          if (!BrowserWindow) {
-            resolveCode(null);
+    /**
+     * @param {any} win
+     * @param {string} targetUrl
+     * @param {number} timeoutMs
+     * @param {boolean} interactive
+     * @returns {Promise<string | null>}
+     */
+    const extractEpicAuthCodeFromWindow = (win, targetUrl, timeoutMs, interactive) =>
+      new Promise((resolveCode) => {
+        if (!BrowserWindow || !win || !win.webContents) {
+          resolveCode(null);
+          return;
+        }
+        let settled = false;
+        /** @type {ReturnType<typeof setTimeout> | null} */
+        let timer = null;
+
+        // Configure canonical UA via `webContents.setUserAgent` (Electron ignores `webPreferences.userAgent`)
+        // and strictly deny child popup windows on OAuth windows.
+        try {
+          if (typeof win.webContents.setUserAgent === 'function') {
+            win.webContents.setUserAgent(cleanUA);
+          }
+          if (typeof win.webContents.setWindowOpenHandler === 'function') {
+            win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+          }
+        } catch {}
+
+        /** @param {string | null} code */
+        const finish = (code) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          try {
+            if (typeof storeSync.destroyScraperWindowCleanly === 'function' && !interactive) {
+              storeSync.destroyScraperWindowCleanly(win);
+            } else if (win && !win.isDestroyed()) {
+              win.close();
+              if (!win.isDestroyed()) win.destroy();
+            }
+          } catch {}
+          resolveCode(code || null);
+        };
+
+        if (timeoutMs > 0) {
+          timer = setTimeout(() => finish(null), timeoutMs);
+        }
+
+        /** @param {string} url */
+        const checkUrl = (url) => {
+          if (!url || settled) return false;
+          const parsed = safeParseUrl(url);
+          if (
+            parsed &&
+            (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
+            parsed.hostname.toLowerCase() === 'localhost' &&
+            parsed.pathname === '/launcher/authorized'
+          ) {
+            const code = parsed.searchParams.get('code');
+            if (
+              code &&
+              /^[a-fA-F0-9]{32}$/.test(code) &&
+              code.toLowerCase() !== EPIC_OAUTH_CLIENT_ID.toLowerCase()
+            ) {
+              finish(code);
+              return true;
+            }
+          }
+          return false;
+        };
+
+        const checkBodyForCode = async () => {
+          if (settled || !win || win.isDestroyed()) return;
+          const currentUrl = win.webContents.getURL() || '';
+          if (checkUrl(currentUrl)) return;
+          const parsedCurrent = safeParseUrl(currentUrl);
+          if (!parsedCurrent || parsedCurrent.protocol !== 'https:') return;
+
+          const host = parsedCurrent.hostname.toLowerCase();
+          const pathname = parsedCurrent.pathname || '';
+          if (
+            !interactive &&
+            isEpicGamesHost(host) &&
+            (pathname.startsWith('/id/login') || pathname.startsWith('/login'))
+          ) {
+            finish(null);
             return;
           }
-          let settled = false;
-          /** @type {ReturnType<typeof setTimeout> | null} */
-          let timer = null;
-
-          /** @param {string | null} code */
-          const finish = (code) => {
-            if (settled) return;
-            settled = true;
-            if (timer) clearTimeout(timer);
+          if (isEpicGamesHost(host) && pathname.startsWith('/id/api/redirect')) {
             try {
-              if (typeof storeSync.destroyScraperWindowCleanly === 'function' && !interactive) {
-                storeSync.destroyScraperWindowCleanly(win);
-              } else if (win && !win.isDestroyed()) {
-                win.close();
-                if (!win.isDestroyed()) win.destroy();
+              const bodyText = await win.webContents.executeJavaScript(
+                'document.body ? document.body.innerText : ""'
+              );
+              if (bodyText) {
+                const extracted = extractEpicAuthCodeFromRedirectBody(bodyText);
+                if (extracted.code) {
+                  finish(extracted.code);
+                  return;
+                }
+                if (!interactive && extracted.explicitNull) {
+                  finish(null);
+                  return;
+                }
               }
             } catch {}
-            resolveCode(code || null);
-          };
-
-          if (timeoutMs > 0) {
-            timer = setTimeout(() => finish(null), timeoutMs);
           }
+        };
 
-          /** @param {string} url */
-          const checkUrl = (url) => {
-            if (!url || settled) return false;
-            const parsed = safeParseUrl(url);
-            if (
-              parsed &&
-              (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
-              parsed.hostname.toLowerCase() === 'localhost' &&
-              parsed.pathname === '/launcher/authorized'
-            ) {
-              const code = parsed.searchParams.get('code');
-              if (code && /^[a-fA-F0-9]{32}$/.test(code)) {
-                finish(code);
-                return true;
-              }
-            }
-            return false;
-          };
-
-          const checkBodyForCode = async () => {
-            if (settled || !win || win.isDestroyed()) return;
-            const currentUrl = win.webContents.getURL() || '';
-            if (checkUrl(currentUrl)) return;
-            const parsedCurrent = safeParseUrl(currentUrl);
-            if (!parsedCurrent || parsedCurrent.protocol !== 'https:') return;
-
-            const host = parsedCurrent.hostname.toLowerCase();
-            const pathname = parsedCurrent.pathname || '';
-            if (
-              !interactive &&
-              isEpicGamesHost(host) &&
-              (pathname.startsWith('/id/login') || pathname.startsWith('/login'))
-            ) {
-              finish(null);
-              return;
-            }
-            if (isEpicGamesHost(host) && pathname.startsWith('/id/api/redirect')) {
-              try {
-                const bodyText = await win.webContents.executeJavaScript(
-                  'document.body ? document.body.innerText : ""'
-                );
-                if (bodyText) {
-                  const match =
-                    String(bodyText).match(/"authorizationCode"\s*:\s*"([a-fA-F0-9]{32})"/i) ||
-                    String(bodyText).match(/\b([a-fA-F0-9]{32})\b/);
-                  if (match && match[1]) {
-                    finish(match[1]);
-                    return;
-                  }
-                  if (
-                    !interactive &&
-                    /"authorizationCode"\s*:\s*null/i.test(String(bodyText))
-                  ) {
-                    finish(null);
-                    return;
-                  }
-                }
-              } catch {}
-            }
-          };
-
-          win.webContents.on('will-prevent-unload', (/** @type {any} */ event) => {
-            event.preventDefault();
-          });
-          win.webContents.on('will-redirect', (/** @type {any} */ _e, /** @type {string} */ url) =>
-            checkUrl(url)
-          );
-          win.webContents.on('will-navigate', (/** @type {any} */ _e, /** @type {string} */ url) =>
-            checkUrl(url)
-          );
-          win.webContents.on(
-            'did-navigate',
-            async (/** @type {any} */ _e, /** @type {string} */ url) => {
-              if (!checkUrl(url)) {
-                await checkBodyForCode();
-              }
-            }
-          );
-          win.webContents.on('did-finish-load', async () => {
-            await checkBodyForCode();
-          });
-          win.on('closed', () => finish(null));
-
-          try {
-            win.loadURL(targetUrl).catch(() => {
-              if (!interactive) finish(null);
-            });
-          } catch {
-            finish(null);
-          }
+        win.webContents.on('will-prevent-unload', (/** @type {any} */ event) => {
+          event.preventDefault();
         });
+        win.webContents.on('will-redirect', (/** @type {any} */ _e, /** @type {string} */ url) =>
+          checkUrl(url)
+        );
+        win.webContents.on('will-navigate', (/** @type {any} */ _e, /** @type {string} */ url) =>
+          checkUrl(url)
+        );
+        win.webContents.on(
+          'did-navigate',
+          async (/** @type {any} */ _e, /** @type {string} */ url) => {
+            if (!checkUrl(url)) {
+              await checkBodyForCode();
+            }
+          }
+        );
+        win.webContents.on('did-finish-load', async () => {
+          await checkBodyForCode();
+        });
+        win.on('closed', () => finish(null));
 
-      try {
-        let authCode = null;
         try {
-          const silentWin = new BrowserWindow({
-            width: 540,
-            height: 720,
-            show: false,
+          win.loadURL(targetUrl).catch(() => {
+            if (!interactive) finish(null);
+          });
+        } catch {
+          finish(null);
+        }
+      });
+
+    try {
+      let authCode = null;
+      try {
+        const silentWin = new BrowserWindow({
+          width: 540,
+          height: 720,
+          show: false,
+          webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
+            partition: 'persist:storefront_auth',
+          },
+        });
+        authCode = await extractEpicAuthCodeFromWindow(silentWin, silentRedirectUrl, 6000, false);
+      } catch {}
+
+      if (!authCode && allowInteractiveAuth) {
+        try {
+          const currentMain = getMainWindow?.();
+          const parentWin =
+            currentMain && !currentMain.isDestroyed() ? currentMain : undefined;
+          const interactiveWin = new BrowserWindow({
+            width: STORE_OAUTH_URLS.epic.width || 540,
+            height: STORE_OAUTH_URLS.epic.height || 720,
+            parent: parentWin,
+            autoHideMenuBar: true,
+            show: true,
+            title: 'Sign in to Epic Games — One Launcher',
             webPreferences: {
               nodeIntegration: false,
               contextIsolation: true,
               sandbox: true,
               partition: 'persist:storefront_auth',
-              userAgent: cleanUA,
             },
           });
-          authCode = await extractEpicAuthCodeFromWindow(silentWin, silentRedirectUrl, 6000, false);
+          authCode = await extractEpicAuthCodeFromWindow(
+            interactiveWin,
+            STORE_OAUTH_URLS.epic.url,
+            180000,
+            true
+          );
         } catch {}
-
-        if (!authCode && allowInteractiveAuth) {
-          try {
-            const currentMain = getMainWindow?.();
-            const parentWin =
-              currentMain && !currentMain.isDestroyed() ? currentMain : undefined;
-            const interactiveWin = new BrowserWindow({
-              width: STORE_OAUTH_URLS.epic.width || 540,
-              height: STORE_OAUTH_URLS.epic.height || 720,
-              parent: parentWin,
-              autoHideMenuBar: true,
-              show: true,
-              title: 'Sign in to Epic Games — One Launcher',
-              webPreferences: {
-                nodeIntegration: false,
-                contextIsolation: true,
-                sandbox: true,
-                partition: 'persist:storefront_auth',
-                userAgent: cleanUA,
-              },
-            });
-            authCode = await extractEpicAuthCodeFromWindow(
-              interactiveWin,
-              STORE_OAUTH_URLS.epic.url,
-              180000,
-              true
-            );
-          } catch {}
-        }
-
-        if (authCode) {
-          const tokenData = await storeSync.exchangeEpicCode(authCode);
-          if (tokenData && tokenData.access_token) {
-            if (typeof storeSync.saveTokensAsync === 'function') {
-              await storeSync.saveTokensAsync('epic', tokenData);
-            } else {
-              storeSync.saveTokens('epic', tokenData);
-            }
-            return tokenData;
-          }
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn('[recoverEpicAuthSession] warning:', msg);
       }
 
-      return null;
+      if (authCode) {
+        const tokenData = await storeSync.exchangeEpicCode(authCode);
+        if (tokenData && tokenData.access_token) {
+          if (typeof storeSync.saveTokensAsync === 'function') {
+            await storeSync.saveTokensAsync('epic', tokenData);
+          } else {
+            storeSync.saveTokens('epic', tokenData);
+          }
+          return tokenData;
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn('[recoverEpicAuthSession] warning:', msg);
+    }
+
+    return null;
   };
 
   return async function recoverEpicAuthSession(rawOptions = {}) {
@@ -531,5 +597,6 @@ module.exports = {
   STEAM_AUTH_PAGE_EXTRACTOR_SCRIPT,
   STEAM_SSR_BG_EXTRACTOR_SCRIPT,
   buildPlatformBrowserUserAgent,
+  extractEpicAuthCodeFromRedirectBody,
   createEpicAuthRecovery,
 };
