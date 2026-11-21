@@ -963,13 +963,17 @@ async function inspectOneDrivePlaceholderStateAsync(targetDir, options = {}) {
  * Preserves `desktop.ini` on top-level Windows Known Folder roots (`Documents`, `Saved Games`,
  * `OneDrive\Documents`, `AppData\LocalLow`, etc.) without counting it as a save file, and avoids
  * recursing into broad parent `OneDrive\Documents` / `OneDrive\Saved Games` trees on `win32`.
+ * When `options.fileFilter` is provided, only files matching `fileFilter(relPosixPath)` are
+ * counted and OS metadata junk outside matching paths is never deleted.
  *
  * @param {string} dirPath
+ * @param {{ fileFilter?: ((relPosixPath: string) => boolean) | null }} [options]
  * @returns {{ exists: boolean, purgedCount: number, realFileCount: number }}
  */
-function purgeOsMetadataAndCountRealFilesSync(dirPath) {
+function purgeOsMetadataAndCountRealFilesSync(dirPath, options = {}) {
   const summary = { exists: false, purgedCount: 0, realFileCount: 0 };
   if (!dirPath || typeof dirPath !== 'string') return summary;
+  const fileFilter = typeof options?.fileFilter === 'function' ? options.fileFilter : null;
   try {
     if (!fs.existsSync(dirPath)) return summary;
     const rootStat = fs.lstatSync(dirPath);
@@ -979,10 +983,11 @@ function purgeOsMetadataAndCountRealFilesSync(dirPath) {
     summary.exists = true;
 
     const isBroadOneDriveRoot = isBroadOneDriveKnownFolderRoot(dirPath);
-    const stack = [dirPath];
+    const stack = [{ dir: dirPath, relPrefix: '' }];
     while (stack.length > 0) {
-      const currentDir = stack.pop();
-      if (!currentDir) continue;
+      const current = stack.pop();
+      if (!current) continue;
+      const { dir: currentDir, relPrefix } = current;
       const preserveRootDesktopIni = isWindowsKnownFolderRootPath(currentDir);
       let entries;
       try {
@@ -992,6 +997,7 @@ function purgeOsMetadataAndCountRealFilesSync(dirPath) {
       }
       for (const name of entries) {
         const fullPath = path.join(currentDir, name);
+        const relPosixPath = relPrefix ? `${relPrefix}/${name}` : name;
         let entryStat;
         try {
           entryStat = fs.lstatSync(fullPath);
@@ -1005,13 +1011,16 @@ function purgeOsMetadataAndCountRealFilesSync(dirPath) {
           if (isBroadOneDriveRoot && process.platform === 'win32') {
             continue;
           }
-          stack.push(fullPath);
+          stack.push({ dir: fullPath, relPrefix: relPosixPath });
           continue;
         }
         if (!entryStat.isFile()) {
           continue;
         }
         if (isSparseOrOfflineStat(entryStat, isOneDrivePath(fullPath))) {
+          continue;
+        }
+        if (fileFilter && !fileFilter(relPosixPath)) {
           continue;
         }
         if (OS_METADATA_JUNK_REGEX.test(name)) {
@@ -1038,13 +1047,17 @@ function purgeOsMetadataAndCountRealFilesSync(dirPath) {
 /**
  * Asynchronous counterpart to `purgeOsMetadataAndCountRealFilesSync` using `fs.promises.opendir`
  * and `fs.promises.lstat` so save-folder scanning never blocks the Electron main thread.
+ * When `options.fileFilter` is provided, only files matching `fileFilter(relPosixPath)` are
+ * counted and OS metadata junk outside matching paths is never deleted.
  *
  * @param {string} dirPath
+ * @param {{ fileFilter?: ((relPosixPath: string) => boolean) | null }} [options]
  * @returns {Promise<{ exists: boolean, purgedCount: number, realFileCount: number }>}
  */
-async function purgeOsMetadataAndCountRealFilesAsync(dirPath) {
+async function purgeOsMetadataAndCountRealFilesAsync(dirPath, options = {}) {
   const summary = { exists: false, purgedCount: 0, realFileCount: 0 };
   if (!dirPath || typeof dirPath !== 'string') return summary;
+  const fileFilter = typeof options?.fileFilter === 'function' ? options.fileFilter : null;
   try {
     /** @type {fs.Stats | null} */
     let rootStat = null;
@@ -1059,10 +1072,11 @@ async function purgeOsMetadataAndCountRealFilesAsync(dirPath) {
     summary.exists = true;
 
     const isBroadOneDriveRoot = isBroadOneDriveKnownFolderRoot(dirPath);
-    const stack = [dirPath];
+    const stack = [{ dir: dirPath, relPrefix: '' }];
     while (stack.length > 0) {
-      const currentDir = stack.pop();
-      if (!currentDir) continue;
+      const current = stack.pop();
+      if (!current) continue;
+      const { dir: currentDir, relPrefix } = current;
       const preserveRootDesktopIni = isWindowsKnownFolderRootPath(currentDir);
       let dirHandle = null;
       try {
@@ -1074,6 +1088,7 @@ async function purgeOsMetadataAndCountRealFilesAsync(dirPath) {
         for await (const dirent of dirHandle) {
           const name = dirent.name;
           const fullPath = path.join(currentDir, name);
+          const relPosixPath = relPrefix ? `${relPrefix}/${name}` : name;
           let entryStat;
           try {
             entryStat = await fs.promises.lstat(fullPath);
@@ -1087,13 +1102,16 @@ async function purgeOsMetadataAndCountRealFilesAsync(dirPath) {
             if (isBroadOneDriveRoot && process.platform === 'win32') {
               continue;
             }
-            stack.push(fullPath);
+            stack.push({ dir: fullPath, relPrefix: relPosixPath });
             continue;
           }
           if (!entryStat.isFile()) {
             continue;
           }
           if (isSparseOrOfflineStat(entryStat, isOneDrivePath(fullPath))) {
+            continue;
+          }
+          if (fileFilter && !fileFilter(relPosixPath)) {
             continue;
           }
           if (OS_METADATA_JUNK_REGEX.test(name)) {

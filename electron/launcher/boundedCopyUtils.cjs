@@ -454,16 +454,19 @@ async function ensureRealDirectoryAsync(dirPath) {
  * Measure and copy real (non-symlink) files from `srcDir` into `destDir` synchronously,
  * enforcing `maxBytes` cap (both pre-copy and during copy), rejecting destination symlinks
  * and self-containment loops, and utilizing APFS/ReFS copy-on-write (`COPYFILE_FICLONE`).
+ * When `options.fileFilter` is provided, only matching files are measured/copied and empty
+ * directories are pruned (never created).
  *
  * @param {string} srcDir
  * @param {string} destDir
  * @param {number} maxBytes
- * @param {{ skipExisting?: boolean, requireNonEmpty?: boolean }} [options]
+ * @param {{ skipExisting?: boolean, requireNonEmpty?: boolean, fileFilter?: ((relPosixPath: string) => boolean) | null }} [options]
  * @returns {{ copied: boolean, reason?: string, totalBytes: number, fileCount: number }}
  */
 function copyRealDirBoundedSync(srcDir, destDir, maxBytes, options = {}) {
   const skipExisting = Boolean(options.skipExisting);
   const requireNonEmpty = Boolean(options.requireNonEmpty);
+  const fileFilter = typeof options.fileFilter === 'function' ? options.fileFilter : null;
 
   try {
     if (!srcDir || !destDir || !fs.existsSync(srcDir)) {
@@ -495,8 +498,9 @@ function copyRealDirBoundedSync(srcDir, destDir, maxBytes, options = {}) {
 
     /**
      * @param {string} dir
+     * @param {string} relPrefix
      */
-    const measure = (dir) => {
+    const measure = (dir, relPrefix) => {
       if (exceeded) return;
       /** @type {fs.Dirent[]} */
       let entries = [];
@@ -509,6 +513,7 @@ function copyRealDirBoundedSync(srcDir, destDir, maxBytes, options = {}) {
       for (const ent of entries) {
         if (ent.isSymbolicLink()) continue;
         const full = path.join(dir, ent.name);
+        const relPosixPath = relPrefix ? `${relPrefix}/${ent.name}` : ent.name;
         let isDir = ent.isDirectory();
         let isFile = ent.isFile();
         /** @type {fs.Stats | null} */
@@ -527,9 +532,12 @@ function copyRealDirBoundedSync(srcDir, destDir, maxBytes, options = {}) {
         }
 
         if (isDir) {
-          measure(full);
+          measure(full, relPosixPath);
           if (exceeded) return;
         } else if (isFile) {
+          if (fileFilter && !fileFilter(relPosixPath)) {
+            continue;
+          }
           try {
             const lst = lstatObj || fs.lstatSync(full);
             if (lst.isSymbolicLink() || !lst.isFile()) continue;
@@ -547,7 +555,7 @@ function copyRealDirBoundedSync(srcDir, destDir, maxBytes, options = {}) {
       }
     };
 
-    measure(srcDir);
+    measure(srcDir, '');
     if (requireNonEmpty && fileCount === 0) {
       return { copied: false, reason: 'empty_directory', totalBytes: 0, fileCount: 0 };
     }
@@ -559,16 +567,37 @@ function copyRealDirBoundedSync(srcDir, destDir, maxBytes, options = {}) {
     let copiedFiles = 0;
 
     /**
+     * @param {string} targetDir
+     */
+    const ensureDestTreeSync = (targetDir) => {
+      ensureRealDirectorySync(destDir);
+      const rel = path.relative(destDir, targetDir);
+      if (!rel) return;
+      const segs = rel.split(path.sep).filter(Boolean);
+      let cur = destDir;
+      for (const seg of segs) {
+        cur = path.join(cur, seg);
+        ensureRealDirectorySync(cur);
+      }
+    };
+
+    /**
      * @param {string} sDir
      * @param {string} dDir
+     * @param {string} relPrefix
      */
-    const copyRec = (sDir, dDir) => {
-      ensureRealDirectorySync(dDir);
+    const copyRec = (sDir, dDir, relPrefix) => {
+      let ensuredSelfDir = false;
+      if (!fileFilter) {
+        ensureRealDirectorySync(dDir);
+        ensuredSelfDir = true;
+      }
       const entries = fs.readdirSync(sDir, { withFileTypes: true });
       for (const ent of entries) {
         if (ent.isSymbolicLink()) continue;
         const sFull = path.join(sDir, ent.name);
         const dFull = path.join(dDir, ent.name);
+        const relPosixPath = relPrefix ? `${relPrefix}/${ent.name}` : ent.name;
 
         let lst;
         try {
@@ -579,8 +608,11 @@ function copyRealDirBoundedSync(srcDir, destDir, maxBytes, options = {}) {
         if (lst.isSymbolicLink()) continue;
 
         if (lst.isDirectory()) {
-          copyRec(sFull, dFull);
+          copyRec(sFull, dFull, relPosixPath);
         } else if (lst.isFile()) {
+          if (fileFilter && !fileFilter(relPosixPath)) {
+            continue;
+          }
           let fileSize = lst.size || 0;
           try {
             const st = fs.statSync(sFull);
@@ -595,6 +627,10 @@ function copyRealDirBoundedSync(srcDir, destDir, maxBytes, options = {}) {
             err.code = 'ERR_SIZE_CAP_EXCEEDED';
             throw err;
           }
+          if (!ensuredSelfDir) {
+            ensureDestTreeSync(dDir);
+            ensuredSelfDir = true;
+          }
           copyFileWithCloneFallbackSync(sFull, dFull, { skipExisting });
           copiedBytes += fileSize;
           copiedFiles += 1;
@@ -602,7 +638,7 @@ function copyRealDirBoundedSync(srcDir, destDir, maxBytes, options = {}) {
       }
     };
 
-    copyRec(srcDir, destDir);
+    copyRec(srcDir, destDir, '');
     return { copied: true, totalBytes: copiedBytes, fileCount: copiedFiles };
   } catch (err) {
     const anyErr = /** @type {any} */ (err);
@@ -625,16 +661,19 @@ function copyRealDirBoundedSync(srcDir, destDir, maxBytes, options = {}) {
 /**
  * Asynchronous counterpart to `copyRealDirBoundedSync` using `fs.promises`, `lstat` symlink
  * rejection, self-containment checks, `COPYFILE_EXCL`, and `COPYFILE_FICLONE`.
+ * When `options.fileFilter` is provided, only matching files are measured/copied and empty
+ * directories are pruned (never created).
  *
  * @param {string} srcDir
  * @param {string} destDir
  * @param {number} maxBytes
- * @param {{ skipExisting?: boolean, requireNonEmpty?: boolean }} [options]
+ * @param {{ skipExisting?: boolean, requireNonEmpty?: boolean, fileFilter?: ((relPosixPath: string) => boolean) | null }} [options]
  * @returns {Promise<{ copied: boolean, reason?: string, totalBytes: number, fileCount: number }>}
  */
 async function copyRealDirBoundedAsync(srcDir, destDir, maxBytes, options = {}) {
   const skipExisting = Boolean(options.skipExisting);
   const requireNonEmpty = Boolean(options.requireNonEmpty);
+  const fileFilter = typeof options.fileFilter === 'function' ? options.fileFilter : null;
 
   try {
     if (!srcDir || !destDir) {
@@ -672,8 +711,9 @@ async function copyRealDirBoundedAsync(srcDir, destDir, maxBytes, options = {}) 
 
     /**
      * @param {string} dir
+     * @param {string} relPrefix
      */
-    const measure = async (dir) => {
+    const measure = async (dir, relPrefix) => {
       if (exceeded) return;
       /** @type {fs.Dirent[]} */
       let entries = [];
@@ -686,6 +726,7 @@ async function copyRealDirBoundedAsync(srcDir, destDir, maxBytes, options = {}) 
       for (const ent of entries) {
         if (ent.isSymbolicLink()) continue;
         const full = path.join(dir, ent.name);
+        const relPosixPath = relPrefix ? `${relPrefix}/${ent.name}` : ent.name;
         let isDir = ent.isDirectory();
         let isFile = ent.isFile();
         /** @type {fs.Stats | null} */
@@ -703,9 +744,12 @@ async function copyRealDirBoundedAsync(srcDir, destDir, maxBytes, options = {}) 
         }
 
         if (isDir) {
-          await measure(full);
+          await measure(full, relPosixPath);
           if (exceeded) return;
         } else if (isFile) {
+          if (fileFilter && !fileFilter(relPosixPath)) {
+            continue;
+          }
           try {
             const lst = lstatObj || (await fs.promises.lstat(full));
             if (lst.isSymbolicLink() || !lst.isFile()) continue;
@@ -723,7 +767,7 @@ async function copyRealDirBoundedAsync(srcDir, destDir, maxBytes, options = {}) 
       }
     };
 
-    await measure(srcDir);
+    await measure(srcDir, '');
     if (requireNonEmpty && fileCount === 0) {
       return { copied: false, reason: 'empty_directory', totalBytes: 0, fileCount: 0 };
     }
@@ -735,16 +779,37 @@ async function copyRealDirBoundedAsync(srcDir, destDir, maxBytes, options = {}) 
     let copiedFiles = 0;
 
     /**
+     * @param {string} targetDir
+     */
+    const ensureDestTreeAsync = async (targetDir) => {
+      await ensureRealDirectoryAsync(destDir);
+      const rel = path.relative(destDir, targetDir);
+      if (!rel) return;
+      const segs = rel.split(path.sep).filter(Boolean);
+      let cur = destDir;
+      for (const seg of segs) {
+        cur = path.join(cur, seg);
+        await ensureRealDirectoryAsync(cur);
+      }
+    };
+
+    /**
      * @param {string} sDir
      * @param {string} dDir
+     * @param {string} relPrefix
      */
-    const copyRec = async (sDir, dDir) => {
-      await ensureRealDirectoryAsync(dDir);
+    const copyRec = async (sDir, dDir, relPrefix) => {
+      let ensuredSelfDir = false;
+      if (!fileFilter) {
+        await ensureRealDirectoryAsync(dDir);
+        ensuredSelfDir = true;
+      }
       const entries = await fs.promises.readdir(sDir, { withFileTypes: true });
       for (const ent of entries) {
         if (ent.isSymbolicLink()) continue;
         const sFull = path.join(sDir, ent.name);
         const dFull = path.join(dDir, ent.name);
+        const relPosixPath = relPrefix ? `${relPrefix}/${ent.name}` : ent.name;
 
         let lst;
         try {
@@ -755,8 +820,11 @@ async function copyRealDirBoundedAsync(srcDir, destDir, maxBytes, options = {}) 
         if (lst.isSymbolicLink()) continue;
 
         if (lst.isDirectory()) {
-          await copyRec(sFull, dFull);
+          await copyRec(sFull, dFull, relPosixPath);
         } else if (lst.isFile()) {
+          if (fileFilter && !fileFilter(relPosixPath)) {
+            continue;
+          }
           let fileSize = lst.size || 0;
           try {
             const st = await fs.promises.stat(sFull);
@@ -771,6 +839,10 @@ async function copyRealDirBoundedAsync(srcDir, destDir, maxBytes, options = {}) 
             err.code = 'ERR_SIZE_CAP_EXCEEDED';
             throw err;
           }
+          if (!ensuredSelfDir) {
+            await ensureDestTreeAsync(dDir);
+            ensuredSelfDir = true;
+          }
           await copyFileWithCloneFallbackAsync(sFull, dFull, { skipExisting });
           copiedBytes += fileSize;
           copiedFiles += 1;
@@ -778,7 +850,7 @@ async function copyRealDirBoundedAsync(srcDir, destDir, maxBytes, options = {}) 
       }
     };
 
-    await copyRec(srcDir, destDir);
+    await copyRec(srcDir, destDir, '');
     return { copied: true, totalBytes: copiedBytes, fileCount: copiedFiles };
   } catch (err) {
     const anyErr = /** @type {any} */ (err);

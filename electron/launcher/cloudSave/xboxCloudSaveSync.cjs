@@ -589,6 +589,14 @@ function createXboxCloudSaveSync(deps) {
         ...(typeof options.blobConcurrency === 'number'
           ? { blobConcurrency: options.blobConcurrency }
           : {}),
+        ...(options.alreadyLocked === true ? { alreadyLocked: true } : {}),
+        ...(typeof options.keepLockHeld === 'boolean'
+          ? { keepLockHeld: options.keepLockHeld }
+          : {}),
+        ...(options.priorHadWrites === true ? { priorHadWrites: true } : {}),
+        ...(typeof options.quotaBytes === 'number' && options.quotaBytes > 0
+          ? { quotaBytes: options.quotaBytes }
+          : {}),
       });
 
       const resolvedScid = String(syncRes?.resolvedScid || locs.scid || '')
@@ -626,11 +634,29 @@ function createXboxCloudSaveSync(deps) {
 
       const filesSynced =
         Number(syncRes?.downloadedContainers || 0) + Number(syncRes?.uploadedContainers || 0);
+      const syncedAtMs = Date.now();
+      const resolvedQuotaBytes =
+        typeof syncRes?.quotaBytes === 'number' &&
+        Number.isFinite(syncRes.quotaBytes) &&
+        syncRes.quotaBytes > 0
+          ? syncRes.quotaBytes
+          : undefined;
+      const resolvedRemainingQuotaBytes =
+        typeof syncRes?.remainingQuotaBytes === 'number' &&
+        Number.isFinite(syncRes.remainingQuotaBytes) &&
+        syncRes.remainingQuotaBytes >= 0
+          ? syncRes.remainingQuotaBytes
+          : undefined;
       return {
         synced: Boolean(syncRes?.synced),
         provider: 'xbox_connected_storage',
         mode,
         resolvedScid,
+        ...(resolvedQuotaBytes !== undefined ? { quotaBytes: resolvedQuotaBytes } : {}),
+        ...(resolvedRemainingQuotaBytes !== undefined
+          ? { remainingQuotaBytes: resolvedRemainingQuotaBytes }
+          : {}),
+        ...(syncRes?.synced ? { syncedAtMs } : {}),
         filesSynced,
         downloadedContainers: Number(syncRes?.downloadedContainers || 0),
         uploadedContainers: Number(syncRes?.uploadedContainers || 0),
@@ -644,7 +670,9 @@ function createXboxCloudSaveSync(deps) {
                 : [],
             }
           : {}),
-        ...(syncRes?.lockHeld ? { reason: 'xbox_cloud_lock_conflict' } : {}),
+        ...(syncRes?.lockHeld && options.keepLockHeld !== true
+          ? { reason: 'xbox_cloud_lock_conflict' }
+          : {}),
       };
     } catch (err) {
       if (
