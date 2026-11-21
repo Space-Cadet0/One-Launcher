@@ -331,9 +331,17 @@ describe('Game Detail Page Refresh & Modal Stability Fix', () => {
     const sidebar = findElements(tree1, (el) => el.type === LibrarySidebar)[0];
     expect(sidebar).toBeDefined();
 
+    const isStorePageElement = (el: { type: unknown; props?: Record<string, unknown> }) =>
+      el.type === SteamStorePage ||
+      (typeof el.type === 'object' &&
+        el.type !== null &&
+        '$$typeof' in el.type &&
+        typeof el.props?.onGameUpdated === 'function' &&
+        (el.props?.game as { id?: string } | undefined)?.id === sample.id);
+
     sidebar.props.onSelectGame(sample.id);
     const tree2 = appHarness.render();
-    const storePage1 = findElements(tree2, (el) => el.type === SteamStorePage)[0];
+    const storePage1 = findElements(tree2, isStorePageElement)[0];
     expect(storePage1).toBeDefined();
     expect(storePage1.key).toBe('steam-1091500');
 
@@ -343,7 +351,7 @@ describe('Game Detail Page Refresh & Modal Stability Fix', () => {
       shortDescription: 'Updated via background sync',
     });
     const tree3 = appHarness.render();
-    const storePage2 = findElements(tree3, (el) => el.type === SteamStorePage)[0];
+    const storePage2 = findElements(tree3, isStorePageElement)[0];
     expect(storePage2).toBeDefined();
     expect(storePage2.key).toBe('steam-1091500');
     appHarness.unmount();
@@ -425,13 +433,27 @@ describe('Game Detail Page Refresh & Modal Stability Fix', () => {
     const actionBarHarness = createComponentHarness(SteamLibraryActionBar, actionBarProps1);
     let actionBarTree = actionBarHarness.render();
 
-    // Initially, GameLaunchConfigModal is closed (isOpen = false)
-    let launchModalNode = findElements(
-      actionBarTree,
-      (el) => el.type === GameLaunchConfigModal
-    )[0];
-    expect(launchModalNode).toBeDefined();
-    expect(launchModalNode.props.isOpen).toBe(false);
+    const findLaunchConfigModalNode = (rootTree: unknown) => {
+      const boundary = findElements(
+        rootTree,
+        (el) => el.props?.modalName === 'Launch Configuration'
+      )[0];
+      if (!boundary) return undefined;
+      return findElements(
+        boundary,
+        (el) =>
+          el.type === GameLaunchConfigModal ||
+          (typeof el.type === 'object' &&
+            el.type !== null &&
+            '$$typeof' in el.type &&
+            typeof el.props?.isOpen === 'boolean' &&
+            Boolean(el.props?.game))
+      )[0];
+    };
+
+    // Initially, GameLaunchConfigModal is lazy-gated and unmounted when closed
+    let launchModalNode = findLaunchConfigModalNode(actionBarTree);
+    expect(launchModalNode).toBeUndefined();
 
     // 2. Open Manage dropdown menu and click "Launch & Compatibility Settings..."
     const manageBtn = findElements(
@@ -454,11 +476,9 @@ describe('Game Detail Page Refresh & Modal Stability Fix', () => {
 
     // Re-render SteamLibraryActionBar -> GameLaunchConfigModal is now open!
     actionBarTree = actionBarHarness.render();
-    launchModalNode = findElements(
-      actionBarTree,
-      (el) => el.type === GameLaunchConfigModal
-    )[0];
-    expect(launchModalNode.props.isOpen).toBe(true);
+    launchModalNode = findLaunchConfigModalNode(actionBarTree);
+    expect(launchModalNode).toBeDefined();
+    expect(launchModalNode!.props.isOpen).toBe(true);
 
     // 3. Mount GameLaunchConfigModal and make an unsaved user edit (-novid -console)
     const modalHarness = createComponentHarness(
@@ -526,17 +546,15 @@ describe('Game Detail Page Refresh & Modal Stability Fix', () => {
 
     // SteamLibraryActionBar re-renders with the new game object reference
     const actionBarTreeAfterSync = actionBarHarness.render(actionBarPropsAfterSync);
-    const launchModalNodeAfterSync = findElements(
-      actionBarTreeAfterSync,
-      (el) => el.type === GameLaunchConfigModal
-    )[0];
+    const launchModalNodeAfterSync = findLaunchConfigModalNode(actionBarTreeAfterSync);
+    expect(launchModalNodeAfterSync).toBeDefined();
 
     // Modal MUST remain open (user is never kicked out!)
-    expect(launchModalNodeAfterSync.props.isOpen).toBe(true);
-    expect(launchModalNodeAfterSync.props.game).toBe(updatedGameFromSync);
+    expect(launchModalNodeAfterSync!.props.isOpen).toBe(true);
+    expect(launchModalNodeAfterSync!.props.game).toBe(updatedGameFromSync);
 
     // GameLaunchConfigModal re-renders with the new game object reference
-    const modalTreeAfterSync = modalHarness.render(launchModalNodeAfterSync.props);
+    const modalTreeAfterSync = modalHarness.render(launchModalNodeAfterSync!.props);
     expect(modalTreeAfterSync).not.toBeNull();
 
     // Unsaved user edit ('-novid -console') MUST be 100% preserved!
