@@ -1,5 +1,6 @@
 import type { CanonicalGame } from './game';
 import type { SteamEnrichedMetadata } from './steam';
+import type { CriticScoreData } from './critic';
 
 export type TransientErrorReason =
   | 'offline'
@@ -77,7 +78,7 @@ export interface OfflineVaultGameDetail {
   enrichedMetadata?: SteamEnrichedMetadata | null;
   achievements?: Record<string, unknown> | null;
   hltb?: Record<string, unknown> | null;
-  criticScore?: Record<string, unknown> | null;
+  criticScore?: CriticScoreData | Record<string, unknown> | null;
   metadataQuality?: MetadataQuality;
   enrichedAt?: number;
 }

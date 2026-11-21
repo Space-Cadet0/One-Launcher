@@ -109,6 +109,7 @@ export interface SteamEnrichedMetadata {
   mediaSyncOutcome?: MediaSyncOutcome;
   mediaSyncFailureCount?: number;
   __quotaSlimmed?: boolean;
+  __digestOnly?: boolean;
   hasScreenshotsCount?: number;
   hasMoviesCount?: number;
   achievements?: {
@@ -128,5 +129,47 @@ export interface SteamEnrichedMetadata {
     linux?: boolean;
   };
   xboxDeliveryHints?: XboxDeliveryHints;
+}
+
+/**
+ * Compact projection of `SteamEnrichedMetadata` persisted in `localStorage` when large
+ * catalogs exceed quota (~5 MB). Always carries `__quotaSlimmed: true` so the C8 metadata
+ * quality lattice treats it as Rank 0 and hydrates full detail from IndexedDB / SQLite.
+ */
+export interface QuotaSlimmedEnrichedMetadata
+  extends Partial<
+    Omit<SteamEnrichedMetadata, 'appId' | '__quotaSlimmed' | '__digestOnly'>
+  > {
+  appId: number;
+  __quotaSlimmed: true;
+  __digestOnly?: boolean;
+  metadataQuality?: SteamEnrichedMetadata['metadataQuality'];
+  enrichedSource?: SteamEnrichedMetadata['enrichedSource'];
+  fetchedAt?: number;
+  enrichedAt?: number;
+  lastMediaSyncAttemptAt?: number;
+  mediaSyncOutcome?: MediaSyncOutcome;
+  mediaSyncFailureCount?: number;
+  hasScreenshotsCount?: number;
+  hasMoviesCount?: number;
+  platforms?: SteamEnrichedMetadata['platforms'];
+  achievements?: {
+    total: number;
+    highlighted?: Array<{
+      name: string;
+      path: string;
+    }>;
+  };
+  xboxDeliveryHints?: XboxDeliveryHints;
+}
+
+export type PersistedSteamEnrichedMetadata =
+  | SteamEnrichedMetadata
+  | QuotaSlimmedEnrichedMetadata;
+
+export function isQuotaSlimmedEnrichedMetadata(
+  meta: SteamEnrichedMetadata | QuotaSlimmedEnrichedMetadata | null | undefined
+): meta is QuotaSlimmedEnrichedMetadata {
+  return Boolean(meta && meta.__quotaSlimmed === true);
 }
 

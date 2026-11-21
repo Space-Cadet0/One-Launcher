@@ -57,6 +57,17 @@ export function resolveHostPlatform(explicit?: HostPlatform | string): HostPlatf
 
 /**
  * Resolves the canonical host CPU architecture (`'arm64' | 'x64'`).
+ *
+ * Precedence:
+ *   1. Valid explicit override (`'arm64' | 'x64'` or standard arch alias)
+ *   2. Electron preload bridge (`window.electronAPI?.arch`) or `fallbackDetectedArch`
+ *   3. Non-Node browser `navigator.userAgentData.architecture` / `navigator.platform`
+ *   4. Default fallback `'arm64'`
+ *
+ * Deliberately NEVER falls back to `process.arch` (mirroring `resolveHostPlatform()`),
+ * so Vitest / CI runs on x64 Linux/Windows hosts keep deterministic Apple Silicon-default
+ * renderer capabilities unless explicitly overridden via `explicit`, `window.electronAPI.arch`,
+ * or `fallbackDetectedArch`.
  */
 export function resolveHostArch(
   explicit?: HostArch | string,
@@ -71,7 +82,7 @@ export function resolveHostArch(
   if (candidateArch) {
     return normalizeArchString(candidateArch);
   }
-  if (typeof navigator !== 'undefined') {
+  if (typeof navigator !== 'undefined' && !navigator.userAgent?.includes('Node')) {
     const uaDataArch = (
       navigator as Navigator & { userAgentData?: { architecture?: string } }
     )?.userAgentData?.architecture;
@@ -82,9 +93,6 @@ export function resolveHostArch(
     if (/\b(x86_64|x64|amd64|wow64|win64)\b/i.test(uaPlatform)) {
       return 'x64';
     }
-  }
-  if (typeof process !== 'undefined' && typeof process.arch === 'string' && process.arch.trim()) {
-    return normalizeArchString(process.arch);
   }
   return 'arm64';
 }

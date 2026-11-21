@@ -189,7 +189,7 @@ export const StorefrontClientsStep: React.FC<StorefrontClientsStepProps> = ({
   const isWin = snapshot.hostPlatform === 'win32';
   const showBottleSection = isMac && chosenRunner !== 'skip';
   const isRepairCapableMode = mode === 'health_check' || mode === 'repair';
-  const connectedSet = new Set<StorefrontId>(connectedStorefronts);
+  const connectedSet = new Set<string>(connectedStorefronts);
   const copyMap = getClientCopyOverrides(isMac, showBottleSection);
 
   const eaDelegatedSummary = useMemo(() => {

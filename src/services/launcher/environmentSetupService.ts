@@ -76,6 +76,7 @@ const ALL_ENVIRONMENT_COMPONENT_IDS: ReadonlySet<EnvironmentComponentId> = new S
   'bottle_bnet',
   'host_rockstar',
   'bottle_rockstar',
+  'host_riot',
   'xbox_runtime',
 ]);
 
@@ -118,6 +119,7 @@ const HOST_CLIENT_ORDER: ReadonlyArray<
     | 'host_ea'
     | 'host_bnet'
     | 'host_rockstar'
+    | 'host_riot'
   >
 > = [
   'host_steam',
@@ -127,6 +129,7 @@ const HOST_CLIENT_ORDER: ReadonlyArray<
   'host_ea',
   'host_bnet',
   'host_rockstar',
+  'host_riot',
 ];
 
 const BOTTLE_CLIENT_ORDER: ReadonlyArray<
@@ -165,6 +168,7 @@ const CLIENT_LOGIN_TARGET_IDS: ReadonlySet<ClientLoginTargetId> = new Set([
   'bottle_bnet',
   'host_rockstar',
   'bottle_rockstar',
+  'host_riot',
 ]);
 
 function isValidComponentId(value: unknown): value is EnvironmentComponentId {
@@ -754,6 +758,22 @@ export function buildFallbackEnvironmentSnapshot(
         'Only needed on Mac for Windows titles that delegate launch and sign-in through Rockstar Games Launcher.',
       statusDetail: isMac ? 'Not installed (optional).' : 'Not needed on Windows.',
     },
+    host_riot: {
+      id: 'host_riot',
+      category: 'host_client',
+      storefrontId: 'riot',
+      scope: 'host',
+      title: isMac ? 'Riot Client (Mac)' : 'Riot Client',
+      shortLabel: isMac ? 'Riot Client (Mac)' : 'Riot Client',
+      status: isWin ? 'missing' : 'not_applicable',
+      canAutoInstall: isWin,
+      recommendationTier: isWin ? 'optional' : 'not_needed',
+      recommendationBadge: isWin ? 'Optional — Delegated Games' : 'Not Needed',
+      defaultSelected: false,
+      whyExplanation:
+        'Only needed for Riot Games / PC Game Pass titles that delegate install, sign-in, and launch through Riot Client.',
+      statusDetail: isWin ? 'Not installed (optional).' : 'Not needed on Mac.',
+    },
     xbox_runtime: {
       id: 'xbox_runtime',
       category: 'built_in_runtime',
@@ -909,6 +929,16 @@ export function buildFallbackEnvironmentSnapshot(
       storefrontId: 'rockstar',
       scope: 'bottle',
       label: 'Rockstar Games Launcher (Windows)',
+      installed: false,
+      authenticated: false,
+      accountMatchesOneLauncher: null,
+      statusSummary: 'Not installed',
+    },
+    host_riot: {
+      targetId: 'host_riot',
+      storefrontId: 'riot',
+      scope: 'host',
+      label: isMac ? 'Riot Client (Mac)' : 'Riot Client',
       installed: false,
       authenticated: false,
       accountMatchesOneLauncher: null,

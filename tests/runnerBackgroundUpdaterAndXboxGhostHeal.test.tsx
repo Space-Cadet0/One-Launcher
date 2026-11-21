@@ -443,6 +443,7 @@ function makeSyntheticSetupSnapshot(
     bottle_bnet: makeSyntheticComponentState('bottle_bnet', { category: 'bottle_client' }),
     host_rockstar: makeSyntheticComponentState('host_rockstar', { category: 'host_client' }),
     bottle_rockstar: makeSyntheticComponentState('bottle_rockstar', { category: 'bottle_client' }),
+    host_riot: makeSyntheticComponentState('host_riot', { category: 'host_client' }),
     xbox_runtime: makeSyntheticComponentState('xbox_runtime', { category: 'built_in_runtime' }),
   };
 

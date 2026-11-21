@@ -3,6 +3,12 @@
  * Supports OpenCritic (primary) and Metacritic (fallback) with verified metrics.
  */
 
+/**
+ * Canonical `localStorage` / staged-cache key prefix for persisted critic score records.
+ * Single source of truth consumed by `criticScoreService`, `reviewCandidateService`, and `syncJobManager`.
+ */
+export const CRITIC_STORAGE_PREFIX = 'antigravity_critic_v8_' as const;
+
 export type CriticTier = 'Mighty' | 'Strong' | 'Fair' | 'Weak';
 export type CriticSource =
   | 'opencritic'

@@ -730,50 +730,6 @@ export interface ElectronAPI {
   offlineVault?: OfflineVaultBridge;
 }
 
-declare module '../contracts/game' {
-  interface GamePlatformOwnership {
-    externalLauncher?: string;
-    externalLauncherUrl?: string;
-    xboxBottleCompatibilityReason?: string;
-    isExternalLauncherStubPackage?: boolean;
-    maxDownloadSizeBytes?: number;
-    pcMaxInstallSizeBytes?: number;
-    kernelAntiCheatName?: string;
-    executableArchitecture?: string;
-    is32BitExecutable?: boolean;
-  }
-
-  interface CanonicalGame {
-    kernelAntiCheatName?: string;
-    executableArchitecture?: string;
-    is32BitExecutable?: boolean;
-  }
-}
-
-declare module '../contracts/launcher' {
-  interface DiskSpaceInfo {
-    caseSensitive?: boolean;
-  }
-
-  interface AvailableInstaller {
-    kernelAntiCheatName?: string;
-    isExternalLauncherStubPackage?: boolean;
-  }
-
-  interface GameInstallInfo {
-    xboxBottleCompatibilityReason?: string;
-    isExternalLauncherStubPackage?: boolean;
-    maxDownloadSizeBytes?: number;
-    pcMaxInstallSizeBytes?: number;
-    kernelAntiCheatName?: string;
-  }
-
-  interface ResolvedLaunchModePreview {
-    modeLabel?: string;
-    cloudSaveSummary?: string;
-  }
-}
-
 declare global {
   interface Window {
     electronAPI?: ElectronAPI;

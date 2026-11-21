@@ -25,6 +25,7 @@ export type EnvironmentComponentId =
   | 'bottle_bnet'
   | 'host_rockstar'
   | 'bottle_rockstar'
+  | 'host_riot'
   | 'xbox_runtime';
 
 export type EnvironmentComponentCategory =
@@ -63,7 +64,8 @@ export type ClientLoginTargetId =
   | 'host_bnet'
   | 'bottle_bnet'
   | 'host_rockstar'
-  | 'bottle_rockstar';
+  | 'bottle_rockstar'
+  | 'host_riot';
 
 export type SetupWizardStepId =
   | 'prerequisites'
@@ -84,9 +86,19 @@ export interface DiscoveredLocalStoreHint {
   publicSteamId?: string;
 }
 
+export type ClientLoginStorefrontId =
+  | 'steam'
+  | 'gog'
+  | 'epic'
+  | 'ubisoft'
+  | 'ea'
+  | 'bnet'
+  | 'rockstar'
+  | 'riot';
+
 export interface ClientAuthProbeState {
   targetId: ClientLoginTargetId;
-  storefrontId: 'steam' | 'gog' | 'epic' | 'ubisoft' | 'ea' | 'bnet' | 'rockstar';
+  storefrontId: ClientLoginStorefrontId;
   scope: 'host' | 'bottle';
   label: string;
   installed: boolean;
@@ -109,7 +121,7 @@ export interface ClientAuthProbeState {
 export interface EnvironmentComponentState {
   id: EnvironmentComponentId;
   category: EnvironmentComponentCategory;
-  storefrontId?: StorefrontId;
+  storefrontId?: StorefrontId | 'riot';
   scope?: 'host' | 'bottle' | 'system';
   title: string;
   shortLabel: string;

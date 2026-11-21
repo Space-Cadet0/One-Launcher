@@ -1,18 +1,49 @@
 import { StorefrontId } from './platform';
 import type { ChainedHandoffTopology } from './game';
-import type { ResolvedEffectiveLaunchPolicy } from './launchPolicyResolver';
+import {
+  isBottleCompatibleWithRunner,
+  resolveDefaultBottleForRunner,
+  type ResolvedEffectiveLaunchPolicy,
+} from './launchPolicyResolver';
 
 export {
+  DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
+  LAUNCH_PROFILE_KEYS,
+  WINE_DEBUG_MODE_TO_ENV_MAP,
+  inferDetectedBuildType,
+  isBottleCompatibleWithRunner,
+  isRunnerSupportedOnHost,
   migrateLegacyHudConfig,
+  normalizeStorefrontClientLifecycle,
+  resolveDefaultBottleForRunner,
+  resolveEffectiveDisplayAspectRatio,
+  resolveEffectiveDisplayScalingMode,
   resolveEffectiveLaunchPolicy,
   resolveEffectiveLifecyclePolicy,
   resolveEffectivePerformanceHud,
+  resolveWineDebugEnvValue,
+  sanitizeBottleDisplayScalingMode,
+  sanitizeCrossOverGraphicsBackend,
+  sanitizeDisplayAspectRatio,
+  sanitizeGameLaunchConfig,
+  sanitizeGlobalBottleDisplayScalingMode,
+  sanitizeGlobalDisplayAspectRatio,
   sanitizeLaunchMethod,
+  sanitizeLauncherPerformanceSettings,
+  sanitizeLegacyCompatLayer,
   sanitizePerformanceHudMode,
+  sanitizeStorefrontLaunchProfile,
+  sanitizeStorefrontLifecycleOverride,
   sanitizeStorefrontLifecyclePolicy,
+  sanitizeVirtualDesktopResolution,
+  sanitizeWineDebugMode,
+  type BottleCompatDescriptor,
+  type BottleCompatOptions,
   type LaunchPolicyBuildType,
+  type ResolveDefaultBottleOptions,
   type ResolveEffectiveLaunchPolicyInput,
   type ResolvedEffectiveLaunchPolicy,
+  type RunnerHostSupportResult,
 } from './launchPolicyResolver';
 
 export type PerformanceHudMode = 'default' | 'on' | 'off';
@@ -350,21 +381,6 @@ export interface LauncherPerformanceSettings {
   ignoreLeadingTheWhenSorting?: boolean;
 }
 
-export const DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS: LauncherPerformanceSettings = {
-  inGameLauncherBehavior: 'hide_tray_hibernate',
-  postGameLauncherBehavior: 'restore_window',
-  pauseBackgroundSyncInGame: true,
-  pauseDownloadsInGame: true,
-  storefrontClientLifecycle: 'minimal_and_close_if_started',
-  autoShutdownWinePrefixOnExit: true,
-  suppressWineDebugLogging: true,
-  defaultBottleDisplayScalingMode: 'auto_fullscreen',
-  defaultDisplayAspectRatio: 'preserve_aspect',
-  enableFullscreenHotkey: true,
-  defaultPerformanceHud: false,
-  ignoreLeadingTheWhenSorting: true,
-};
-
 export interface StorefrontLaunchProfile {
   launchMethod?: LaunchMethod;
   customExecutablePath?: string;
@@ -421,45 +437,6 @@ export interface StorefrontLaunchProfile {
   /** Per-game override for storefront client lifecycle policy ('default' inherits global LauncherPerformanceSettings) */
   storefrontClientLifecycle?: 'default' | StorefrontClientLifecyclePolicy;
 }
-
-/**
- * Canonical per-storefront launch profile keys in exact lockstep order with
- * `electron/launcher/engineStateRegistry.cjs` (`LAUNCH_PROFILE_KEYS`).
- */
-export const LAUNCH_PROFILE_KEYS = [
-  'launchMethod',
-  'customExecutablePath',
-  'workingDirectory',
-  'launchArguments',
-  'environmentVariables',
-  'compatibilityLayer',
-  'wineBottleName',
-  'winePrefixPath',
-  'crossoverGraphicsBackend',
-  'crossoverD3DMetalVersion',
-  'crossoverHighResolutionMode',
-  'crossoverDlss',
-  'wineMsync',
-  'wineEsync',
-  'metalHud',
-  'dxvkHud',
-  'performanceHud',
-  'wineDebug',
-  'preferredMaxFrameRate',
-  'metalfxSpatialUpscaleFactor',
-  'virtualDesktop',
-  'virtualDesktopResolution',
-  'displayScalingMode',
-  'displayAspectRatio',
-  'emulateModeset',
-  'forceLargeAddressAware',
-  'audioBufferClamp',
-  'advertiseAvx',
-  'inGameLauncherBehavior',
-  'storefrontClientLifecycle',
-  'preLaunchCommand',
-  'postExitCommand',
-] as const satisfies readonly (keyof StorefrontLaunchProfile)[];
 
 export interface GameLaunchConfig extends StorefrontLaunchProfile {
   gameId: string;
@@ -554,6 +531,8 @@ export interface ResolvedLaunchModePreview {
   availableModes: LaunchMethod[];
   /** Shared pure launch policy resolution backing both renderer preview and main-process execution */
   resolvedPolicy?: ResolvedEffectiveLaunchPolicy;
+  modeLabel?: string;
+  cloudSaveSummary?: string;
   /** Dynamic visibility flags for modal sections based on host OS, storefront build type, and active runner */
   visibleSections: {
     compatibilityLayer: boolean;
@@ -687,6 +666,7 @@ export interface DiskSpaceInfo {
   totalBytes: number;
   usedBytes: number;
   volumeMissing?: boolean;
+  caseSensitive?: boolean;
 }
 
 export interface AvailableInstaller {
@@ -710,6 +690,8 @@ export interface AvailableInstaller {
   epicPartnerRegistryPath?: string;
   requiresKernelAntiCheat?: boolean;
   antiCheatName?: string;
+  kernelAntiCheatName?: string;
+  isExternalLauncherStubPackage?: boolean;
 }
 
 export interface GameInstallInfo {
@@ -719,6 +701,8 @@ export interface GameInstallInfo {
   estimatedSizeBytes?: number;
   downloadSizeBytes?: number;
   dlcSizeBytes?: number;
+  maxDownloadSizeBytes?: number;
+  pcMaxInstallSizeBytes?: number;
   defaultInstallDir: string;
   availableInstallDirs: string[];
   availableInstallers?: AvailableInstaller[];
@@ -731,12 +715,15 @@ export interface GameInstallInfo {
   externalLauncher?: string;
   externalLauncherUrl?: string;
   externalStorefrontHandoff?: string;
+  xboxBottleCompatibilityReason?: string;
+  isExternalLauncherStubPackage?: boolean;
   chainedLauncherHandoff?: string;
   chainedExternalInstallId?: string;
   chainedHandoffTopology?: ChainedHandoffTopology;
   epicPartnerRegistryPath?: string;
   requiresKernelAntiCheat?: boolean;
   antiCheatName?: string;
+  kernelAntiCheatName?: string;
   diskSpace?: DiskSpaceInfo;
   xboxCompatibility?: {
     tier:
@@ -933,17 +920,10 @@ export function isBottleCompatibleWithLayer(
   layer: Pick<CompatibilityLayerInfo, 'type' | 'bottleDetails'> | undefined,
   layerType?: CompatibilityLayerType | string
 ): boolean {
-  const trimmed = bottleName.trim();
-  if (!trimmed) return false;
   const effectiveType = layerType || layer?.type;
-  const arch = layer?.bottleDetails?.[trimmed]?.wineArch;
-  if (effectiveType === 'crossover_preview_arm64') {
-    return arch ? arch === 'arm64' : !/^OneLauncher$/i.test(trimmed);
-  }
-  if (effectiveType === 'crossover' || effectiveType === 'crossover_preview') {
-    return arch ? arch === 'win64' : !/-arm64$/i.test(trimmed);
-  }
-  return true;
+  return isBottleCompatibleWithRunner(bottleName, effectiveType, {
+    bottleDetails: layer?.bottleDetails,
+  });
 }
 
 export function resolveDefaultBottleForLayer(
@@ -952,22 +932,8 @@ export function resolveDefaultBottleForLayer(
   descriptorDefault?: string
 ): string | undefined {
   const effectiveType = layerType || layer?.type;
-  const bottles = layer?.availableBottles || [];
-  const compatible = bottles.filter((b) => isBottleCompatibleWithLayer(b, layer, effectiveType));
-  const preferredDefault =
-    descriptorDefault ||
-    (effectiveType === 'crossover_preview_arm64'
-      ? 'OneLauncher-arm64'
-      : effectiveType === 'crossover' || effectiveType === 'crossover_preview'
-        ? 'OneLauncher'
-        : undefined);
-  if (preferredDefault) {
-    const exact = compatible.find((b) => b.toLowerCase() === preferredDefault.toLowerCase());
-    if (exact) return exact;
-  }
-  if (effectiveType === 'crossover' || effectiveType === 'crossover_preview') {
-    const defaultNamed = compatible.find((b) => b.toLowerCase() === 'default');
-    if (defaultNamed) return defaultNamed;
-  }
-  return compatible[0] || preferredDefault || bottles[0];
+  return resolveDefaultBottleForRunner(layer?.availableBottles, effectiveType, {
+    bottleDetails: layer?.bottleDetails,
+    descriptorDefault,
+  });
 }

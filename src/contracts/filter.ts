@@ -118,7 +118,17 @@ export function isLibraryFilterActive(
   return countActiveFilterCriteria(state, bounds, options) > 0;
 }
 
-function mapFeatureKeyword(target: string): FeatureFilterOption | null {
+export const UNMAPPED_LIBRARY_FILTER_TYPES: ReadonlySet<FilterType> = new Set<FilterType>([
+  'franchise',
+  'platform',
+  'status',
+]);
+
+export function isMappedLibraryFilterType(type: FilterType): boolean {
+  return !UNMAPPED_LIBRARY_FILTER_TYPES.has(type);
+}
+
+export function mapFeatureKeyword(target: string): FeatureFilterOption | null {
   if (/single-?player/i.test(target)) return 'singleplayer';
   if (/\bco-?op\b|coop/i.test(target)) return 'coop';
   if (/multi-?player|\bpvp\b|online pvp|lan pvp|cross-platform multiplayer/i.test(target)) {
@@ -176,102 +186,123 @@ export function activeGameFilterToLibraryFilterState(
     }
   };
 
-  if (filter.type === 'os') {
-    if (
-      target === 'mac' ||
-      target === 'macos' ||
-      target === 'mac os' ||
-      target === 'osx' ||
-      target === 'apple' ||
-      target === 'mac_native'
-    ) {
-      if (!base.osCompatibility.includes('mac_native')) {
-        base.osCompatibility.push('mac_native');
-      }
-    } else if (
-      target === 'windows' ||
-      target === 'win' ||
-      target === 'pc' ||
-      target === 'windows_native'
-    ) {
-      if (!base.osCompatibility.includes('windows_native')) {
-        base.osCompatibility.push('windows_native');
-      }
-    } else if (
-      target.includes('crossover') ||
-      target.includes('wine') ||
-      target.includes('gptk') ||
-      target.includes('compat')
-    ) {
-      if (!base.osCompatibility.includes('mac_compat_layer')) {
-        base.osCompatibility.push('mac_compat_layer');
-      }
-    }
-    return base;
-  }
-
-  if (filter.type === 'opencritic' || filter.type === 'rating' || filter.type === 'critic') {
-    const tiers: CriticTierFilterOption[] = ['mighty', 'strong', 'fair', 'weak'];
-    for (const tier of tiers) {
-      if (target === tier || target.includes(tier)) {
-        if (!base.criticTiers.includes(tier)) {
-          base.criticTiers.push(tier);
+  switch (filter.type) {
+    case 'os': {
+      if (
+        target === 'mac' ||
+        target === 'macos' ||
+        target === 'mac os' ||
+        target === 'osx' ||
+        target === 'darwin' ||
+        target === 'apple' ||
+        target === 'mac_native'
+      ) {
+        if (!base.osCompatibility.includes('mac_native')) {
+          base.osCompatibility.push('mac_native');
+        }
+      } else if (
+        target === 'windows' ||
+        target === 'win' ||
+        target === 'win32' ||
+        target === 'pc' ||
+        target === 'windows_native'
+      ) {
+        if (!base.osCompatibility.includes('windows_native')) {
+          base.osCompatibility.push('windows_native');
+        }
+      } else if (
+        target.includes('crossover') ||
+        target.includes('wine') ||
+        target.includes('gptk') ||
+        target.includes('compat')
+      ) {
+        if (!base.osCompatibility.includes('mac_compat_layer')) {
+          base.osCompatibility.push('mac_compat_layer');
         }
       }
+      return base;
     }
-    const numMatch = target.match(/\b(\d{2,3})\b/);
-    if (numMatch) {
-      const score = Number(numMatch[1]);
-      if (score >= 1 && score <= 100) {
-        base.minCriticScore = score;
+
+    case 'opencritic':
+    case 'rating':
+    case 'critic': {
+      const tiers: CriticTierFilterOption[] = ['mighty', 'strong', 'fair', 'weak'];
+      for (const tier of tiers) {
+        if (target === tier || target.includes(tier)) {
+          if (!base.criticTiers.includes(tier)) {
+            base.criticTiers.push(tier);
+          }
+        }
       }
+      const numMatch = target.match(/\b(\d{1,3})\b/);
+      if (numMatch) {
+        const score = Number(numMatch[1]);
+        if (score >= 1 && score <= 100) {
+          base.minCriticScore = score;
+        }
+      }
+      return base;
     }
-    return base;
-  }
 
-  if (filter.type === 'review') {
-    let sentiment: ReviewSentimentFilterOption | null = null;
-    if (target.includes('overwhelmingly') || target === 'overwhelmingly_positive') {
-      sentiment = 'overwhelmingly_positive';
-    } else if (target.includes('very') || target === 'very_positive') {
-      sentiment = 'very_positive';
-    } else if (target.includes('mostly') || target === 'mostly_positive' || target === 'positive') {
-      sentiment = 'mostly_positive';
-    } else if (target.includes('mixed')) {
-      sentiment = 'mixed';
-    } else if (target.includes('negative')) {
-      sentiment = 'negative';
+    case 'review': {
+      let sentiment: ReviewSentimentFilterOption | null = null;
+      // Check 'negative' BEFORE 'overwhelmingly'/'very'/'mostly' so Steam's
+      // 'Overwhelmingly Negative' / 'Very Negative' / 'Mostly Negative' map to 'negative'.
+      if (target.includes('negative')) {
+        sentiment = 'negative';
+      } else if (target.includes('overwhelmingly') || target === 'overwhelmingly_positive') {
+        sentiment = 'overwhelmingly_positive';
+      } else if (target.includes('very') || target === 'very_positive') {
+        sentiment = 'very_positive';
+      } else if (target.includes('mostly') || target === 'mostly_positive' || target === 'positive') {
+        sentiment = 'mostly_positive';
+      } else if (target.includes('mixed')) {
+        sentiment = 'mixed';
+      }
+      if (sentiment && !base.reviewSentiments.includes(sentiment)) {
+        base.reviewSentiments.push(sentiment);
+      }
+      return base;
     }
-    if (sentiment && !base.reviewSentiments.includes(sentiment)) {
-      base.reviewSentiments.push(sentiment);
+
+    case 'developer':
+    case 'publisher': {
+      pushUniqueCaseInsensitive(base.creators, rawVal);
+      return base;
     }
-    return base;
-  }
 
-  if (filter.type === 'developer' || filter.type === 'publisher') {
-    pushUniqueCaseInsensitive(base.creators, rawVal);
-    return base;
-  }
-
-  if (filter.type === 'feature') {
-    const feat = mapFeatureKeyword(target);
-    if (feat && !base.features.includes(feat)) {
-      base.features.push(feat);
+    case 'feature': {
+      const feat = mapFeatureKeyword(target);
+      if (feat && !base.features.includes(feat)) {
+        base.features.push(feat);
+      }
+      return base;
     }
-    return base;
-  }
 
-  if (filter.type === 'genre') {
-    pushUniqueCaseInsensitive(base.genres, rawVal);
-    return base;
-  }
+    case 'genre': {
+      pushUniqueCaseInsensitive(base.genres, rawVal);
+      return base;
+    }
 
-  if (filter.type === 'tag') {
-    pushUniqueCaseInsensitive(base.tags, rawVal);
-    return base;
-  }
+    case 'tag': {
+      pushUniqueCaseInsensitive(base.tags, rawVal);
+      return base;
+    }
 
-  return base;
+    case 'franchise':
+    case 'platform':
+    case 'status': {
+      // Evaluated directly by `matchesGameFilter(game, activeFilter)` rather than
+      // `LibraryFilterState` facet arrays. Handled explicitly so exhaustiveness checks
+      // prevent any future `FilterType` from being silently ignored.
+      return base;
+    }
+
+    default: {
+      const _exhaustiveCheck: never = filter.type;
+      return _exhaustiveCheck;
+    }
+  }
 }
 
 /**
@@ -291,7 +322,7 @@ export function doesLibraryFilterStateStillMatchActiveFilter(
   }
 
   const mapped = activeGameFilterToLibraryFilterState(activeFilter);
-  if (countActiveFilterCriteria(mapped) === 0) {
+  if (countActiveFilterCriteria(mapped, undefined, { supportsWindowsTranslation: true }) === 0) {
     return true;
   }
 

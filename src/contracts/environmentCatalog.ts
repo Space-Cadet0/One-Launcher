@@ -1,0 +1,868 @@
+import type {
+  ClientLoginStorefrontId,
+  ClientLoginTargetId,
+  EnvironmentComponentCategory,
+  EnvironmentComponentId,
+  RecommendationTier,
+} from './environmentSetup';
+import type { CompatibilityLayerType } from './launcher';
+import type { HostPlatform } from './hostPlatform';
+import type { StorefrontId } from './platform';
+
+export type NonNativeRunnerType = Exclude<CompatibilityLayerType, 'native'>;
+export type PreferredRunnerSelection = NonNativeRunnerType | 'skip';
+
+export type RunnerComponentId = Extract<
+  EnvironmentComponentId,
+  | 'runner_crossover'
+  | 'runner_crossover_preview'
+  | 'runner_crossover_preview_arm64'
+  | 'runner_wine'
+  | 'runner_gptk'
+>;
+
+export type HostClientComponentId = Extract<
+  EnvironmentComponentId,
+  | 'host_steam'
+  | 'host_gog'
+  | 'host_epic'
+  | 'host_ubisoft'
+  | 'host_ea'
+  | 'host_bnet'
+  | 'host_rockstar'
+  | 'host_riot'
+>;
+
+export type BottleClientComponentId = Extract<
+  EnvironmentComponentId,
+  | 'bottle_steam'
+  | 'bottle_gog'
+  | 'bottle_epic'
+  | 'bottle_ubisoft'
+  | 'bottle_ea'
+  | 'bottle_bnet'
+  | 'bottle_rockstar'
+>;
+
+export interface EnvironmentComponentCatalogEntry {
+  readonly id: EnvironmentComponentId;
+  readonly category: EnvironmentComponentCategory;
+  readonly storefrontId?: StorefrontId | 'riot';
+  readonly scope: 'host' | 'bottle' | 'system';
+  readonly macScope: 'host' | 'bottle' | 'system';
+  readonly winScope: 'host' | 'bottle' | 'system';
+  readonly title: string;
+  readonly macTitle: string;
+  readonly shortLabel: string;
+  readonly macShortLabel: string;
+  readonly runnerType?: NonNativeRunnerType;
+  readonly estimatedDownloadMB?: number;
+  readonly requiresAppleSilicon?: boolean;
+  readonly canAutoInstallOnMac: boolean;
+  readonly canAutoInstallOnWin: boolean;
+  readonly requiresExternalDownloadOnMac: boolean;
+  readonly requiresExternalDownloadOnWin: boolean;
+  readonly externalDownloadUrl?: string;
+  readonly macRecommendationTier: RecommendationTier;
+  readonly winRecommendationTier: RecommendationTier;
+  readonly defaultBottleName?: string;
+  readonly supportedBottleArches?: readonly ('win64' | 'arm64')[];
+  readonly supportedInWineBottle?: boolean;
+}
+
+export interface ClientLoginTargetCatalogEntry {
+  readonly targetId: ClientLoginTargetId;
+  readonly storefrontId: ClientLoginStorefrontId;
+  readonly scope: 'host' | 'bottle';
+  readonly label: string;
+  readonly macLabel: string;
+}
+
+/**
+ * Canonical ordered list of all 25 environment components (including `host_riot`).
+ * Strictly mirrored 1:1 with `electron/launcher/policy/environmentCatalog.cjs` (Gate 13).
+ */
+export const ENVIRONMENT_COMPONENT_IDS: readonly EnvironmentComponentId[] = Object.freeze([
+  'rosetta2',
+  'win_vcredist',
+  'win_webview2',
+  'runner_crossover',
+  'runner_crossover_preview',
+  'runner_crossover_preview_arm64',
+  'runner_wine',
+  'runner_gptk',
+  'bottle_default',
+  'host_steam',
+  'bottle_steam',
+  'host_gog',
+  'bottle_gog',
+  'host_epic',
+  'bottle_epic',
+  'host_ubisoft',
+  'bottle_ubisoft',
+  'host_ea',
+  'bottle_ea',
+  'host_bnet',
+  'bottle_bnet',
+  'host_rockstar',
+  'bottle_rockstar',
+  'host_riot',
+  'xbox_runtime',
+]);
+
+/**
+ * Canonical ordered list of all 15 guided client login targets (including `host_riot`).
+ */
+export const CLIENT_LOGIN_TARGET_IDS: readonly ClientLoginTargetId[] = Object.freeze([
+  'host_steam',
+  'bottle_steam',
+  'host_gog',
+  'bottle_gog',
+  'host_epic',
+  'bottle_epic',
+  'host_ubisoft',
+  'bottle_ubisoft',
+  'host_ea',
+  'bottle_ea',
+  'host_bnet',
+  'bottle_bnet',
+  'host_rockstar',
+  'bottle_rockstar',
+  'host_riot',
+]);
+
+export const RUNNER_COMPONENT_TO_TYPE: ReadonlyArray<{
+  readonly componentId: RunnerComponentId;
+  readonly runnerType: NonNativeRunnerType;
+}> = Object.freeze([
+  Object.freeze({ componentId: 'runner_crossover' as const, runnerType: 'crossover' as const }),
+  Object.freeze({
+    componentId: 'runner_crossover_preview' as const,
+    runnerType: 'crossover_preview' as const,
+  }),
+  Object.freeze({
+    componentId: 'runner_crossover_preview_arm64' as const,
+    runnerType: 'crossover_preview_arm64' as const,
+  }),
+  Object.freeze({ componentId: 'runner_wine' as const, runnerType: 'wine' as const }),
+  Object.freeze({ componentId: 'runner_gptk' as const, runnerType: 'gptk' as const }),
+]);
+
+export const HOST_CLIENT_COMPONENT_IDS: readonly HostClientComponentId[] = Object.freeze([
+  'host_steam',
+  'host_gog',
+  'host_epic',
+  'host_ubisoft',
+  'host_ea',
+  'host_bnet',
+  'host_rockstar',
+  'host_riot',
+]);
+
+export const BOTTLE_CLIENT_COMPONENT_IDS: readonly BottleClientComponentId[] = Object.freeze([
+  'bottle_steam',
+  'bottle_gog',
+  'bottle_epic',
+  'bottle_ubisoft',
+  'bottle_ea',
+  'bottle_bnet',
+  'bottle_rockstar',
+]);
+
+export const VALID_PREFERRED_RUNNERS: readonly PreferredRunnerSelection[] = Object.freeze([
+  'crossover',
+  'crossover_preview',
+  'crossover_preview_arm64',
+  'gptk',
+  'wine',
+  'skip',
+]);
+
+/**
+ * Explicit exhaustive mapping from every `ClientLoginTargetId` to its canonical storefront ID.
+ * Eliminates substring checks like `targetId.includes('ea')` matching `'host_steam'`.
+ */
+export const TARGET_TO_STOREFRONT_MAP: Readonly<
+  Record<ClientLoginTargetId, ClientLoginStorefrontId>
+> = Object.freeze({
+  host_steam: 'steam',
+  bottle_steam: 'steam',
+  host_gog: 'gog',
+  bottle_gog: 'gog',
+  host_epic: 'epic',
+  bottle_epic: 'epic',
+  host_ubisoft: 'ubisoft',
+  bottle_ubisoft: 'ubisoft',
+  host_ea: 'ea',
+  bottle_ea: 'ea',
+  host_bnet: 'bnet',
+  bottle_bnet: 'bnet',
+  host_rockstar: 'rockstar',
+  bottle_rockstar: 'rockstar',
+  host_riot: 'riot',
+});
+
+export const TARGET_TO_SCOPE_MAP: Readonly<Record<ClientLoginTargetId, 'host' | 'bottle'>> =
+  Object.freeze({
+    host_steam: 'host',
+    bottle_steam: 'bottle',
+    host_gog: 'host',
+    bottle_gog: 'bottle',
+    host_epic: 'host',
+    bottle_epic: 'bottle',
+    host_ubisoft: 'host',
+    bottle_ubisoft: 'bottle',
+    host_ea: 'host',
+    bottle_ea: 'bottle',
+    host_bnet: 'host',
+    bottle_bnet: 'bottle',
+    host_rockstar: 'host',
+    bottle_rockstar: 'bottle',
+    host_riot: 'host',
+  });
+
+export const CLIENT_LOGIN_TARGET_CATALOG: Readonly<
+  Record<ClientLoginTargetId, ClientLoginTargetCatalogEntry>
+> = Object.freeze({
+  host_steam: Object.freeze({
+    targetId: 'host_steam',
+    storefrontId: 'steam',
+    scope: 'host',
+    label: 'Steam',
+    macLabel: 'Steam (Mac)',
+  }),
+  bottle_steam: Object.freeze({
+    targetId: 'bottle_steam',
+    storefrontId: 'steam',
+    scope: 'bottle',
+    label: 'Steam (Windows)',
+    macLabel: 'Steam (Windows)',
+  }),
+  host_gog: Object.freeze({
+    targetId: 'host_gog',
+    storefrontId: 'gog',
+    scope: 'host',
+    label: 'GOG Galaxy',
+    macLabel: 'GOG Galaxy (Mac)',
+  }),
+  bottle_gog: Object.freeze({
+    targetId: 'bottle_gog',
+    storefrontId: 'gog',
+    scope: 'bottle',
+    label: 'GOG Galaxy (Windows)',
+    macLabel: 'GOG Galaxy (Windows)',
+  }),
+  host_epic: Object.freeze({
+    targetId: 'host_epic',
+    storefrontId: 'epic',
+    scope: 'host',
+    label: 'Epic Games Launcher',
+    macLabel: 'Epic Games Launcher (Mac)',
+  }),
+  bottle_epic: Object.freeze({
+    targetId: 'bottle_epic',
+    storefrontId: 'epic',
+    scope: 'bottle',
+    label: 'Epic Games Launcher (Windows)',
+    macLabel: 'Epic Games Launcher (Windows)',
+  }),
+  host_ubisoft: Object.freeze({
+    targetId: 'host_ubisoft',
+    storefrontId: 'ubisoft',
+    scope: 'host',
+    label: 'Ubisoft Connect',
+    macLabel: 'Ubisoft Connect',
+  }),
+  bottle_ubisoft: Object.freeze({
+    targetId: 'bottle_ubisoft',
+    storefrontId: 'ubisoft',
+    scope: 'bottle',
+    label: 'Ubisoft Connect (Windows)',
+    macLabel: 'Ubisoft Connect (Windows)',
+  }),
+  host_ea: Object.freeze({
+    targetId: 'host_ea',
+    storefrontId: 'ea',
+    scope: 'host',
+    label: 'EA App',
+    macLabel: 'EA App',
+  }),
+  bottle_ea: Object.freeze({
+    targetId: 'bottle_ea',
+    storefrontId: 'ea',
+    scope: 'bottle',
+    label: 'EA App (Windows)',
+    macLabel: 'EA App (Windows)',
+  }),
+  host_bnet: Object.freeze({
+    targetId: 'host_bnet',
+    storefrontId: 'bnet',
+    scope: 'host',
+    label: 'Battle.net',
+    macLabel: 'Battle.net (Mac)',
+  }),
+  bottle_bnet: Object.freeze({
+    targetId: 'bottle_bnet',
+    storefrontId: 'bnet',
+    scope: 'bottle',
+    label: 'Battle.net (Windows)',
+    macLabel: 'Battle.net (Windows)',
+  }),
+  host_rockstar: Object.freeze({
+    targetId: 'host_rockstar',
+    storefrontId: 'rockstar',
+    scope: 'host',
+    label: 'Rockstar Games Launcher',
+    macLabel: 'Rockstar Games Launcher',
+  }),
+  bottle_rockstar: Object.freeze({
+    targetId: 'bottle_rockstar',
+    storefrontId: 'rockstar',
+    scope: 'bottle',
+    label: 'Rockstar Games Launcher (Windows)',
+    macLabel: 'Rockstar Games Launcher (Windows)',
+  }),
+  host_riot: Object.freeze({
+    targetId: 'host_riot',
+    storefrontId: 'riot',
+    scope: 'host',
+    label: 'Riot Client',
+    macLabel: 'Riot Client (Mac)',
+  }),
+});
+
+export const ENVIRONMENT_COMPONENT_CATALOG: Readonly<
+  Record<EnvironmentComponentId, EnvironmentComponentCatalogEntry>
+> = Object.freeze({
+  rosetta2: Object.freeze({
+    id: 'rosetta2',
+    category: 'os_prerequisite',
+    scope: 'system',
+    macScope: 'system',
+    winScope: 'system',
+    title: 'Apple Rosetta 2',
+    macTitle: 'Apple Rosetta 2',
+    shortLabel: 'Rosetta 2',
+    macShortLabel: 'Rosetta 2',
+    estimatedDownloadMB: 5,
+    requiresAppleSilicon: true,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'required',
+    winRecommendationTier: 'not_needed',
+  }),
+  win_vcredist: Object.freeze({
+    id: 'win_vcredist',
+    category: 'os_prerequisite',
+    scope: 'system',
+    macScope: 'system',
+    winScope: 'system',
+    title: 'Microsoft Visual C++',
+    macTitle: 'Microsoft Visual C++',
+    shortLabel: 'Visual C++',
+    macShortLabel: 'Visual C++',
+    estimatedDownloadMB: 25,
+    canAutoInstallOnMac: false,
+    canAutoInstallOnWin: true,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'not_needed',
+    winRecommendationTier: 'recommended',
+  }),
+  win_webview2: Object.freeze({
+    id: 'win_webview2',
+    category: 'os_prerequisite',
+    scope: 'system',
+    macScope: 'system',
+    winScope: 'system',
+    title: 'Microsoft Edge WebView2',
+    macTitle: 'Microsoft Edge WebView2',
+    shortLabel: 'WebView2',
+    macShortLabel: 'WebView2',
+    canAutoInstallOnMac: false,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: true,
+    externalDownloadUrl: 'https://go.microsoft.com/fwlink/p/?LinkId=2124703',
+    macRecommendationTier: 'not_needed',
+    winRecommendationTier: 'optional',
+  }),
+  runner_crossover: Object.freeze({
+    id: 'runner_crossover',
+    category: 'compatibility_runner',
+    scope: 'system',
+    macScope: 'system',
+    winScope: 'system',
+    title: 'CrossOver',
+    macTitle: 'CrossOver',
+    shortLabel: 'CrossOver',
+    macShortLabel: 'CrossOver',
+    runnerType: 'crossover',
+    estimatedDownloadMB: 420,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    externalDownloadUrl: 'https://www.codeweavers.com/crossover/download',
+    macRecommendationTier: 'recommended',
+    winRecommendationTier: 'not_needed',
+    defaultBottleName: 'OneLauncher',
+    supportedBottleArches: Object.freeze(['win64'] as const),
+  }),
+  runner_crossover_preview: Object.freeze({
+    id: 'runner_crossover_preview',
+    category: 'compatibility_runner',
+    scope: 'system',
+    macScope: 'system',
+    winScope: 'system',
+    title: 'CrossOver Preview',
+    macTitle: 'CrossOver Preview',
+    shortLabel: 'CrossOver Preview',
+    macShortLabel: 'CrossOver Preview',
+    runnerType: 'crossover_preview',
+    estimatedDownloadMB: 480,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    externalDownloadUrl: 'https://www.codeweavers.com/preview/download',
+    macRecommendationTier: 'optional',
+    winRecommendationTier: 'not_needed',
+    defaultBottleName: 'OneLauncher',
+    supportedBottleArches: Object.freeze(['win64'] as const),
+  }),
+  runner_crossover_preview_arm64: Object.freeze({
+    id: 'runner_crossover_preview_arm64',
+    category: 'compatibility_runner',
+    scope: 'system',
+    macScope: 'system',
+    winScope: 'system',
+    title: 'CrossOver Preview (arm64 / FEX)',
+    macTitle: 'CrossOver Preview (arm64 / FEX)',
+    shortLabel: 'Preview (arm64)',
+    macShortLabel: 'Preview (arm64)',
+    runnerType: 'crossover_preview_arm64',
+    estimatedDownloadMB: 490,
+    requiresAppleSilicon: true,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    externalDownloadUrl: 'https://www.codeweavers.com/preview/download',
+    macRecommendationTier: 'optional',
+    winRecommendationTier: 'not_needed',
+    defaultBottleName: 'OneLauncher-arm64',
+    supportedBottleArches: Object.freeze(['arm64'] as const),
+  }),
+  runner_wine: Object.freeze({
+    id: 'runner_wine',
+    category: 'compatibility_runner',
+    scope: 'system',
+    macScope: 'system',
+    winScope: 'system',
+    title: 'Wine',
+    macTitle: 'Wine',
+    shortLabel: 'Wine',
+    macShortLabel: 'Wine',
+    runnerType: 'wine',
+    estimatedDownloadMB: 240,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    externalDownloadUrl: 'https://github.com/Gcenx/macOS_Wine_builds/releases/latest',
+    macRecommendationTier: 'optional',
+    winRecommendationTier: 'not_needed',
+  }),
+  runner_gptk: Object.freeze({
+    id: 'runner_gptk',
+    category: 'compatibility_runner',
+    scope: 'system',
+    macScope: 'system',
+    winScope: 'system',
+    title: 'Apple Game Porting Toolkit',
+    macTitle: 'Apple Game Porting Toolkit',
+    shortLabel: 'Apple GPTK',
+    macShortLabel: 'Apple GPTK',
+    runnerType: 'gptk',
+    estimatedDownloadMB: 228,
+    requiresAppleSilicon: true,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    externalDownloadUrl: 'https://github.com/Gcenx/game-porting-toolkit/releases/latest',
+    macRecommendationTier: 'optional',
+    winRecommendationTier: 'not_needed',
+  }),
+  bottle_default: Object.freeze({
+    id: 'bottle_default',
+    category: 'bottle',
+    scope: 'bottle',
+    macScope: 'bottle',
+    winScope: 'bottle',
+    title: 'Windows Game Bottle ("OneLauncher")',
+    macTitle: 'Windows Game Bottle ("OneLauncher")',
+    shortLabel: 'Windows Bottle',
+    macShortLabel: 'Windows Bottle',
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'recommended',
+    winRecommendationTier: 'not_needed',
+  }),
+  host_steam: Object.freeze({
+    id: 'host_steam',
+    category: 'host_client',
+    storefrontId: 'steam',
+    scope: 'host',
+    macScope: 'host',
+    winScope: 'host',
+    title: 'Steam',
+    macTitle: 'Steam (Mac)',
+    shortLabel: 'Steam',
+    macShortLabel: 'Steam (Mac)',
+    estimatedDownloadMB: 220,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: true,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'recommended',
+    winRecommendationTier: 'recommended',
+  }),
+  bottle_steam: Object.freeze({
+    id: 'bottle_steam',
+    category: 'bottle_client',
+    storefrontId: 'steam',
+    scope: 'bottle',
+    macScope: 'bottle',
+    winScope: 'bottle',
+    title: 'Steam (Windows)',
+    macTitle: 'Steam (Windows)',
+    shortLabel: 'Steam (Windows)',
+    macShortLabel: 'Steam (Windows)',
+    estimatedDownloadMB: 240,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'recommended',
+    winRecommendationTier: 'not_needed',
+  }),
+  host_gog: Object.freeze({
+    id: 'host_gog',
+    category: 'host_client',
+    storefrontId: 'gog',
+    scope: 'host',
+    macScope: 'host',
+    winScope: 'host',
+    title: 'GOG Galaxy',
+    macTitle: 'GOG Galaxy (Mac)',
+    shortLabel: 'GOG Galaxy',
+    macShortLabel: 'GOG Galaxy (Mac)',
+    estimatedDownloadMB: 280,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: true,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'optional',
+    winRecommendationTier: 'optional',
+  }),
+  bottle_gog: Object.freeze({
+    id: 'bottle_gog',
+    category: 'bottle_client',
+    storefrontId: 'gog',
+    scope: 'bottle',
+    macScope: 'bottle',
+    winScope: 'bottle',
+    title: 'GOG Galaxy (Windows)',
+    macTitle: 'GOG Galaxy (Windows)',
+    shortLabel: 'GOG Galaxy (Windows)',
+    macShortLabel: 'GOG Galaxy (Windows)',
+    estimatedDownloadMB: 290,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'optional',
+    winRecommendationTier: 'not_needed',
+  }),
+  host_epic: Object.freeze({
+    id: 'host_epic',
+    category: 'host_client',
+    storefrontId: 'epic',
+    scope: 'host',
+    macScope: 'host',
+    winScope: 'host',
+    title: 'Epic Games Launcher',
+    macTitle: 'Epic Games Launcher (Mac)',
+    shortLabel: 'Epic Launcher',
+    macShortLabel: 'Epic Launcher (Mac)',
+    estimatedDownloadMB: 520,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: true,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'not_needed',
+    winRecommendationTier: 'not_needed',
+  }),
+  bottle_epic: Object.freeze({
+    id: 'bottle_epic',
+    category: 'bottle_client',
+    storefrontId: 'epic',
+    scope: 'bottle',
+    macScope: 'bottle',
+    winScope: 'bottle',
+    title: 'Epic Games Launcher (Windows)',
+    macTitle: 'Epic Games Launcher (Windows)',
+    shortLabel: 'Epic Launcher (Windows)',
+    macShortLabel: 'Epic Launcher (Windows)',
+    estimatedDownloadMB: 540,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'not_needed',
+    winRecommendationTier: 'not_needed',
+  }),
+  host_ubisoft: Object.freeze({
+    id: 'host_ubisoft',
+    category: 'host_client',
+    storefrontId: 'ubisoft',
+    scope: 'host',
+    macScope: 'host',
+    winScope: 'host',
+    title: 'Ubisoft Connect',
+    macTitle: 'Ubisoft Connect',
+    shortLabel: 'Ubisoft Connect',
+    macShortLabel: 'Ubisoft Connect',
+    estimatedDownloadMB: 255,
+    canAutoInstallOnMac: false,
+    canAutoInstallOnWin: true,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'not_needed',
+    winRecommendationTier: 'optional',
+    supportedInWineBottle: true,
+  }),
+  bottle_ubisoft: Object.freeze({
+    id: 'bottle_ubisoft',
+    category: 'bottle_client',
+    storefrontId: 'ubisoft',
+    scope: 'bottle',
+    macScope: 'bottle',
+    winScope: 'bottle',
+    title: 'Ubisoft Connect (Windows)',
+    macTitle: 'Ubisoft Connect (Windows)',
+    shortLabel: 'Ubisoft Connect (Windows)',
+    macShortLabel: 'Ubisoft Connect (Windows)',
+    estimatedDownloadMB: 255,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'optional',
+    winRecommendationTier: 'not_needed',
+    supportedInWineBottle: true,
+  }),
+  host_ea: Object.freeze({
+    id: 'host_ea',
+    category: 'host_client',
+    storefrontId: 'ea',
+    scope: 'host',
+    macScope: 'host',
+    winScope: 'host',
+    title: 'EA App',
+    macTitle: 'EA App',
+    shortLabel: 'EA App',
+    macShortLabel: 'EA App',
+    estimatedDownloadMB: 255,
+    canAutoInstallOnMac: false,
+    canAutoInstallOnWin: true,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'not_needed',
+    winRecommendationTier: 'optional',
+    supportedInWineBottle: true,
+  }),
+  bottle_ea: Object.freeze({
+    id: 'bottle_ea',
+    category: 'bottle_client',
+    storefrontId: 'ea',
+    scope: 'bottle',
+    macScope: 'bottle',
+    winScope: 'bottle',
+    title: 'EA App (Windows)',
+    macTitle: 'EA App (Windows)',
+    shortLabel: 'EA App (Windows)',
+    macShortLabel: 'EA App (Windows)',
+    estimatedDownloadMB: 255,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'optional',
+    winRecommendationTier: 'not_needed',
+    supportedInWineBottle: true,
+  }),
+  host_bnet: Object.freeze({
+    id: 'host_bnet',
+    category: 'host_client',
+    storefrontId: 'bnet',
+    scope: 'host',
+    macScope: 'host',
+    winScope: 'host',
+    title: 'Battle.net',
+    macTitle: 'Battle.net (Mac)',
+    shortLabel: 'Battle.net',
+    macShortLabel: 'Battle.net (Mac)',
+    estimatedDownloadMB: 180,
+    canAutoInstallOnMac: false,
+    canAutoInstallOnWin: true,
+    requiresExternalDownloadOnMac: true,
+    requiresExternalDownloadOnWin: false,
+    externalDownloadUrl: 'https://download.battle.net/?product=bnetdesk',
+    macRecommendationTier: 'optional',
+    winRecommendationTier: 'optional',
+    supportedInWineBottle: true,
+  }),
+  bottle_bnet: Object.freeze({
+    id: 'bottle_bnet',
+    category: 'bottle_client',
+    storefrontId: 'bnet',
+    scope: 'bottle',
+    macScope: 'bottle',
+    winScope: 'bottle',
+    title: 'Battle.net (Windows)',
+    macTitle: 'Battle.net (Windows)',
+    shortLabel: 'Battle.net (Windows)',
+    macShortLabel: 'Battle.net (Windows)',
+    estimatedDownloadMB: 180,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'optional',
+    winRecommendationTier: 'not_needed',
+    supportedInWineBottle: true,
+  }),
+  host_rockstar: Object.freeze({
+    id: 'host_rockstar',
+    category: 'host_client',
+    storefrontId: 'rockstar',
+    scope: 'host',
+    macScope: 'host',
+    winScope: 'host',
+    title: 'Rockstar Games Launcher',
+    macTitle: 'Rockstar Games Launcher',
+    shortLabel: 'Rockstar Launcher',
+    macShortLabel: 'Rockstar Launcher',
+    estimatedDownloadMB: 115,
+    canAutoInstallOnMac: false,
+    canAutoInstallOnWin: true,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'not_needed',
+    winRecommendationTier: 'optional',
+    supportedInWineBottle: true,
+  }),
+  bottle_rockstar: Object.freeze({
+    id: 'bottle_rockstar',
+    category: 'bottle_client',
+    storefrontId: 'rockstar',
+    scope: 'bottle',
+    macScope: 'bottle',
+    winScope: 'bottle',
+    title: 'Rockstar Games Launcher (Windows)',
+    macTitle: 'Rockstar Games Launcher (Windows)',
+    shortLabel: 'Rockstar Launcher (Windows)',
+    macShortLabel: 'Rockstar Launcher (Windows)',
+    estimatedDownloadMB: 115,
+    canAutoInstallOnMac: true,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'optional',
+    winRecommendationTier: 'not_needed',
+    supportedInWineBottle: true,
+  }),
+  host_riot: Object.freeze({
+    id: 'host_riot',
+    category: 'host_client',
+    storefrontId: 'riot',
+    scope: 'host',
+    macScope: 'host',
+    winScope: 'host',
+    title: 'Riot Client',
+    macTitle: 'Riot Client (Mac)',
+    shortLabel: 'Riot Client',
+    macShortLabel: 'Riot Client (Mac)',
+    estimatedDownloadMB: 75,
+    canAutoInstallOnMac: false,
+    canAutoInstallOnWin: true,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: false,
+    macRecommendationTier: 'not_needed',
+    winRecommendationTier: 'optional',
+    supportedInWineBottle: false,
+  }),
+  xbox_runtime: Object.freeze({
+    id: 'xbox_runtime',
+    category: 'built_in_runtime',
+    storefrontId: 'xbox',
+    scope: 'system',
+    macScope: 'bottle',
+    winScope: 'system',
+    title: 'Microsoft Gaming Services',
+    macTitle: 'Microsoft Gaming Services',
+    shortLabel: 'Gaming Services',
+    macShortLabel: 'Gaming Services',
+    canAutoInstallOnMac: false,
+    canAutoInstallOnWin: false,
+    requiresExternalDownloadOnMac: false,
+    requiresExternalDownloadOnWin: true,
+    externalDownloadUrl: 'ms-windows-store://pdp/?productid=9MWPM2CQNLHN',
+    macRecommendationTier: 'built_in',
+    winRecommendationTier: 'recommended',
+  }),
+});
+
+const ENVIRONMENT_COMPONENT_ID_SET = new Set<string>(ENVIRONMENT_COMPONENT_IDS);
+const CLIENT_LOGIN_TARGET_ID_SET = new Set<string>(CLIENT_LOGIN_TARGET_IDS);
+const VALID_PREFERRED_RUNNER_SET = new Set<string>(VALID_PREFERRED_RUNNERS);
+
+export function isValidEnvironmentComponentId(value: unknown): value is EnvironmentComponentId {
+  return typeof value === 'string' && ENVIRONMENT_COMPONENT_ID_SET.has(value);
+}
+
+export function isValidClientLoginTargetId(value: unknown): value is ClientLoginTargetId {
+  return typeof value === 'string' && CLIENT_LOGIN_TARGET_ID_SET.has(value);
+}
+
+export function isValidPreferredRunner(value: unknown): value is PreferredRunnerSelection {
+  return typeof value === 'string' && VALID_PREFERRED_RUNNER_SET.has(value);
+}
+
+export function resolveStorefrontForLoginTarget(
+  targetId: unknown
+): ClientLoginStorefrontId | undefined {
+  if (!isValidClientLoginTargetId(targetId)) return undefined;
+  return TARGET_TO_STOREFRONT_MAP[targetId];
+}
+
+export function resolveScopeForLoginTarget(targetId: unknown): 'host' | 'bottle' | undefined {
+  if (!isValidClientLoginTargetId(targetId)) return undefined;
+  return TARGET_TO_SCOPE_MAP[targetId];
+}
+
+export function resolveComponentScopeForHost(
+  componentId: EnvironmentComponentId,
+  hostPlatform: HostPlatform | string
+): 'host' | 'bottle' | 'system' {
+  const entry = ENVIRONMENT_COMPONENT_CATALOG[componentId];
+  if (!entry) return 'system';
+  return hostPlatform === 'darwin' ? entry.macScope : entry.winScope;
+}

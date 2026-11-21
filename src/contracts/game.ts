@@ -109,14 +109,23 @@ export interface GamePlatformOwnership {
   isRecentlyAddedToGamePass?: boolean;
   subscriptionExpired?: boolean;
   isCrossPlatformLauncherRuntime?: boolean;
+  externalLauncher?: string;
+  externalLauncherUrl?: string;
   externalStorefrontHandoff?: StorefrontId | 'riot';
   xboxBottleCompatibilityTier?: XboxBottleCompatibilityTier;
+  xboxBottleCompatibilityReason?: string;
+  isExternalLauncherStubPackage?: boolean;
+  maxDownloadSizeBytes?: number;
+  pcMaxInstallSizeBytes?: number;
   chainedLauncherHandoff?: string;
   chainedExternalInstallId?: string;
   chainedHandoffTopology?: ChainedHandoffTopology;
   epicPartnerRegistryPath?: string;
   requiresKernelAntiCheat?: boolean;
   antiCheatName?: string;
+  kernelAntiCheatName?: string;
+  executableArchitecture?: string;
+  is32BitExecutable?: boolean;
   packageFormat?: 'uwp' | 'gdk' | 'win32' | string;
   lastPlayed?: string;
   playtimeMinutes?: number;
@@ -169,5 +178,8 @@ export interface CanonicalGame {
   isVerifiedEntitlement?: boolean;
   requiresKernelAntiCheat?: boolean;
   antiCheatName?: string;
+  kernelAntiCheatName?: string;
+  executableArchitecture?: string;
+  is32BitExecutable?: boolean;
 }
 

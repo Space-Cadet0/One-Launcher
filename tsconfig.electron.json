@@ -12,8 +12,6 @@
     "types": ["node"]
   },
   "include": [
-    "electron/*.cjs",
-    "electron/*/*.cjs",
-    "electron/*/*/*.cjs"
+    "electron/**/*.cjs"
   ]
 }
