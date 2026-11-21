@@ -2,7 +2,10 @@ import { CanonicalGame, XboxGamePassSyncMode } from '../../../contracts/game';
 import { StorefrontCredentials, StorefrontIntegration } from '../../../contracts/integration';
 import { StorefrontId } from '../../../contracts/platform';
 import { getSafeLocalStorage } from '../../common/runtimeEnv';
-import { cacheUserXboxAchievements } from '../../storage/knownGameAchievements';
+import {
+  cacheUserXboxAchievements,
+  clearStorefrontAchievementSummaries,
+} from '../../storage/knownGameAchievements';
 import { epicIntegration } from '../epicIntegration';
 import { gogIntegration } from '../gogIntegration';
 import { steamIntegration } from '../steamIntegration';
@@ -26,6 +29,18 @@ const STOREFRONT_ACHIEVEMENT_STORAGE_KEYS: Partial<Record<StorefrontId, readonly
 };
 
 function clearPerStorefrontAchievementCaches(storefrontId: StorefrontId): void {
+  if (
+    storefrontId === 'steam' ||
+    storefrontId === 'gog' ||
+    storefrontId === 'epic' ||
+    storefrontId === 'xbox'
+  ) {
+    try {
+      clearStorefrontAchievementSummaries(storefrontId);
+    } catch {
+      // Ignore summary store cleanup errors
+    }
+  }
   const storage = getSafeLocalStorage();
   if (storage) {
     const keys = STOREFRONT_ACHIEVEMENT_STORAGE_KEYS[storefrontId] || [];
@@ -59,16 +74,16 @@ function clearPerStorefrontAchievementCaches(storefrontId: StorefrontId): void {
   // Clear in-memory / IDB detailed achievement cache asynchronously (dynamic import preserves 3-tier Rollup DAG)
   void import('../../achievements/achievementDetailService')
     .then((mod) => {
-      const svc = mod?.achievementDetailService as
-        | {
-            clearStorefrontCache?: (store: StorefrontId) => void;
-            clearCache?: () => void;
-          }
-        | undefined;
-      if (typeof svc?.clearStorefrontCache === 'function') {
-        svc.clearStorefrontCache(storefrontId);
-      } else if (typeof svc?.clearCache === 'function') {
-        svc.clearCache();
+      if (
+        (storefrontId === 'steam' ||
+          storefrontId === 'gog' ||
+          storefrontId === 'epic' ||
+          storefrontId === 'xbox') &&
+        typeof mod?.achievementDetailService?.clearStorefrontCache === 'function'
+      ) {
+        mod.achievementDetailService.clearStorefrontCache(storefrontId);
+      } else if (typeof mod?.achievementDetailService?.clearCache === 'function') {
+        mod.achievementDetailService.clearCache();
       }
     })
     .catch(() => {});
