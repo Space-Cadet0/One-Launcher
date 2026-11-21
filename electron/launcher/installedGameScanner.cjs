@@ -835,6 +835,40 @@ function createScanContext(options, isDefaultProdScan, skipWin32BackgroundPrewar
           launchArguments: preferred.launchArguments || secondary.launchArguments,
           isWindowsBinaryOnMac: Boolean(preferred.isWindowsBinaryOnMac),
         });
+      } else if (
+        record.platformId === 'steam' &&
+        existing.isWindowsBinaryOnMac &&
+        record.isWindowsBinaryOnMac &&
+        existing.installPath &&
+        record.installPath
+      ) {
+        let existingIsSymlink = false;
+        let recordIsSymlink = false;
+        try {
+          existingIsSymlink = fs.lstatSync(existing.installPath).isSymbolicLink();
+        } catch {}
+        try {
+          recordIsSymlink = fs.lstatSync(record.installPath).isSymbolicLink();
+        } catch {}
+        if (!existingIsSymlink && recordIsSymlink) {
+          discoveredMap.set(key, {
+            ...record,
+            ...existing,
+            executablePath: existing.executablePath || record.executablePath,
+            installPath: existing.installPath,
+            manifestPath: existing.manifestPath || record.manifestPath,
+            launchArguments: existing.launchArguments || record.launchArguments,
+          });
+        } else {
+          discoveredMap.set(key, {
+            ...existing,
+            ...record,
+            executablePath: record.executablePath || existing.executablePath,
+            installPath: record.installPath || existing.installPath,
+            manifestPath: record.manifestPath || existing.manifestPath,
+            launchArguments: record.launchArguments || existing.launchArguments,
+          });
+        }
       } else {
         discoveredMap.set(key, {
           ...existing,

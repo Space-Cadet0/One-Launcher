@@ -18,7 +18,7 @@ const {
   resolveDriveCPathCaseInsensitive,
   resolveBottleSteamExe,
 } = require('../wineAndCrossOverManager.cjs');
-const { parseSteamLibraryFoldersVdf } = require('../binaryAndManifestInspectors.cjs');
+const { parseSteamLibraryFoldersVdf, parseSteamAcf } = require('../binaryAndManifestInspectors.cjs');
 const { compareSemver } = require('../../utils/semverUtils.cjs');
 
 /** @type {Array<[string, string, number]>} */
@@ -342,6 +342,165 @@ function hasBottleSteamAppManifest(bottlePath, appId) {
   }
 
   return false;
+}
+
+const MAX_STEAM_ACF_BYTES = 512 * 1024;
+
+/**
+ * Strictly read-only collector of installed numeric Steam AppIDs inside `bottlePath`
+ * (excluding `228980` Steamworks Common Redistributables, sorted ascending).
+ * Inspects `<bottleSteamRoot>/steamapps/appmanifest_<id>.acf` (requiring `<common>/<installdir>`
+ * to exist as a directory/valid symlink) AND any valid external library folders listed in
+ * `libraryfolders.vdf`.
+ *
+ * @param {string} bottlePath
+ * @param {string | null} [preResolvedSteamExe]
+ * @returns {number[]}
+ */
+function listBottleInstalledSteamAppIds(bottlePath, preResolvedSteamExe = null) {
+  if (!bottlePath || typeof bottlePath !== 'string' || !bottlePath.trim()) {
+    return [];
+  }
+
+  let resolvedBottle = bottlePath.trim();
+  try {
+    if (!fs.existsSync(resolvedBottle)) return [];
+    resolvedBottle = path.resolve(resolvedBottle);
+  } catch {
+    return [];
+  }
+
+  const bottleSteamExe = preResolvedSteamExe || resolveBottleSteamExe(resolvedBottle);
+  if (!bottleSteamExe) {
+    return [];
+  }
+
+  const bottleSteamRoot = path.dirname(bottleSteamExe);
+  const driveCRoot =
+    resolveDriveCPathCaseInsensitive(resolvedBottle, ['drive_c']) ||
+    path.join(resolvedBottle, 'drive_c');
+
+  /** @type {string[]} */
+  const candidateLibRoots = [];
+  const seenLibRoots = new Set();
+  const addLibRoot = (/** @type {string | null | undefined} */ rootDir) => {
+    if (!rootDir || typeof rootDir !== 'string') return;
+    const resolved = path.resolve(rootDir);
+    const key = resolved.toLowerCase();
+    if (seenLibRoots.has(key)) return;
+    seenLibRoots.add(key);
+    candidateLibRoots.push(resolved);
+  };
+
+  addLibRoot(bottleSteamRoot);
+
+  const vdfCandidates = [
+    path.join(bottleSteamRoot, 'steamapps', 'libraryfolders.vdf'),
+    path.join(bottleSteamRoot, 'SteamApps', 'libraryfolders.vdf'),
+    path.join(bottleSteamRoot, 'config', 'libraryfolders.vdf'),
+  ];
+  for (const vdfPath of vdfCandidates) {
+    const vdfContent = readBoundedUtf8FileSync(vdfPath, MAX_LIBRARYFOLDERS_VDF_BYTES);
+    if (!vdfContent) continue;
+    const libPaths = parseSteamLibraryFoldersVdf(vdfContent);
+    for (const lp of libPaths) {
+      const resolvedHosts = resolveWineLibraryPathInBottle(resolvedBottle, driveCRoot, lp);
+      for (const hostRoot of resolvedHosts) {
+        addLibRoot(hostRoot);
+      }
+    }
+  }
+
+  /** @type {Set<string>} */
+  const seenSteamappsKeys = new Set();
+  /** @type {Set<number>} */
+  const foundAppIds = new Set();
+
+  /** @param {string} steamappsDir */
+  const scanSteamappsDir = (steamappsDir) => {
+    if (!steamappsDir) return;
+    let realSteamapps = '';
+    try {
+      const st = fs.statSync(steamappsDir);
+      if (!st.isDirectory()) return;
+      realSteamapps = fs.realpathSync(steamappsDir);
+    } catch {
+      return;
+    }
+    const key = realSteamapps.toLowerCase();
+    if (seenSteamappsKeys.has(key)) return;
+    seenSteamappsKeys.add(key);
+
+    /** @type {string[]} */
+    let entries = [];
+    try {
+      entries = fs.readdirSync(steamappsDir);
+    } catch {
+      return;
+    }
+
+    const commonDir =
+      resolveDriveCPathCaseInsensitive(steamappsDir, ['common']) ||
+      path.join(steamappsDir, 'common');
+
+    for (const entry of entries) {
+      const match = /^appmanifest_(\d+)\.acf$/i.exec(entry);
+      if (!match) continue;
+      const appId = Number(match[1]);
+      if (!Number.isSafeInteger(appId) || appId <= 0 || appId === 228980) continue;
+
+      const acfText = readBoundedUtf8FileSync(path.join(steamappsDir, entry), MAX_STEAM_ACF_BYTES);
+      if (!acfText) continue;
+
+      /** @type {any} */
+      let parsed = null;
+      try {
+        parsed = parseSteamAcf(acfText);
+      } catch {}
+      if (!parsed || Number(parsed.appId) !== appId) continue;
+
+      const stateFlags =
+        parsed.StateFlags !== undefined ? String(parsed.StateFlags).trim() : undefined;
+      const stateFlagsNum =
+        stateFlags !== undefined && /^\d+$/.test(stateFlags) ? Number(stateFlags) : NaN;
+      const bytesToDl = Number(parsed.BytesToDownload || 0);
+      const bytesDl = Number(parsed.BytesDownloaded || 0);
+      const isInstalledFlagSet = Number.isFinite(stateFlagsNum) && (stateFlagsNum & 4) === 4;
+      const isActivelyDownloading = Boolean(
+        !isInstalledFlagSet &&
+          ((Number.isFinite(stateFlagsNum) &&
+            (stateFlagsNum & (2 | 256 | 512 | 1024 | 2048)) !== 0) ||
+            (stateFlags && bytesToDl > 0 && bytesDl < bytesToDl))
+      );
+      if (isActivelyDownloading) continue;
+
+      const installdir = typeof parsed.installdir === 'string' ? parsed.installdir : '';
+      if (
+        !installdir ||
+        !installdir.trim() ||
+        /[\\/\x00]/.test(installdir) ||
+        installdir === '.' ||
+        installdir === '..'
+      ) {
+        continue;
+      }
+
+      const gameDir = path.join(commonDir, installdir);
+      try {
+        if (fs.statSync(gameDir).isDirectory()) {
+          foundAppIds.add(appId);
+        }
+      } catch {}
+    }
+  };
+
+  for (const libRoot of candidateLibRoots) {
+    scanSteamappsDir(path.join(libRoot, 'steamapps'));
+    scanSteamappsDir(path.join(libRoot, 'SteamApps'));
+    scanSteamappsDir(libRoot);
+  }
+
+  return Array.from(foundAppIds).sort((a, b) => a - b);
 }
 
 function resolveBottleGogGalaxyExe(winePrefix) {
@@ -1494,7 +1653,14 @@ function cloneCompatLayersList(/** @type {any[]} */ layers) {
             bottleDetails: Object.fromEntries(
               Object.entries(layer.bottleDetails).map(([k, v]) => [
                 k,
-                v && typeof v === 'object' ? { ...v } : v,
+                v && typeof v === 'object'
+                  ? {
+                      ...v,
+                      ...(Array.isArray(v.installedSteamAppIds)
+                        ? { installedSteamAppIds: [...v.installedSteamAppIds] }
+                        : {}),
+                    }
+                  : v,
               ])
             ),
           }
@@ -1743,6 +1909,7 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
          *   timestamp?: string;
          *   hasSteam?: boolean;
          *   steamSignedIn?: boolean;
+         *   installedSteamAppIds?: number[];
          *   hasGogGalaxy?: boolean;
          *   hasEpicLauncher?: boolean;
          * }>}
@@ -1757,6 +1924,10 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
             hasSteam && bottleSteamExe
               ? hasSignedInSteamUserInLoginUsersVdf(path.dirname(bottleSteamExe))
               : false;
+          const installedSteamAppIds =
+            hasSteam && bottleSteamExe
+              ? listBottleInstalledSteamAppIds(bPath, bottleSteamExe)
+              : [];
           const hasGogGalaxy = Boolean(resolveBottleGogGalaxyExe(bPath));
           const hasEpicLauncher = Boolean(resolveBottleEpicLauncherExe(bPath));
           bottleDetails[bName] = {
@@ -1765,6 +1936,7 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
             ...(meta.timestamp ? { timestamp: meta.timestamp } : {}),
             hasSteam,
             steamSignedIn,
+            installedSteamAppIds,
             hasGogGalaxy,
             hasEpicLauncher,
           };
@@ -2254,7 +2426,9 @@ module.exports = {
   configureExternalWineManagerSpecs,
   extractBottleRootFromPath,
   extractRunnerPreviewDate,
+  resolveWineLibraryPathInBottle,
   hasBottleSteamAppManifest,
+  listBottleInstalledSteamAppIds,
   resolveBottleGogGalaxyExe,
   resolveBottleEpicLauncherExe,
   inspectBottleConfMetadata,

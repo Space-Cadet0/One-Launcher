@@ -762,7 +762,20 @@ async function uninstallGame(/** @type {any} */ payload = {}, /** @type {any} */
               !installdir.includes('..')
             ) {
               const acfCommonDir = path.join(steamappsDir, 'common', installdir);
-              if (fs.existsSync(acfCommonDir) && isSafeToDeleteInstallPath(acfCommonDir, options)) {
+              /** @type {fs.Stats | null} */
+              let commonLstat = null;
+              try {
+                commonLstat = fs.lstatSync(acfCommonDir);
+              } catch {}
+              if (commonLstat && commonLstat.isSymbolicLink()) {
+                try {
+                  fs.unlinkSync(acfCommonDir);
+                } catch {}
+              } else if (
+                commonLstat &&
+                fs.existsSync(acfCommonDir) &&
+                isSafeToDeleteInstallPath(acfCommonDir, options)
+              ) {
                 try {
                   await safeRemoveInstallDirectoryAsync(acfCommonDir, {
                     ...options,

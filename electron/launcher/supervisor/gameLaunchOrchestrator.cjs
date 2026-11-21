@@ -2351,6 +2351,7 @@ async function launchGameInternal(
                   errorCode: 'BOTTLE_STEAM_NOT_INSTALLED',
                   targetBottleName,
                   targetBottlePath: targetWinePrefix,
+                  ...(chosenCompatLayer?.type ? { chosenRunnerType: chosenCompatLayer.type } : {}),
                   ...(installBottleName ? { installBottleName } : {}),
                   installBottleHasSteam: Boolean(installBottleSteamExe),
                   ...(recommendedCompatRunnerType
@@ -2382,6 +2383,7 @@ async function launchGameInternal(
                 errorCode: 'BOTTLE_STEAM_APP_NOT_IN_TARGET_BOTTLE',
                 targetBottleName,
                 targetBottlePath: targetWinePrefix,
+                ...(chosenCompatLayer?.type ? { chosenRunnerType: chosenCompatLayer.type } : {}),
                 installBottleName,
                 installBottleHasSteam: Boolean(installBottleSteamExe),
                 ...(recommendedCompatRunnerType
@@ -2413,6 +2415,7 @@ async function launchGameInternal(
                   errorCode: 'BOTTLE_STEAM_NOT_INSTALLED',
                   targetBottleName,
                   targetBottlePath: targetWinePrefix,
+                  ...(chosenCompatLayer?.type ? { chosenRunnerType: chosenCompatLayer.type } : {}),
                   ...(installBottleName ? { installBottleName } : {}),
                   installBottleHasSteam: Boolean(installBottleSteamExe),
                   ...(recommendedCompatRunnerType
@@ -4665,7 +4668,27 @@ async function launchGameInternal(
               localInstallDir
             ) {
               try {
-                const winWatchDir = toWineWindowsPath(localInstallDir, targetWinePrefix);
+                let effectiveWatchDir = localInstallDir;
+                if (bottleSteamExe && localInstallDir) {
+                  try {
+                    const installBasename = path.basename(localInstallDir);
+                    if (installBasename && installBasename !== '.' && installBasename !== '..') {
+                      const candidateLocalCommon = path.join(
+                        path.dirname(bottleSteamExe),
+                        'steamapps',
+                        'common',
+                        installBasename
+                      );
+                      if (
+                        fs.existsSync(candidateLocalCommon) &&
+                        fs.realpathSync(candidateLocalCommon) === fs.realpathSync(localInstallDir)
+                      ) {
+                        effectiveWatchDir = candidateLocalCommon;
+                      }
+                    }
+                  } catch {}
+                }
+                const winWatchDir = toWineWindowsPath(effectiveWatchDir, targetWinePrefix);
                 const rawWatchBottleArch = String(
                   compatResult?.wineArch ||
                     (targetWinePrefix ? inspectBottleConfMetadata(targetWinePrefix).wineArch : '') ||

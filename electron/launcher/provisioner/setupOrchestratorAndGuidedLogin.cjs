@@ -16,10 +16,20 @@ const {
   safeIsBottleSlug,
 } = require('../engineStateRegistry.cjs');
 const {
+  resolveDriveCPathCaseInsensitive,
   resolveBottleSteamExe,
   isCrossOverPerlWineWrapperOptions,
   applyCrossOverEnvironmentHygiene,
 } = require('../wineAndCrossOverManager.cjs');
+const { atomicWriteFileSync } = require('../securityAndPathUtils.cjs');
+const {
+  parseSteamAcf,
+  parseSteamLibraryFoldersVdf,
+} = require('../binaryAndManifestInspectors.cjs');
+const { isBottleWinExeRunning } = require('../storefrontReadinessBarrier.cjs');
+const {
+  resolveWineLibraryPathInBottle,
+} = require('../mac/compatLayerRegistryAndDetection.cjs');
 const macNativeInstallerAndCodesign = /** @type {any} */ (
   require('../macNativeInstallerAndCodesign.cjs')
 );
@@ -27,6 +37,8 @@ const {
   resolveTargetMacAppBundlePath,
   isValidBottleDirectory,
   detectCompatibilityLayers,
+  listBottleSubdirectories,
+  listAllInitializedBottlePaths,
   shutdownWinePrefix,
   resolveBottleGogGalaxyExe,
   resolveBottleEpicLauncherExe,
@@ -99,6 +111,605 @@ const activeSetupRuns = new Map();
 
 /** @type {Map<string, { abortController: AbortController, runId: string }>} */
 const activeGuidedLogins = new Map();
+
+const MAX_LINK_STEAM_TEXT_BYTES = 512 * 1024;
+
+/**
+ * Tokenize Valve KeyValues VDF content into quoted strings and structural braces `{` / `}`
+ * while preserving exact character offsets for safe surgical splicing.
+ *
+ * @param {string} vdfContent
+ * @returns {Array<{ type: 'string' | 'lbrace' | 'rbrace', value: string, start: number, end: number }>}
+ */
+function tokenizeValveVdf(vdfContent) {
+  /** @type {Array<{ type: 'string' | 'lbrace' | 'rbrace', value: string, start: number, end: number }>} */
+  const tokens = [];
+  const len = vdfContent.length;
+  let i = 0;
+  while (i < len) {
+    const ch = vdfContent[i];
+    if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+      i += 1;
+      continue;
+    }
+    if (ch === '/' && i + 1 < len && vdfContent[i + 1] === '/') {
+      i += 2;
+      while (i < len && vdfContent[i] !== '\n') i += 1;
+      continue;
+    }
+    if (ch === '{') {
+      tokens.push({ type: 'lbrace', value: '{', start: i, end: i + 1 });
+      i += 1;
+      continue;
+    }
+    if (ch === '}') {
+      tokens.push({ type: 'rbrace', value: '}', start: i, end: i + 1 });
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      const start = i;
+      i += 1;
+      let value = '';
+      while (i < len && vdfContent[i] !== '"') {
+        if (vdfContent[i] === '\\' && i + 1 < len) {
+          value += vdfContent[i + 1];
+          i += 2;
+        } else {
+          value += vdfContent[i];
+          i += 1;
+        }
+      }
+      if (i < len && vdfContent[i] === '"') {
+        i += 1;
+      }
+      tokens.push({ type: 'string', value, start, end: i });
+      continue;
+    }
+    i += 1;
+  }
+  return tokens;
+}
+
+/**
+ * Locate `"libraryfolders" -> "0" -> "apps" { ... }` in a Valve `libraryfolders.vdf` file,
+ * returning brace indices and existing AppID keys inside `"0" -> "apps"`.
+ *
+ * @param {string} vdfContent
+ * @returns {{ openBraceIndex: number, closeBraceIndex: number, existingAppIds: Set<string> } | null}
+ */
+function locateLibraryFoldersZeroAppsBlock(vdfContent) {
+  const tokens = tokenizeValveVdf(vdfContent);
+  /**
+   * @param {number} lbraceTokIdx
+   * @returns {number}
+   */
+  const skipBlock = (lbraceTokIdx) => {
+    let depth = 0;
+    for (let idx = lbraceTokIdx; idx < tokens.length; idx += 1) {
+      if (tokens[idx].type === 'lbrace') depth += 1;
+      else if (tokens[idx].type === 'rbrace') {
+        depth -= 1;
+        if (depth === 0) return idx + 1;
+      }
+    }
+    return tokens.length;
+  };
+
+  let idx = 0;
+  while (idx + 1 < tokens.length) {
+    const rootKey = tokens[idx];
+    const rootNext = tokens[idx + 1];
+    if (rootKey.type === 'string' && rootNext.type === 'lbrace') {
+      if (rootKey.value.toLowerCase() !== 'libraryfolders') {
+        idx = skipBlock(idx + 1);
+        continue;
+      }
+      let c = idx + 2;
+      while (c < tokens.length && tokens[c].type !== 'rbrace') {
+        const childKey = tokens[c];
+        const childVal = tokens[c + 1];
+        if (!childVal) break;
+        if (childKey.type === 'string' && childVal.type === 'string') {
+          c += 2;
+          continue;
+        }
+        if (childKey.type === 'string' && childVal.type === 'lbrace') {
+          if (childKey.value === '0') {
+            let z = c + 2;
+            while (z < tokens.length && tokens[z].type !== 'rbrace') {
+              const zKey = tokens[z];
+              const zVal = tokens[z + 1];
+              if (!zVal) break;
+              if (zKey.type === 'string' && zVal.type === 'string') {
+                z += 2;
+                continue;
+              }
+              if (zKey.type === 'string' && zVal.type === 'lbrace') {
+                if (zKey.value.toLowerCase() === 'apps') {
+                  const openBraceIndex = zVal.start;
+                  /** @type {Set<string>} */
+                  const existingAppIds = new Set();
+                  let a = z + 2;
+                  while (a < tokens.length && tokens[a].type !== 'rbrace') {
+                    const appKey = tokens[a];
+                    const appVal = tokens[a + 1];
+                    if (appKey.type === 'string' && appVal && appVal.type === 'string') {
+                      existingAppIds.add(appKey.value.trim());
+                      a += 2;
+                    } else if (appVal && appVal.type === 'lbrace') {
+                      a = skipBlock(a + 1);
+                    } else {
+                      a += 1;
+                    }
+                  }
+                  if (a < tokens.length && tokens[a].type === 'rbrace') {
+                    return {
+                      openBraceIndex,
+                      closeBraceIndex: tokens[a].start,
+                      existingAppIds,
+                    };
+                  }
+                  return null;
+                }
+                z = skipBlock(z + 1);
+                continue;
+              }
+              z += 1;
+            }
+            return null;
+          }
+          c = skipBlock(c + 1);
+          continue;
+        }
+        c += 1;
+      }
+      return null;
+    }
+    idx += 1;
+  }
+  return null;
+}
+
+/**
+ * Safely synchronize `"0" -> "apps"` entries in existing target bottle `libraryfolders.vdf` files
+ * against all `appmanifest_<appId>.acf` files in `<targetSteamRoot>/steamapps/`, strictly when
+ * `steam.exe` is NOT running inside `targetBottlePath`.
+ *
+ * @param {string} targetSteamRoot
+ * @param {string} targetSteamappsDir
+ * @param {string} targetBottlePath
+ * @param {Record<string, any>} options
+ */
+async function syncTargetBottleLibraryFoldersVdf(
+  targetSteamRoot,
+  targetSteamappsDir,
+  targetBottlePath,
+  options
+) {
+  const rawCandidates = [
+    path.join(targetSteamappsDir, 'libraryfolders.vdf'),
+    path.join(targetSteamRoot, 'config', 'libraryfolders.vdf'),
+  ];
+  /** @type {string[]} */
+  const existingVdfs = [];
+  /** @type {Set<string>} */
+  const seenVdfKeys = new Set();
+  for (const cand of rawCandidates) {
+    try {
+      const st = await fs.promises.stat(cand);
+      if (!st.isFile() || st.size <= 0 || st.size > MAX_LINK_STEAM_TEXT_BYTES) continue;
+      const realCand = await fs.promises.realpath(cand).catch(() => path.resolve(cand));
+      const key = realCand.toLowerCase();
+      if (seenVdfKeys.has(key)) continue;
+      seenVdfKeys.add(key);
+      existingVdfs.push(cand);
+    } catch {}
+  }
+  if (existingVdfs.length === 0) return;
+
+  /** @type {Array<{ appIdNum: number, appIdStr: string, sizeOnDisk: string }>} */
+  const targetManifests = [];
+  try {
+    const entries = await fs.promises.readdir(targetSteamappsDir);
+    for (const entry of entries) {
+      const match = /^appmanifest_(\d+)\.acf$/i.exec(entry);
+      if (!match) continue;
+      const appIdStr = match[1];
+      const appIdNum = Number(appIdStr);
+      if (!Number.isSafeInteger(appIdNum) || appIdNum <= 0) continue;
+      const acfPath = path.join(targetSteamappsDir, entry);
+      try {
+        const st = await fs.promises.stat(acfPath);
+        if (!st.isFile() || st.size <= 0 || st.size > MAX_LINK_STEAM_TEXT_BYTES) continue;
+        const rawAcf = await fs.promises.readFile(acfPath, 'utf8');
+        const parsed = parseSteamAcf(rawAcf);
+        if (!parsed || Number(parsed.appId) !== appIdNum) continue;
+        const rawSize = parsed.SizeOnDisk !== undefined ? String(parsed.SizeOnDisk).trim() : '';
+        const sizeOnDisk = /^\d+$/.test(rawSize) ? rawSize : '0';
+        targetManifests.push({ appIdNum, appIdStr, sizeOnDisk });
+      } catch {}
+    }
+  } catch {
+    return;
+  }
+  if (targetManifests.length === 0) return;
+  targetManifests.sort((a, b) => a.appIdNum - b.appIdNum);
+
+  const steamRunning = await isBottleWinExeRunning('steam.exe', targetBottlePath, options);
+  if (steamRunning) {
+    return;
+  }
+
+  for (const vdfPath of existingVdfs) {
+    try {
+      const vdfContent = await fs.promises.readFile(vdfPath, 'utf8');
+      const block = locateLibraryFoldersZeroAppsBlock(vdfContent);
+      if (!block) continue;
+
+      /** @type {string[]} */
+      const linesToInsert = [];
+      for (const item of targetManifests) {
+        if (block.existingAppIds.has(item.appIdStr)) continue;
+        block.existingAppIds.add(item.appIdStr);
+        linesToInsert.push(`\t\t\t"${item.appIdStr}"\t\t"${item.sizeOnDisk}"\n`);
+      }
+      if (linesToInsert.length === 0) continue;
+
+      const insertionPayload = linesToInsert.join('');
+      let lineStartBeforeClose = block.closeBraceIndex;
+      while (
+        lineStartBeforeClose > block.openBraceIndex + 1 &&
+        (vdfContent[lineStartBeforeClose - 1] === ' ' ||
+          vdfContent[lineStartBeforeClose - 1] === '\t')
+      ) {
+        lineStartBeforeClose -= 1;
+      }
+
+      let updatedContent = '';
+      if (
+        lineStartBeforeClose > block.openBraceIndex + 1 &&
+        vdfContent[lineStartBeforeClose - 1] === '\n'
+      ) {
+        updatedContent =
+          vdfContent.slice(0, lineStartBeforeClose) +
+          insertionPayload +
+          vdfContent.slice(lineStartBeforeClose);
+      } else {
+        updatedContent =
+          vdfContent.slice(0, block.closeBraceIndex) +
+          `\n${insertionPayload}\t\t` +
+          vdfContent.slice(block.closeBraceIndex);
+      }
+
+      if (updatedContent !== vdfContent) {
+        atomicWriteFileSync(vdfPath, updatedContent);
+      }
+    } catch {}
+  }
+}
+
+/**
+ * Link already-installed Windows Steam games from other initialized bottles into
+ * `targetBottlePath` with zero re-downloading and zero disk duplication:
+ * - Creates POSIX directory symlinks inside `<targetSteamRoot>/steamapps/common/<installdir>`
+ *   pointing to the canonical physical game directory (`fs.promises.realpath`), without ever
+ *   overwriting an existing non-symlink directory.
+ * - Atomically copies missing `appmanifest_<appId>.acf` files into `<targetSteamRoot>/steamapps/`.
+ * - When `steam.exe` is not running inside `targetBottlePath`, registers missing linked apps
+ *   into `"0" -> "apps"` of existing `libraryfolders.vdf` files.
+ *
+ * @param {string} targetBottlePath
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ linkedCount: number, linkedAppIds: number[] }>}
+ */
+async function linkInstalledSteamAppsIntoBottle(targetBottlePath, options = {}) {
+  if (!targetBottlePath || typeof targetBottlePath !== 'string' || !targetBottlePath.trim()) {
+    return { linkedCount: 0, linkedAppIds: [] };
+  }
+
+  const resolvedTargetBottle = path.resolve(targetBottlePath.trim());
+  const targetSteamExe = resolveBottleSteamExe(resolvedTargetBottle);
+  if (!targetSteamExe) {
+    return { linkedCount: 0, linkedAppIds: [] };
+  }
+
+  const realTargetBottle = await fs.promises
+    .realpath(resolvedTargetBottle)
+    .catch(() => resolvedTargetBottle);
+  const targetBottleKeys = new Set([
+    resolvedTargetBottle.toLowerCase(),
+    realTargetBottle.toLowerCase(),
+  ]);
+
+  const targetSteamRoot = path.dirname(targetSteamExe);
+  const targetSteamappsDir =
+    resolveDriveCPathCaseInsensitive(targetSteamRoot, ['steamapps']) ||
+    path.join(targetSteamRoot, 'steamapps');
+  const targetCommonDir = path.join(targetSteamappsDir, 'common');
+  await fs.promises.mkdir(targetCommonDir, { recursive: true });
+
+  const realTargetSteamappsDir = await fs.promises
+    .realpath(targetSteamappsDir)
+    .catch(() => path.resolve(targetSteamappsDir));
+  const realTargetCommonDir = await fs.promises
+    .realpath(targetCommonDir)
+    .catch(() => path.resolve(targetCommonDir));
+  const realTargetCommonPrefix = `${realTargetCommonDir.toLowerCase()}${path.sep}`;
+
+  // Discover all other initialized bottle directories on the host
+  /** @type {string[]} */
+  const sourceBottlePaths = [];
+  /** @type {Set<string>} */
+  const seenBottleKeys = new Set(targetBottleKeys);
+
+  /** @param {string | null | undefined} candidateBottle */
+  const addSourceBottle = async (candidateBottle) => {
+    if (!candidateBottle || typeof candidateBottle !== 'string') return;
+    const resolved = path.resolve(candidateBottle);
+    const resolvedKey = resolved.toLowerCase();
+    if (seenBottleKeys.has(resolvedKey)) return;
+    let realPath = resolved;
+    try {
+      const st = await fs.promises.stat(resolved);
+      if (!st.isDirectory()) return;
+      realPath = await fs.promises.realpath(resolved);
+    } catch {
+      return;
+    }
+    const realKey = realPath.toLowerCase();
+    if (seenBottleKeys.has(realKey)) return;
+    seenBottleKeys.add(resolvedKey);
+    seenBottleKeys.add(realKey);
+    sourceBottlePaths.push(resolved);
+  };
+
+  const discoverOpts = {
+    ...options,
+    ...explicitHomedirOpt(options),
+    platform: options.platform || process.platform,
+  };
+
+  try {
+    const layers = detectCompatibilityLayers(discoverOpts);
+    for (const layer of layers) {
+      if (!layer || !layer.bottlesDir) continue;
+      for (const bName of listBottleSubdirectories(layer.bottlesDir, discoverOpts)) {
+        await addSourceBottle(path.join(layer.bottlesDir, bName));
+      }
+    }
+  } catch {}
+
+  try {
+    for (const bPath of listAllInitializedBottlePaths(discoverOpts)) {
+      await addSourceBottle(bPath);
+    }
+  } catch {}
+
+  // Discover all source Windows Steam `steamapps` directories across other bottles
+  /** @type {string[]} */
+  const sourceSteamappsDirs = [];
+  /** @type {Set<string>} */
+  const seenSteamappsKeys = new Set([realTargetSteamappsDir.toLowerCase()]);
+
+  /** @param {string | null | undefined} candidateSteamapps */
+  const addSourceSteamappsDir = async (candidateSteamapps) => {
+    if (!candidateSteamapps || typeof candidateSteamapps !== 'string') return;
+    let realDir = '';
+    try {
+      const st = await fs.promises.stat(candidateSteamapps);
+      if (!st.isDirectory()) return;
+      realDir = await fs.promises.realpath(candidateSteamapps);
+    } catch {
+      return;
+    }
+    const key = realDir.toLowerCase();
+    if (seenSteamappsKeys.has(key)) return;
+    seenSteamappsKeys.add(key);
+    sourceSteamappsDirs.push(realDir);
+  };
+
+  for (const srcBottle of sourceBottlePaths) {
+    const driveCRoot =
+      resolveDriveCPathCaseInsensitive(srcBottle, ['drive_c']) ||
+      path.join(srcBottle, 'drive_c');
+    const steamRootCandidates = new Set([
+      path.join(srcBottle, 'drive_c', 'Program Files (x86)', 'Steam'),
+      path.join(srcBottle, 'drive_c', 'Program Files', 'Steam'),
+    ]);
+    const srcSteamExe = resolveBottleSteamExe(srcBottle);
+    if (srcSteamExe) {
+      steamRootCandidates.add(path.dirname(srcSteamExe));
+    }
+
+    for (const srcSteamRoot of steamRootCandidates) {
+      await addSourceSteamappsDir(path.join(srcSteamRoot, 'steamapps'));
+      await addSourceSteamappsDir(path.join(srcSteamRoot, 'SteamApps'));
+
+      const vdfCandidates = [
+        path.join(srcSteamRoot, 'steamapps', 'libraryfolders.vdf'),
+        path.join(srcSteamRoot, 'SteamApps', 'libraryfolders.vdf'),
+        path.join(srcSteamRoot, 'config', 'libraryfolders.vdf'),
+      ];
+      for (const vdfPath of vdfCandidates) {
+        try {
+          const st = await fs.promises.stat(vdfPath);
+          if (!st.isFile() || st.size <= 0 || st.size > MAX_LINK_STEAM_TEXT_BYTES) continue;
+          const vdfContent = await fs.promises.readFile(vdfPath, 'utf8');
+          const libPaths = parseSteamLibraryFoldersVdf(vdfContent);
+          for (const lp of libPaths) {
+            const resolvedHosts = resolveWineLibraryPathInBottle(srcBottle, driveCRoot, lp);
+            for (const hostRoot of resolvedHosts) {
+              await addSourceSteamappsDir(path.join(hostRoot, 'steamapps'));
+              await addSourceSteamappsDir(path.join(hostRoot, 'SteamApps'));
+              await addSourceSteamappsDir(hostRoot);
+            }
+          }
+        } catch {}
+      }
+    }
+  }
+
+  /** @type {Set<number>} */
+  const linkedAppIdSet = new Set();
+
+  for (const sourceSteamappsDir of sourceSteamappsDirs) {
+    /** @type {string[]} */
+    let entries = [];
+    try {
+      entries = (await fs.promises.readdir(sourceSteamappsDir)).sort();
+    } catch {
+      continue;
+    }
+
+    const sourceCommonDir =
+      resolveDriveCPathCaseInsensitive(sourceSteamappsDir, ['common']) ||
+      path.join(sourceSteamappsDir, 'common');
+
+    for (const entry of entries) {
+      const match = /^appmanifest_(\d+)\.acf$/i.exec(entry);
+      if (!match) continue;
+      const appIdStr = match[1];
+      const appIdNum = Number(appIdStr);
+      if (!Number.isSafeInteger(appIdNum) || appIdNum <= 0) continue;
+
+      const sourceAcfPath = path.join(sourceSteamappsDir, entry);
+      let rawAcf = '';
+      try {
+        const st = await fs.promises.stat(sourceAcfPath);
+        if (!st.isFile() || st.size <= 0 || st.size > MAX_LINK_STEAM_TEXT_BYTES) continue;
+        rawAcf = await fs.promises.readFile(sourceAcfPath, 'utf8');
+      } catch {
+        continue;
+      }
+
+      /** @type {any} */
+      let parsed = null;
+      try {
+        parsed = parseSteamAcf(rawAcf);
+      } catch {}
+      if (!parsed || Number(parsed.appId) !== appIdNum) continue;
+
+      const stateFlags =
+        parsed.StateFlags !== undefined ? String(parsed.StateFlags).trim() : undefined;
+      const stateFlagsNum =
+        stateFlags !== undefined && /^\d+$/.test(stateFlags) ? Number(stateFlags) : NaN;
+      const bytesToDl = Number(parsed.BytesToDownload || 0);
+      const bytesDl = Number(parsed.BytesDownloaded || 0);
+      const isInstalledFlagSet = Number.isFinite(stateFlagsNum) && (stateFlagsNum & 4) === 4;
+      const isActivelyDownloading = Boolean(
+        !isInstalledFlagSet &&
+          ((Number.isFinite(stateFlagsNum) &&
+            (stateFlagsNum & (2 | 256 | 512 | 1024 | 2048)) !== 0) ||
+            (stateFlags && bytesToDl > 0 && bytesDl < bytesToDl))
+      );
+      if (isActivelyDownloading) continue;
+
+      const installdir = typeof parsed.installdir === 'string' ? parsed.installdir : '';
+      if (
+        !installdir ||
+        !installdir.trim() ||
+        /[\\/\x00]/.test(installdir) ||
+        installdir === '.' ||
+        installdir === '..'
+      ) {
+        continue;
+      }
+
+      const sourceGameDir = path.join(sourceCommonDir, installdir);
+      let realSourceGameDir = '';
+      try {
+        const srcStat = await fs.promises.stat(sourceGameDir);
+        if (!srcStat.isDirectory()) continue;
+        realSourceGameDir = await fs.promises.realpath(sourceGameDir);
+      } catch {
+        continue;
+      }
+
+      // Guard against self-referential symlinks pointing back inside targetCommonDir
+      const realSourceLower = realSourceGameDir.toLowerCase();
+      if (
+        realSourceLower === realTargetCommonDir.toLowerCase() ||
+        realSourceLower.startsWith(realTargetCommonPrefix)
+      ) {
+        continue;
+      }
+
+      const targetGameDir = path.join(targetCommonDir, installdir);
+      let linkedThisApp = false;
+      let canWriteManifest = true;
+
+      try {
+        const targetLstat = await fs.promises.lstat(targetGameDir);
+        if (targetLstat.isSymbolicLink()) {
+          let symlinkValid = false;
+          try {
+            symlinkValid = (await fs.promises.stat(targetGameDir)).isDirectory();
+          } catch {}
+          if (!symlinkValid) {
+            await fs.promises.unlink(targetGameDir);
+            await fs.promises.symlink(realSourceGameDir, targetGameDir, 'dir');
+            linkedThisApp = true;
+          }
+        } else if (!targetLstat.isDirectory()) {
+          // Existing non-directory file collides with installdir; do not overwrite or link
+          canWriteManifest = false;
+        }
+        // Existing non-symlink directory: NEVER overwrite!
+      } catch (lstatErr) {
+        if (/** @type {any} */ (lstatErr)?.code === 'ENOENT') {
+          try {
+            await fs.promises.symlink(realSourceGameDir, targetGameDir, 'dir');
+            linkedThisApp = true;
+          } catch {
+            canWriteManifest = false;
+          }
+        } else {
+          canWriteManifest = false;
+        }
+      }
+
+      if (!canWriteManifest) continue;
+
+      const targetAcfPath = path.join(targetSteamappsDir, `appmanifest_${appIdStr}.acf`);
+      let targetAcfExists = false;
+      try {
+        await fs.promises.lstat(targetAcfPath);
+        targetAcfExists = true;
+      } catch {}
+
+      if (!targetAcfExists) {
+        try {
+          atomicWriteFileSync(targetAcfPath, rawAcf);
+          linkedThisApp = true;
+        } catch {}
+      }
+
+      if (linkedThisApp) {
+        linkedAppIdSet.add(appIdNum);
+      }
+    }
+  }
+
+  try {
+    await syncTargetBottleLibraryFoldersVdf(
+      targetSteamRoot,
+      targetSteamappsDir,
+      resolvedTargetBottle,
+      options
+    );
+  } catch (vdfErr) {
+    diagLog.warn('linkInstalledSteamAppsIntoBottle.vdfSync', vdfErr, {
+      bottlePath: resolvedTargetBottle,
+    });
+  }
+
+  const linkedAppIds = Array.from(linkedAppIdSet).sort((a, b) => a - b);
+  return {
+    linkedCount: linkedAppIds.length,
+    linkedAppIds,
+  };
+}
 
 /**
  * Ensure a target bottle is initialized before installing a bottled client, skipping
@@ -999,12 +1610,26 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
               );
               const existingSteam = resolveBottleSteamExe(bottlePath);
               if (existingSteam && !options.forceReinstall) {
+                /** @type {{ linkedCount: number, linkedAppIds: number[] }} */
+                let linkRes = { linkedCount: 0, linkedAppIds: [] };
+                try {
+                  linkRes = await linkInstalledSteamAppsIntoBottle(bottlePath, options);
+                } catch (linkErr) {
+                  diagLog.warn('runEnvironmentSetupTasks.linkInstalledSteamApps', linkErr, {
+                    bottlePath,
+                  });
+                }
+                invalidateScanCaches({ skipPreviewUrlCacheClear: true });
                 succeededComponents.push('bottle_steam');
+                const skipMsg =
+                  linkRes.linkedCount > 0
+                    ? `Windows Steam is already installed in "${bottleName}"; linked ${linkRes.linkedCount} existing Steam game${linkRes.linkedCount === 1 ? '' : 's'}.`
+                    : `Windows Steam is already installed in "${bottleName}".`;
                 emitEnvironmentSetupProgress(
                   {
                     ...progressBase,
                     phase: 'skipped',
-                    message: `Windows Steam is already installed in "${bottleName}".`,
+                    message: skipMsg,
                   },
                   options
                 );
@@ -1013,7 +1638,7 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
                   action: task.action,
                   status: 'skipped',
                   installedPath: existingSteam,
-                  message: `Windows Steam is already installed in "${bottleName}".`,
+                  message: skipMsg,
                 });
                 continue;
               }
@@ -1077,13 +1702,27 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
                   options,
                   controller.signal
                 );
+                /** @type {{ linkedCount: number, linkedAppIds: number[] }} */
+                let linkRes = { linkedCount: 0, linkedAppIds: [] };
+                try {
+                  linkRes = await linkInstalledSteamAppsIntoBottle(bottlePath, options);
+                } catch (linkErr) {
+                  diagLog.warn('runEnvironmentSetupTasks.linkInstalledSteamApps', linkErr, {
+                    bottlePath,
+                  });
+                }
+                invalidateScanCaches({ skipPreviewUrlCacheClear: true });
                 succeededComponents.push('bottle_steam');
+                const installMsg =
+                  linkRes.linkedCount > 0
+                    ? `Installed Windows Steam in bottle "${bottleName}" and linked ${linkRes.linkedCount} existing Steam game${linkRes.linkedCount === 1 ? '' : 's'}.`
+                    : `Installed Windows Steam in bottle "${bottleName}".`;
                 emitEnvironmentSetupProgress(
                   {
                     ...progressBase,
                     phase: 'completed',
                     progressPercent: 100,
-                    message: `Installed Windows Steam in bottle "${bottleName}".`,
+                    message: installMsg,
                   },
                   options
                 );
@@ -1092,7 +1731,7 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
                   action: task.action,
                   status: 'completed',
                   installedPath: installedSteamExe,
-                  message: `Installed Windows Steam in bottle "${bottleName}".`,
+                  message: installMsg,
                 });
               } finally {
                 try {
@@ -2706,6 +3345,17 @@ async function startGuidedClientLogin(payload, options = {}) {
           );
         }
 
+        if (targetId === 'bottle_steam' && latestState.bottlePath) {
+          try {
+            await linkInstalledSteamAppsIntoBottle(latestState.bottlePath, options);
+          } catch (linkErr) {
+            diagLog.warn('startGuidedClientLogin.linkInstalledSteamApps', linkErr, {
+              bottlePath: latestState.bottlePath,
+            });
+          }
+          invalidateScanCaches({ skipPreviewUrlCacheClear: true });
+        }
+
         if (
           latestState.bottlePath &&
           (targetId === 'bottle_ubisoft' ||
@@ -2746,6 +3396,7 @@ async function startGuidedClientLogin(payload, options = {}) {
 
 module.exports = {
   isWinVcRedistInstalledFast,
+  linkInstalledSteamAppsIntoBottle,
   runEnvironmentSetupTasks,
   cancelEnvironmentSetup,
   closeForegroundClientGracefully,
