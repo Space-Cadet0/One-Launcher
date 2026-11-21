@@ -354,6 +354,16 @@ export default defineConfig({
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         },
       },
+      '/api/opencritic-web': {
+        target: 'https://opencritic.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/opencritic-web/, ''),
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Referer: 'https://opencritic.com/',
+        },
+      },
       '/api/opencritic': {
         target: 'https://api.opencritic.com',
         changeOrigin: true,
@@ -363,23 +373,42 @@ export default defineConfig({
           Origin: 'https://opencritic.com',
         },
       },
-      '/api/metacritic': {
-        target: 'https://www.metacritic.com',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/metacritic/, ''),
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          Referer: 'https://www.metacritic.com/',
-        },
-      },
       '/api/metacritic-backend': {
         target: 'https://backend.metacritic.com',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/metacritic-backend/, ''),
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'User-Agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           Referer: 'https://www.metacritic.com/',
-          Origin: 'https://www.metacritic.com',
+        },
+      },
+      '/api/metacritic': {
+        target: 'https://www.metacritic.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/metacritic/, ''),
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Referer: 'https://www.metacritic.com/',
+        },
+      },
+      '/api/wikidata-sparql': {
+        target: 'https://query.wikidata.org',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/wikidata-sparql/, ''),
+        headers: {
+          'User-Agent':
+            'One-Launcher/0.2.8 (https://github.com/Space-Cadet0/One-Launcher; desktop library metadata bridge)',
+        },
+      },
+      '/api/wikidata-api': {
+        target: 'https://www.wikidata.org',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/wikidata-api/, ''),
+        headers: {
+          'User-Agent':
+            'One-Launcher/0.2.8 (https://github.com/Space-Cadet0/One-Launcher; desktop library metadata bridge)',
         },
       },
     },

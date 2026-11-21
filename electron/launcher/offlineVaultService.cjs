@@ -560,6 +560,151 @@ function carryForwardVaultRequirements(incomingObj, existingObj) {
   }
 }
 
+/**
+ * Computes the monotonic review-source authority rank for a persisted `critic_json` object:
+ * - 5: User override (`isUserOverride === true` / `userOverride === true` / `tier === 'override'`)
+ * - 4: Metacritic press consensus (`source === 'metacritic'`)
+ * - 3: OpenCritic press consensus (`source === 'opencritic'`)
+ * - 2: High-sample community consensus (`metacritic_user` with `numReviews >= 25`, or `steam` with `numReviews >= 10`)
+ * - 1: Storefront/low-sample fallback (`gog`/`epic`/`xbox`/`custom`, or low-sample `metacritic_user`/`steam`)
+ * - 0: Empty, null, or invalid (`score <= 0`)
+ *
+ * @param {unknown} criticObj
+ * @returns {number}
+ */
+function getCriticAuthorityRank(criticObj) {
+  if (!criticObj || typeof criticObj !== 'object' || Array.isArray(criticObj)) {
+    return 0;
+  }
+  const obj = /** @type {Record<string, any>} */ (criticObj);
+  const score = Number(obj.score);
+  if (!Number.isFinite(score) || score <= 0) {
+    return 0;
+  }
+  if (obj.isUserOverride === true || obj.userOverride === true || obj.tier === 'override') {
+    return 5;
+  }
+  const source = String(obj.source || '').trim().toLowerCase();
+  const rawReviews = Number(obj.numReviews ?? obj.reviewCount ?? 0);
+  const numReviews = Number.isFinite(rawReviews) && rawReviews > 0 ? rawReviews : 0;
+
+  if (source === 'metacritic') {
+    return 4;
+  }
+  if (source === 'opencritic') {
+    return 3;
+  }
+  if (source === 'metacritic_user') {
+    return numReviews >= 25 ? 2 : 1;
+  }
+  if (source === 'steam') {
+    return numReviews >= 10 ? 2 : 1;
+  }
+  if (source === 'gog' || source === 'epic' || source === 'xbox' || source === 'custom') {
+    return 1;
+  }
+  return 1;
+}
+
+/**
+ * Validates that an `enriched_json` object carries a trustworthy Metacritic score anchor
+ * (`score > 0`) and is NOT a legacy `local_federated` GOG star-rating masquerading as Metacritic.
+ *
+ * @param {unknown} enrichedObj
+ * @returns {boolean}
+ */
+function isTrustedEnrichedMetacritic(enrichedObj) {
+  if (!enrichedObj || typeof enrichedObj !== 'object' || Array.isArray(enrichedObj)) {
+    return false;
+  }
+  const obj = /** @type {Record<string, any>} */ (enrichedObj);
+  if (!obj.metacritic || typeof obj.metacritic !== 'object') {
+    return false;
+  }
+  const score = Number(obj.metacritic.score);
+  if (!Number.isFinite(score) || score <= 0) {
+    return false;
+  }
+  const mcUrl = typeof obj.metacritic.url === 'string' ? obj.metacritic.url.trim() : '';
+  const hasRealMetacriticUrl = /metacritic\.com/i.test(mcUrl);
+  if (hasRealMetacriticUrl) {
+    return true;
+  }
+  const isGogLocalFederated =
+    obj.metadataQuality === 'local_federated' &&
+    (Boolean(obj.gogId) || obj.enrichedSource === 'gog' || !(Number(obj.appId) > 0));
+  if (isGogLocalFederated) {
+    return false;
+  }
+  if (obj.enrichedSource === 'gog' && !hasRealMetacriticUrl) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Checks whether an `enriched_json.reviewSummary` carries actual review counts or positive percentage.
+ *
+ * @param {unknown} summary
+ * @returns {boolean}
+ */
+function hasMeaningfulVaultReviewSummary(summary) {
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
+    return false;
+  }
+  const s = /** @type {Record<string, any>} */ (summary);
+  const totalReviews = Number(s.totalReviews ?? 0);
+  const reviewScore = Number(s.reviewScore ?? 0);
+  const positivePercent = Number(s.positivePercent ?? 0);
+  return (
+    (Number.isFinite(totalReviews) && totalReviews > 0) ||
+    (Number.isFinite(reviewScore) &&
+      reviewScore > 0 &&
+      Number.isFinite(positivePercent) &&
+      positivePercent > 0)
+  );
+}
+
+/**
+ * Carries forward existing trusted `enriched_json.metacritic` (excluding legacy GOG local_federated
+ * star ratings) and meaningful `enriched_json.reviewSummary` across same-rank or lower-rank upserts
+ * whenever incoming `enrichedMetadata` omits them (and does not remap to a different Steam AppID).
+ *
+ * @param {Record<string, any>} incomingObj
+ * @param {Record<string, any>} existingObj
+ */
+function carryForwardVaultCriticAndReviewFields(incomingObj, existingObj) {
+  if (
+    !incomingObj ||
+    typeof incomingObj !== 'object' ||
+    !existingObj ||
+    typeof existingObj !== 'object' ||
+    incomingObj.__quotaSlimmed === true ||
+    existingObj.__quotaSlimmed === true
+  ) {
+    return;
+  }
+
+  const hasDifferentPositiveAppId =
+    Number(incomingObj.appId) > 0 &&
+    Number(existingObj.appId) > 0 &&
+    Number(incomingObj.appId) !== Number(existingObj.appId);
+  if (hasDifferentPositiveAppId) {
+    return;
+  }
+
+  if (!isTrustedEnrichedMetacritic(incomingObj) && isTrustedEnrichedMetacritic(existingObj)) {
+    incomingObj.metacritic = existingObj.metacritic;
+  }
+
+  if (
+    !hasMeaningfulVaultReviewSummary(incomingObj.reviewSummary) &&
+    hasMeaningfulVaultReviewSummary(existingObj.reviewSummary)
+  ) {
+    incomingObj.reviewSummary = existingObj.reviewSummary;
+  }
+}
+
 function hasVaultNonPlaceholderStrings(list, placeholder) {
   return Boolean(
     Array.isArray(list) &&
@@ -2727,6 +2872,7 @@ class OfflineVaultService {
         }
         if (incomingEnriched && existingEnrichedObj) {
           carryForwardVaultRequirements(incomingEnriched, existingEnrichedObj);
+          carryForwardVaultCriticAndReviewFields(incomingEnriched, existingEnrichedObj);
         }
 
         const rawIncomingEnrichedJson = incomingEnriched ? JSON.stringify(incomingEnriched) : null;
@@ -3290,6 +3436,7 @@ class OfflineVaultService {
     }
     if (incomingEnrichedObj && existingEnrichedObj) {
       carryForwardVaultRequirements(incomingEnrichedObj, existingEnrichedObj);
+      carryForwardVaultCriticAndReviewFields(incomingEnrichedObj, existingEnrichedObj);
     }
 
     const incomingEnrichedJson = incomingEnrichedObj
@@ -3357,12 +3504,24 @@ class OfflineVaultService {
         : existing?.hltb_json
           ? compressVaultJson(existing.hltb_json)
           : null;
-    const finalCriticJson =
-      payload.criticScore !== undefined && payload.criticScore !== null
-        ? compressVaultJson(JSON.stringify(payload.criticScore))
-        : existing?.critic_json
-          ? compressVaultJson(existing.critic_json)
-          : null;
+    let finalCriticJson = existing?.critic_json ? compressVaultJson(existing.critic_json) : null;
+    if (payload.clearCriticScore === true) {
+      finalCriticJson = null;
+    } else if (payload.criticScore === null && payload.forceCriticScore === true) {
+      finalCriticJson = null;
+    } else if (payload.criticScore !== undefined && payload.criticScore !== null) {
+      if (payload.forceCriticScore === true) {
+        finalCriticJson = compressVaultJson(JSON.stringify(payload.criticScore));
+      } else {
+        const existingCriticObj =
+          existing && existing.critic_json ? parseVaultJson(existing.critic_json) : null;
+        const existingCriticRank = getCriticAuthorityRank(existingCriticObj);
+        const incomingCriticRank = getCriticAuthorityRank(payload.criticScore);
+        if (existingCriticRank === 0 || incomingCriticRank >= existingCriticRank) {
+          finalCriticJson = compressVaultJson(JSON.stringify(payload.criticScore));
+        }
+      }
+    }
 
     const canonicalTitle =
       typeof payload.canonicalTitle === 'string' && payload.canonicalTitle.trim()
@@ -6555,4 +6714,7 @@ module.exports = {
   sanitizeVaultPlatformEntry,
   sanitizeVaultPlatformEntriesOsFlags,
   isFederatedAssetRowCompatible,
+  getCriticAuthorityRank,
+  isTrustedEnrichedMetacritic,
+  carryForwardVaultCriticAndReviewFields,
 };

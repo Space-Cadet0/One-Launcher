@@ -733,6 +733,7 @@ export async function hydrateAllStagedCacheFromVault(): Promise<number> {
           typeof entry.ttlMs === 'number' &&
           now - entry.cachedAt >= entry.ttlMs
         ) {
+          void vaultDelete(rawKey);
           continue;
         }
         addBoundedKey(trackedCacheKeys, cacheKey);
@@ -940,6 +941,7 @@ export function clearExpiredStagedCache(options?: { onlyNegativeAndTransient?: b
   const onlyNegOrTransient = Boolean(options?.onlyNegativeAndTransient);
   const storage = getStorage();
   const now = Date.now();
+  const expiredVaultKeys = new Set<string>();
 
   if (storage) {
     try {
@@ -987,8 +989,10 @@ export function clearExpiredStagedCache(options?: { onlyNegativeAndTransient?: b
         storage.removeItem(k);
         trackedCacheKeys.delete(k);
         localStorageMirroredKeys.delete(k);
+        vaultHydratedKeys.delete(k);
         parsedStagedMemo.delete(k);
         memoryFallback.delete(k);
+        expiredVaultKeys.add(k);
       }
     } catch {}
   }
@@ -1010,11 +1014,17 @@ export function clearExpiredStagedCache(options?: { onlyNegativeAndTransient?: b
       }
       if (now - entry.cachedAt >= entry.ttlMs) {
         memoryFallback.delete(key);
+        trackedCacheKeys.delete(key);
         vaultHydratedKeys.delete(key);
         localStorageMirroredKeys.delete(key);
         parsedStagedMemo.delete(key);
+        expiredVaultKeys.add(key);
       }
     }
+  }
+
+  for (const expiredKey of expiredVaultKeys) {
+    void vaultDelete(`${STAGED_VAULT_KEY_PREFIX}${expiredKey}`);
   }
 }
 
