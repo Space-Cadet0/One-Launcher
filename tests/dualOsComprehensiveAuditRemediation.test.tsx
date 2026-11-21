@@ -136,7 +136,11 @@ describe('Dual-OS Comprehensive Audit Remediation Suite (macOS ARM64/Rosetta 2 +
         delete process.env.VITEST;
         process.env.NODE_ENV = 'production';
 
-        const runLaunchAndCaptureDyld = async (exePath: string, slug: string) => {
+        const runLaunchAndCaptureDyld = async (
+          exePath: string,
+          slug: string,
+          approveDyld = true
+        ) => {
           let capturedDyld: string | undefined = 'UNSET_SENTINEL';
           const gameId = `custom-sip-${slug}-${Date.now()}`;
           launcherEngine.saveGameLaunchConfig(
@@ -148,7 +152,10 @@ describe('Dual-OS Comprehensive Audit Remediation Suite (macOS ARM64/Rosetta 2 +
                 DYLD_INSERT_LIBRARIES: '/opt/synthetic/liboverlay.dylib',
               },
             },
-            { userDataDir: tmpUserData }
+            {
+              userDataDir: tmpUserData,
+              ...(approveDyld ? { approveLaunchCommands: true } : {}),
+            }
           );
 
           const res = await launcherEngine.launchGame(
@@ -172,13 +179,15 @@ describe('Dual-OS Comprehensive Audit Remediation Suite (macOS ARM64/Rosetta 2 +
           return capturedDyld;
         };
 
+        // 0. Unapproved saveGameLaunchConfig NEVER auto-approves DYLD_INSERT_LIBRARIES
+        expect(await runLaunchAndCaptureDyld(userBinary, 'user-macho-unapproved', false)).toBeUndefined();
         // 1. Direct Apple SIP binary (/usr/bin/env) -> strips DYLD_INSERT_LIBRARIES
         if (fs.existsSync('/usr/bin/env')) {
           expect(await runLaunchAndCaptureDyld('/usr/bin/env', 'usr-bin-env')).toBeUndefined();
         }
         // 2. User script with SIP-protected shebang (#!/usr/bin/perl) -> strips DYLD_INSERT_LIBRARIES
         expect(await runLaunchAndCaptureDyld(sipPerlScript, 'perl-shebang')).toBeUndefined();
-        // 3. Non-SIP user Mach-O binary -> preserves DYLD_INSERT_LIBRARIES
+        // 3. Explicitly approved non-SIP user Mach-O binary -> preserves DYLD_INSERT_LIBRARIES
         expect(await runLaunchAndCaptureDyld(userBinary, 'user-macho')).toBe(
           '/opt/synthetic/liboverlay.dylib'
         );
