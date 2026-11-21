@@ -323,12 +323,15 @@ export function runIntelligentNonSteamMatchPass(currentCatalog: CanonicalGame[])
         owner !== g &&
         (hasSameStorefrontConflict(owner, g) ||
           normalizeCanonicalTitle(owner.title) !== normTitle);
-      const conflictingOwner = Boolean(
-        existingOwners?.some(isConflictingOwner) || existingIdOwners?.some(isConflictingOwner)
-      );
-      if (conflictingOwner) {
+      const conflictingSteamOwner = Boolean(existingOwners?.some(isConflictingOwner));
+      if (conflictingSteamOwner) {
         return g;
       }
+      const conflictingIdOwner = Boolean(existingIdOwners?.some(isConflictingOwner));
+      // If another conflicting game occupies the legacy string id `steam-${matched}` (for instance
+      // an explicitly unlinked non-Steam override with `steamAppId: undefined`), keep `g.id` unique
+      // while still linking `steamAppId: matched`.
+      const resolvedId = conflictingIdOwner ? g.id : candidateId;
       const gogPlat = g.platforms?.find((p) => p.platformId === 'gog');
       const browseAssets = steamApi.peekCachedBrowseAssets(matched);
       const candidateHeader =
@@ -358,12 +361,12 @@ export function runIntelligentNonSteamMatchPass(currentCatalog: CanonicalGame[])
       const enriched: CanonicalGame = {
         ...g,
         steamAppId: matched,
-        id: candidateId,
+        id: resolvedId,
         headerImage: nextHeader,
         capsuleImage: nextCapsule,
       };
       registerAssigned(matched, enriched);
-      registerGameId(candidateId, enriched);
+      registerGameId(resolvedId, enriched);
       anyChanged = true;
       return enriched;
     }

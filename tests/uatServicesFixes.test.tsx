@@ -102,6 +102,7 @@ import { xboxIntegration } from '../src/services/integrations/xboxIntegration';
 import { steamAchievementsService } from '../src/services/steam/steamAchievementsService';
 import * as localSystemScanner from '../src/services/system/localSystemScanner';
 import {
+  findIncompatibleCollidingOverrideForGame,
   getUserOverrideForGame,
   saveUserOverride,
 } from '../src/services/storage/userOverrideStorage';
@@ -1040,6 +1041,358 @@ describe('UAT Phase 3 Services & Hooks Remediation Suite', () => {
         const steamOnlyAfterNonSteamOverride = vault.getGameDetail('steam-999123');
         expect(steamOnlyAfterNonSteamOverride?.criticScore?.id).toBe('mc-steam-only-original');
         expect(steamOnlyAfterNonSteamOverride?.criticScore?.score).toBe(84);
+      } finally {
+        vault.shutdown();
+        fs.rmSync(tmpVaultDir, { recursive: true, force: true });
+      }
+    });
+
+    it('self-heals pre-poisoned xbox-9P38D19T7LRV across cold-boot hydration, mergeStorefrontGames (with 9998-12-30 placeholder date), and SQLite upsertGames while restoring steamAppId 2537590', async () => {
+      const msfs2020CriticOverride = {
+        id: 'mc-microsoft-flight-simulator',
+        source: 'metacritic' as const,
+        score: 91,
+        tier: 'Mighty' as const,
+        numReviews: 71,
+        url: 'https://www.metacritic.com/game/microsoft-flight-simulator/critic-reviews/',
+        summary: 'Synthetic MSFS 2020 press consensus',
+        isVerified: true,
+        isSynthetic: false,
+      };
+      const msfs2020Override = makeUserGameOverride({
+        gameId: 'steam-2537590',
+        platformId: 'xbox',
+        platformGameId: '9NRRJLLXM68V',
+        title: 'Microsoft Flight Simulator (2020)',
+        steamAppId: null,
+        isExplicitNonSteam: true,
+        matchedStore: 'custom',
+        matchedId: 'xbox-9NRRJLLXM68V',
+        releaseDate: '2021-07-27',
+        reviewScoreOverride: msfs2020CriticOverride,
+        reviewRoute: {
+          mode: 'routed',
+          source: 'metacritic',
+          url: msfs2020CriticOverride.url,
+          metacriticSlug: 'microsoft-flight-simulator',
+          steamAppId: 2537590,
+          xboxProductId: '9NRRJLLXM68V',
+          targetTitle: 'Microsoft Flight Simulator (2020)',
+        },
+      });
+      saveUserOverride(msfs2020Override);
+
+      const msfs2020Game = makeCanonicalGame({
+        id: 'steam-2537590',
+        title: 'Microsoft Flight Simulator (2020)',
+        originalStoreTitle: 'Microsoft Flight Simulator',
+        steamAppId: undefined,
+        isExplicitNonSteam: true,
+        releaseDate: '2021-07-27',
+        reviewScoreOverride: msfs2020CriticOverride,
+        platforms: [
+          {
+            platformId: 'xbox',
+            platformGameId: '9NRRJLLXM68V',
+            xboxProductId: '9NRRJLLXM68V',
+            installed: false,
+          },
+        ],
+        enrichedMetadata: {
+          appId: 0,
+          name: 'Microsoft Flight Simulator (2020)',
+          aboutTheGame: 'MSFS 2020 description',
+          detailedDescription: 'MSFS 2020 description',
+          shortDescription: 'MSFS 2020 description',
+          headerImage: '',
+          screenshots: [],
+          movies: [],
+          developers: ['Asobo Studio'],
+          publishers: ['Xbox Game Studios'],
+          genres: ['Simulation'],
+          tags: [],
+          categories: [],
+          releaseDate: '2021-07-27',
+          supportedLanguages: 'English',
+          systemRequirements: {},
+          reviewSummary: {
+            reviewScore: 0,
+            reviewScoreDesc: '',
+            totalPositive: 0,
+            totalNegative: 0,
+            totalReviews: 0,
+            positivePercent: 0,
+          },
+          enrichedSource: 'xbox',
+          metadataQuality: 'storefront_native',
+        },
+      });
+
+      // Exact pre-poisoned state observed in live production:
+      // steamAppId was ALREADY wiped to undefined, isExplicitNonSteam === true,
+      // releaseDate === '2021-07-27', Xbox-native enrichedMetadata has appId: 0 & releaseDate: '2021-07-27',
+      // Steam CDN artwork points to 2537590, and SQLite summary_json retains reviewScoreOverride (91).
+      const prePoisoned2024: CanonicalGame = makeCanonicalGame({
+        id: 'xbox-9P38D19T7LRV',
+        title: 'Microsoft Flight Simulator 2024',
+        originalStoreTitle: 'Microsoft Flight Simulator 2024',
+        steamAppId: undefined,
+        isExplicitNonSteam: true,
+        releaseDate: '2021-07-27',
+        headerImage:
+          'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2537590/header.jpg',
+        capsuleImage:
+          'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2537590/library_600x900_2x.jpg',
+        reviewScoreOverride: msfs2020CriticOverride,
+        platforms: [
+          {
+            platformId: 'xbox',
+            platformGameId: '9P38D19T7LRV',
+            xboxProductId: '9P38D19T7LRV',
+            installed: false,
+            ownershipType: 'subscription',
+          },
+        ],
+        enrichedMetadata: {
+          appId: 0,
+          name: 'Microsoft Flight Simulator 2024',
+          aboutTheGame: 'Xbox storefront native blurb',
+          detailedDescription: 'Xbox storefront native blurb',
+          shortDescription: 'Xbox storefront native blurb',
+          headerImage:
+            'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2537590/header.jpg',
+          screenshots: [],
+          movies: [],
+          developers: ['Asobo Studio'],
+          publishers: ['Xbox Game Studios'],
+          genres: ['Simulation'],
+          tags: [],
+          categories: [],
+          releaseDate: '2021-07-27',
+          supportedLanguages: 'English',
+          systemRequirements: {},
+          reviewSummary: {
+            reviewScore: 0,
+            reviewScoreDesc: '',
+            totalPositive: 0,
+            totalNegative: 0,
+            totalReviews: 0,
+            positivePercent: 0,
+          },
+          enrichedSource: 'xbox',
+          metadataQuality: 'storefront_native',
+        },
+      });
+
+      // Link 1 check: findIncompatibleCollidingOverrideForGame MUST detect msfs2020Override
+      // even when steamAppId is undefined and enrichedMetadata.appId is 0 (via Steam CDN art & reviewScoreOverride.id)
+      const detectedCollision = findIncompatibleCollidingOverrideForGame(prePoisoned2024);
+      expect(detectedCollision?.platformGameId).toBe('9NRRJLLXM68V');
+      const slimmedWithoutReviewOv: CanonicalGame = { ...prePoisoned2024 };
+      delete slimmedWithoutReviewOv.reviewScoreOverride;
+      expect(
+        findIncompatibleCollidingOverrideForGame(slimmedWithoutReviewOv)?.platformGameId
+      ).toBe('9NRRJLLXM68V');
+
+      const tmpVaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-bug-c2-selfheal-'));
+      interface SelfHealVaultServiceLike {
+        upsertGames: (games: CanonicalGame[]) => { success: boolean; upserted?: number };
+        saveGameDetail: (payload: Record<string, unknown>) => { success: boolean };
+        getCatalogSnapshot: () => {
+          success: boolean;
+          games: CanonicalGame[];
+          details: Record<
+            string,
+            {
+              enrichedMetadata?: { releaseDate?: string; appId?: number } | null;
+              criticScore?: { id?: string; score?: number } | null;
+            }
+          >;
+        };
+        getGameDetail: (gameId: string) => {
+          enrichedMetadata?: { releaseDate?: string; appId?: number } | null;
+          criticScore?: { id?: string; score?: number } | null;
+          metadataQuality?: string;
+          enrichedAt?: number;
+        } | null;
+        shutdown: () => void;
+      }
+      const { OfflineVaultService } = nodeRequire(
+        path.join(ROOT_DIR, 'electron/launcher/offlineVaultService.cjs')
+      ) as {
+        OfflineVaultService: new (opts: { userDataDir: string }) => SelfHealVaultServiceLike;
+      };
+      const vault = new OfflineVaultService({ userDataDir: tmpVaultDir });
+
+      try {
+        // Seed SQLite vault with exact pre-poisoned MSFS 2024 row + valid MSFS 2020 row + clean MSFS 2024 Metacritic 78
+        vault.upsertGames([msfs2020Game, prePoisoned2024]);
+        vault.saveGameDetail({
+          gameId: 'xbox-9P38D19T7LRV',
+          canonicalTitle: 'Microsoft Flight Simulator 2024',
+          platforms: prePoisoned2024.platforms,
+          criticScore: {
+            id: 'mc-microsoft-flight-simulator-2024',
+            source: 'metacritic',
+            score: 78,
+          },
+        });
+
+        // Confirm pre-poisoned baseline in SQLite before healing
+        const preSnap = vault.getCatalogSnapshot();
+        const preVault2024 = preSnap.games.find((g) => g.id === 'xbox-9P38D19T7LRV');
+        expect(preVault2024?.isExplicitNonSteam).toBe(true);
+        expect(preVault2024?.releaseDate).toBe('2021-07-27');
+        expect(preVault2024?.reviewScoreOverride?.id).toBe('mc-microsoft-flight-simulator');
+        expect(preVault2024?.steamAppId).toBeUndefined();
+
+        // --- PATH A: Cold-Boot Hydration (`hydrateCatalogFromIndexedDb`) ---
+        integrationStorage.clearIntegrationStorage();
+        saveUserOverride(msfs2020Override);
+        testEnv.windowObj.electronAPI = {
+          isElectron: true,
+          offlineVault: {
+            getUserOverrides: vi.fn().mockResolvedValue({
+              'steam-2537590': msfs2020Override,
+            }),
+            getUserTagOverrides: vi.fn().mockResolvedValue({}),
+            getCatalogSnapshot: vi.fn().mockImplementation(async () => vault.getCatalogSnapshot()),
+            upsertGames: vi.fn().mockImplementation(async (games: CanonicalGame[]) =>
+              vault.upsertGames(games)
+            ),
+            deleteGames: vi.fn().mockResolvedValue({ success: true }),
+          },
+        } as unknown as Partial<ElectronAPI>;
+
+        const hydrated = await integrationStorage.hydrateCatalogFromIndexedDb();
+        expect(hydrated).not.toBeNull();
+        const hydrated2024 = hydrated?.find((g) => g.id === 'xbox-9P38D19T7LRV');
+        const hydrated2020 = hydrated?.find((g) => g.id === 'steam-2537590');
+        expect(hydrated2024).toBeDefined();
+        expect(hydrated2024?.steamAppId).toBe(2537590);
+        expect(hydrated2024?.isExplicitNonSteam).toBeUndefined();
+        expect(hydrated2024?.reviewScoreOverride).toBeUndefined();
+        expect(hydrated2024?.releaseDate).not.toBe('2021-07-27');
+        expect(hydrated2024?.releaseDate).toBe('TBA');
+        expect(hydrated2024?.enrichedMetadata).toBeUndefined();
+
+        expect(hydrated2020).toBeDefined();
+        expect(hydrated2020?.isExplicitNonSteam).toBe(true);
+        expect(hydrated2020?.releaseDate).toBe('2021-07-27');
+        expect(hydrated2020?.reviewScoreOverride?.score).toBe(91);
+
+        // Confirm SQLite row was purged during cold-boot hydration
+        const postHydrateSnap = vault.getCatalogSnapshot();
+        const postHydrateVault2024 = postHydrateSnap.games.find(
+          (g) => g.id === 'xbox-9P38D19T7LRV'
+        );
+        expect(postHydrateVault2024?.steamAppId).toBe(2537590);
+        expect(postHydrateVault2024?.isExplicitNonSteam).toBeUndefined();
+        expect(postHydrateVault2024?.reviewScoreOverride).toBeUndefined();
+        expect(postHydrateVault2024?.releaseDate).toBe('TBA');
+        expect(vault.getGameDetail('xbox-9P38D19T7LRV')?.enrichedMetadata).toBeNull();
+        expect(vault.getGameDetail('xbox-9P38D19T7LRV')?.criticScore?.score).toBe(78);
+
+        // --- PATH B: Live Sync Integrations (`mergeStorefrontGames` -> `runIntelligentNonSteamMatchPass` -> `sanitizeGameCatalog` -> `vault.upsertGames`) ---
+        // Re-seed exact pre-poisoned SQLite row, AND simulate incoming Xbox Display Catalog
+        // sentinel releaseDate `'9998-12-30T00:00:00Z'` (so validIncomingReleaseDate === undefined!)
+        vault.upsertGames([msfs2020Game, prePoisoned2024]);
+        const incomingXbox2024Sentinel = makeCanonicalGame({
+          id: 'xbox-9P38D19T7LRV',
+          title: 'Microsoft Flight Simulator 2024',
+          releaseDate: '9998-12-30T00:00:00Z',
+          steamAppId: undefined,
+          isVerifiedEntitlement: true,
+          platforms: [
+            {
+              platformId: 'xbox',
+              platformGameId: '9P38D19T7LRV',
+              xboxProductId: '9P38D19T7LRV',
+              installed: false,
+              ownershipType: 'subscription',
+            },
+          ],
+        });
+        const incomingXbox2020 = makeCanonicalGame({
+          id: 'xbox-9NRRJLLXM68V',
+          title: 'Microsoft Flight Simulator',
+          releaseDate: '2021-07-27',
+          isVerifiedEntitlement: true,
+          platforms: [
+            {
+              platformId: 'xbox',
+              platformGameId: '9NRRJLLXM68V',
+              xboxProductId: '9NRRJLLXM68V',
+              installed: false,
+              ownershipType: 'subscription',
+            },
+          ],
+        });
+
+        const mergedAfterXbox = mergeStorefrontGames(
+          [msfs2020Game, prePoisoned2024],
+          [incomingXbox2020, incomingXbox2024Sentinel],
+          'xbox',
+          { authoritativeComplete: true }
+        );
+        const matchedAfterXbox = runIntelligentNonSteamMatchPass(mergedAfterXbox);
+        const sanitizedAfterXbox = sanitizeGameCatalog(matchedAfterXbox);
+
+        const healedSync2024 = sanitizedAfterXbox.find((g) => g.id === 'xbox-9P38D19T7LRV');
+        const keptSync2020 = sanitizedAfterXbox.find((g) => g.id === 'steam-2537590');
+        expect(healedSync2024).toBeDefined();
+        expect(healedSync2024?.title).toBe('Microsoft Flight Simulator 2024');
+        expect(healedSync2024?.steamAppId).toBe(2537590);
+        expect(healedSync2024?.isExplicitNonSteam).toBeUndefined();
+        expect(healedSync2024?.reviewScoreOverride).toBeUndefined();
+        expect(healedSync2024?.releaseDate).toBe('TBA');
+        expect(healedSync2024?.enrichedMetadata).toBeUndefined();
+
+        expect(keptSync2020).toBeDefined();
+        expect(keptSync2020?.isExplicitNonSteam).toBe(true);
+        expect(keptSync2020?.releaseDate).toBe('2021-07-27');
+        expect(keptSync2020?.reviewScoreOverride?.id).toBe('mc-microsoft-flight-simulator');
+
+        // Link 3: Upsert healed catalog into pre-poisoned SQLite vault
+        vault.upsertGames(sanitizedAfterXbox);
+        const postSyncSnap = vault.getCatalogSnapshot();
+        const postSyncVault2024 = postSyncSnap.games.find((g) => g.id === 'xbox-9P38D19T7LRV');
+        expect(postSyncVault2024?.steamAppId).toBe(2537590);
+        expect(postSyncVault2024?.isExplicitNonSteam).toBeUndefined();
+        expect(postSyncVault2024?.reviewScoreOverride).toBeUndefined();
+        expect(postSyncVault2024?.releaseDate).toBe('TBA');
+        expect(vault.getGameDetail('xbox-9P38D19T7LRV')?.enrichedMetadata).toBeNull();
+        expect(vault.getGameDetail('xbox-9P38D19T7LRV')?.metadataQuality).toBe(
+          'skeleton_fallback'
+        );
+        expect(vault.getGameDetail('xbox-9P38D19T7LRV')?.criticScore?.score).toBe(78);
+
+        // --- PATH C: Universal Invariant on unrelated un-overridden game (zero overrides in storage) ---
+        testEnv.localStorageMock.clear();
+        const staleUnoverriddenGog = makeCanonicalGame({
+          id: 'gog-777001',
+          title: 'Synthetic Orbital Pioneer',
+          steamAppId: undefined,
+          isExplicitNonSteam: true,
+          releaseDate: '2022-03-15',
+          reviewScoreOverride: {
+            id: 'mc-stale-override',
+            source: 'metacritic',
+            score: 64,
+            tier: 'Fair',
+            numReviews: 12,
+            url: 'https://www.metacritic.com/game/synthetic-orbital/critic-reviews/',
+            summary: 'Stale removed override',
+            isVerified: true,
+            isSynthetic: false,
+          },
+          platforms: [{ platformId: 'gog', platformGameId: '777001', installed: false }],
+        });
+        const universalSanitized = sanitizeGameCatalog([staleUnoverriddenGog], {
+          allowNewPurchases: true,
+        });
+        expect(universalSanitized[0]?.isExplicitNonSteam).toBeUndefined();
+        expect(universalSanitized[0]?.reviewScoreOverride).toBeUndefined();
       } finally {
         vault.shutdown();
         fs.rmSync(tmpVaultDir, { recursive: true, force: true });

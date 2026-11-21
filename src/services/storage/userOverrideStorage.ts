@@ -12,6 +12,7 @@ import { sanitizeAllowedStoreUri } from '../common/htmlSanitizer';
 import { getSafeLocalStorage } from '../common/runtimeEnv';
 import { stripHtmlToPlainSynopsis } from '../common/synopsisTextUtils';
 import { getAlphabeticalTitleSortKey } from '../common/titleSortUtils';
+import { sanitizeStoreReleaseDate } from '../common/titleUtils';
 
 function isTestEnv(): boolean {
   try {
@@ -1814,16 +1815,19 @@ interface OverrideLookupIndex {
   byGameId: Map<string, UserGameOverride[]>;
   byPlatComposite: Map<string, UserGameOverride[]>;
   byBarePlatGameId: Map<string, UserGameOverride[]>;
+  bySteamAppId: Map<number, UserGameOverride[]>;
+  byReviewOverrideId: Map<string, UserGameOverride[]>;
+  allOverrides: UserGameOverride[];
 }
 
 const overrideLookupIndexCache = new WeakMap<UserGameOverridesMap, OverrideLookupIndex>();
 
-function pushUniqueOverride(
-  bucketMap: Map<string, UserGameOverride[]>,
-  key: string,
+function pushUniqueOverride<K>(
+  bucketMap: Map<K, UserGameOverride[]>,
+  key: K,
   ov: UserGameOverride
 ): void {
-  if (!key) return;
+  if (key === undefined || key === null || key === '') return;
   let bucket = bucketMap.get(key);
   if (!bucket) {
     bucket = [ov];
@@ -1833,6 +1837,8 @@ function pushUniqueOverride(
   }
 }
 
+const OVERRIDE_STEAM_KEY_RE = /^steam-(\d+)$/i;
+
 function getOverrideLookupIndex(map: UserGameOverridesMap): OverrideLookupIndex {
   const cached = overrideLookupIndexCache.get(map);
   if (cached) return cached;
@@ -1840,15 +1846,57 @@ function getOverrideLookupIndex(map: UserGameOverridesMap): OverrideLookupIndex 
   const byGameId = new Map<string, UserGameOverride[]>();
   const byPlatComposite = new Map<string, UserGameOverride[]>();
   const byBarePlatGameId = new Map<string, UserGameOverride[]>();
+  const bySteamAppId = new Map<number, UserGameOverride[]>();
+  const byReviewOverrideId = new Map<string, UserGameOverride[]>();
+  const allOverrides: UserGameOverride[] = [];
+  const seenOverrides = new Set<UserGameOverride>();
   let hasAny = false;
+
+  const addSteamAppIdIndex = (rawId: unknown, ov: UserGameOverride) => {
+    const num = Number(rawId);
+    if (Number.isFinite(num) && num > 0) {
+      pushUniqueOverride(bySteamAppId, num, ov);
+    }
+  };
 
   for (const key in map) {
     if (!Object.prototype.hasOwnProperty.call(map, key)) continue;
     const ov = map[key];
     if (!ov) continue;
     hasAny = true;
+    if (!seenOverrides.has(ov)) {
+      seenOverrides.add(ov);
+      allOverrides.push(ov);
+    }
+    const keySteamMatch = key.match(OVERRIDE_STEAM_KEY_RE);
+    if (keySteamMatch) {
+      addSteamAppIdIndex(keySteamMatch[1], ov);
+    } else if (/^\d+$/.test(key)) {
+      addSteamAppIdIndex(key, ov);
+    }
     if (ov.gameId) {
       pushUniqueOverride(byGameId, ov.gameId, ov);
+      const ovSteamMatch = ov.gameId.match(OVERRIDE_STEAM_KEY_RE);
+      if (ovSteamMatch) {
+        addSteamAppIdIndex(ovSteamMatch[1], ov);
+      }
+    }
+    if (typeof ov.steamAppId === 'number' && ov.steamAppId > 0) {
+      addSteamAppIdIndex(ov.steamAppId, ov);
+    }
+    if (typeof ov.reviewRoute?.steamAppId === 'number' && ov.reviewRoute.steamAppId > 0) {
+      addSteamAppIdIndex(ov.reviewRoute.steamAppId, ov);
+    }
+    if (typeof ov.metadataRoute?.steamAppId === 'number' && ov.metadataRoute.steamAppId > 0) {
+      addSteamAppIdIndex(ov.metadataRoute.steamAppId, ov);
+    }
+    if (
+      ov.reviewScoreOverride &&
+      typeof ov.reviewScoreOverride === 'object' &&
+      typeof ov.reviewScoreOverride.id === 'string' &&
+      ov.reviewScoreOverride.id.trim().length > 0
+    ) {
+      pushUniqueOverride(byReviewOverrideId, ov.reviewScoreOverride.id.trim(), ov);
     }
     if (ov.platformGameId) {
       const bareId = String(ov.platformGameId);
@@ -1870,6 +1918,9 @@ function getOverrideLookupIndex(map: UserGameOverridesMap): OverrideLookupIndex 
     byGameId,
     byPlatComposite,
     byBarePlatGameId,
+    bySteamAppId,
+    byReviewOverrideId,
+    allOverrides,
   };
   overrideLookupIndexCache.set(map, built);
   return built;
@@ -1974,15 +2025,261 @@ export function doesReviewScoreOverrideMatch(
   );
 }
 
+const STEAM_CDN_APP_ID_RE = /\/steam\/apps\/(\d+)\//i;
+
+const MONTH_NAME_TO_NUM: Readonly<Record<string, number>> = {
+  jan: 1,
+  january: 1,
+  feb: 2,
+  february: 2,
+  mar: 3,
+  march: 3,
+  apr: 4,
+  april: 4,
+  may: 5,
+  jun: 6,
+  june: 6,
+  jul: 7,
+  july: 7,
+  aug: 8,
+  august: 8,
+  sep: 9,
+  sept: 9,
+  september: 9,
+  oct: 10,
+  october: 10,
+  nov: 11,
+  november: 11,
+  dec: 12,
+  december: 12,
+};
+
+function extractCalendarYmd(raw?: string | null): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const iso = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$/);
+  if (iso) {
+    return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  }
+  const mdy = trimmed.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})$/);
+  if (mdy) {
+    const month = MONTH_NAME_TO_NUM[mdy[1].toLowerCase()];
+    if (month) {
+      return `${mdy[3]}-${String(month).padStart(2, '0')}-${String(Number(mdy[2])).padStart(2, '0')}`;
+    }
+  }
+  const dmy = trimmed.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})$/);
+  if (dmy) {
+    const month = MONTH_NAME_TO_NUM[dmy[2].toLowerCase()];
+    if (month) {
+      return `${dmy[3]}-${String(month).padStart(2, '0')}-${String(Number(dmy[1])).padStart(2, '0')}`;
+    }
+  }
+  return null;
+}
+
+export type GameArtworkUrlSource = Pick<
+  Partial<CanonicalGame>,
+  'headerImage' | 'capsuleImage' | 'enrichedMetadata'
+> & {
+  coverUrl?: string;
+};
+
+/**
+ * Extracts all unique positive Steam App IDs embedded in Steam CDN artwork URLs
+ * (`headerImage`, `capsuleImage`, `coverUrl`, and `enrichedMetadata` art) matching `/\/steam\/apps\/(\d+)\//`.
+ */
+export function extractSteamAppIdsFromArtworkUrls(game?: GameArtworkUrlSource | null): number[] {
+  if (!game || typeof game !== 'object') return [];
+  const urls = [
+    game.headerImage,
+    game.capsuleImage,
+    game.coverUrl,
+    game.enrichedMetadata?.headerImage,
+    game.enrichedMetadata?.capsuleImage,
+  ];
+  const found: number[] = [];
+  for (const url of urls) {
+    if (typeof url !== 'string' || !url) continue;
+    const match = url.match(STEAM_CDN_APP_ID_RE);
+    if (!match) continue;
+    const parsed = Number(match[1]);
+    if (Number.isFinite(parsed) && parsed > 0 && !found.includes(parsed)) {
+      found.push(parsed);
+    }
+  }
+  return found;
+}
+
+/**
+ * Extracts the first positive Steam App ID from a game's Steam CDN artwork URLs.
+ */
+export function extractSteamAppIdFromArtworkUrls(
+  game?: GameArtworkUrlSource | null
+): number | undefined {
+  const ids = extractSteamAppIdsFromArtworkUrls(game);
+  return ids.length > 0 ? ids[0] : undefined;
+}
+
+/**
+ * Collects all non-placeholder release date strings pinned on or baselined by a `UserGameOverride`.
+ */
+export function getOverrideLeakableReleaseDates(ov?: UserGameOverride | null): string[] {
+  if (!ov || typeof ov !== 'object') return [];
+  const legacyOv = ov as UserGameOverride & { customReleaseDate?: string };
+  const rawDates = [ov.releaseDate, legacyOv.customReleaseDate, ov.nativeBaseline?.releaseDate];
+  const out: string[] = [];
+  for (const d of rawDates) {
+    if (typeof d !== 'string') continue;
+    const trimmed = d.trim();
+    if (!trimmed || /^tba$/i.test(trimmed)) continue;
+    if (!out.includes(trimmed)) {
+      out.push(trimmed);
+    }
+  }
+  return out;
+}
+
+/**
+ * Collects release dates from any sibling catalog entry owned by `conflictingOv` (for overrides
+ * whose donor `releaseDate` lived on the sibling catalog record rather than the override object).
+ */
+export function collectSiblingDonorReleaseDates(
+  conflictingOv: UserGameOverride | undefined | null,
+  catalog: readonly CanonicalGame[] | undefined | null,
+  overrides: UserGameOverridesMap,
+  excludeGame?: CanonicalGame | null
+): string[] {
+  if (!conflictingOv || !Array.isArray(catalog) || catalog.length === 0) return [];
+  const out: string[] = [];
+  const addDate = (raw?: string | null) => {
+    if (typeof raw !== 'string') return;
+    const trimmed = raw.trim();
+    if (!trimmed || /^tba$/i.test(trimmed)) return;
+    if (!out.includes(trimmed)) out.push(trimmed);
+  };
+  for (const entry of catalog) {
+    if (!entry || entry === excludeGame) continue;
+    const entryOv = getUserOverrideForGame(entry, overrides);
+    if (
+      entryOv &&
+      (entryOv === conflictingOv ||
+        (Boolean(entryOv.gameId) &&
+          entryOv.gameId === conflictingOv.gameId &&
+          entryOv.platformId === conflictingOv.platformId &&
+          entryOv.platformGameId === conflictingOv.platformGameId))
+    ) {
+      addDate(entry.releaseDate);
+      addDate(entry.enrichedMetadata?.releaseDate);
+    }
+  }
+  return out;
+}
+
+/**
+ * Collects icon URLs from `conflictingOv` and any sibling catalog entry owned by `conflictingOv`
+ * so leaked sibling icons can be stripped when self-healing a pre-poisoned un-overridden game.
+ */
+export function collectSiblingDonorIconUrls(
+  conflictingOv: UserGameOverride | undefined | null,
+  catalog: readonly CanonicalGame[] | undefined | null,
+  overrides: UserGameOverridesMap,
+  excludeGame?: CanonicalGame | null
+): string[] {
+  if (!conflictingOv) return [];
+  const out: string[] = [];
+  const addUrl = (raw?: string | null) => {
+    if (typeof raw !== 'string') return;
+    const trimmed = raw.trim();
+    if (trimmed && !out.includes(trimmed)) out.push(trimmed);
+  };
+  addUrl(conflictingOv.iconUrl);
+  addUrl(conflictingOv.nativeBaseline?.iconUrl);
+  if (Array.isArray(catalog) && catalog.length > 0) {
+    for (const entry of catalog) {
+      if (!entry || entry === excludeGame) continue;
+      const entryOv = getUserOverrideForGame(entry, overrides);
+      if (
+        entryOv &&
+        (entryOv === conflictingOv ||
+          (Boolean(entryOv.gameId) &&
+            entryOv.gameId === conflictingOv.gameId &&
+            entryOv.platformId === conflictingOv.platformId &&
+            entryOv.platformGameId === conflictingOv.platformGameId))
+      ) {
+        addUrl(entry.iconUrl);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Returns `true` when `dateStr` matches a release date carried by `ov` or its sibling donor catalog entry.
+ */
+export function doesReleaseDateMatchOverride(
+  dateStr: string | undefined | null,
+  ov?: UserGameOverride | null,
+  extraDonorDates?: readonly string[]
+): boolean {
+  if (!dateStr || typeof dateStr !== 'string') return false;
+  const trimmed = dateStr.trim();
+  if (!trimmed || /^tba$/i.test(trimmed)) return false;
+
+  const candidates = getOverrideLeakableReleaseDates(ov);
+  if (Array.isArray(extraDonorDates)) {
+    for (const d of extraDonorDates) {
+      if (typeof d === 'string') {
+        const dt = d.trim();
+        if (dt && !/^tba$/i.test(dt) && !candidates.includes(dt)) {
+          candidates.push(dt);
+        }
+      }
+    }
+  }
+  if (candidates.length === 0) return false;
+
+  const normA = sanitizeStoreReleaseDate(trimmed) || trimmed;
+  const ymdA = extractCalendarYmd(normA) || extractCalendarYmd(trimmed);
+
+  for (const cand of candidates) {
+    if (trimmed === cand) return true;
+    const normB = sanitizeStoreReleaseDate(cand) || cand;
+    if (normA === normB) return true;
+    if (ymdA) {
+      const ymdB = extractCalendarYmd(normB) || extractCalendarYmd(cand);
+      if (ymdB && ymdA === ymdB) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Resolves a cached/instant offline Steam App ID from a game title using the registered
+ * instant title matcher without requiring an active `steamAppId` on the game object.
+ */
+export function resolveInstantSteamAppIdFromTitle(title?: string | null): number | undefined {
+  if (!title || typeof title !== 'string' || !registeredInstantSteamTitleMatcher) {
+    return undefined;
+  }
+  const matched = registeredInstantSteamTitleMatcher(title);
+  return typeof matched === 'number' && Number.isFinite(matched) && matched > 0
+    ? matched
+    : undefined;
+}
+
 /**
  * Finds an incompatible user override pinned to a different product ID on the same storefront
- * that collides with `game`'s ID or Steam App ID / `enrichedMetadata.appId` (for a game that
- * has NO compatible override of its own). Returns `undefined` when `game` owns a compatible
- * override or has no same-storefront colliding override.
+ * that collides with `game`'s ID, Steam App ID, `enrichedMetadata.appId`, `newGame?.steamAppId`,
+ * Steam CDN artwork URLs (`/\/steam\/apps\/(\d+)\//`), instant title Steam match, or leaked
+ * `reviewScoreOverride` (for a game that has NO compatible override of its own).
+ * Returns `undefined` when `game` owns a compatible override or has no same-storefront colliding override.
  */
 export function findIncompatibleCollidingOverrideForGame(
   game: CanonicalGame,
-  overrides?: UserGameOverridesMap
+  overrides?: UserGameOverridesMap,
+  newGame?: (Partial<CanonicalGame> & { coverUrl?: string }) | null
 ): UserGameOverride | undefined {
   if (!game || !Array.isArray(game.platforms) || game.platforms.length === 0) return undefined;
   const map = overrides ?? loadUserOverrides();
@@ -1999,31 +2296,67 @@ export function findIncompatibleCollidingOverrideForGame(
       candidates.push(ov);
     }
   };
+  const addBucket = (bucket?: UserGameOverride[]) => {
+    if (!bucket) return;
+    for (const c of bucket) addCandidate(c);
+  };
 
   if (game.id) {
     addCandidate(map[game.id]);
-    const byId = idx.byGameId.get(game.id);
-    if (byId) {
-      for (const c of byId) addCandidate(c);
+    addBucket(idx.byGameId.get(game.id));
+  }
+  if (newGame?.id && newGame.id !== game.id) {
+    addCandidate(map[newGame.id]);
+    addBucket(idx.byGameId.get(newGame.id));
+  }
+
+  const appIds = new Set<number>();
+  const addAppId = (rawId: unknown) => {
+    const num = Number(rawId);
+    if (Number.isFinite(num) && num > 0) {
+      appIds.add(num);
+    }
+  };
+  addAppId(game.steamAppId);
+  addAppId(game.enrichedMetadata?.appId);
+  addAppId(newGame?.steamAppId);
+  addAppId(newGame?.enrichedMetadata?.appId);
+  for (const artId of extractSteamAppIdsFromArtworkUrls(game as GameArtworkUrlSource)) {
+    appIds.add(artId);
+  }
+  if (newGame) {
+    for (const artId of extractSteamAppIdsFromArtworkUrls(newGame)) {
+      appIds.add(artId);
     }
   }
-  const appIds = new Set<number>();
-  if (typeof game.steamAppId === 'number' && game.steamAppId > 0) {
-    appIds.add(game.steamAppId);
+  addAppId(resolveInstantSteamAppIdFromTitle(game.title));
+  if (newGame?.title && newGame.title !== game.title) {
+    addAppId(resolveInstantSteamAppIdFromTitle(newGame.title));
   }
-  const enrichedAppId = Number(game.enrichedMetadata?.appId);
-  if (Number.isFinite(enrichedAppId) && enrichedAppId > 0) {
-    appIds.add(enrichedAppId);
-  }
+
   for (const appId of appIds) {
     const steamKey = `steam-${appId}`;
     addCandidate(map[steamKey]);
     addCandidate(map[String(appId)]);
-    const bySteamId = idx.byGameId.get(steamKey);
-    if (bySteamId) {
-      for (const c of bySteamId) addCandidate(c);
+    addBucket(idx.byGameId.get(steamKey));
+    addBucket(idx.bySteamAppId.get(appId));
+  }
+
+  const reviewPayloads = [game.reviewScoreOverride, newGame?.reviewScoreOverride];
+  for (const rev of reviewPayloads) {
+    if (!rev || typeof rev !== 'object') continue;
+    if (typeof rev.id === 'string' && rev.id.trim().length > 0) {
+      addBucket(idx.byReviewOverrideId.get(rev.id.trim()));
+    }
+    for (const ov of idx.allOverrides) {
+      if (doesReviewScoreOverrideMatch(rev, ov.reviewScoreOverride)) {
+        addCandidate(ov);
+      }
     }
   }
+
+  let bestMatch: UserGameOverride | undefined;
+  let bestScore = -1;
 
   for (const ov of candidates) {
     if (isUserOverrideCompatibleWithGame(ov, game)) continue;
@@ -2042,12 +2375,226 @@ export function findIncompatibleCollidingOverrideForGame(
         String(p.platformGameId || '').toLowerCase() !== pinnedPlatGameId &&
         (!p.xboxProductId || String(p.xboxProductId).toLowerCase() !== pinnedPlatGameId)
     );
-    if (ownsDifferentProductOnSameStore) {
-      return ov;
+    if (!ownsDifferentProductOnSameStore) continue;
+
+    let evidenceScore = 0;
+    if (doesReviewScoreOverrideMatch(game.reviewScoreOverride, ov.reviewScoreOverride)) {
+      evidenceScore += 4;
+    }
+    if (
+      doesReleaseDateMatchOverride(game.releaseDate, ov) ||
+      doesReleaseDateMatchOverride(game.enrichedMetadata?.releaseDate, ov)
+    ) {
+      evidenceScore += 2;
+    }
+    if (ov.isExplicitNonSteam === true || ov.steamAppId === null) {
+      evidenceScore += 1;
+    }
+    if (evidenceScore > bestScore) {
+      bestScore = evidenceScore;
+      bestMatch = ov;
     }
   }
 
-  return undefined;
+  return bestMatch;
+}
+
+export interface SelfHealUnoverriddenGameOptions {
+  newGame?: (Partial<CanonicalGame> & { coverUrl?: string }) | null;
+  incomingValidReleaseDate?: string;
+  catalog?: readonly CanonicalGame[];
+  allowSteamAppIdRestore?: boolean;
+}
+
+export interface SelfHealUnoverriddenGameResult {
+  game: CanonicalGame;
+  healed: boolean;
+  conflictingOverride?: UserGameOverride;
+  leakedExplicitNonSteam: boolean;
+  leakedReviewScoreOverride: boolean;
+  leakedReleaseDate: boolean;
+  clearedPoisonedEnriched: boolean;
+  restoredSteamAppId?: number;
+}
+
+/**
+ * Enforces the universal un-overridden game invariants on a game that has NO matching compatible
+ * `UserGameOverride`:
+ * 1. An un-overridden game can NEVER legitimately carry `isExplicitNonSteam === true` or
+ *    `reviewScoreOverride` (always stripped).
+ * 2. When a colliding same-storefront sibling override is detected, any leaked `releaseDate`
+ *    (top-level or `enrichedMetadata.releaseDate`) is cleared even when no incoming store release
+ *    date is available, and poisoned `enrichedMetadata` lacking an authoritative recipient Steam
+ *    App ID is purged so fresh enrichment repopulates it.
+ * 3. When `steamAppId` was stripped during sibling-override bleed, restores the valid Steam App ID
+ *    from `newGame?.steamAppId`, recipient Steam `enrichedMetadata.appId`, Steam CDN artwork URLs,
+ *    or instant title matching.
+ */
+export function selfHealUnoverriddenGameLeakedFields(
+  game: CanonicalGame,
+  overrides?: UserGameOverridesMap,
+  options?: SelfHealUnoverriddenGameOptions
+): SelfHealUnoverriddenGameResult {
+  const noOp: SelfHealUnoverriddenGameResult = {
+    game,
+    healed: false,
+    leakedExplicitNonSteam: false,
+    leakedReviewScoreOverride: false,
+    leakedReleaseDate: false,
+    clearedPoisonedEnriched: false,
+  };
+  if (!game || typeof game !== 'object') return noOp;
+
+  const map = overrides ?? loadUserOverrides();
+  if (map && getUserOverrideForGame(game, map)) {
+    return noOp;
+  }
+
+  const leakedExplicitNonSteam = game.isExplicitNonSteam === true;
+  const leakedReviewScoreOverride = game.reviewScoreOverride !== undefined;
+  const conflictingOverride = map
+    ? findIncompatibleCollidingOverrideForGame(game, map, options?.newGame)
+    : undefined;
+  const donorDates =
+    conflictingOverride && map && options?.catalog
+      ? collectSiblingDonorReleaseDates(conflictingOverride, options.catalog, map, game)
+      : [];
+
+  const leakedTopReleaseDate = Boolean(
+    conflictingOverride &&
+      doesReleaseDateMatchOverride(game.releaseDate, conflictingOverride, donorDates)
+  );
+  const leakedEnrichedReleaseDate = Boolean(
+    conflictingOverride &&
+      doesReleaseDateMatchOverride(
+        game.enrichedMetadata?.releaseDate,
+        conflictingOverride,
+        donorDates
+      )
+  );
+  const leakedReleaseDate = Boolean(
+    leakedTopReleaseDate ||
+      (leakedEnrichedReleaseDate && (leakedExplicitNonSteam || leakedReviewScoreOverride))
+  );
+
+  const hadPoisoningSignal = Boolean(
+    leakedExplicitNonSteam || leakedReviewScoreOverride || conflictingOverride
+  );
+  let restoredSteamAppId: number | undefined;
+  if (options?.allowSteamAppIdRestore !== false && !game.steamAppId) {
+    if (typeof options?.newGame?.steamAppId === 'number' && options.newGame.steamAppId > 0) {
+      restoredSteamAppId = options.newGame.steamAppId;
+    } else if (hadPoisoningSignal) {
+      const enrichedRecipientAppId =
+        Number(game.enrichedMetadata?.appId) > 0 && game.enrichedMetadata?.enrichedSource !== 'xbox'
+          ? Number(game.enrichedMetadata?.appId)
+          : undefined;
+      restoredSteamAppId =
+        enrichedRecipientAppId ||
+        extractSteamAppIdFromArtworkUrls(game as GameArtworkUrlSource) ||
+        extractSteamAppIdFromArtworkUrls(options?.newGame) ||
+        resolveInstantSteamAppIdFromTitle(game.title);
+    }
+  }
+
+  const effectiveSteamAppId = game.steamAppId || restoredSteamAppId;
+  const hasAuthoritativeRecipientAppId = Boolean(
+    game.enrichedMetadata &&
+      Number(game.enrichedMetadata.appId) > 0 &&
+      game.enrichedMetadata.enrichedSource !== 'xbox' &&
+      (!effectiveSteamAppId || Number(game.enrichedMetadata.appId) === effectiveSteamAppId)
+  );
+  const clearedPoisonedEnriched = Boolean(
+    game.enrichedMetadata && leakedEnrichedReleaseDate && !hasAuthoritativeRecipientAppId
+  );
+  const shouldPatchEnrichedDate = Boolean(
+    game.enrichedMetadata && leakedEnrichedReleaseDate && hasAuthoritativeRecipientAppId
+  );
+  const donorIconUrls =
+    conflictingOverride &&
+    map &&
+    (leakedExplicitNonSteam || leakedReviewScoreOverride || leakedReleaseDate)
+      ? collectSiblingDonorIconUrls(conflictingOverride, options?.catalog, map, game)
+      : [];
+  const leakedIconUrl = Boolean(
+    typeof game.iconUrl === 'string' &&
+      game.iconUrl.trim().length > 0 &&
+      donorIconUrls.includes(game.iconUrl.trim())
+  );
+
+  if (
+    !leakedExplicitNonSteam &&
+    !leakedReviewScoreOverride &&
+    !leakedReleaseDate &&
+    !clearedPoisonedEnriched &&
+    !shouldPatchEnrichedDate &&
+    !restoredSteamAppId &&
+    !leakedIconUrl
+  ) {
+    return {
+      ...noOp,
+      conflictingOverride,
+    };
+  }
+
+  const next: CanonicalGame = { ...game };
+  if (leakedExplicitNonSteam) {
+    delete next.isExplicitNonSteam;
+  }
+  if (leakedReviewScoreOverride) {
+    delete next.reviewScoreOverride;
+  }
+  if (restoredSteamAppId) {
+    next.steamAppId = restoredSteamAppId;
+  }
+  if (clearedPoisonedEnriched) {
+    next.enrichedMetadata = undefined;
+  } else if (shouldPatchEnrichedDate && next.enrichedMetadata) {
+    const replacementMetaDate =
+      options?.incomingValidReleaseDate ||
+      (!leakedTopReleaseDate && next.releaseDate
+        ? sanitizeStoreReleaseDate(next.releaseDate)
+        : undefined) ||
+      'TBA';
+    next.enrichedMetadata = {
+      ...next.enrichedMetadata,
+      releaseDate: replacementMetaDate,
+    };
+  }
+  if (leakedReleaseDate) {
+    const cleanEnrichedDate =
+      !clearedPoisonedEnriched &&
+      next.enrichedMetadata?.releaseDate &&
+      !doesReleaseDateMatchOverride(
+        next.enrichedMetadata.releaseDate,
+        conflictingOverride,
+        donorDates
+      )
+        ? sanitizeStoreReleaseDate(next.enrichedMetadata.releaseDate)
+        : undefined;
+    next.releaseDate = options?.incomingValidReleaseDate || cleanEnrichedDate || 'TBA';
+  }
+  if (leakedIconUrl) {
+    if (
+      options?.newGame?.iconUrl &&
+      !donorIconUrls.includes(options.newGame.iconUrl.trim())
+    ) {
+      next.iconUrl = options.newGame.iconUrl;
+    } else {
+      delete next.iconUrl;
+    }
+  }
+
+  return {
+    game: next,
+    healed: true,
+    conflictingOverride,
+    leakedExplicitNonSteam,
+    leakedReviewScoreOverride,
+    leakedReleaseDate,
+    clearedPoisonedEnriched,
+    restoredSteamAppId,
+  };
 }
 
 /**
@@ -2591,7 +3138,9 @@ export function getAllUserOverrides(): UserGameOverridesMap {
 }
 
 /**
- * Applies all user-defined overrides across an entire canonical catalog.
+ * Applies all user-defined overrides across an entire canonical catalog and strips stale
+ * override-only fields (`isExplicitNonSteam === true`, `reviewScoreOverride`) from any game
+ * that has no matching compatible override.
  */
 export function applyUserOverridesToCatalog(
   catalog: CanonicalGame[],
@@ -2599,12 +3148,28 @@ export function applyUserOverridesToCatalog(
 ): CanonicalGame[] {
   if (!Array.isArray(catalog)) return [];
   const map = overrides ?? loadUserOverrides();
-  if (!map || getOverrideLookupIndex(map).isEmpty) return catalog;
+  const hasAnyOverrides = Boolean(map && !getOverrideLookupIndex(map).isEmpty);
 
-  return catalog.map((game) => {
-    const ov = getUserOverrideForGame(game, map);
-    return ov ? applyUserOverrideToGame(game, ov) : game;
+  let changed = false;
+  const nextCatalog = catalog.map((game) => {
+    if (!game) return game;
+    const ov = hasAnyOverrides ? getUserOverrideForGame(game, map) : undefined;
+    if (ov) {
+      const applied = applyUserOverrideToGame(game, ov);
+      if (applied !== game) changed = true;
+      return applied;
+    }
+    if (game.isExplicitNonSteam === true || game.reviewScoreOverride !== undefined) {
+      const cleaned: CanonicalGame = { ...game };
+      delete cleaned.isExplicitNonSteam;
+      delete cleaned.reviewScoreOverride;
+      changed = true;
+      return cleaned;
+    }
+    return game;
   });
+
+  return changed ? nextCatalog : catalog;
 }
 
 export interface EffectiveSteamLookupInput {

@@ -387,10 +387,10 @@ export function disambiguateSameStorefrontCollision(params: {
 
   // B. Disambiguate Shared steamAppId / id Between Same-Storefront Editions
   const curExisting = cleaned[candidateIndex];
-  if (
-    (curExisting.steamAppId && game.steamAppId && curExisting.steamAppId === game.steamAppId) ||
-    curExisting.id === game.id
-  ) {
+  const sharesSteamAppId = Boolean(
+    curExisting.steamAppId && game.steamAppId && curExisting.steamAppId === game.steamAppId
+  );
+  if (sharesSteamAppId || curExisting.id === game.id) {
     const sharedAppId = curExisting.steamAppId || game.steamAppId;
     const existingHasSteam = curExisting.platforms.some((p) => p.platformId === 'steam');
     const gameHasSteam = game.platforms.some((p) => p.platformId === 'steam');
@@ -445,9 +445,9 @@ export function disambiguateSameStorefrontCollision(params: {
           cleaned[candidateIndex] = {
             ...curExisting,
             id: nextId,
-            steamAppId: undefined,
+            ...(sharesSteamAppId ? { steamAppId: undefined } : {}),
           };
-          if (sharedAppId && steamIdToIndex.get(sharedAppId) === candidateIndex) {
+          if (sharesSteamAppId && sharedAppId && steamIdToIndex.get(sharedAppId) === candidateIndex) {
             steamIdToIndex.delete(sharedAppId);
           }
           if (oldId && idToIndex.get(oldId) === candidateIndex) {
@@ -458,7 +458,7 @@ export function disambiguateSameStorefrontCollision(params: {
           game = {
             ...game,
             id: nextId,
-            steamAppId: undefined,
+            ...(sharesSteamAppId ? { steamAppId: undefined } : {}),
           };
         }
       }

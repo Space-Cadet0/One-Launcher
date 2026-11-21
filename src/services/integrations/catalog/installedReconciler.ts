@@ -95,25 +95,36 @@ export function collectDroppedAndSelfHealedCatalogDelta(
           }
         }
       }
-    } else if (Array.isArray(sg.platforms)) {
-      const survivingPlats = Array.isArray(survivingGame.platforms) ? survivingGame.platforms : [];
-      if (survivingPlats.length !== sg.platforms.length) {
+    } else {
+      if (
+        Boolean(sg.isExplicitNonSteam) !== Boolean(survivingGame.isExplicitNonSteam) ||
+        sg.steamAppId !== survivingGame.steamAppId ||
+        sg.releaseDate !== survivingGame.releaseDate ||
+        (sg.reviewScoreOverride !== undefined) !== (survivingGame.reviewScoreOverride !== undefined) ||
+        (Boolean(sg.enrichedMetadata) && !survivingGame.enrichedMetadata)
+      ) {
         platformOrVersionHealed = true;
       }
-      for (const p of sg.platforms) {
-        if (!p) continue;
-        const matchedSurviving = survivingPlats.find((sp) => sp.platformId === p.platformId);
-        if (!matchedSurviving) {
+      if (Array.isArray(sg.platforms)) {
+        const survivingPlats = Array.isArray(survivingGame.platforms) ? survivingGame.platforms : [];
+        if (survivingPlats.length !== sg.platforms.length) {
           platformOrVersionHealed = true;
-          if (p.platformId === 'xbox') {
-            collectXboxOrphanVaultIdVariants(p, survivingIdSet, droppedSet);
+        }
+        for (const p of sg.platforms) {
+          if (!p) continue;
+          const matchedSurviving = survivingPlats.find((sp) => sp.platformId === p.platformId);
+          if (!matchedSurviving) {
+            platformOrVersionHealed = true;
+            if (p.platformId === 'xbox') {
+              collectXboxOrphanVaultIdVariants(p, survivingIdSet, droppedSet);
+            }
+          } else if (
+            !hasLocalInstallMetadata(p) &&
+            p.version !== undefined &&
+            matchedSurviving.version === undefined
+          ) {
+            platformOrVersionHealed = true;
           }
-        } else if (
-          !hasLocalInstallMetadata(p) &&
-          p.version !== undefined &&
-          matchedSurviving.version === undefined
-        ) {
-          platformOrVersionHealed = true;
         }
       }
     }

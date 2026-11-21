@@ -42,8 +42,7 @@ import {
   getUserOverrideForGame,
   applyUserOverrideToGame,
   applyUserOverridesToCatalog,
-  doesReviewScoreOverrideMatch,
-  findIncompatibleCollidingOverrideForGame,
+  selfHealUnoverriddenGameLeakedFields,
   loadHiddenStorefrontEntries,
   isStorefrontEntryHidden,
   isNonGameStorefrontEntryRestored,
@@ -685,44 +684,15 @@ export function sanitizeGameCatalog(
     if (userOverride) {
       game = applyUserOverrideToGame(game, userOverride);
       normTitle = normalizeCanonicalTitle(game.title);
-    } else if (hasUserOverrides) {
-      // Self-heal leaked fields previously bled from an incompatible sibling override on the
-      // same storefront (e.g. xbox:9NRRJLLXM68V override sharing steam-2537590 with xbox:9P38D19T7LRV).
-      const conflictingOv = findIncompatibleCollidingOverrideForGame(game, userOverrides);
-      if (conflictingOv) {
-        const leakedReview = doesReviewScoreOverrideMatch(
-          game.reviewScoreOverride,
-          conflictingOv.reviewScoreOverride
-        );
-        const leakedNonSteam = Boolean(
-          game.isExplicitNonSteam === true &&
-            (conflictingOv.isExplicitNonSteam === true || conflictingOv.steamAppId === null)
-        );
-        const leakedEnrichedDate = Boolean(
-          conflictingOv.releaseDate &&
-            game.enrichedMetadata?.releaseDate === conflictingOv.releaseDate &&
-            (leakedReview || leakedNonSteam)
-        );
-        if (leakedReview || leakedNonSteam || leakedEnrichedDate) {
-          const healed: CanonicalGame = { ...game };
-          if (leakedReview) {
-            delete healed.reviewScoreOverride;
-          }
-          if (leakedNonSteam) {
-            delete healed.isExplicitNonSteam;
-          }
-          if (leakedEnrichedDate && healed.enrichedMetadata) {
-            const safeTopDate =
-              healed.releaseDate && healed.releaseDate !== conflictingOv.releaseDate
-                ? sanitizeStoreReleaseDate(healed.releaseDate)
-                : undefined;
-            healed.enrichedMetadata = {
-              ...healed.enrichedMetadata,
-              releaseDate: safeTopDate || 'TBA',
-            };
-          }
-          game = healed;
-        }
+    } else if (!skipUserOverrides) {
+      // Universal Invariant + Sibling Donor Bleed Self-Heal:
+      // An un-overridden game can never legitimately carry isExplicitNonSteam === true or
+      // reviewScoreOverride, nor retain leaked sibling releaseDate / poisoned enrichedMetadata.
+      const healedRes = selfHealUnoverriddenGameLeakedFields(game, userOverrides, {
+        catalog: expandedCatalog,
+      });
+      if (healedRes.healed) {
+        game = healedRes.game;
       }
     }
 

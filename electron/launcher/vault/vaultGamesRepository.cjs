@@ -32,6 +32,26 @@ const {
 } = require('./vaultMetadataLattice.cjs');
 
 /**
+ * Compares two persisted critic / reviewScoreOverride payloads for substantive equality
+ * (used to avoid clobbering unrelated valid critic_json when purging a leaked reviewScoreOverride).
+ *
+ * @param {any} a
+ * @param {any} b
+ * @returns {boolean}
+ */
+function doVaultReviewScoresMatch(a, b) {
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') {
+    return false;
+  }
+  if (a.id && b.id && a.id === b.id && a.score === b.score && a.source === b.source) {
+    return true;
+  }
+  return Boolean(
+    a.source === b.source && a.score === b.score && a.url && b.url && a.url === b.url
+  );
+}
+
+/**
  * Returns true when persisted `existingEnrichedObj` came from a Steam App ID (`appId > 0`)
  * that is structurally incompatible with the incoming game/override route (explicitly
  * unlinked non-Steam game or re-matched to a different Steam App ID).
@@ -331,6 +351,14 @@ function upsertGames(service, games) {
     'games.deleteByGameId',
     'DELETE FROM vault_games WHERE game_id = ?'
   );
+  const selectCriticForSelfHealStmt = service.stmt(
+    'games.selectCriticForSelfHeal',
+    'SELECT critic_json FROM vault_games WHERE game_id = ?'
+  );
+  const clearPoisonedCriticStmt = service.stmt(
+    'games.clearPoisonedCriticById',
+    'UPDATE vault_games SET critic_json = NULL, updated_at = ? WHERE game_id = ?'
+  );
   const upsertStmt = service.stmt(
     'games.upsertCore',
     `
@@ -509,13 +537,42 @@ function upsertGames(service, games) {
           typeof existingSummaryObj === 'object' &&
           Boolean(existingSummaryObj.isExplicitNonSteam) !== Boolean(g.isExplicitNonSteam)
       );
+      const existingSummaryReviewOverrideCleared = Boolean(
+        !incomingIsSlimmed &&
+          existingSummaryObj &&
+          typeof existingSummaryObj === 'object' &&
+          !g.isExplicitNonSteam &&
+          existingSummaryObj.reviewScoreOverride !== undefined &&
+          existingSummaryObj.reviewScoreOverride !== null &&
+          g.reviewScoreOverride === undefined
+      );
+      const existingLeakedReleaseDateCleared = Boolean(
+        !incomingIsSlimmed &&
+          existingSummaryObj &&
+          typeof existingSummaryObj === 'object' &&
+          typeof existingSummaryObj.releaseDate === 'string' &&
+          existingSummaryObj.releaseDate.trim() !== '' &&
+          existingSummaryObj.releaseDate !== 'TBA' &&
+          (!g.releaseDate || String(g.releaseDate).trim() === '' || g.releaseDate === 'TBA')
+      );
 
-      // Protect summary_json against __quotaSlimmed / empty-field clobber (never across conflicting products)
+      if (existingSummaryPolarityConflict || existingSummaryReviewOverrideCleared) {
+        if (g.isExplicitNonSteam !== true) {
+          delete summaryCopy.isExplicitNonSteam;
+        }
+        if (g.reviewScoreOverride === undefined) {
+          delete summaryCopy.reviewScoreOverride;
+        }
+      }
+
+      // Protect summary_json against __quotaSlimmed / empty-field clobber (never across conflicting
+      // products, polarity flips, or purged leaked reviewScoreOverrides; releaseDate is never carried forward)
       if (
         existingSummaryObj &&
         typeof existingSummaryObj === 'object' &&
         !existingRowPlatformConflict &&
-        !existingSummaryPolarityConflict
+        !existingSummaryPolarityConflict &&
+        !existingSummaryReviewOverrideCleared
       ) {
         if (
           !(
@@ -635,9 +692,26 @@ function upsertGames(service, games) {
         incomingQuality = 'skeleton_fallback';
       }
 
+      const existingEnrichedMatchesClearedLeakedDate = Boolean(
+        existingLeakedReleaseDateCleared &&
+          existingEnrichedObj &&
+          typeof existingEnrichedObj === 'object' &&
+          !(Number(existingEnrichedObj.appId) > 0) &&
+          existingEnrichedObj.releaseDate === existingSummaryObj.releaseDate
+      );
+      const existingNonSteamEnrichedInvalidatedByReviewPurge = Boolean(
+        existingSummaryReviewOverrideCleared &&
+          existingEnrichedObj &&
+          typeof existingEnrichedObj === 'object' &&
+          !(Number(existingEnrichedObj.appId) > 0) &&
+          (!incomingEnriched || incomingIsSlimmed)
+      );
+
       const hardEnrichedInvalidated = Boolean(
         existingRowPlatformConflict ||
           existingSummaryPolarityConflict ||
+          existingEnrichedMatchesClearedLeakedDate ||
+          existingNonSteamEnrichedInvalidatedByReviewPurge ||
           isExistingVaultSteamEnrichedInvalidated(existingEnrichedObj, {
             isExplicitNonSteam: g.isExplicitNonSteam === true,
             steamAppId,
@@ -772,6 +846,23 @@ function upsertGames(service, games) {
           nowTs,
           finalEnrichedAt
         );
+        if (
+          existing &&
+          (existingSummaryPolarityConflict || existingSummaryReviewOverrideCleared) &&
+          existingSummaryObj?.reviewScoreOverride &&
+          typeof existingSummaryObj.reviewScoreOverride === 'object'
+        ) {
+          const criticRow = selectCriticForSelfHealStmt.get(gameId);
+          const existingCriticObj = criticRow?.critic_json
+            ? parseVaultJson(criticRow.critic_json)
+            : null;
+          if (
+            existingCriticObj &&
+            doVaultReviewScoresMatch(existingCriticObj, existingSummaryObj.reviewScoreOverride)
+          ) {
+            clearPoisonedCriticStmt.run(nowTs, gameId);
+          }
+        }
         upserted++;
       }
 

@@ -18,11 +18,14 @@ import { clearExpiredStagedCache } from '../../storage/stagedCacheService';
 import { EPIC_USER_LIBRARY, GOG_USER_LIBRARY } from '../../storage/storefrontLibraries';
 import {
   applyUserOverridesToCatalog,
+  collectSiblingDonorReleaseDates,
+  doesReleaseDateMatchOverride,
   getUserOverrideForGame,
   hydrateUserOverridesFromVault,
   inferReviewRouteFromOverride,
   isEnrichedMetadataIncompatibleWithOverride,
   loadUserOverrides,
+  selfHealUnoverriddenGameLeakedFields,
 } from '../../storage/userOverrideStorage';
 import { hydrateUserTagOverridesFromVault } from '../../storage/userTagStorage';
 import { sanitizeGameCatalog } from '../catalogSanitizer';
@@ -321,9 +324,9 @@ function writeCatalogToLocalStorage(
           : g.enrichedMetadata;
         const withRichMeta =
           mergedMeta !== g.enrichedMetadata ? { ...g, enrichedMetadata: mergedMeta } : g;
-        const allowReviewScoreOverride = hasAnyOverrides
-          ? Boolean(gOv && (gOv.reviewScoreOverride !== undefined || gOv.reviewRoute !== undefined))
-          : true;
+        const allowReviewScoreOverride = Boolean(
+          gOv && (gOv.reviewScoreOverride !== undefined || gOv.reviewRoute !== undefined)
+        );
         return recoverRichSummaryFieldsFromDonor(withRichMeta, prevRich, mergedMeta, true, {
           allowReviewScoreOverride,
         });
@@ -674,6 +677,7 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
   let vaultCatalog = await vaultGet<CanonicalGame[]>(IDB_KEY_MAIN_CATALOG);
   let vaultSnapIds: Set<string> | null = null;
   let hydratedAnyCriticFromVault = false;
+  const selfHealedOverridePoisonIds = new Set<string>();
 
   if (window.electronAPI?.offlineVault?.getCatalogSnapshot) {
     try {
@@ -728,16 +732,60 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
             seedHltbFromVaultIfMissing(g.title, g.steamAppId ?? undefined, detailEntry.hltb);
           }
         }
+        const sanitizeDetailMetaForGame = (
+          rawDetailMeta: CanonicalGame['enrichedMetadata'] | undefined,
+          targetGame: CanonicalGame,
+          ov: ReturnType<typeof getUserOverrideForGame>,
+          conflictingOv: ReturnType<typeof selfHealUnoverriddenGameLeakedFields>['conflictingOverride'],
+          donorDates: readonly string[]
+        ): CanonicalGame['enrichedMetadata'] | undefined => {
+          if (!rawDetailMeta || isEnrichedMetadataIncompatibleWithOverride(rawDetailMeta, ov, targetGame)) {
+            return undefined;
+          }
+          if (
+            !ov &&
+            conflictingOv &&
+            doesReleaseDateMatchOverride(rawDetailMeta.releaseDate, conflictingOv, donorDates)
+          ) {
+            const hasAuthoritativeRecipientAppId = Boolean(
+              Number(rawDetailMeta.appId) > 0 &&
+                rawDetailMeta.enrichedSource !== 'xbox' &&
+                (!targetGame.steamAppId || Number(rawDetailMeta.appId) === targetGame.steamAppId)
+            );
+            if (!hasAuthoritativeRecipientAppId) {
+              return undefined;
+            }
+            return { ...rawDetailMeta, releaseDate: 'TBA' };
+          }
+          return rawDetailMeta;
+        };
+
         if (!hasAuthoritativeIdbCatalog) {
           const loadedOverrides = loadUserOverrides();
-          vaultCatalog = snap.games.map((g) => {
-            const ov = getUserOverrideForGame(g, loadedOverrides);
+          vaultCatalog = snap.games.map((rawG) => {
+            const ov = getUserOverrideForGame(rawG, loadedOverrides);
+            const healRes = !ov
+              ? selfHealUnoverriddenGameLeakedFields(rawG, loadedOverrides, {
+                  catalog: snap.games,
+                })
+              : null;
+            const g = healRes ? healRes.game : rawG;
+            if (healRes?.healed && g.id) {
+              selfHealedOverridePoisonIds.add(g.id);
+            }
+            const conflictingOv = healRes?.conflictingOverride;
+            const donorDates = conflictingOv
+              ? collectSiblingDonorReleaseDates(conflictingOv, snap.games, loadedOverrides, g)
+              : [];
             const detailEntry = g?.id ? details[g.id] : undefined;
             const rawDetailMeta = detailEntry?.enrichedMetadata ?? undefined;
-            const compatibleDetailMeta =
-              rawDetailMeta && !isEnrichedMetadataIncompatibleWithOverride(rawDetailMeta, ov, g)
-                ? rawDetailMeta
-                : undefined;
+            const compatibleDetailMeta = sanitizeDetailMetaForGame(
+              rawDetailMeta,
+              g,
+              ov,
+              conflictingOv,
+              donorDates
+            );
             const detailMeta =
               compatibleDetailMeta && detailEntry?.enrichedAt && !compatibleDetailMeta.enrichedAt
                 ? { ...compatibleDetailMeta, enrichedAt: detailEntry.enrichedAt }
@@ -755,7 +803,6 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
           void vaultSet(IDB_KEY_MAIN_CATALOG, vaultCatalog);
         } else {
           const loadedOverrides = loadUserOverrides();
-          const hasAnyOverrides = Object.keys(loadedOverrides).length > 0;
           const snapGamesById = new Map<string, CanonicalGame[]>();
           for (const sg of snap.games) {
             if (!sg?.id) continue;
@@ -767,10 +814,37 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
             list.push(sg);
           }
           let upgradedAnyFromVaultDetails = false;
-          vaultCatalog = vaultCatalog!.map((g) => {
-            const ov = getUserOverrideForGame(g, loadedOverrides);
+          const idbSnapshotForDonors = vaultCatalog!;
+          vaultCatalog = idbSnapshotForDonors.map((rawG) => {
+            const ov = getUserOverrideForGame(rawG, loadedOverrides);
+            const healRes = !ov
+              ? selfHealUnoverriddenGameLeakedFields(rawG, loadedOverrides, {
+                  catalog: idbSnapshotForDonors,
+                })
+              : null;
+            const g = healRes ? healRes.game : rawG;
+            if (healRes?.healed && g.id) {
+              selfHealedOverridePoisonIds.add(g.id);
+            }
+            const conflictingOv = healRes?.conflictingOverride;
+            const donorDates = conflictingOv
+              ? collectSiblingDonorReleaseDates(
+                  conflictingOv,
+                  idbSnapshotForDonors,
+                  loadedOverrides,
+                  g
+                )
+              : [];
             const rawSnapCandidates = g?.id ? snapGamesById.get(g.id) : undefined;
-            const snapGame = rawSnapCandidates?.find((cand) =>
+            const normalizedSnapCandidates = rawSnapCandidates?.map((cand) => {
+              const candOv = getUserOverrideForGame(cand, loadedOverrides);
+              return !candOv
+                ? selfHealUnoverriddenGameLeakedFields(cand, loadedOverrides, {
+                    catalog: snap.games,
+                  }).game
+                : cand;
+            });
+            const snapGame = normalizedSnapCandidates?.find((cand) =>
               isDonorGameCompatibleWithTarget(g, cand)
             );
             const hadIncompatibleSnapGame = Boolean(
@@ -779,10 +853,13 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
             const detailEntry = !hadIncompatibleSnapGame && g?.id ? details[g.id] : undefined;
             const rawDetailMeta =
               detailEntry?.enrichedMetadata ?? snapGame?.enrichedMetadata ?? undefined;
-            const compatibleDetailMeta =
-              rawDetailMeta && !isEnrichedMetadataIncompatibleWithOverride(rawDetailMeta, ov, g)
-                ? rawDetailMeta
-                : undefined;
+            const compatibleDetailMeta = sanitizeDetailMetaForGame(
+              rawDetailMeta,
+              g,
+              ov,
+              conflictingOv,
+              donorDates
+            );
             const detailMeta =
               compatibleDetailMeta && detailEntry?.enrichedAt && !compatibleDetailMeta.enrichedAt
                 ? { ...compatibleDetailMeta, enrichedAt: detailEntry.enrichedAt }
@@ -798,21 +875,21 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
             let nextGame =
               mergedMeta !== g.enrichedMetadata ? { ...g, enrichedMetadata: mergedMeta } : g;
             if (snapGame || (mergedMeta && !mergedMeta.__quotaSlimmed)) {
-              const allowReviewScoreOverride = hasAnyOverrides
-                ? Boolean(ov && (ov.reviewScoreOverride !== undefined || ov.reviewRoute !== undefined))
-                : true;
+              const allowReviewScoreOverride = Boolean(
+                ov && (ov.reviewScoreOverride !== undefined || ov.reviewRoute !== undefined)
+              );
               const recovered = recoverRichSummaryFieldsFromDonor(
                 nextGame,
                 snapGame,
                 mergedMeta,
-                Boolean(g.enrichedMetadata?.__quotaSlimmed),
+                Boolean(rawG.enrichedMetadata?.__quotaSlimmed),
                 { allowReviewScoreOverride }
               );
               if (recovered !== nextGame) {
                 nextGame = recovered;
               }
             }
-            if (nextGame !== g) {
+            if (nextGame !== rawG) {
               upgradedAnyFromVaultDetails = true;
             }
             return nextGame;
@@ -858,10 +935,12 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
         deleteOrphanedGamesFromOfflineVault(droppedVaultIds);
       }
       lastPersistedVaultCatalogIds = survivingIdSet;
+      const hasOverrideSelfHeal = selfHealedOverridePoisonIds.size > 0;
       if (
         hadUnstrippedXboxTitles ||
         cleaned.length !== vaultCatalog.length ||
-        platformOrVersionHealed
+        platformOrVersionHealed ||
+        hasOverrideSelfHeal
       ) {
         const storage = getSafeLocalStorage();
         const existingRaw = storage?.getItem(STORAGE_KEY_MAIN_CATALOG);
@@ -869,6 +948,22 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
           writeCatalogToLocalStorage(mergedCache);
         } else {
           void vaultSet(IDB_KEY_MAIN_CATALOG, mergedCache);
+          if (
+            (hasOverrideSelfHeal || platformOrVersionHealed) &&
+            window.electronAPI?.offlineVault?.upsertGames
+          ) {
+            try {
+              const gamesToUpsert =
+                hasOverrideSelfHeal && !platformOrVersionHealed && !hadUnstrippedXboxTitles
+                  ? mergedCache.filter((mg) => Boolean(mg?.id && selfHealedOverridePoisonIds.has(mg.id)))
+                  : mergedCache;
+              if (gamesToUpsert.length > 0) {
+                void window.electronAPI.offlineVault.upsertGames(gamesToUpsert)?.catch?.(() => {});
+              }
+            } catch {
+              // Ignore offlineVault IPC bridge errors
+            }
+          }
         }
       }
       if (

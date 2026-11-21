@@ -22,12 +22,16 @@ import {
 } from '../../storage/metadataReconciliation';
 import {
   applyUserOverrideToGame,
-  doesReviewScoreOverrideMatch,
+  collectSiblingDonorIconUrls,
+  collectSiblingDonorReleaseDates,
+  doesReleaseDateMatchOverride,
+  extractSteamAppIdFromArtworkUrls,
   findIncompatibleCollidingOverrideForGame,
   getUserOverrideForGame,
   isEnrichedMetadataIncompatibleWithOverride,
   isUserOverrideCompatibleWithGame,
   loadUserOverrides,
+  resolveInstantSteamAppIdFromTitle,
 } from '../../storage/userOverrideStorage';
 import {
   hasSameStorefrontConflict,
@@ -685,24 +689,44 @@ export function mergeStorefrontGames(
           : updatedPlatforms;
 
       const conflictingSiblingOverride = !existingOverride
-        ? findIncompatibleCollidingOverrideForGame(existing, userOverrides)
+        ? findIncompatibleCollidingOverrideForGame(existing, userOverrides, newGame)
         : undefined;
+      const conflictingDonorReleaseDates = conflictingSiblingOverride
+        ? collectSiblingDonorReleaseDates(
+            conflictingSiblingOverride,
+            merged,
+            userOverrides,
+            existing
+          )
+        : [];
+      // Universal Invariant: a game with NO matching compatible user override can NEVER
+      // legitimately carry `isExplicitNonSteam === true` or `reviewScoreOverride`.
       const leakedExplicitNonSteam = Boolean(
-        conflictingSiblingOverride &&
-          existing.isExplicitNonSteam === true &&
-          (conflictingSiblingOverride.isExplicitNonSteam === true ||
-            conflictingSiblingOverride.steamAppId === null)
+        !existingOverride && existing.isExplicitNonSteam === true
       );
       const leakedReviewScoreOverride = Boolean(
+        !existingOverride && existing.reviewScoreOverride !== undefined
+      );
+      const leakedTopReleaseDate = Boolean(
         conflictingSiblingOverride &&
-          doesReviewScoreOverrideMatch(
-            existing.reviewScoreOverride,
-            conflictingSiblingOverride.reviewScoreOverride
+          doesReleaseDateMatchOverride(
+            existing.releaseDate,
+            conflictingSiblingOverride,
+            conflictingDonorReleaseDates
+          )
+      );
+      const leakedExistingEnrichedReleaseDate = Boolean(
+        conflictingSiblingOverride &&
+          doesReleaseDateMatchOverride(
+            existing.enrichedMetadata?.releaseDate,
+            conflictingSiblingOverride,
+            conflictingDonorReleaseDates
           )
       );
       const leakedReleaseDate = Boolean(
-        conflictingSiblingOverride?.releaseDate &&
-          existing.releaseDate === conflictingSiblingOverride.releaseDate
+        leakedTopReleaseDate ||
+          (leakedExistingEnrichedReleaseDate &&
+            (leakedExplicitNonSteam || leakedReviewScoreOverride))
       );
       const nextIsExplicitNonSteam = leakedExplicitNonSteam
         ? undefined
@@ -711,9 +735,22 @@ export function mergeStorefrontGames(
         ? undefined
         : existing.reviewScoreOverride;
 
+      const hadOverridePoisoning = Boolean(
+        leakedExplicitNonSteam || leakedReviewScoreOverride || conflictingSiblingOverride
+      );
+      const restoredSteamAppId =
+        !existingOverride && !nextIsExplicitNonSteam && !existing.steamAppId && !newGame.steamAppId
+          ? (Number(existing.enrichedMetadata?.appId) > 0 &&
+            existing.enrichedMetadata?.enrichedSource !== 'xbox'
+              ? Number(existing.enrichedMetadata?.appId)
+              : undefined) ||
+            (hadOverridePoisoning ? extractSteamAppIdFromArtworkUrls(existing) : undefined) ||
+            (hadOverridePoisoning ? extractSteamAppIdFromArtworkUrls(newGame) : undefined) ||
+            (hadOverridePoisoning ? resolveInstantSteamAppIdFromTitle(existing.title) : undefined)
+          : undefined;
       const mergedSteamAppId = nextIsExplicitNonSteam
         ? undefined
-        : existing.steamAppId || newGame.steamAppId;
+        : existing.steamAppId || newGame.steamAppId || restoredSteamAppId;
 
       const gogPlatForArt = platformsRef.find((p) => p.platformId === 'gog');
       const artworkCtx: ArtworkRecoveryContext = {
@@ -733,15 +770,48 @@ export function mergeStorefrontGames(
         newGame.capsuleImage,
         { ...artworkCtx, headerUrl: nextHeaderImage }
       );
-      const nextIconUrl = !isUnsuitableHeaderUrl(existing.iconUrl)
-        ? existing.iconUrl
-        : newGame.iconUrl || newGame.capsuleImage || newGame.headerImage || existing.iconUrl;
+      const conflictingDonorIconUrls =
+        conflictingSiblingOverride &&
+        (leakedExplicitNonSteam || leakedReviewScoreOverride || leakedReleaseDate)
+          ? collectSiblingDonorIconUrls(
+              conflictingSiblingOverride,
+              merged,
+              userOverrides,
+              existing
+            )
+          : [];
+      const leakedIconUrl = Boolean(
+        typeof existing.iconUrl === 'string' &&
+          existing.iconUrl.trim().length > 0 &&
+          conflictingDonorIconUrls.includes(existing.iconUrl.trim())
+      );
+      const nextIconUrl =
+        !leakedIconUrl && !isUnsuitableHeaderUrl(existing.iconUrl)
+          ? existing.iconUrl
+          : (newGame.iconUrl && !conflictingDonorIconUrls.includes(newGame.iconUrl.trim())
+              ? newGame.iconUrl
+              : undefined) ||
+            newGame.capsuleImage ||
+            newGame.headerImage ||
+            (leakedIconUrl ? undefined : existing.iconUrl);
 
       const nextTitle = preferStorefrontTitle ? newGame.title : existing.title;
       const nextSortTitle = preferStorefrontTitle
         ? newGame.sortTitle || existing.sortTitle
         : existing.sortTitle;
-      const nextId = mergedSteamAppId ? `steam-${mergedSteamAppId}` : existing.id;
+      const candidateSteamId = mergedSteamAppId ? `steam-${mergedSteamAppId}` : undefined;
+      const candidateSteamIdOccupied = Boolean(
+        candidateSteamId &&
+          candidateSteamId !== existing.id &&
+          ((byId.get(candidateSteamId)?.size || 0) > 0 ||
+            Boolean(
+              !existingOverride &&
+                userOverrides[candidateSteamId] &&
+                !isUserOverrideCompatibleWithGame(userOverrides[candidateSteamId], existing)
+            ))
+      );
+      const nextId =
+        mergedSteamAppId && !candidateSteamIdOccupied ? `steam-${mergedSteamAppId}` : existing.id;
       const nextDevelopers =
         existing.developers && existing.developers.length > 0
           ? existing.developers
@@ -810,12 +880,11 @@ export function mergeStorefrontGames(
         newGame.detailedDescription
       );
       const validIncomingReleaseDate = sanitizeStoreReleaseDate(newGame.releaseDate);
-      const nextReleaseDate =
-        leakedReleaseDate && validIncomingReleaseDate
-          ? validIncomingReleaseDate
-          : pickPreferredReleaseDate(existing.releaseDate, newGame.releaseDate) ||
-            existing.releaseDate ||
-            newGame.releaseDate;
+      const nextReleaseDate = leakedReleaseDate
+        ? validIncomingReleaseDate || 'TBA'
+        : pickPreferredReleaseDate(existing.releaseDate, newGame.releaseDate) ||
+          existing.releaseDate ||
+          newGame.releaseDate;
       const nextReviewSummary = existing.reviewSummary || newGame.reviewSummary;
       const nextIsVerifiedEntitlement =
         existing.isVerifiedEntitlement || newGame.isVerifiedEntitlement;
@@ -826,16 +895,33 @@ export function mergeStorefrontGames(
       const nextKernelAntiCheatName =
         existing.kernelAntiCheatName || newGame.kernelAntiCheatName;
       const nextAntiCheatName = existing.antiCheatName || newGame.antiCheatName;
+      const existingEnrichedHasAuthoritativeRecipientAppId = Boolean(
+        existing.enrichedMetadata &&
+          Number(existing.enrichedMetadata.appId) > 0 &&
+          existing.enrichedMetadata.enrichedSource !== 'xbox' &&
+          (!mergedSteamAppId || Number(existing.enrichedMetadata.appId) === mergedSteamAppId)
+      );
+      const shouldDropPoisonedExistingEnriched = Boolean(
+        existing.enrichedMetadata &&
+          leakedExistingEnrichedReleaseDate &&
+          !existingEnrichedHasAuthoritativeRecipientAppId
+      );
+      const sanitizedExistingEnriched = shouldDropPoisonedExistingEnriched
+        ? undefined
+        : existing.enrichedMetadata;
       const rawNextEnrichedMetadata = pickBestEnrichedMetadata(
-        existing.enrichedMetadata,
+        sanitizedExistingEnriched,
         newGame.enrichedMetadata
       );
       const nextEnrichedMetadata =
-        conflictingSiblingOverride?.releaseDate &&
+        conflictingSiblingOverride &&
         rawNextEnrichedMetadata &&
-        rawNextEnrichedMetadata.releaseDate === conflictingSiblingOverride.releaseDate &&
-        validIncomingReleaseDate
-          ? { ...rawNextEnrichedMetadata, releaseDate: validIncomingReleaseDate }
+        doesReleaseDateMatchOverride(
+          rawNextEnrichedMetadata.releaseDate,
+          conflictingSiblingOverride,
+          conflictingDonorReleaseDates
+        )
+          ? { ...rawNextEnrichedMetadata, releaseDate: validIncomingReleaseDate || 'TBA' }
           : rawNextEnrichedMetadata;
 
       const gameUnchanged =
@@ -1189,6 +1275,7 @@ export function mergeUpdatedGamePreservingLivePlatformState(
   const liveMetaForMerge =
     donorCompatible &&
     liveGame.enrichedMetadata &&
+    !liveGame.enrichedMetadata.__quotaSlimmed &&
     !isEnrichedMetadataIncompatibleWithOverride(
       liveGame.enrichedMetadata,
       incomingOverride,
