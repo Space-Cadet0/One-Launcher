@@ -6,8 +6,106 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const { execFile } = require('node:child_process');
-const { atomicWriteFileSync } = require('./securityAndPathUtils.cjs');
+const { atomicWriteFileSync, isContainedWithinRoot } = require('./securityAndPathUtils.cjs');
 const { resolveDriveCPathCaseInsensitive } = require('./wineAndCrossOverManager.cjs');
+
+const MAX_WINE_REG_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_EOSH_REVISION_BYTES = 64 * 1024;
+const MAX_EOSH_EGI_BYTES = 512 * 1024;
+const FORBIDDEN_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * Validate and normalize a Wine/Windows registry subkey path, rejecting control chars
+ * (`\r`, `\n`, `\0`) and section bracket delimiters (`[`, `]`) to prevent `.reg` section injection.
+ *
+ * @param {unknown} rawSubKey
+ * @returns {string}
+ */
+function sanitizeWineRegSubKeyPath(rawSubKey) {
+  if (typeof rawSubKey !== 'string') return '';
+  if (rawSubKey.includes('\0') || /[\r\n[\]]/.test(rawSubKey)) return '';
+  const normalized = rawSubKey
+    .trim()
+    .replace(/^\\+|\\+$/g, '')
+    .replace(/\\+/g, '\\');
+  if (!normalized || normalized.length > 512) return '';
+  return normalized;
+}
+
+/**
+ * Bounded synchronous UTF-8 file read with optional symlink rejection.
+ *
+ * @param {string} filePath
+ * @param {number} maxBytes
+ * @param {{ rejectSymlink?: boolean }} [opts]
+ * @returns {string | null}
+ */
+function readTextFileBoundedSync(filePath, maxBytes, opts = {}) {
+  if (!filePath || typeof filePath !== 'string' || filePath.includes('\0')) return null;
+  try {
+    const lst = fs.lstatSync(filePath);
+    if (opts.rejectSymlink && lst.isSymbolicLink()) return null;
+    const st = lst.isSymbolicLink() ? fs.statSync(filePath) : lst;
+    if (!st.isFile() || st.size > maxBytes) return null;
+    return fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Verify that `childDir` is not a symlink escaping `rootDir` (resolving both via `realpathSync`).
+ *
+ * @param {string} rootDir
+ * @param {string} childDir
+ * @returns {boolean}
+ */
+function isRealDirContainedSync(rootDir, childDir) {
+  if (!rootDir || !childDir || rootDir.includes('\0') || childDir.includes('\0')) return false;
+  try {
+    const lst = fs.lstatSync(childDir);
+    if (lst.isSymbolicLink() || !lst.isDirectory()) return false;
+    const realRoot = fs.realpathSync(rootDir);
+    const realChild = fs.realpathSync(childDir);
+    return isContainedWithinRoot(realRoot, realChild);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check if `filePath` already exists as a symbolic link (safe to return false on ENOENT).
+ *
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+function isExistingSymlinkSync(filePath) {
+  try {
+    return fs.lstatSync(filePath).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Clamp relative Windows path segments (`..` never traverses above drive root).
+ *
+ * @param {string} relRaw
+ * @returns {string[]}
+ */
+function clampRelativeDriveParts(relRaw) {
+  /** @type {string[]} */
+  const stack = [];
+  for (const seg of String(relRaw || '').replace(/\\/g, '/').split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') {
+      if (stack.length > 0) stack.pop();
+      continue;
+    }
+    stack.push(seg);
+  }
+  return stack;
+}
 
 /**
  * Convert a host POSIX path into the Windows path representation visible inside `bottlePath`.
@@ -19,7 +117,8 @@ const { resolveDriveCPathCaseInsensitive } = require('./wineAndCrossOverManager.
  * @returns {string}
  */
 function toWineWindowsPath(posixPath, bottlePath = '') {
-  if (!posixPath || typeof posixPath !== 'string') return '';
+  if (!posixPath || typeof posixPath !== 'string' || posixPath.includes('\0')) return '';
+  if (bottlePath && (typeof bottlePath !== 'string' || bottlePath.includes('\0'))) return '';
   const trimmed = posixPath.trim();
   if (!trimmed) return '';
 
@@ -63,7 +162,8 @@ function toWineWindowsPath(posixPath, bottlePath = '') {
  * @returns {string}
  */
 function fromWineWindowsPath(winPath, bottlePath = '') {
-  if (!winPath || typeof winPath !== 'string') return '';
+  if (!winPath || typeof winPath !== 'string' || winPath.includes('\0')) return '';
+  if (bottlePath && (typeof bottlePath !== 'string' || bottlePath.includes('\0'))) return '';
   const trimmed = winPath.trim();
   if (!trimmed) return '';
 
@@ -78,7 +178,7 @@ function fromWineWindowsPath(winPath, bottlePath = '') {
 
   const driveLetter = driveMatch[1].toUpperCase();
   const relRaw = driveMatch[2] || '';
-  const relParts = relRaw.replace(/\\/g, '/').split('/').filter(Boolean);
+  const relParts = clampRelativeDriveParts(relRaw);
 
   if (
     process.platform === 'win32' &&
@@ -104,10 +204,13 @@ function fromWineWindowsPath(winPath, bottlePath = '') {
 
   if (driveLetter === 'C' && bottlePath && typeof bottlePath === 'string' && bottlePath.trim()) {
     const driveCRoot = path.join(bottlePath.trim(), 'drive_c');
-    if (fs.existsSync(driveCRoot)) {
-      return resolveDriveCPathCaseInsensitive(driveCRoot, relParts);
+    const resolved = fs.existsSync(driveCRoot)
+      ? resolveDriveCPathCaseInsensitive(driveCRoot, relParts)
+      : path.join(driveCRoot, ...relParts);
+    if (!isContainedWithinRoot(driveCRoot, resolved)) {
+      return '';
     }
-    return path.join(driveCRoot, ...relParts);
+    return resolved;
   }
 
   if (driveLetter === 'Z') {
@@ -126,7 +229,11 @@ function fromWineWindowsPath(winPath, bottlePath = '') {
     try {
       if (fs.existsSync(dosLink)) {
         const realRoot = fs.realpathSync(dosLink);
-        return path.join(realRoot, ...relParts);
+        const resolved = path.join(realRoot, ...relParts);
+        if (!isContainedWithinRoot(realRoot, resolved)) {
+          return '';
+        }
+        return resolved;
       }
     } catch {}
   }
@@ -142,6 +249,7 @@ function fromWineWindowsPath(winPath, bottlePath = '') {
  */
 function escapeWineRegString(raw) {
   return String(raw ?? '')
+    .replace(/\0/g, '')
     .replace(/\\/g, '\\\\')
     .replace(/"/g, '\\"')
     .replace(/\r/g, '\\r')
@@ -167,13 +275,13 @@ function formatWineRegEntryLine(key, valOrType, maybeValue) {
       : valOrType;
   if (val && typeof val === 'object') {
     if (typeof val.rawRegLine === 'string') {
-      return val.rawRegLine;
+      return val.rawRegLine.replace(/[\r\n\0]+/g, '');
     }
     if (val.delete === true) {
       return `${lhs}=-`;
     }
     if (typeof val.rawRegRhs === 'string') {
-      return `${lhs}=${val.rawRegRhs}`;
+      return `${lhs}=${val.rawRegRhs.replace(/[\r\n\0]+/g, '')}`;
     }
     const rawType = String(val.type || '').trim().toLowerCase();
     const rawPayload = val.value !== undefined ? val.value : val.data;
@@ -188,7 +296,12 @@ function formatWineRegEntryLine(key, valOrType, maybeValue) {
       ) {
         return `${lhs}=${rawPayload.trim().toLowerCase()}`;
       }
-      const u64 = BigInt(rawPayload ?? 0) & 0xffffffffffffffffn;
+      let u64 = 0n;
+      try {
+        u64 = BigInt(rawPayload ?? 0) & 0xffffffffffffffffn;
+      } catch {
+        u64 = 0n;
+      }
       const bytes = [];
       for (let i = 0; i < 8; i += 1) {
         bytes.push(Number((u64 >> BigInt(i * 8)) & 0xffn).toString(16).padStart(2, '0'));
@@ -348,10 +461,7 @@ function syncLiveWineRegistryBatchAsync(bottlePath, hiveName, sectionUpdates, op
       item.hiveName === 'HKEY_CURRENT_USER' || item.hiveName === 'HKEY_LOCAL_MACHINE'
         ? item.hiveName
         : hiveName || 'HKEY_LOCAL_MACHINE';
-    const normSub = String(item.normalizedSubKey)
-      .trim()
-      .replace(/^\\+|\\+$/g, '')
-      .replace(/\\+/g, '\\');
+    const normSub = sanitizeWineRegSubKeyPath(item.normalizedSubKey);
     if (!normSub) continue;
     const blockKey = `${itemHive}\\${normSub.toLowerCase()}`;
 
@@ -427,16 +537,21 @@ function syncLiveWineRegistryBatchAsync(bottlePath, hiveName, sectionUpdates, op
 
   const tempRegPath = path.join(
     os.tmpdir(),
-    `one-launcher-winereg-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.reg`
+    `one-launcher-winereg-${process.pid}-${Date.now()}-${crypto.randomBytes(12).toString('hex')}.reg`
   );
   const isCrossOverBottle = /\/Bottles\/([^/]+)$/i.exec(bottlePath.replace(/\\/g, '/'));
   /** @type {Record<string, any>} */
-  const rawBottleEnv = {
-    ...process.env,
-    ...(options.env && typeof options.env === 'object' ? options.env : {}),
-    WINEPREFIX: bottlePath,
-    ...(isCrossOverBottle && isCrossOverBottle[1] ? { CX_BOTTLE: isCrossOverBottle[1] } : {}),
-  };
+  const rawBottleEnv = { ...process.env };
+  if (options.env && typeof options.env === 'object') {
+    for (const [k, v] of Object.entries(options.env)) {
+      if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
+      rawBottleEnv[k] = v;
+    }
+  }
+  rawBottleEnv.WINEPREFIX = bottlePath;
+  if (isCrossOverBottle && isCrossOverBottle[1]) {
+    rawBottleEnv.CX_BOTTLE = isCrossOverBottle[1];
+  }
 
   let spawnBin = wineBin;
   /** @type {Record<string, any>} */
@@ -470,7 +585,11 @@ function syncLiveWineRegistryBatchAsync(bottlePath, hiveName, sectionUpdates, op
   const runImport = () =>
     new Promise((resolve) => {
       try {
-        fs.writeFileSync(tempRegPath, '\uFEFF' + regLines.join('\r\n'), 'utf16le');
+        fs.writeFileSync(tempRegPath, '\uFEFF' + regLines.join('\r\n'), {
+          encoding: 'utf16le',
+          flag: 'wx',
+          mode: 0o600,
+        });
       } catch {
         resolve(false);
         return;
@@ -708,10 +827,7 @@ function upsertWineSystemRegKeysBatch(bottlePath, keySpecs, options = {}) {
   const normalizedSpecs = [];
   for (const spec of keySpecs) {
     if (!spec || !spec.subKeyPath) continue;
-    const normalizedSubKey = String(spec.subKeyPath)
-      .trim()
-      .replace(/^\\+|\\+$/g, '')
-      .replace(/\\+/g, '\\');
+    const normalizedSubKey = sanitizeWineRegSubKeyPath(spec.subKeyPath);
     if (!normalizedSubKey) continue;
     /** @type {Array<[string, any]>} */
     const entryPairs = Array.isArray(spec.entries)
@@ -729,15 +845,21 @@ function upsertWineSystemRegKeysBatch(bottlePath, keySpecs, options = {}) {
     return { updated: false, regFilePath };
   }
 
+  if (isExistingSymlinkSync(regFilePath)) {
+    return { updated: false, regFilePath };
+  }
+
   let content = '';
   let hadExistingFile = false;
   if (fs.existsSync(regFilePath)) {
-    try {
-      content = fs.readFileSync(regFilePath, 'utf8');
-      hadExistingFile = true;
-    } catch {
-      content = '';
+    const boundedRegContent = readTextFileBoundedSync(regFilePath, MAX_WINE_REG_FILE_BYTES, {
+      rejectSymlink: true,
+    });
+    if (boundedRegContent === null) {
+      return { updated: false, regFilePath };
     }
+    content = boundedRegContent;
+    hadExistingFile = true;
   }
   const priorContent = content;
 
@@ -822,10 +944,7 @@ function deleteWineSystemRegKey(bottlePath, subKeyPath, options = {}) {
     return { removed: 0, regFilePath };
   }
 
-  const normalizedSubKey = String(subKeyPath)
-    .trim()
-    .replace(/^\\+|\\+$/g, '')
-    .replace(/\\+/g, '\\');
+  const normalizedSubKey = sanitizeWineRegSubKeyPath(subKeyPath);
   if (!normalizedSubKey) {
     return { removed: 0, regFilePath };
   }
@@ -846,12 +965,13 @@ function deleteWineSystemRegKey(bottlePath, subKeyPath, options = {}) {
     }
   }
 
-  let content = '';
-  try {
-    content = fs.readFileSync(regFilePath, 'utf8');
-  } catch {
+  const boundedContent = readTextFileBoundedSync(regFilePath, MAX_WINE_REG_FILE_BYTES, {
+    rejectSymlink: true,
+  });
+  if (boundedContent === null) {
     return { removed: 0, regFilePath };
   }
+  const content = boundedContent;
 
   const lines = content.split(/\r?\n/);
   /** @type {string[]} */
@@ -917,15 +1037,20 @@ function computeDotNetUtcTicksBigInt(nowMs = Date.now()) {
  * @returns {number}
  */
 function readEpicEoshRevisionNumber(revisionJsonPath) {
-  if (!revisionJsonPath || !fs.existsSync(revisionJsonPath)) return 0;
+  if (!revisionJsonPath) return 0;
+  const raw = readTextFileBoundedSync(revisionJsonPath, MAX_EOSH_REVISION_BYTES, {
+    rejectSymlink: true,
+  });
+  if (!raw) return 0;
   try {
-    const raw = fs.readFileSync(revisionJsonPath, 'utf8');
-    const numMatch = raw.match(/"number"\s*:\s*(\d+)/);
+    const numMatch = raw.match(/"number"\s*:\s*(\d{1,15})/);
     if (numMatch) {
-      return Number(numMatch[1]) || 0;
+      const n = Number(numMatch[1]);
+      return Number.isSafeInteger(n) && n >= 0 ? n : 0;
     }
     const parsed = JSON.parse(raw);
-    return Number(parsed?.number || 0) || 0;
+    const n = Number(parsed?.number || 0);
+    return Number.isSafeInteger(n) && n >= 0 ? n : 0;
   } catch {
     return 0;
   }
@@ -938,8 +1063,10 @@ function readEpicEoshRevisionNumber(revisionJsonPath) {
  * @param {number} nextNumber
  */
 function writeEpicEoshRevisionJson(revisionJsonPath, nextNumber) {
+  if (!revisionJsonPath || isExistingSymlinkSync(revisionJsonPath)) return;
   const ticks = computeDotNetUtcTicksBigInt(Date.now());
-  const rawJson = `{"timestamp":${ticks.toString()},"number":${Math.max(1, Math.trunc(nextNumber))}}`;
+  const safeNum = Number.isSafeInteger(Math.trunc(nextNumber)) ? Math.max(1, Math.trunc(nextNumber)) : 1;
+  const rawJson = `{"timestamp":${ticks.toString()},"number":${safeNum}}`;
   atomicWriteFileSync(revisionJsonPath, rawJson);
 }
 
@@ -962,7 +1089,7 @@ function normalizeInstallPathKey(p) {
  * @returns {{ synced: boolean, egiPath?: string, revision?: number, reason?: string }}
  */
 function syncEpicEoshInstalledItem(programDataEpicDir, itemSpec = {}) {
-  if (!programDataEpicDir || typeof programDataEpicDir !== 'string') {
+  if (!programDataEpicDir || typeof programDataEpicDir !== 'string' || programDataEpicDir.includes('\0')) {
     return { synced: false, reason: 'missing_programdata_epic' };
   }
 
@@ -974,6 +1101,9 @@ function syncEpicEoshInstalledItem(programDataEpicDir, itemSpec = {}) {
   );
   if (!fs.existsSync(installedItemsDir)) {
     return { synced: false, reason: 'eosh_not_initialized' };
+  }
+  if (!isRealDirContainedSync(programDataEpicDir, installedItemsDir)) {
+    return { synced: false, reason: 'eosh_dir_unsafe' };
   }
 
   const artifactId = String(itemSpec.artifactId ?? itemSpec.appName ?? '').trim();
@@ -994,11 +1124,17 @@ function syncEpicEoshInstalledItem(programDataEpicDir, itemSpec = {}) {
   const egiFileName = `${guidLowerNoDashes}.egi`;
   const egiPath = path.join(installedItemsDir, egiFileName);
   const revisionJsonPath = path.join(installedItemsDir, 'Revision.json');
+  if (!isContainedWithinRoot(installedItemsDir, egiPath) || isExistingSymlinkSync(egiPath)) {
+    return { synced: false, reason: 'egi_path_unsafe' };
+  }
 
   let prevItemRevision = 0;
   try {
-    if (fs.existsSync(egiPath)) {
-      const existingEgi = JSON.parse(fs.readFileSync(egiPath, 'utf8'));
+    const existingRaw = readTextFileBoundedSync(egiPath, MAX_EOSH_EGI_BYTES, {
+      rejectSymlink: true,
+    });
+    if (existingRaw) {
+      const existingEgi = JSON.parse(existingRaw);
       prevItemRevision = Number(existingEgi?.revision || 0) || 0;
     }
   } catch {
@@ -1011,8 +1147,18 @@ function syncEpicEoshInstalledItem(programDataEpicDir, itemSpec = {}) {
     for (const f of fs.readdirSync(installedItemsDir)) {
       if (!f.toLowerCase().endsWith('.egi') || f.toLowerCase() === egiFileName) continue;
       const candidatePath = path.join(installedItemsDir, f);
+      if (
+        !isContainedWithinRoot(installedItemsDir, candidatePath) ||
+        isExistingSymlinkSync(candidatePath)
+      ) {
+        continue;
+      }
       try {
-        const parsed = JSON.parse(fs.readFileSync(candidatePath, 'utf8'));
+        const candidateRaw = readTextFileBoundedSync(candidatePath, MAX_EOSH_EGI_BYTES, {
+          rejectSymlink: true,
+        });
+        if (!candidateRaw) continue;
+        const parsed = JSON.parse(candidateRaw);
         const sameArtifact =
           parsed?.artifactId &&
           String(parsed.artifactId).toLowerCase() === artifactId.toLowerCase();
@@ -1091,7 +1237,11 @@ function syncEpicEoshInstalledItem(programDataEpicDir, itemSpec = {}) {
  * @returns {{ removed: number, revision?: number }}
  */
 function removeEpicEoshInstalledItem(programDataEpicDir, matchCriteria = {}) {
-  if (!programDataEpicDir || typeof programDataEpicDir !== 'string') {
+  if (
+    !programDataEpicDir ||
+    typeof programDataEpicDir !== 'string' ||
+    programDataEpicDir.includes('\0')
+  ) {
     return { removed: 0 };
   }
 
@@ -1102,6 +1252,9 @@ function removeEpicEoshInstalledItem(programDataEpicDir, matchCriteria = {}) {
     'InstalledItems'
   );
   if (!fs.existsSync(installedItemsDir)) {
+    return { removed: 0 };
+  }
+  if (!isRealDirContainedSync(programDataEpicDir, installedItemsDir)) {
     return { removed: 0 };
   }
 
@@ -1141,8 +1294,18 @@ function removeEpicEoshInstalledItem(programDataEpicDir, matchCriteria = {}) {
     for (const f of fs.readdirSync(installedItemsDir)) {
       if (!f.toLowerCase().endsWith('.egi')) continue;
       const fullPath = path.join(installedItemsDir, f);
+      if (
+        !isContainedWithinRoot(installedItemsDir, fullPath) ||
+        isExistingSymlinkSync(fullPath)
+      ) {
+        continue;
+      }
       try {
-        const parsed = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+        const rawEgi = readTextFileBoundedSync(fullPath, MAX_EOSH_EGI_BYTES, {
+          rejectSymlink: true,
+        });
+        if (!rawEgi) continue;
+        const parsed = JSON.parse(rawEgi);
         const artLower = String(parsed?.artifactId || '').trim().toLowerCase();
         const itemLower = String(parsed?.itemId || '').trim().toLowerCase();
         const dirKey = normalizeInstallPathKey(parsed?.dir);

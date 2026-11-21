@@ -1,3 +1,6 @@
+// @ts-check
+'use strict';
+
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
@@ -11,9 +14,139 @@ const {
   toHostFilesystemPath,
   atomicWriteFileSync,
   atomicWriteSecureFileSync,
+  isContainedWithinRoot,
   isStoreDisconnectedTombstoned,
   recordImportedEpicInstall,
 } = require('./securityAndPathUtils.cjs');
+
+const MAX_LEGENDARY_LARGE_JSON_BYTES = 32 * 1024 * 1024;
+const MAX_EPIC_META_JSON_BYTES = 4 * 1024 * 1024;
+const MAX_EPIC_SMALL_JSON_BYTES = 512 * 1024;
+const MAX_EPIC_MANIFEST_COPY_BYTES = 64 * 1024 * 1024;
+const MAX_EPIC_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024;
+const FORBIDDEN_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * Validate an Epic `appName` before joining it into filesystem paths (prevents `../` traversal).
+ *
+ * @param {unknown} rawName
+ * @returns {boolean}
+ */
+function isSafeEpicAppName(rawName) {
+  if (typeof rawName !== 'string') return false;
+  const trimmed = rawName.trim();
+  if (!trimmed || trimmed.length > 200) return false;
+  if (
+    trimmed.includes('\0') ||
+    trimmed.includes('/') ||
+    trimmed.includes('\\') ||
+    trimmed.includes('..') ||
+    /[\x00-\x1f\x7f]/.test(trimmed)
+  ) {
+    return false;
+  }
+  return trimmed !== '.' && trimmed !== '..';
+}
+
+/**
+ * Validate an Epic installation GUID (hex string, no path separators).
+ *
+ * @param {unknown} rawGuid
+ * @returns {boolean}
+ */
+function isSafeEpicGuid(rawGuid) {
+  return typeof rawGuid === 'string' && /^[0-9a-fA-F]{1,64}$/.test(rawGuid.trim());
+}
+
+/**
+ * Strip NUL and CR/LF control characters from Epic CLI launch argument values.
+ *
+ * @param {unknown} rawVal
+ * @returns {string}
+ */
+function sanitizeEpicCliArgValue(rawVal) {
+  return String(rawVal ?? '').replace(/[\0\r\n]+/g, '').trim();
+}
+
+/**
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+function isExistingSymlinkSync(filePath) {
+  try {
+    return fs.lstatSync(filePath).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verify that `targetPath` is strictly contained within `rootDir` and is not a symbolic link.
+ *
+ * @param {string} rootDir
+ * @param {string} targetPath
+ * @param {string} [platform]
+ * @returns {boolean}
+ */
+function isSafeContainedFileSync(rootDir, targetPath, platform = process.platform) {
+  if (!rootDir || !targetPath) return false;
+  if (!isContainedWithinRoot(rootDir, targetPath, platform)) return false;
+  return !isExistingSymlinkSync(targetPath);
+}
+
+/**
+ * Bounded synchronous UTF-8 JSON file read with optional symlink rejection.
+ *
+ * @param {string} filePath
+ * @param {number} maxBytes
+ * @param {{ rejectSymlink?: boolean }} [opts]
+ * @returns {any | null}
+ */
+function readJsonFileBoundedSync(filePath, maxBytes, opts = {}) {
+  if (!filePath || typeof filePath !== 'string' || filePath.includes('\0')) return null;
+  try {
+    const lst = fs.lstatSync(filePath);
+    if (opts.rejectSymlink && lst.isSymbolicLink()) return null;
+    const st = lst.isSymbolicLink() ? fs.statSync(filePath) : lst;
+    if (!st.isFile() || st.size > maxBytes) return null;
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Atomically copy a regular file (rejecting symlinks and oversized inputs) via temp+rename
+ * without leaving a `.bak` sibling file behind.
+ *
+ * @param {string} srcFile
+ * @param {string} dstFile
+ * @param {number} maxBytes
+ * @returns {boolean}
+ */
+function atomicCopyFileNoBackupSync(srcFile, dstFile, maxBytes) {
+  if (!srcFile || !dstFile || srcFile.includes('\0') || dstFile.includes('\0')) return false;
+  let tmpPath = '';
+  try {
+    const srcLstat = fs.lstatSync(srcFile);
+    if (srcLstat.isSymbolicLink() || !srcLstat.isFile() || srcLstat.size > maxBytes) return false;
+    if (isExistingSymlinkSync(dstFile)) return false;
+    const hostDst = toHostFilesystemPath(dstFile);
+    fs.mkdirSync(path.dirname(hostDst), { recursive: true });
+    tmpPath = `${hostDst}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    const buf = fs.readFileSync(srcFile);
+    fs.writeFileSync(tmpPath, buf, { flag: 'wx' });
+    fs.renameSync(tmpPath, hostDst);
+    return true;
+  } catch {
+    if (tmpPath) {
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {}
+    }
+    return false;
+  }
+}
 const {
   discoverWindowsEpicRegistryPaths,
 } = require('../utils/windowsRegistryDiscovery.cjs');
@@ -162,7 +295,8 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
     for (const legFile of legendaryInstalledFiles) {
       if (!fs.existsSync(legFile)) continue;
       try {
-        const raw = JSON.parse(fs.readFileSync(legFile, 'utf8'));
+        const raw = readJsonFileBoundedSync(legFile, MAX_LEGENDARY_LARGE_JSON_BYTES);
+        if (!raw) continue;
         const entries = Array.isArray(raw)
           ? raw
           : raw && typeof raw === 'object'
@@ -242,8 +376,12 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
           const files = fs.readdirSync(manifestsDir);
           for (const f of files) {
             if (!f.toLowerCase().endsWith('.item')) continue;
+            const itemFullPath = path.join(manifestsDir, f);
+            if (!isSafeContainedFileSync(manifestsDir, itemFullPath, platform)) continue;
             try {
-              const parsed = JSON.parse(fs.readFileSync(path.join(manifestsDir, f), 'utf8'));
+              const parsed = readJsonFileBoundedSync(itemFullPath, MAX_EPIC_SMALL_JSON_BYTES, {
+                rejectSymlink: true,
+              });
               if (parsed && typeof parsed === 'object') {
                 list.push({ ...parsed, _fileName: f });
               }
@@ -261,7 +399,8 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
       const assetsFile = path.join(legDir, 'assets.json');
       if (!fs.existsSync(assetsFile)) continue;
       try {
-        const rawAssets = JSON.parse(fs.readFileSync(assetsFile, 'utf8'));
+        const rawAssets = readJsonFileBoundedSync(assetsFile, MAX_LEGENDARY_LARGE_JSON_BYTES);
+        if (!rawAssets) continue;
         const assetLists = [];
         if (Array.isArray(rawAssets)) {
           assetLists.push(rawAssets);
@@ -339,10 +478,13 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
                 (hIt.InstallLocation &&
                   path.resolve(hIt.InstallLocation) === path.resolve(installPath)))
             ) {
-              try {
-                fs.rmSync(path.join(eglManifestsDir, hIt._fileName), { force: true });
-                hostTouched = true;
-              } catch {}
+              const hostItemTarget = path.join(eglManifestsDir, hIt._fileName);
+              if (isSafeContainedFileSync(eglManifestsDir, hostItemTarget, platform)) {
+                try {
+                  fs.rmSync(hostItemTarget, { force: true });
+                  hostTouched = true;
+                } catch {}
+              }
             }
           }
         }
@@ -389,13 +531,16 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
 
       /** @type {any} */
       let meta = null;
-      for (const metaDir of metadataDirs) {
-        const metaFile = path.join(metaDir, `${appName}.json`);
-        if (fs.existsSync(metaFile)) {
-          try {
-            meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+      if (isSafeEpicAppName(appName)) {
+        for (const metaDir of metadataDirs) {
+          const metaFile = path.join(metaDir, `${appName}.json`);
+          if (!isContainedWithinRoot(metaDir, metaFile, platform)) continue;
+          if (fs.existsSync(metaFile)) {
+            meta = readJsonFileBoundedSync(metaFile, MAX_EPIC_META_JSON_BYTES, {
+              rejectSymlink: true,
+            });
             if (meta) break;
-          } catch {}
+          }
         }
       }
 
@@ -500,10 +645,20 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
 
       let relativeExePath = '';
       if (entry.executable && !path.isAbsolute(String(entry.executable))) {
-        relativeExePath = String(entry.executable);
-      } else if (entry.executablePath && String(entry.executablePath).startsWith(installPath)) {
+        const rawRel = String(entry.executable);
+        const resolvedCandidate = path.resolve(installPath, rawRel.replace(/\\/g, path.sep));
+        if (isContainedWithinRoot(installPath, resolvedCandidate, platform)) {
+          relativeExePath = path.relative(installPath, resolvedCandidate);
+        }
+      }
+      if (
+        !relativeExePath &&
+        entry.executablePath &&
+        isContainedWithinRoot(installPath, String(entry.executablePath), platform)
+      ) {
         relativeExePath = path.relative(installPath, entry.executablePath);
-      } else {
+      }
+      if (!relativeExePath) {
         const discovered =
           discoveredForPlatform ||
           findPrimaryExecutable(installPath, {
@@ -511,7 +666,10 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
             hintName: entry.title || appName,
             preferWindowsExecutable: isWinEpicEntry,
           });
-        if (discovered.executablePath && discovered.executablePath.startsWith(installPath)) {
+        if (
+          discovered.executablePath &&
+          isContainedWithinRoot(installPath, discovered.executablePath, platform)
+        ) {
           relativeExePath = path.relative(installPath, discovered.executablePath);
         } else if (discovered.executablePath) {
           relativeExePath = path.basename(discovered.executablePath);
@@ -560,14 +718,18 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
         ) {
           return false;
         }
-        const itemGuid = String(it.InstallationGuid);
-        const mancpnExists = fs.existsSync(
-          path.join(installPath, '.egstore', `${itemGuid}.mancpn`)
-        );
+        const itemGuid = String(it.InstallationGuid).trim();
+        if (!isSafeEpicGuid(itemGuid)) return false;
+        const egstoreCheckDir = path.join(installPath, '.egstore');
+        const mancpnPath = path.join(egstoreCheckDir, `${itemGuid}.mancpn`);
+        if (!isContainedWithinRoot(egstoreCheckDir, mancpnPath, platform)) return false;
+        const mancpnExists = fs.existsSync(mancpnPath);
         if (!mancpnExists) return false;
+        const manifestCheckPath = path.join(egstoreCheckDir, `${itemGuid}.manifest`);
         if (
           sourceManifestPath &&
-          !fs.existsSync(path.join(installPath, '.egstore', `${itemGuid}.manifest`))
+          (!isContainedWithinRoot(egstoreCheckDir, manifestCheckPath, platform) ||
+            !fs.existsSync(manifestCheckPath))
         ) {
           return false;
         }
@@ -652,7 +814,10 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
           const egFiles = fs.readdirSync(egstoreDir);
           for (const ef of egFiles) {
             if (ef.toLowerCase().endsWith('.item')) {
-              fs.rmSync(path.join(egstoreDir, ef), { force: true });
+              const egItemTarget = path.join(egstoreDir, ef);
+              if (isSafeContainedFileSync(egstoreDir, egItemTarget, platform)) {
+                fs.rmSync(egItemTarget, { force: true });
+              }
             }
           }
         } catch {}
@@ -662,8 +827,15 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
         );
         if (sourceManifestPath && fs.existsSync(sourceManifestPath)) {
           const destManifest = path.join(egstoreDir, `${guid}.manifest`);
-          if (path.resolve(sourceManifestPath) !== path.resolve(destManifest)) {
-            fs.copyFileSync(sourceManifestPath, destManifest);
+          if (
+            path.resolve(sourceManifestPath) !== path.resolve(destManifest) &&
+            isSafeContainedFileSync(egstoreDir, destManifest, platform)
+          ) {
+            atomicCopyFileNoBackupSync(
+              sourceManifestPath,
+              destManifest,
+              MAX_EPIC_MANIFEST_COPY_BYTES
+            );
           }
         }
       } catch {}
@@ -675,14 +847,20 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
             oldItem._fileName &&
             oldItem._fileName !== `${guid}.item`
           ) {
-            try {
-              fs.rmSync(path.join(targetManifestsDir, oldItem._fileName), { force: true });
-            } catch {}
+            const oldItemTarget = path.join(targetManifestsDir, oldItem._fileName);
+            if (isSafeContainedFileSync(targetManifestsDir, oldItemTarget, platform)) {
+              try {
+                fs.rmSync(oldItemTarget, { force: true });
+              } catch {}
+            }
           }
         }
         const serializedItem = JSON.stringify(itemPayload, null, 2);
-        atomicWriteFileSync(path.join(targetManifestsDir, `${guid}.item`), serializedItem);
-        syncedCount++;
+        const destItemPath = path.join(targetManifestsDir, `${guid}.item`);
+        if (isSafeContainedFileSync(targetManifestsDir, destItemPath, platform)) {
+          atomicWriteFileSync(destItemPath, serializedItem);
+          syncedCount++;
+        }
       } catch {}
 
       if (targetProgramDataEpicDir) {
@@ -699,10 +877,24 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
         });
       }
 
-      if (entry._legFile && fs.existsSync(entry._legFile) && entry.egl_guid !== guid) {
+      if (
+        entry._legFile &&
+        fs.existsSync(entry._legFile) &&
+        entry.egl_guid !== guid &&
+        !FORBIDDEN_PROTO_KEYS.has(appName)
+      ) {
         try {
-          const rawLeg = JSON.parse(fs.readFileSync(entry._legFile, 'utf8'));
-          if (rawLeg && typeof rawLeg === 'object' && !Array.isArray(rawLeg) && rawLeg[appName]) {
+          const rawLeg = readJsonFileBoundedSync(entry._legFile, MAX_LEGENDARY_LARGE_JSON_BYTES, {
+            rejectSymlink: true,
+          });
+          if (
+            rawLeg &&
+            typeof rawLeg === 'object' &&
+            !Array.isArray(rawLeg) &&
+            Object.prototype.hasOwnProperty.call(rawLeg, appName) &&
+            rawLeg[appName] &&
+            typeof rawLeg[appName] === 'object'
+          ) {
             rawLeg[appName].egl_guid = guid;
             atomicWriteFileSync(entry._legFile, JSON.stringify(rawLeg, null, 2));
           }
@@ -734,8 +926,11 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
           for (const f of files) {
             if (!f.toLowerCase().endsWith('.item')) continue;
             const fullItemPath = path.join(manifestsDir, f);
+            if (!isSafeContainedFileSync(manifestsDir, fullItemPath, platform)) continue;
             try {
-              const parsed = JSON.parse(fs.readFileSync(fullItemPath, 'utf8'));
+              const parsed = readJsonFileBoundedSync(fullItemPath, MAX_EPIC_SMALL_JSON_BYTES, {
+                rejectSymlink: true,
+              });
               if (!parsed || typeof parsed !== 'object') continue;
               if (
                 !parsed.bIsIncompleteInstall &&
@@ -763,7 +958,9 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
       const listMap = new Map();
       if (fs.existsSync(datPath)) {
         try {
-          const existingDat = JSON.parse(fs.readFileSync(datPath, 'utf8'));
+          const existingDat = readJsonFileBoundedSync(datPath, MAX_EPIC_META_JSON_BYTES, {
+            rejectSymlink: true,
+          });
           const existingList = Array.isArray(existingDat?.InstallationList)
             ? existingDat.InstallationList
             : [];
@@ -893,7 +1090,7 @@ function unregisterEpicFirstPartyLauncher(
       const instFile = path.join(legDir, 'installed.json');
       if (fs.existsSync(instFile)) {
         try {
-          const raw = JSON.parse(fs.readFileSync(instFile, 'utf8'));
+          const raw = readJsonFileBoundedSync(instFile, MAX_LEGENDARY_LARGE_JSON_BYTES);
           const entries = Array.isArray(raw)
             ? raw
             : raw && typeof raw === 'object'
@@ -927,7 +1124,7 @@ function unregisterEpicFirstPartyLauncher(
       const assetsFile = path.join(legDir, 'assets.json');
       if (fs.existsSync(assetsFile)) {
         try {
-          const rawAssets = JSON.parse(fs.readFileSync(assetsFile, 'utf8'));
+          const rawAssets = readJsonFileBoundedSync(assetsFile, MAX_LEGENDARY_LARGE_JSON_BYTES);
           const assetLists = [];
           if (Array.isArray(rawAssets)) assetLists.push(rawAssets);
           else if (rawAssets && typeof rawAssets === 'object') {
@@ -1020,8 +1217,12 @@ function unregisterEpicFirstPartyLauncher(
           for (const f of files) {
             if (!f.toLowerCase().endsWith('.item')) continue;
             const fullItemPath = path.join(target.manifestsDir, f);
+            if (!isSafeContainedFileSync(target.manifestsDir, fullItemPath, platform)) continue;
             try {
-              const item = JSON.parse(fs.readFileSync(fullItemPath, 'utf8'));
+              const item = readJsonFileBoundedSync(fullItemPath, MAX_EPIC_SMALL_JSON_BYTES, {
+                rejectSymlink: true,
+              });
+              if (!item || typeof item !== 'object') continue;
               const itApp = String(item?.AppName || '')
                 .trim()
                 .toLowerCase();
@@ -1044,9 +1245,12 @@ function unregisterEpicFirstPartyLauncher(
         } catch {}
       }
 
-      if (target.datPath && fs.existsSync(target.datPath)) {
+      if (target.datPath && fs.existsSync(target.datPath) && !isExistingSymlinkSync(target.datPath)) {
         try {
-          const rawDat = JSON.parse(fs.readFileSync(target.datPath, 'utf8'));
+          const rawDat = readJsonFileBoundedSync(target.datPath, MAX_EPIC_META_JSON_BYTES, {
+            rejectSymlink: true,
+          });
+          if (!rawDat || typeof rawDat !== 'object') continue;
           const existingList = Array.isArray(rawDat?.InstallationList)
             ? rawDat.InstallationList
             : [];
@@ -1198,9 +1402,15 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
       const dstFile = path.join(legendaryConfigPath, fileName);
       if (fs.existsSync(srcFile) && !fs.existsSync(dstFile)) {
         try {
-          fs.copyFileSync(srcFile, dstFile);
-          if (fileName === 'installed.json') {
-            const parsedExt = JSON.parse(fs.readFileSync(srcFile, 'utf8'));
+          const copied = atomicCopyFileNoBackupSync(
+            srcFile,
+            dstFile,
+            MAX_LEGENDARY_LARGE_JSON_BYTES
+          );
+          if (copied && fileName === 'installed.json') {
+            const parsedExt = readJsonFileBoundedSync(dstFile, MAX_LEGENDARY_LARGE_JSON_BYTES, {
+              rejectSymlink: true,
+            });
             const extEntries = Array.isArray(parsedExt)
               ? parsedExt
               : parsedExt && typeof parsedExt === 'object'
@@ -1233,7 +1443,7 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
     !options.allowInteractiveAuth;
   if (epicTombstoned) {
     try {
-      if (fs.existsSync(userFilePath)) {
+      if (fs.existsSync(userFilePath) && !isExistingSymlinkSync(userFilePath)) {
         fs.unlinkSync(userFilePath);
       }
     } catch {}
@@ -1296,15 +1506,19 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
   for (const candFile of candidateUserJsonPaths) {
     if (!fs.existsSync(candFile)) continue;
     try {
-      const parsedUser = JSON.parse(fs.readFileSync(candFile, 'utf8'));
+      const parsedUser = readJsonFileBoundedSync(candFile, MAX_EPIC_SMALL_JSON_BYTES, {
+        rejectSymlink: true,
+      });
+      if (!parsedUser || typeof parsedUser !== 'object') continue;
       const sanitized = sanitizeEpicCandidateRecord(parsedUser, options);
       if (sanitized) {
         fallbackAccountMeta = fallbackAccountMeta || sanitized.meta;
         if (sanitized.poisoned) {
           if (
-            path.resolve(candFile) === path.resolve(userFilePath) ||
-            path.resolve(candFile) ===
-              path.resolve(path.join(homedir, '.config/legendary/user.json'))
+            (path.resolve(candFile) === path.resolve(userFilePath) ||
+              path.resolve(candFile) ===
+                path.resolve(path.join(homedir, '.config/legendary/user.json'))) &&
+            !isExistingSymlinkSync(candFile)
           ) {
             try {
               fs.unlinkSync(candFile);
@@ -1449,9 +1663,12 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
     /** @type {any} */
     let existingDiskParsed = null;
     try {
-      if (fs.existsSync(userFilePath)) {
-        existingDiskRaw = fs.readFileSync(userFilePath, 'utf8');
-        existingDiskParsed = JSON.parse(existingDiskRaw);
+      if (fs.existsSync(userFilePath) && !isExistingSymlinkSync(userFilePath)) {
+        const st = fs.statSync(userFilePath);
+        if (st.isFile() && st.size <= MAX_EPIC_SMALL_JSON_BYTES) {
+          existingDiskRaw = fs.readFileSync(userFilePath, 'utf8');
+          existingDiskParsed = JSON.parse(existingDiskRaw);
+        }
       }
     } catch {}
 
@@ -1538,7 +1755,7 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
   }
 
   try {
-    if (fs.existsSync(userFilePath)) {
+    if (fs.existsSync(userFilePath) && !isExistingSymlinkSync(userFilePath)) {
       fs.unlinkSync(userFilePath);
     }
   } catch {}
@@ -1693,31 +1910,44 @@ async function refreshLocalLegendaryMetadata(options = {}) {
     LEGENDARY_CONFIG_PATH: getLegendaryConfigDir(options),
   };
   const execFn = typeof options.execFileFn === 'function' ? options.execFileFn : execFile;
-  const timeoutMs = Number(options.timeoutMs || 25000);
+  const rawTimeoutMs = Number(options.timeoutMs || 25000);
+  const timeoutMs = Number.isFinite(rawTimeoutMs)
+    ? Math.min(120000, Math.max(1000, Math.trunc(rawTimeoutMs)))
+    : 25000;
 
   const runLegendaryArgs = (/** @type {string[]} */ cliArgs) =>
     new Promise((resolve) => {
-      const target =
-        (options.platform || process.platform) === 'win32'
-          ? resolveWindowsNodeShebangSpawn(legendaryBin, cliArgs)
-          : { cmd: legendaryBin, args: cliArgs };
-      execFn(
-        target.cmd,
-        target.args,
-        {
-          env: execEnv,
-          timeout: timeoutMs,
-          maxBuffer: 32 * 1024 * 1024,
-          windowsHide: true,
-        },
-        (/** @type {any} */ err, /** @type {any} */ stdout, /** @type {any} */ stderr) => {
-          resolve({
-            err,
-            stdout: String(stdout || ''),
-            stderr: String(stderr || ''),
-          });
-        }
-      );
+      let settled = false;
+      const done = (/** @type {any} */ payload) => {
+        if (settled) return;
+        settled = true;
+        resolve(payload);
+      };
+      try {
+        const target =
+          (options.platform || process.platform) === 'win32'
+            ? resolveWindowsNodeShebangSpawn(legendaryBin, cliArgs)
+            : { cmd: legendaryBin, args: cliArgs };
+        execFn(
+          target.cmd,
+          target.args,
+          {
+            env: execEnv,
+            timeout: timeoutMs,
+            maxBuffer: 32 * 1024 * 1024,
+            windowsHide: true,
+          },
+          (/** @type {any} */ err, /** @type {any} */ stdout, /** @type {any} */ stderr) => {
+            done({
+              err,
+              stdout: String(stdout || ''),
+              stderr: String(stderr || ''),
+            });
+          }
+        );
+      } catch (spawnErr) {
+        done({ err: spawnErr, stdout: '', stderr: '' });
+      }
     });
 
   let usedThirdPartyFlag = true;
@@ -1793,7 +2023,8 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
   const aliasToAppName = new Map();
   /** @type {any[]} */
   const metaSummaries = [];
-  const seenMetaAppNames = new Set();
+  /** @type {Map<string, any>} */
+  const seenMetaByAppName = new Map();
 
   for (const dir of configDirs) {
     if (!dir || !fs.existsSync(dir)) continue;
@@ -1804,6 +2035,7 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
         const st = fs.statSync(aliasesFile);
         const mtimeMs = st.mtimeMs || 0;
         const size = st.size || 0;
+        if (!st.isFile() || size > MAX_LEGENDARY_LARGE_JSON_BYTES) continue;
         const cachedAliases = legendaryAliasesFileCache.get(aliasesFile);
         let aliasEntries = null;
         if (
@@ -1815,7 +2047,7 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
           aliasEntries = cachedAliases.entries;
         } else {
           aliasEntries = [];
-          const aliasesObj = JSON.parse(fs.readFileSync(aliasesFile, 'utf8'));
+          const aliasesObj = readJsonFileBoundedSync(aliasesFile, MAX_LEGENDARY_LARGE_JSON_BYTES);
           if (aliasesObj && typeof aliasesObj === 'object') {
             for (const [appNameKey, list] of Object.entries(aliasesObj)) {
               if (!Array.isArray(list)) continue;
@@ -1848,61 +2080,63 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
         const st = fs.statSync(assetsFile);
         const mtimeMs = st.mtimeMs || 0;
         const size = st.size || 0;
-        const cachedAssets = legendaryAssetsFileCache.get(assetsFile);
-        let fileWinAssets = null;
-        let fileMacAssets = null;
-        if (
-          cachedAssets &&
-          cachedAssets.mtimeMs === mtimeMs &&
-          cachedAssets.size === size &&
-          Array.isArray(cachedAssets.winAssets) &&
-          Array.isArray(cachedAssets.macAssets)
-        ) {
-          fileWinAssets = cachedAssets.winAssets;
-          fileMacAssets = cachedAssets.macAssets;
-        } else {
-          fileWinAssets = [];
-          fileMacAssets = [];
-          const parsed = JSON.parse(fs.readFileSync(assetsFile, 'utf8'));
-          if (Array.isArray(parsed)) {
-            for (const item of parsed) {
-              if (!item || typeof item !== 'object') continue;
-              const hasMacInfo =
-                String(item.platform || '').toLowerCase() === 'mac' ||
-                Boolean(
-                  item.asset_infos &&
-                    item.asset_infos.Mac &&
-                    Object.keys(item.asset_infos.Mac).length > 0
-                );
-              const hasWinInfo =
-                String(item.platform || '').toLowerCase() === 'windows' ||
-                Boolean(
-                  item.asset_infos &&
-                    item.asset_infos.Windows &&
-                    Object.keys(item.asset_infos.Windows).length > 0
-                ) ||
-                (!item.platform && !item.asset_infos);
+        if (st.isFile() && size <= MAX_LEGENDARY_LARGE_JSON_BYTES) {
+          const cachedAssets = legendaryAssetsFileCache.get(assetsFile);
+          let fileWinAssets = null;
+          let fileMacAssets = null;
+          if (
+            cachedAssets &&
+            cachedAssets.mtimeMs === mtimeMs &&
+            cachedAssets.size === size &&
+            Array.isArray(cachedAssets.winAssets) &&
+            Array.isArray(cachedAssets.macAssets)
+          ) {
+            fileWinAssets = cachedAssets.winAssets;
+            fileMacAssets = cachedAssets.macAssets;
+          } else {
+            fileWinAssets = [];
+            fileMacAssets = [];
+            const parsed = readJsonFileBoundedSync(assetsFile, MAX_LEGENDARY_LARGE_JSON_BYTES);
+            if (Array.isArray(parsed)) {
+              for (const item of parsed) {
+                if (!item || typeof item !== 'object') continue;
+                const hasMacInfo =
+                  String(item.platform || '').toLowerCase() === 'mac' ||
+                  Boolean(
+                    item.asset_infos &&
+                      item.asset_infos.Mac &&
+                      Object.keys(item.asset_infos.Mac).length > 0
+                  );
+                const hasWinInfo =
+                  String(item.platform || '').toLowerCase() === 'windows' ||
+                  Boolean(
+                    item.asset_infos &&
+                      item.asset_infos.Windows &&
+                      Object.keys(item.asset_infos.Windows).length > 0
+                  ) ||
+                  (!item.platform && !item.asset_infos);
 
-              if (hasMacInfo) fileMacAssets.push(item);
-              if (hasWinInfo) fileWinAssets.push(item);
+                if (hasMacInfo) fileMacAssets.push(item);
+                if (hasWinInfo) fileWinAssets.push(item);
+              }
+            } else if (parsed && typeof parsed === 'object') {
+              if (Array.isArray(parsed.Windows)) {
+                fileWinAssets.push(...parsed.Windows);
+              }
+              if (Array.isArray(parsed.Mac)) {
+                fileMacAssets.push(...parsed.Mac);
+              }
             }
-          } else if (parsed && typeof parsed === 'object') {
-            if (Array.isArray(parsed.Windows)) {
-              fileWinAssets.push(...parsed.Windows);
-            }
-            if (Array.isArray(parsed.Mac)) {
-              fileMacAssets.push(...parsed.Mac);
-            }
+            setBoundedMapEntry(
+              legendaryAssetsFileCache,
+              assetsFile,
+              { mtimeMs, size, winAssets: fileWinAssets, macAssets: fileMacAssets },
+              MAX_LEGENDARY_CACHE_DIRS
+            );
           }
-          setBoundedMapEntry(
-            legendaryAssetsFileCache,
-            assetsFile,
-            { mtimeMs, size, winAssets: fileWinAssets, macAssets: fileMacAssets },
-            MAX_LEGENDARY_CACHE_DIRS
-          );
+          winAssets.push(...fileWinAssets);
+          macAssets.push(...fileMacAssets);
         }
-        winAssets.push(...fileWinAssets);
-        macAssets.push(...fileMacAssets);
       } catch {}
     }
 
@@ -1927,7 +2161,11 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
           dirSummaries = [];
           for (const f of files) {
             try {
-              const json = JSON.parse(fs.readFileSync(path.join(metaDir, f), 'utf8'));
+              const metaJsonPath = path.join(metaDir, f);
+              if (!isSafeContainedFileSync(metaDir, metaJsonPath)) continue;
+              const json = readJsonFileBoundedSync(metaJsonPath, MAX_EPIC_META_JSON_BYTES, {
+                rejectSymlink: true,
+              });
               if (!json || typeof json !== 'object') continue;
               const appName = String(json.app_name || f.replace(/\.json$/i, '')).trim();
               if (!appName) continue;
@@ -2019,33 +2257,32 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
         }
         for (const s of dirSummaries) {
           const key = s.appName.toLowerCase();
-          if (!seenMetaAppNames.has(key)) {
-            seenMetaAppNames.add(key);
-            metaSummaries.push({ ...s });
+          const existing = seenMetaByAppName.get(key);
+          if (!existing) {
+            const copy = { ...s };
+            seenMetaByAppName.set(key, copy);
+            metaSummaries.push(copy);
           } else {
-            const existing = metaSummaries.find((m) => m.appName.toLowerCase() === key);
-            if (existing) {
-              if (!existing.deploymentId && s.deploymentId) existing.deploymentId = s.deploymentId;
-              if (!existing.namespace && s.namespace) existing.namespace = s.namespace;
-              if (!existing.catalogItemId && s.catalogItemId) {
-                existing.catalogItemId = s.catalogItemId;
-              }
-              if (!existing.chainedLauncherHandoff && s.chainedLauncherHandoff) {
-                existing.chainedLauncherHandoff = s.chainedLauncherHandoff;
-                existing.externalStorefrontHandoff = s.externalStorefrontHandoff;
-                existing.chainedHandoffTopology = s.chainedHandoffTopology;
-                existing.hasMac = false;
-                existing.hasWin = true;
-              }
-              if (!existing.epicPartnerRegistryPath && s.epicPartnerRegistryPath) {
-                existing.epicPartnerRegistryPath = s.epicPartnerRegistryPath;
-              }
-              if (!existing.epicPartnerRegistryKey && s.epicPartnerRegistryKey) {
-                existing.epicPartnerRegistryKey = s.epicPartnerRegistryKey;
-              }
-              if (!existing.chainedExternalInstallId && s.chainedExternalInstallId) {
-                existing.chainedExternalInstallId = s.chainedExternalInstallId;
-              }
+            if (!existing.deploymentId && s.deploymentId) existing.deploymentId = s.deploymentId;
+            if (!existing.namespace && s.namespace) existing.namespace = s.namespace;
+            if (!existing.catalogItemId && s.catalogItemId) {
+              existing.catalogItemId = s.catalogItemId;
+            }
+            if (!existing.chainedLauncherHandoff && s.chainedLauncherHandoff) {
+              existing.chainedLauncherHandoff = s.chainedLauncherHandoff;
+              existing.externalStorefrontHandoff = s.externalStorefrontHandoff;
+              existing.chainedHandoffTopology = s.chainedHandoffTopology;
+              existing.hasMac = false;
+              existing.hasWin = true;
+            }
+            if (!existing.epicPartnerRegistryPath && s.epicPartnerRegistryPath) {
+              existing.epicPartnerRegistryPath = s.epicPartnerRegistryPath;
+            }
+            if (!existing.epicPartnerRegistryKey && s.epicPartnerRegistryKey) {
+              existing.epicPartnerRegistryKey = s.epicPartnerRegistryKey;
+            }
+            if (!existing.chainedExternalInstallId && s.chainedExternalInstallId) {
+              existing.chainedExternalInstallId = s.chainedExternalInstallId;
             }
           }
         }
@@ -2063,8 +2300,10 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
     const k = String(rawKey || '')
       .toLowerCase()
       .trim();
-    if (!k) return;
-    const prev = epicPlatformSupport[k] || { windows: false, mac: false };
+    if (!k || FORBIDDEN_PROTO_KEYS.has(k)) return;
+    const prev = Object.prototype.hasOwnProperty.call(epicPlatformSupport, k)
+      ? epicPlatformSupport[k]
+      : { windows: false, mac: false };
     epicPlatformSupport[k] = {
       windows: Boolean(prev.windows || win),
       mac: Boolean(prev.mac || mac),
@@ -2089,7 +2328,12 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
   }
   for (const s of metaSummaries) {
     const forcePartnerWinOnly = Boolean(s.chainedLauncherHandoff);
-    const existingByApp = epicPlatformSupport[s.appName.toLowerCase()];
+    const appKeyLower = s.appName.toLowerCase();
+    const existingByApp =
+      !FORBIDDEN_PROTO_KEYS.has(appKeyLower) &&
+      Object.prototype.hasOwnProperty.call(epicPlatformSupport, appKeyLower)
+        ? epicPlatformSupport[appKeyLower]
+        : undefined;
     const hasWin = forcePartnerWinOnly ? true : Boolean(s.hasWin || existingByApp?.windows);
     const hasMac = forcePartnerWinOnly ? false : Boolean(s.hasMac || existingByApp?.mac);
     if (forcePartnerWinOnly) {
@@ -2098,7 +2342,7 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
         const k = String(rk || '')
           .toLowerCase()
           .trim();
-        if (k) {
+        if (k && !FORBIDDEN_PROTO_KEYS.has(k)) {
           epicPlatformSupport[k] = { windows: true, mac: false };
         }
       }
@@ -2260,14 +2504,20 @@ function resolveEpicAppAndPlatforms(/** @type {any} */ payload = {}, /** @type {
 
   if (
     (!namespace || !catalogItemId || !deploymentId || !chainedLauncherHandoff) &&
-    resolvedAppName
+    resolvedAppName &&
+    isSafeEpicAppName(resolvedAppName)
   ) {
     for (const dir of configDirs) {
       if (!dir) continue;
-      const metaFile = path.join(dir, 'metadata', `${resolvedAppName}.json`);
+      const metaDir = path.join(dir, 'metadata');
+      const metaFile = path.join(metaDir, `${resolvedAppName}.json`);
+      if (!isSafeContainedFileSync(metaDir, metaFile)) continue;
       if (fs.existsSync(metaFile)) {
         try {
-          const metaJson = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+          const metaJson = readJsonFileBoundedSync(metaFile, MAX_EPIC_META_JSON_BYTES, {
+            rejectSymlink: true,
+          });
+          if (!metaJson || typeof metaJson !== 'object') continue;
           namespace = namespace || metaJson?.namespace || metaJson?.metadata?.namespace;
           catalogItemId =
             catalogItemId ||
@@ -2337,7 +2587,10 @@ async function performJsonHttpRequest(
   /** @type {any} */ fetchFn = null
 ) {
   const fetchImpl = fetchFn || (typeof global !== 'undefined' ? global.fetch : null);
-  const timeoutMs = Number(reqOptions.timeoutMs || 3500);
+  const rawTimeout = Number(reqOptions.timeoutMs || 3500);
+  const timeoutMs = Number.isFinite(rawTimeout)
+    ? Math.min(60000, Math.max(250, Math.trunc(rawTimeout)))
+    : 3500;
   if (typeof fetchImpl === 'function') {
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
@@ -2351,15 +2604,25 @@ async function performJsonHttpRequest(
       });
       const status = Number(response?.status || (response?.ok ? 200 : 500));
       const ok = Boolean(response?.ok ?? (status >= 200 && status < 300));
-      let data = null;
-      if (typeof response?.json === 'function') {
+      const contentLenHeader =
+        typeof response?.headers?.get === 'function' ? response.headers.get('content-length') : null;
+      if (contentLenHeader && Number(contentLenHeader) > MAX_EPIC_HTTP_RESPONSE_BYTES) {
         try {
-          data = await response.json();
+          await response?.body?.cancel?.();
         } catch {}
-      } else if (typeof response?.text === 'function') {
+        return { ok: false, status, data: null };
+      }
+      let data = null;
+      if (typeof response?.text === 'function') {
         try {
           const txt = await response.text();
-          data = txt ? JSON.parse(txt) : null;
+          if (Buffer.byteLength(txt, 'utf8') <= MAX_EPIC_HTTP_RESPONSE_BYTES) {
+            data = txt ? JSON.parse(txt) : null;
+          }
+        } catch {}
+      } else if (typeof response?.json === 'function') {
+        try {
+          data = await response.json();
         } catch {}
       }
       return { ok, status, data };
@@ -2369,8 +2632,24 @@ async function performJsonHttpRequest(
   }
 
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (/** @type {{ ok: boolean, status: number, data: any }} */ payload) => {
+      if (settled) return;
+      settled = true;
+      resolve(payload);
+    };
     try {
       const parsedUrl = new URL(url);
+      const isLoopbackHttp =
+        parsedUrl.protocol === 'http:' &&
+        (parsedUrl.hostname === '127.0.0.1' ||
+          parsedUrl.hostname === 'localhost' ||
+          parsedUrl.hostname === '[::1]' ||
+          parsedUrl.hostname === '::1');
+      if (parsedUrl.protocol !== 'https:' && !isLoopbackHttp) {
+        finish({ ok: false, status: 0, data: null });
+        return;
+      }
       const client = parsedUrl.protocol === 'http:' ? http : https;
       const req = client.request(
         parsedUrl,
@@ -2380,34 +2659,52 @@ async function performJsonHttpRequest(
           timeout: timeoutMs,
         },
         (res) => {
-          let raw = '';
+          /** @type {Buffer[]} */
+          const chunks = [];
+          let totalBytes = 0;
+          let oversized = false;
           res.on('data', (chunk) => {
-            raw += String(chunk);
+            if (oversized) return;
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+            totalBytes += buf.length;
+            if (totalBytes > MAX_EPIC_HTTP_RESPONSE_BYTES) {
+              oversized = true;
+              try {
+                res.destroy();
+                req.destroy();
+              } catch {}
+              finish({ ok: false, status: Number(res.statusCode || 0), data: null });
+              return;
+            }
+            chunks.push(buf);
           });
+          res.on('error', () => finish({ ok: false, status: 0, data: null }));
           res.on('end', () => {
+            if (oversized) return;
             const status = Number(res.statusCode || 500);
             const ok = status >= 200 && status < 300;
             let data = null;
             try {
+              const raw = Buffer.concat(chunks).toString('utf8');
               data = raw ? JSON.parse(raw) : null;
             } catch {}
-            resolve({ ok, status, data });
+            finish({ ok, status, data });
           });
         }
       );
-      req.on('error', () => resolve({ ok: false, status: 0, data: null }));
+      req.on('error', () => finish({ ok: false, status: 0, data: null }));
       req.on('timeout', () => {
         try {
           req.destroy();
         } catch {}
-        resolve({ ok: false, status: 0, data: null });
+        finish({ ok: false, status: 0, data: null });
       });
       if (reqOptions.body !== undefined) {
         req.write(reqOptions.body);
       }
       req.end();
     } catch {
-      resolve({ ok: false, status: 0, data: null });
+      finish({ ok: false, status: 0, data: null });
     }
   });
 }
@@ -2471,7 +2768,7 @@ async function resolveEpicLaunchAuthArguments(
   const savedTokens =
     options.savedTokens ||
     (activeStoreSync && typeof activeStoreSync.loadSavedTokens === 'function'
-      ? activeStoreSync.loadSavedTokens()
+      ? activeStoreSync.loadSavedTokens(options)
       : {});
 
   const effectiveOffline = Boolean(options.skipNetwork) || !isNetworkOnlineForLaunch(options);
@@ -2511,7 +2808,9 @@ async function resolveEpicLaunchAuthArguments(
     const userJsonFile = path.join(legAuth.legendaryConfigPath, 'user.json');
     if (fs.existsSync(userJsonFile)) {
       try {
-        const parsedUser = JSON.parse(fs.readFileSync(userJsonFile, 'utf8'));
+        const parsedUser = readJsonFileBoundedSync(userJsonFile, MAX_EPIC_SMALL_JSON_BYTES, {
+          rejectSymlink: true,
+        });
         accessToken = accessToken || parsedUser?.access_token || null;
         refreshToken = refreshToken || parsedUser?.refresh_token || null;
         accountId = accountId || parsedUser?.account_id || parsedUser?.in_app_id || '';
@@ -2596,35 +2895,41 @@ async function resolveEpicLaunchAuthArguments(
   }
 
   const { epicLocale } = resolveHostLocaleInfo(options);
-  const resolvedEpicLocale = epicLocale || 'en';
+  const resolvedEpicLocale = sanitizeEpicCliArgValue(epicLocale || 'en') || 'en';
+  const safeExchangeCode = exchangeCode ? sanitizeEpicCliArgValue(exchangeCode) : null;
+  const safeAppName = sanitizeEpicCliArgValue(appName);
+  const safeDisplayName = sanitizeEpicCliArgValue(displayName || 'Player') || 'Player';
+  const safeAccountId = sanitizeEpicCliArgValue(accountId);
+  const safeNamespace = sanitizeEpicCliArgValue(namespace);
+  const safeDeploymentId = sanitizeEpicCliArgValue(deploymentId);
 
-  const authenticated = Boolean(exchangeCode);
+  const authenticated = Boolean(safeExchangeCode);
   /** @type {string[]} */
   let epicArgs = [];
   if (authenticated) {
     epicArgs = [
       '-AUTH_LOGIN=unused',
-      `-AUTH_PASSWORD=${exchangeCode}`,
+      `-AUTH_PASSWORD=${safeExchangeCode}`,
       '-AUTH_TYPE=exchangecode',
-      ...(appName ? [`-epicapp=${appName}`] : []),
+      ...(safeAppName ? [`-epicapp=${safeAppName}`] : []),
       '-epicenv=Prod',
       '-EpicPortal',
-      `-epicusername=${displayName || 'Player'}`,
-      `-epicuserid=${accountId || ''}`,
+      `-epicusername=${safeDisplayName}`,
+      `-epicuserid=${safeAccountId}`,
       `-epiclocale=${resolvedEpicLocale}`,
-      ...(namespace ? [`-epicsandboxid=${namespace}`] : []),
-      ...(deploymentId ? [`-epicdeploymentid=${deploymentId}`] : []),
+      ...(safeNamespace ? [`-epicsandboxid=${safeNamespace}`] : []),
+      ...(safeDeploymentId ? [`-epicdeploymentid=${safeDeploymentId}`] : []),
     ];
-  } else if (appName) {
+  } else if (safeAppName) {
     epicArgs = [
-      `-epicapp=${appName}`,
+      `-epicapp=${safeAppName}`,
       '-epicenv=Prod',
       '-EpicPortal',
-      `-epicusername=${displayName || 'Player'}`,
-      `-epicuserid=${accountId || ''}`,
+      `-epicusername=${safeDisplayName}`,
+      `-epicuserid=${safeAccountId}`,
       `-epiclocale=${resolvedEpicLocale}`,
-      ...(namespace ? [`-epicsandboxid=${namespace}`] : []),
-      ...(deploymentId ? [`-epicdeploymentid=${deploymentId}`] : []),
+      ...(safeNamespace ? [`-epicsandboxid=${safeNamespace}`] : []),
+      ...(safeDeploymentId ? [`-epicdeploymentid=${safeDeploymentId}`] : []),
     ];
   }
 
@@ -2632,13 +2937,13 @@ async function resolveEpicLaunchAuthArguments(
     args: epicArgs,
     authenticated,
     ...(effectiveOffline && !authenticated ? { offlineSkipped: true, reason: 'offline_skipped' } : {}),
-    appName: appName || '',
-    namespace: namespace || '',
+    appName: safeAppName || '',
+    namespace: safeNamespace || '',
     catalogItemId: catalogItemId || '',
-    deploymentId: deploymentId || '',
-    accountId: accountId || '',
-    displayName: displayName || 'Player',
-    exchangeCode: exchangeCode || null,
+    deploymentId: safeDeploymentId || '',
+    accountId: safeAccountId || '',
+    displayName: safeDisplayName || 'Player',
+    exchangeCode: safeExchangeCode || null,
   };
 }
 
