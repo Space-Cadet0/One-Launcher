@@ -5,7 +5,7 @@ import type {
   ScrapedMetadataBundle,
   ReviewScoreRoute,
 } from '../../contracts/override';
-import { normalizeTitleForStoreSearch } from '../common/titleUtils';
+import { extractParentheticalReleaseYear } from '../common/titleUtils';
 import {
   calculateSyntheticSteamScore,
   calculateTier,
@@ -15,10 +15,12 @@ import {
 } from '../critic/criticUtils';
 import { KNOWN_CRITIC_SCORES } from '../critic/knownCriticScores';
 import { metacriticResolver, isTitleCompatible } from '../critic/metacriticResolver';
+import { openCriticResolver } from '../critic/openCriticResolver';
 import { steamReviewResolver } from '../critic/steamReviewResolver';
 import { storefrontStarResolver } from '../critic/storefrontStarResolver';
 import { storefrontReviewHarvester } from '../critic/storefrontReviewHarvester';
-import { requestScheduler, Priority } from '../network/requestScheduler';
+import { wikidataBridge, normalizeWikidataGogSlug } from '../critic/wikidataBridge';
+import { Priority } from '../network/requestScheduler';
 import { loadStagedCache } from '../storage/stagedCacheService';
 import { loadUserOverrides, getUserOverrideForGame } from '../storage/userOverrideStorage';
 import { steamMatcher } from '../steam/steamMatcher';
@@ -32,26 +34,48 @@ interface SteamEnrichedReviewEntry {
   };
 }
 
-interface OpenCriticGameDetailResponse {
-  id?: number;
-  name?: string;
-  topCriticScore?: number;
-  percentRecommended?: number;
-  numReviews?: number;
-  tier?: string;
-  firstReleaseDate?: string;
-  reviewSummary?: {
-    summary?: string;
-  };
-}
-
 const STEAM_ENRICHED_REVIEW_MAP: Record<string, SteamEnrichedReviewEntry> =
   steamEnrichedCache || {};
 
-const OPENCRITIC_PUBLIC_HEADERS: Record<string, string> = {
-  Accept: 'application/json',
-  Referer: 'https://opencritic.com/',
-};
+function extractDirectOpenCriticId(rawInput?: string | null): number | null {
+  if (!rawInput || typeof rawInput !== 'string') return null;
+  const trimmed = rawInput.trim();
+  const match = trimmed.match(
+    /^(?:https?:\/\/)?(?:www\.)?opencritic\.com\/game\/(\d+)(?:\/[^?#\s]*)?(?:[?#].*)?$/i
+  );
+  if (!match?.[1]) return null;
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function extractGogSlugCandidate(params: {
+  gogId?: string;
+  candidateStoreUrl?: string;
+  anchorRawStoreUrl?: string;
+  availableMetadataSources?: ScrapedMetadataBundle['availableMetadataSources'];
+}): string | undefined {
+  const fromGogId = normalizeWikidataGogSlug(params.gogId);
+  if (fromGogId) return fromGogId;
+
+  const fromCandidateUrl = normalizeWikidataGogSlug(params.candidateStoreUrl);
+  if (fromCandidateUrl) return fromCandidateUrl;
+
+  const fromAnchorUrl = normalizeWikidataGogSlug(params.anchorRawStoreUrl);
+  if (fromAnchorUrl) return fromAnchorUrl;
+
+  if (Array.isArray(params.availableMetadataSources)) {
+    for (const src of params.availableMetadataSources) {
+      if (src.source === 'gog') {
+        const fromSourceUrl = normalizeWikidataGogSlug(src.storeUrl);
+        if (fromSourceUrl) return fromSourceUrl;
+        const fromSourceId = normalizeWikidataGogSlug(src.gogId);
+        if (fromSourceId) return fromSourceId;
+      }
+    }
+  }
+
+  return undefined;
+}
 
 function isXboxStoreUrl(rawUrl?: string | null): boolean {
   if (!rawUrl) return false;
@@ -230,6 +254,47 @@ export class ReviewCandidateService {
     const rawCandidates: ReviewCandidateOption[] = [];
 
     const hasCustomQuery = Boolean(customSearchQuery && customSearchQuery.trim());
+    const directOpenCriticId = hasCustomQuery ? extractDirectOpenCriticId(customSearchQuery) : null;
+    if (directOpenCriticId !== null) {
+      const targetTitle = (
+        scrapedBundle?.title ||
+        candidate?.title ||
+        game.title ||
+        ''
+      ).trim();
+      const ocData = await withTimeout(
+        openCriticResolver.resolveById(directOpenCriticId, {
+          priority: Priority.P0_INTERACTIVE,
+          bypassCache: true,
+        }),
+        7500,
+        null
+      );
+      if (!ocData || typeof ocData.score !== 'number' || ocData.score <= 0) {
+        return [];
+      }
+      const option: ReviewCandidateOption = {
+        id: 'opencritic',
+        source: 'opencritic',
+        sourceLabel: 'OpenCritic',
+        score: ocData.score,
+        tier: ocData.tier || calculateTier(ocData.score, ocData.percentRecommended),
+        percentRecommended: ocData.percentRecommended,
+        numReviews: ocData.numReviews,
+        url: ocData.url || `https://opencritic.com/game/${directOpenCriticId}/game`,
+        summary: ocData.summary,
+        isVerified: true,
+        badgeText: 'Verified Press Consensus',
+      };
+      const routedOption: ReviewCandidateOption = {
+        ...option,
+        reviewRoute: buildCandidateRoute(option, {
+          title: targetTitle,
+        }),
+      };
+      return this.deduplicateAndRank([routedOption]);
+    }
+
     const title = (
       customSearchQuery?.trim() ||
       scrapedBundle?.title ||
@@ -582,12 +647,13 @@ export class ReviewCandidateService {
         let userOption: ReviewCandidateOption | null = null;
 
         if (bundle?.critic && typeof bundle.critic.score === 'number' && bundle.critic.score > 0) {
-          const titleYearMatch = title.match(/\((?:[^)]*,\s*)?((?:19|20)\d{2})[^)]*\)/);
+          const titleParenYear = extractParentheticalReleaseYear(title);
+          const titleParenYearStr = titleParenYear !== null ? String(titleParenYear) : null;
           const resolvedYearSuffixedSlug = Boolean(
-            titleYearMatch &&
+            titleParenYearStr &&
             anchor?.metacriticSlug &&
-            !anchor.metacriticSlug.endsWith(titleYearMatch[1]) &&
-            bundle.critic.url?.includes(`${anchor.metacriticSlug}-${titleYearMatch[1]}`)
+            !anchor.metacriticSlug.endsWith(titleParenYearStr) &&
+            bundle.critic.url?.includes(`${anchor.metacriticSlug}-${titleParenYearStr}`)
           );
 
           const isSameScoreAsAnchor = Boolean(
@@ -648,106 +714,59 @@ export class ReviewCandidateService {
       }
     };
 
-    // OpenCritic Task
+    // OpenCritic Task (Wikidata CC0 P2864 bridge + OpenCritic SSR resolver)
     const fetchOpenCriticTask = async (): Promise<ReviewCandidateOption | null> => {
       if (!title) return null;
       try {
-        const cleanTitle =
-          normalizeTitleForStoreSearch(title, { stripEditions: true }) ||
-          normalizeTitleForStoreSearch(title);
+        let resolvedOpenCriticId: number | undefined =
+          typeof anchor?.openCriticId === 'number' && anchor.openCriticId > 0
+            ? anchor.openCriticId
+            : undefined;
+        const isAnchorId = resolvedOpenCriticId !== undefined;
 
-        const baseUrl =
-          typeof window !== 'undefined' && window.location?.hostname === 'localhost'
-            ? '/api/opencritic'
-            : 'https://api.opencritic.com';
-
-        const searchUrl = `${baseUrl}/api/game/search?criteria=${encodeURIComponent(cleanTitle || title)}`;
-        const headers: Record<string, string> = { ...OPENCRITIC_PUBLIC_HEADERS };
-
-        const candidates = await requestScheduler.schedule(
-          searchUrl,
-          async () => {
-            const res = await fetch(searchUrl, {
-              headers,
-              signal: typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal ? AbortSignal.timeout(3500) : undefined,
-            });
-            if (!res.ok) return null;
-            return (await res.json()) as Array<{ id: number; name: string; dist?: number }>;
-          },
-          Priority.P0_INTERACTIVE,
-          'api.opencritic.com'
-        );
-
-        if (!Array.isArray(candidates) || candidates.length === 0) return null;
-
-        let best: { id: number; name: string; dist?: number } | null = null;
-        if (anchor?.openCriticId) {
-          best = candidates.find((c) => c.id === anchor.openCriticId) || null;
-        }
-
-        if (!best) {
-          for (const c of candidates) {
-            if (typeof c.dist === 'number' && c.dist <= 0.35) {
-              if (
-                !isSequelMismatch(cleanTitle || title, c.name) &&
-                isTitleCompatible(cleanTitle || title, c.name)
-              ) {
-                best = c;
-                break;
-              }
-            }
+        if (resolvedOpenCriticId === undefined) {
+          const gogSlug = extractGogSlugCandidate({
+            gogId,
+            candidateStoreUrl: candidate?.storeUrl,
+            anchorRawStoreUrl: anchor?.rawStoreUrl,
+            availableMetadataSources: scrapedBundle?.availableMetadataSources,
+          });
+          const wikidataLinks = await wikidataBridge.resolveForGame({
+            steamAppId,
+            gogSlug,
+            title,
+            releaseYear,
+            priority: Priority.P0_INTERACTIVE,
+          });
+          if (
+            typeof wikidataLinks?.openCriticId === 'number' &&
+            wikidataLinks.openCriticId > 0
+          ) {
+            resolvedOpenCriticId = wikidataLinks.openCriticId;
           }
         }
 
-        if (!best) return null;
-
-        const detailsUrl = `${baseUrl}/api/game/${best.id}`;
-        const data = await requestScheduler.schedule(
-          detailsUrl,
-          async () => {
-            const res = await fetch(detailsUrl, {
-              headers,
-              signal: typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal ? AbortSignal.timeout(3500) : undefined,
-            });
-            if (!res.ok) return null;
-            return (await res.json()) as OpenCriticGameDetailResponse;
-          },
-          Priority.P0_INTERACTIVE,
-          'api.opencritic.com'
-        );
-
-        if (!data || typeof data.topCriticScore !== 'number' || data.topCriticScore <= 0) {
+        if (resolvedOpenCriticId === undefined) {
           return null;
         }
 
-        if (releaseYear && data.firstReleaseDate) {
-          const hasYearInTitle = /\b(19\d\d|20\d\d)\b/.test(title);
-          const targetYrMatch = String(releaseYear).match(/\b(19\d\d|20\d\d)\b/);
-          const ocYrMatch = String(data.firstReleaseDate).match(/\b(19\d\d|20\d\d)\b/);
-          const isRemaster =
-            /\b(remastered|remaster|definitive|enhanced|anniversary|complete|goty|director'?s cut|redux|remake)\b/i.test(
-              title
-            );
-          if (targetYrMatch && ocYrMatch) {
-            const targetYr = parseInt(targetYrMatch[1], 10);
-            const ocYr = parseInt(ocYrMatch[1], 10);
-            if ((hasYearInTitle || targetYr <= 2020) && Math.abs(targetYr - ocYr) >= 4 && !isRemaster) {
-              return null;
-            }
-          }
+        const ocData = await openCriticResolver.resolveById(resolvedOpenCriticId, {
+          expectedTitle: title,
+          releaseYear,
+          priority: Priority.P0_INTERACTIVE,
+          isVerifiedAnchor: isAnchorId,
+          anchorScore: isAnchorId ? anchor?.openCriticScore : undefined,
+          anchorStorefront: isAnchorId ? anchor?.storefront : undefined,
+          anchorUrl: isAnchorId ? anchor?.openCriticUrl : undefined,
+          bypassCache: true,
+        });
+
+        if (!ocData || typeof ocData.score !== 'number' || ocData.score <= 0) {
+          return null;
         }
 
-        const score = Math.round(data.topCriticScore);
-        const percentRecommended =
-          typeof data.percentRecommended === 'number' ? Math.round(data.percentRecommended) : undefined;
-        const tier = (data.tier as CriticTier) || calculateTier(score, percentRecommended);
-        const slug = (data.name || best.name)
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/^-|-$/g, '');
-        const canonicalUrl = anchor?.openCriticUrl || `https://opencritic.com/game/${best.id}/${slug}`;
         const isAnchorMatched = Boolean(
-          anchor?.openCriticScore || (anchor?.openCriticId && anchor.openCriticId === best.id)
+          anchor?.openCriticScore || (anchor?.openCriticId && anchor.openCriticId === resolvedOpenCriticId)
         );
         const storeName = getAnchorStoreName(anchor?.storefront);
 
@@ -755,13 +774,13 @@ export class ReviewCandidateService {
           id: isAnchorMatched ? 'anchor-opencritic' : 'opencritic',
           source: 'opencritic',
           sourceLabel: 'OpenCritic',
-          score,
-          tier,
-          percentRecommended,
-          numReviews: typeof data.numReviews === 'number' ? data.numReviews : 25,
-          url: canonicalUrl,
+          score: ocData.score,
+          tier: ocData.tier || calculateTier(ocData.score, ocData.percentRecommended),
+          percentRecommended: ocData.percentRecommended,
+          numReviews: ocData.numReviews,
+          url: ocData.url || anchor?.openCriticUrl || `https://opencritic.com/game/${resolvedOpenCriticId}/game`,
           summary:
-            data.reviewSummary?.summary ||
+            ocData.summary ||
             (isAnchorMatched && anchor ? `Verified by official ${storeName} store review anchor.` : undefined),
           isVerified: true,
           isRecommended: isAnchorMatched,
