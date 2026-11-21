@@ -73,7 +73,7 @@ export function VirtualGridRows<T>({
   useLayoutEffect(() => {
     const next = computeOffsetRelativeToScrollParent(containerRef.current, scrollElement);
     setScrollMargin((prev) => (prev === next ? prev : next));
-  });
+  }, [scrollElement]);
 
   useLayoutEffect(() => {
     virtualizerRef.current.measure();
@@ -108,6 +108,15 @@ export function VirtualGridRows<T>({
       }
     });
     ro.observe(scrollElement);
+    const parentEl = containerRef.current?.parentElement;
+    if (
+      parentEl &&
+      parentEl !== scrollElement &&
+      typeof Element !== 'undefined' &&
+      parentEl instanceof Element
+    ) {
+      ro.observe(parentEl);
+    }
     return () => ro.disconnect();
   }, [scrollElement]);
 
@@ -209,7 +218,7 @@ export function VirtualListRows<T>({
   useLayoutEffect(() => {
     const next = computeOffsetRelativeToScrollParent(containerRef.current, scrollElement);
     setScrollMargin((prev) => (prev === next ? prev : next));
-  });
+  }, [scrollElement]);
 
   useLayoutEffect(() => {
     const syncMargin = () => {
@@ -240,6 +249,15 @@ export function VirtualListRows<T>({
       }
     });
     ro.observe(scrollElement);
+    const parentEl = containerRef.current?.parentElement;
+    if (
+      parentEl &&
+      parentEl !== scrollElement &&
+      typeof Element !== 'undefined' &&
+      parentEl instanceof Element
+    ) {
+      ro.observe(parentEl);
+    }
     return () => ro.disconnect();
   }, [scrollElement]);
 

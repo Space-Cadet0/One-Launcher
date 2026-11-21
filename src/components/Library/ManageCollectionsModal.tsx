@@ -55,6 +55,7 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
   const [editingIcon, setEditingIcon] = useState<string>('folder');
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
   const [dropSlotIndex, setDropSlotIndex] = useState<number | null>(null);
 
@@ -175,6 +176,7 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
   };
 
   const handleStartEditing = (col: GameCollection) => {
+    setConfirmDeleteId(null);
     setEditingId(col.id);
     setEditingName(col.name);
     setEditingIcon(getEffectiveCollectionIconId(col));
@@ -267,7 +269,7 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                 <React.Fragment key={col.id}>
                   <div
                     data-testid={`collection-row-${col.id}`}
-                    draggable={!isEditing && Boolean(onReorderCollections)}
+                    draggable={!isEditing && confirmDeleteId !== col.id && Boolean(onReorderCollections)}
                     onDragStart={(e) => {
                       setDraggedIndex(index);
                       setDropSlotIndex(index);
@@ -315,7 +317,16 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                     } ${isAfterTarget ? 'border-b-2 border-b-[#66c0f4]' : ''}`}
                   >
                     {isEditing ? (
-                      <div className="space-y-2.5 w-full">
+                      <div
+                        className="space-y-2.5 w-full"
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setEditingId(null);
+                          }
+                        }}
+                      >
                         <div className="flex items-center gap-2 w-full">
                           <div className="flex items-center justify-center w-7 h-7 rounded bg-[#0e141b] border border-steam-accent/60 shrink-0">
                             <CollectionIcon iconId={editingIcon} collectionId={col.id} size={15} />
@@ -330,15 +341,16 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                             onChange={(e) => setEditingName(e.target.value)}
                             onKeyDown={(e) => {
                               if (e.key === 'Enter') {
+                                if (e.nativeEvent?.isComposing || isImeComposing(e)) return;
                                 e.preventDefault();
-                                if (isImeComposing(e)) return;
                                 handleRenameSubmit(col.id);
                               } else if (e.key === 'Escape') {
+                                e.preventDefault();
                                 e.stopPropagation();
                                 setEditingId(null);
                               }
                             }}
-                            className="bg-[#0e141b] border border-steam-accent text-white text-xs rounded px-2 py-1 flex-1 outline-none"
+                            className="bg-[#0e141b] border border-steam-accent text-white text-xs rounded px-2 py-1 flex-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-steam-accent focus-visible:ring-offset-1 focus-visible:ring-offset-[#16202d]"
                             autoFocus
                           />
                           <button
@@ -496,17 +508,52 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                               >
                                 <Edit2 className="w-3 h-3" />
                               </button>
-                              {!col.isDefault && (
-                                <button
-                                  type="button"
-                                  onClick={() => onDeleteCollection(col.id)}
-                                  className="min-w-6 min-h-6 flex items-center justify-center text-slate-300 hover:text-red-400 rounded hover:bg-[#2a3c4e]"
-                                  title="Delete collection"
-                                  aria-label={`Delete ${col.name}`}
-                                >
-                                  <Trash2 className="w-3 h-3" />
-                                </button>
-                              )}
+                              {!col.isDefault &&
+                                (confirmDeleteId === col.id ? (
+                                  <div
+                                    className="flex items-center gap-1"
+                                    role="group"
+                                    aria-label={`Confirm deleting ${col.name}`}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Escape') {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        setConfirmDeleteId(null);
+                                      }
+                                    }}
+                                  >
+                                    <button
+                                      type="button"
+                                      data-testid={`confirm-delete-collection-${col.id}`}
+                                      onClick={() => {
+                                        setConfirmDeleteId(null);
+                                        onDeleteCollection(col.id);
+                                      }}
+                                      className="min-h-6 px-2 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400"
+                                    >
+                                      Confirm Delete
+                                    </button>
+                                    <button
+                                      type="button"
+                                      autoFocus
+                                      data-testid={`cancel-delete-collection-${col.id}`}
+                                      onClick={() => setConfirmDeleteId(null)}
+                                      className="min-h-6 px-2 py-0.5 rounded bg-[#2a3c4e] hover:bg-[#364d63] text-slate-100 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-steam-accent"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmDeleteId(col.id)}
+                                    className="min-w-6 min-h-6 flex items-center justify-center text-slate-300 hover:text-red-400 rounded hover:bg-[#2a3c4e]"
+                                    title="Delete collection"
+                                    aria-label={`Delete ${col.name}`}
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                ))}
                             </>
                           )}
                         </div>
@@ -551,11 +598,16 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                   value={newColName}
                   onChange={(e) => setNewColName(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && isImeComposing(e)) {
+                    if (e.key === 'Enter' && (e.nativeEvent?.isComposing || isImeComposing(e))) {
                       e.preventDefault();
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setIsCreatingNew(false);
+                      setShowNewIconPicker(false);
                     }
                   }}
-                  className="bg-[#0e141b] border border-[#2a475e] text-white placeholder-slate-400 text-xs rounded px-3 py-1.5 flex-1 focus:border-steam-accent outline-none"
+                  className="bg-[#0e141b] border border-[#2a475e] text-white placeholder-slate-400 text-xs rounded px-3 py-1.5 flex-1 focus:border-steam-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-steam-accent focus-visible:ring-offset-1 focus-visible:ring-offset-[#1b2838]"
                   autoFocus
                 />
                 <button

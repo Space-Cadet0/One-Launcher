@@ -683,7 +683,8 @@ describe('UI/UX Game Page, Launch & Compatibility Settings, and Storefront Funct
     const release2 = acquireModalOverlayLock();
     expect(isModalOverlayOpen()).toBe(true);
     expect(mockDocEl.attrs.get('data-modal-overlay-open')).toBe('true');
-    expect(mockRoot.attrs.has('inert')).toBe(true);
+    // Native <dialog>.showModal() owns background inertness so focus returns to the invoker on close
+    expect(mockRoot.attrs.has('inert')).toBe(false);
     expect(fakeBody.style.overflow).toBe('');
     expect(events).toEqual([true]);
 

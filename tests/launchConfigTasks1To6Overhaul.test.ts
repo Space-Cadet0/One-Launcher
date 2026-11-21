@@ -1270,7 +1270,7 @@ describe('Launch & Compatibility Settings 6-Task Overhaul — Comprehensive QA &
       launchModal.unmount();
       installModal.unmount();
 
-      // 4. Reference-counted modalOverlayLock lifecycle (data-modal-overlay-open + #root inert)
+      // 4. Reference-counted modalOverlayLock lifecycle (data-modal-overlay-open without setting #root[inert])
       const origHtmlElement = (globalThis as any).HTMLElement;
       class MockHTMLElement {
         private attrMap = new Map<string, string>();
@@ -1294,10 +1294,11 @@ describe('Launch & Compatibility Settings 6-Task Overhaul — Comprehensive QA &
         const releaseSecond = acquireModalOverlayLock();
         expect(isModalOverlayOpen()).toBe(true);
         expect(document.documentElement.getAttribute('data-modal-overlay-open')).toBe('true');
-        expect(rootEl.getAttribute('inert')).toBe('');
+        expect(rootEl.getAttribute('inert')).toBeNull();
         releaseFirst();
         expect(isModalOverlayOpen()).toBe(true);
-        expect(rootEl.getAttribute('inert')).toBe('');
+        expect(document.documentElement.getAttribute('data-modal-overlay-open')).toBe('true');
+        expect(rootEl.getAttribute('inert')).toBeNull();
         releaseSecond();
         expect(isModalOverlayOpen()).toBe(false);
         expect(document.documentElement.getAttribute('data-modal-overlay-open')).toBeNull();

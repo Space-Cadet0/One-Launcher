@@ -5,6 +5,10 @@
 @layer base {
   :root {
     color-scheme: dark;
+    /* WCAG 1.4.11 compliant scrollbar tokens: #4c799c vs #0f161e = 3.92:1, #5789b0 vs #0f161e = 4.86:1 */
+    --scrollbar-track: #0f161e;
+    --scrollbar-thumb: #4c799c;
+    --scrollbar-thumb-hover: #5789b0;
   }
 
   body {
@@ -14,20 +18,63 @@
     min-height: 100vh;
   }
 
-  /* Steam custom scrollbar */
-  ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+  /* Standard scrollbar styling (modern-web-guidance: customize-scrollbar-color-and-thickness) */
+  :root,
+  body,
+  main,
+  aside,
+  dialog,
+  .modal-scroll-body,
+  .ol-studio-scroll-body,
+  .overflow-y-auto,
+  .overflow-x-auto,
+  .overflow-auto {
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+    scrollbar-width: thin;
   }
-  ::-webkit-scrollbar-track {
-    background: #0f161e;
+
+  /* Legacy WebKit fallback gated so modern browsers use standard scrollbar-color/scrollbar-width */
+  @supports not (scrollbar-color: auto) {
+    :root,
+    body,
+    main,
+    aside,
+    dialog,
+    .modal-scroll-body,
+    .ol-studio-scroll-body,
+    .overflow-y-auto,
+    .overflow-x-auto,
+    .overflow-auto {
+      scrollbar-width: auto;
+    }
+
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--scrollbar-track);
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--scrollbar-thumb);
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: var(--scrollbar-thumb-hover);
+    }
   }
-  ::-webkit-scrollbar-thumb {
-    background: #2a475e;
-    border-radius: 4px;
-  }
-  ::-webkit-scrollbar-thumb:hover {
-    background: #3d688a;
+}
+
+.scrollbar-none {
+  scrollbar-width: none;
+}
+
+@supports not (scrollbar-width: none) {
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
   }
 }
 
@@ -426,6 +473,15 @@ html[data-modal-overlay-open='true'] #root [style*='app-region'] {
 /* ========================================================
    NATIVE TOP-LAYER <dialog> MODAL SHELL & REDUCED MOTION
    ======================================================== */
+dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog::backdrop {
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
 :where(dialog.ol-modal-dialog, dialog.modal-shell) {
   border: 0;
   padding: 0;
@@ -438,6 +494,16 @@ html[data-modal-overlay-open='true'] #root [style*='app-region'] {
   color: inherit;
   overflow: auto;
   overscroll-behavior: contain;
+  opacity: 0;
+  transition-property: opacity, transform, display, overlay;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
+  transition-behavior: allow-discrete;
+}
+
+dialog.ol-modal-dialog[open],
+dialog.modal-shell[open] {
+  opacity: 1;
 }
 
 dialog.ol-modal-dialog:modal,
@@ -447,9 +513,42 @@ dialog.modal-shell:modal {
 
 dialog.ol-modal-dialog::backdrop,
 dialog.modal-shell::backdrop {
-  background-color: rgba(5, 8, 12, 0.85);
+  background-color: rgba(5, 8, 12, 0);
   overflow: hidden;
   overscroll-behavior: contain;
+  transition-property: background-color, display, overlay;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
+  transition-behavior: allow-discrete;
+}
+
+dialog.ol-modal-dialog[open]::backdrop,
+dialog.modal-shell[open]::backdrop {
+  background-color: rgba(5, 8, 12, 0.85);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  :where(dialog.ol-modal-dialog, dialog.modal-shell) {
+    transform: translateY(4px) scale(0.98);
+  }
+
+  dialog.ol-modal-dialog[open],
+  dialog.modal-shell[open] {
+    transform: none;
+  }
+
+  @starting-style {
+    dialog.ol-modal-dialog[open],
+    dialog.modal-shell[open] {
+      opacity: 0;
+      transform: translateY(4px) scale(0.98);
+    }
+
+    dialog.ol-modal-dialog[open]::backdrop,
+    dialog.modal-shell[open]::backdrop {
+      background-color: rgba(5, 8, 12, 0);
+    }
+  }
 }
 
 .ol-studio-scroll-body {
@@ -485,6 +584,25 @@ dialog.modal-shell::backdrop {
 
   .dual-range-input::-moz-range-thumb {
     transition-duration: 0s !important;
+  }
+
+  dialog.ol-modal-dialog,
+  dialog.modal-shell,
+  dialog.ol-modal-dialog::backdrop,
+  dialog.modal-shell::backdrop {
+    transition-duration: 60ms;
+  }
+
+  @starting-style {
+    dialog.ol-modal-dialog[open],
+    dialog.modal-shell[open] {
+      opacity: 0;
+    }
+
+    dialog.ol-modal-dialog[open]::backdrop,
+    dialog.modal-shell[open]::backdrop {
+      background-color: rgba(5, 8, 12, 0);
+    }
   }
 }
 

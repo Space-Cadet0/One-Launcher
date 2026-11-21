@@ -107,7 +107,7 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
 }) => {
   const [internalOpen, setInternalOpen] = useState<boolean>(false);
   const [queue, setQueue] = useState<DownloadTaskState[]>(() =>
-    launcherService.getDownloadQueue()
+    isOpen ? launcherService.getDownloadQueue() : []
   );
   const [dismissedTaskIds, setDismissedTaskIds] = useState<Set<string>>(() => new Set());
   const [pendingActionIds, setPendingActionIds] = useState<Set<string>>(() => new Set());
@@ -119,22 +119,31 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
   }, [isOpen]);
 
   useEffect(() => {
-    const unsub = launcherService.subscribe(() => {
-      setQueue([...launcherService.getDownloadQueue()]);
-    });
-
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return undefined;
+    }
     const handleOpenEvent = () => {
       setInternalOpen(true);
     };
 
     window.addEventListener('antigravity:open-download-drawer', handleOpenEvent);
     return () => {
-      unsub();
       window.removeEventListener('antigravity:open-download-drawer', handleOpenEvent);
     };
   }, []);
 
   const effectiveOpen = isOpen !== undefined ? isOpen || internalOpen : internalOpen;
+
+  useEffect(() => {
+    if (!effectiveOpen) return undefined;
+    setQueue([...launcherService.getDownloadQueue()]);
+    const unsub = launcherService.subscribe(() => {
+      setQueue([...launcherService.getDownloadQueue()]);
+    });
+    return () => {
+      unsub();
+    };
+  }, [effectiveOpen]);
 
   const handleClose = () => {
     setInternalOpen(false);
@@ -309,9 +318,9 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
                         />
                       )}
                       <div className="min-w-0">
-                        <h4 className="text-xs font-bold text-white truncate" title={task.title}>
+                        <h3 className="text-xs font-bold text-white truncate" title={task.title}>
                           {task.title}
-                        </h4>
+                        </h3>
                         <div className="flex items-center gap-1.5 text-[10px] text-steam-subtext mt-0.5">
                           <StorefrontIcon
                             storefrontId={task.platformId}

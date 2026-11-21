@@ -1,5 +1,5 @@
 let activeModalOverlayCount = 0;
-let lockedRootWithInert = false;
+let lockGeneration = 0;
 
 export function canPortalModalToBody(): boolean {
   return (
@@ -38,12 +38,13 @@ export function isModalOverlayOpen(): boolean {
 }
 
 /**
- * Emergency reset to clear `#root[inert]` and `data-modal-overlay-open` in case
- * an unhandled component or modal crash aborted normal unmount cleanup.
+ * Emergency reset to clear `data-modal-overlay-open`, invalidate any stale
+ * `release()` closures from earlier modal lifecycles, and defensively clear any
+ * stray `#root[inert]` attribute in case an unhandled crash aborted unmount cleanup.
  */
 export function emergencyResetModalOverlayLock(): void {
+  lockGeneration += 1;
   activeModalOverlayCount = 0;
-  lockedRootWithInert = false;
   if (typeof document !== 'undefined') {
     if (document.documentElement?.removeAttribute) {
       document.documentElement.removeAttribute('data-modal-overlay-open');
@@ -68,24 +69,19 @@ export function emergencyResetModalOverlayLock(): void {
 
 /**
  * Tracks active modal overlay count and broadcasts `antigravity:modal-overlay-changed`
- * so background trailer players can pause while a modal is open.
+ * so background trailer players, warmup jobs, and drag regions react cleanly while
+ * a modal is open.
  *
- * Only marks `#root` inert when `canPortalModalToBody()` is `true` (meaning modals
- * portal onto `document.body` outside `#root`), preventing any inline `#root[inert]`
- * focus deadlock while preserving background inertness for portaled overlays.
+ * Intentionally does NOT set `#root[inert]`: native `<dialog>.showModal()` already
+ * places modals in the top layer and makes outside DOM inert while guaranteeing
+ * browser focus restoration back to the invoker on `dialog.close()`.
  */
 export function acquireModalOverlayLock(): () => void {
+  const acquiredGeneration = lockGeneration;
   activeModalOverlayCount += 1;
   if (activeModalOverlayCount === 1) {
     if (typeof document !== 'undefined' && document.documentElement?.setAttribute) {
       document.documentElement.setAttribute('data-modal-overlay-open', 'true');
-    }
-    if (canPortalModalToBody() && typeof document.getElementById === 'function') {
-      const rootEl = document.getElementById('root');
-      if (rootEl && typeof rootEl.setAttribute === 'function') {
-        rootEl.setAttribute('inert', '');
-        lockedRootWithInert = true;
-      }
     }
     if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
       try {
@@ -102,24 +98,13 @@ export function acquireModalOverlayLock(): () => void {
 
   let released = false;
   return () => {
-    if (released) return;
+    if (released || acquiredGeneration !== lockGeneration) return;
     released = true;
     activeModalOverlayCount = Math.max(0, activeModalOverlayCount - 1);
     if (activeModalOverlayCount === 0) {
       if (typeof document !== 'undefined' && document.documentElement?.removeAttribute) {
         document.documentElement.removeAttribute('data-modal-overlay-open');
       }
-      if (
-        lockedRootWithInert &&
-        typeof document !== 'undefined' &&
-        typeof document.getElementById === 'function'
-      ) {
-        const rootEl = document.getElementById('root');
-        if (rootEl && typeof rootEl.removeAttribute === 'function') {
-          rootEl.removeAttribute('inert');
-        }
-      }
-      lockedRootWithInert = false;
       if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
         try {
           window.dispatchEvent(

@@ -30,12 +30,21 @@ function setBoundedScrollEntry(map: Map<string, number>, key: string, value: num
   map.set(key, value);
 }
 
-function hasOpenModalDialog(): boolean {
-  return (
-    typeof document !== 'undefined' &&
-    typeof document.querySelector === 'function' &&
-    Boolean(document.querySelector('dialog[open]'))
-  );
+function hasOpenModalOrPopover(): boolean {
+  if (typeof document === 'undefined' || typeof document.querySelector !== 'function') {
+    return false;
+  }
+  if (document.querySelector('dialog[open]')) {
+    return true;
+  }
+  try {
+    if (document.querySelector('[popover]:popover-open')) {
+      return true;
+    }
+  } catch {
+    // Fallback for DOM engines that do not recognize :popover-open
+  }
+  return Boolean(document.querySelector('[popover][data-fallback-open="true"]'));
 }
 
 let nextNavId = 0;
@@ -192,7 +201,7 @@ export function useNavigationHistory(
   // Global keyboard shortcuts (Alt+Left / Cmd+[, Alt+Right / Cmd+], Backspace) and mouse buttons (3 & 4)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.isComposing || hasOpenModalDialog()) return;
+      if (e.isComposing || hasOpenModalOrPopover()) return;
 
       const activeEl = document.activeElement;
       const isInput =
@@ -228,7 +237,7 @@ export function useNavigationHistory(
     };
 
     const handleMouseUp = (e: MouseEvent) => {
-      if (hasOpenModalDialog()) return;
+      if (hasOpenModalOrPopover()) return;
       if (e.button === 3) {
         // Browser/Mouse Back button
         if (canGoBack) {

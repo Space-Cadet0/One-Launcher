@@ -5,7 +5,6 @@ import {
   useRef,
   useCallback,
   useDeferredValue,
-  startTransition,
   Suspense,
 } from 'react';
 import { CanonicalGame } from './contracts/game';
@@ -17,11 +16,7 @@ import {
   activeGameFilterToLibraryFilterState,
   doesLibraryFilterStateStillMatchActiveFilter,
 } from './contracts/filter';
-import type {
-  EnvironmentComponentId,
-  SetupWizardOpenMode,
-  SetupWizardStepId,
-} from './contracts/environmentSetup';
+import type { SetupWizardStepId } from './contracts/environmentSetup';
 import { TopNavBar } from './components/Navigation/TopNavBar';
 import { GlobalSyncProgressBar } from './components/Navigation/GlobalSyncProgressBar';
 import { LibrarySidebar } from './components/Library/LibrarySidebar';
@@ -52,14 +47,10 @@ import {
   evaluateLibraryFilter,
 } from './services/filter/libraryFilterIndex';
 import { launcherService } from './services/launcher/launcherService';
-import {
-  environmentSetupService,
-  getRemovedComponents,
-  OPEN_SYSTEM_SETUP_EVENT,
-  shouldAutoOpenSetupWizardOnStartup,
-  type OpenSystemSetupEventDetail,
-} from './services/launcher/environmentSetupService';
 import { useNavigationHistory } from './hooks/useNavigationHistory';
+import { useScrollRestoration } from './hooks/useScrollRestoration';
+import { useDocumentTitle } from './hooks/useDocumentTitle';
+import { useAppModalOrchestrator } from './hooks/useAppModalOrchestrator';
 import { useCriticScoreWarmup } from './hooks/useCriticScoreWarmup';
 import { useCollectionsManager } from './hooks/useCollectionsManager';
 import { useSyncNotice } from './hooks/useSyncNotice';
@@ -71,13 +62,16 @@ import { useBackgroundMediaWarmup } from './hooks/useBackgroundMediaWarmup';
 import { useManualLibrarySyncActions } from './hooks/useManualLibrarySyncActions';
 import { AlertTriangle, CheckCircle2, Layers, Sliders } from 'lucide-react';
 
-import { SteamStorePage } from './components/SteamStoreDetail/SteamStorePage';
-
 export { InGameHibernationView };
 
 import { lazyWithRetry } from './utils/lazyWithRetry';
 export { lazyWithRetry };
 
+const SteamStorePage = lazyWithRetry(() =>
+  import('./components/SteamStoreDetail/SteamStorePage').then((m) => ({
+    default: m.SteamStorePage,
+  }))
+);
 const ManageCollectionsModal = lazyWithRetry(() =>
   import('./components/Library/ManageCollectionsModal').then((m) => ({
     default: m.ManageCollectionsModal,
@@ -88,16 +82,16 @@ const IntegrationsModal = lazyWithRetry(() =>
     default: m.IntegrationsModal,
   }))
 );
-const loadFixMatchWizardModal = () =>
+const FixMatchWizardModal = lazyWithRetry(() =>
   import('./components/Library/FixMatchWizardModal').then((m) => ({
     default: m.FixMatchWizardModal,
-  }));
-const loadLibraryMatchManagerModal = () =>
+  }))
+);
+const LibraryMatchManagerModal = lazyWithRetry(() =>
   import('./components/Library/LibraryMatchManagerModal').then((m) => ({
     default: m.LibraryMatchManagerModal,
-  }));
-const FixMatchWizardModal = lazyWithRetry(loadFixMatchWizardModal);
-const LibraryMatchManagerModal = lazyWithRetry(loadLibraryMatchManagerModal);
+  }))
+);
 const GameAchievementsModal = lazyWithRetry(() =>
   import('./components/Achievements/GameAchievementsModal').then((m) => ({
     default: m.GameAchievementsModal,
@@ -108,16 +102,18 @@ const DownloadManagerDrawer = lazyWithRetry(() =>
     default: m.DownloadManagerDrawer,
   }))
 );
-const loadSystemSetupWizardModal = () =>
+const SystemSetupWizardModal = lazyWithRetry(() =>
   import('./components/Launcher/SystemSetupWizard/SystemSetupWizardModal').then((m) => ({
     default: m.SystemSetupWizardModal,
-  }));
-const SystemSetupWizardModal = lazyWithRetry(loadSystemSetupWizardModal);
+  }))
+);
 const SettingsModal = lazyWithRetry(() =>
   import('./components/Settings/SettingsModal').then((m) => ({
     default: m.SettingsModal,
   }))
 );
+
+const NOOP_TOP_NAV_HOME_CLICK = () => {};
 
 function areShallowValuesEqual(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
@@ -314,38 +310,11 @@ export function App() {
     return games[0] || null;
   }, [games, currentEntry.selectedGameId, currentEntry.title]);
 
-  useEffect(() => {
-    const targetScrollY = currentEntry.scrollY ?? 0;
-    let attempts = 0;
-    const maxAttempts = 10;
-
-    const applyScroll = () => {
-      if (!mainContentRef.current) return;
-      mainContentRef.current.scrollTop = targetScrollY;
-      const child = mainContentRef.current.firstElementChild as HTMLElement | null;
-      if (child && child.scrollHeight > child.clientHeight) {
-        child.scrollTop = targetScrollY;
-      }
-      attempts++;
-      const currentY = mainContentRef.current.scrollTop || child?.scrollTop || 0;
-      if (targetScrollY > 0 && Math.abs(currentY - targetScrollY) > 5 && attempts < maxAttempts) {
-        requestAnimationFrame(applyScroll);
-      }
-    };
-
-    applyScroll();
-    const rafId = requestAnimationFrame(applyScroll);
-    const t1 = setTimeout(applyScroll, 30);
-    const t2 = setTimeout(applyScroll, 80);
-    const t3 = setTimeout(applyScroll, 150);
-
-    return () => {
-      cancelAnimationFrame(rafId);
-      clearTimeout(t1);
-      clearTimeout(t2);
-      clearTimeout(t3);
-    };
-  }, [currentEntry.id]);
+  useScrollRestoration({
+    containerRef: mainContentRef,
+    navigationEntryId: currentEntry.id,
+    targetScrollY: currentEntry.scrollY ?? 0,
+  });
 
   const navigateSelectGame = useCallback(
     (gameOrId: CanonicalGame | string) => {
@@ -578,30 +547,48 @@ export function App() {
     showSyncNotice,
   });
 
-  const [isIntegrationsModalOpen, setIsIntegrationsModalOpen] = useState(false);
-  const [isAchievementsModalOpen, setIsAchievementsModalOpen] = useState(false);
-  const [achievementsModalGame, setAchievementsModalGame] = useState<CanonicalGame | null>(null);
-  const [achievementsInitialStorefrontId, setAchievementsInitialStorefrontId] = useState<
-    StorefrontId | undefined
-  >(undefined);
-  const [isDownloadDrawerOpen, setIsDownloadDrawerOpen] = useState(false);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [settingsInitialSection, setSettingsInitialSection] = useState<'general' | 'macos_bottle'>(
-    'general'
-  );
-  const [isSystemSetupOpen, setIsSystemSetupOpen] = useState(false);
-  const [systemSetupMode, setSystemSetupMode] = useState<SetupWizardOpenMode>('health_check');
-  const [systemSetupInitialStep, setSystemSetupInitialStep] = useState<
-    SetupWizardStepId | undefined
-  >(undefined);
-  const [systemSetupFocusComponent, setSystemSetupFocusComponent] = useState<
-    EnvironmentComponentId | undefined
-  >(undefined);
-  const [systemSetupAlertCount, setSystemSetupAlertCount] = useState<number>(
-    () => environmentSetupService.getLastSnapshot()?.counts.removedSinceLastSetupCount || 0
-  );
-  const hasCheckedStartupWizardRef = useRef(false);
-  const setupSessionBaselineSigRef = useRef<string>('');
+  const prevConnectedStorefrontsRef = useRef<StorefrontId[]>([]);
+  const handleSetupStateChanged = useCallback(() => {
+    setGameRefreshKey((k) => k + 1);
+  }, []);
+
+  const {
+    isInteractiveModalBusy,
+    isIntegrationsModalOpen,
+    handleOpenIntegrationsModal,
+    handleCloseIntegrationsModal,
+    isAchievementsModalOpen,
+    achievementsModalGame,
+    achievementsInitialStorefrontId,
+    handleOpenAchievements,
+    handleCloseAchievementsModal,
+    handleTopNavOpenAchievements,
+    isDownloadDrawerOpen,
+    handleOpenDownloadDrawer,
+    handleCloseDownloadDrawer,
+    isSettingsOpen,
+    settingsInitialSection,
+    handleTopNavOpenSettings,
+    handleCloseSettingsModal,
+    handleOpenIntegrationsFromSettings,
+    isSystemSetupOpen,
+    systemSetupMode,
+    systemSetupInitialStep,
+    systemSetupFocusComponent,
+    systemSetupAlertCount,
+    handleOpenSystemSetup,
+    handleCloseSystemSetup,
+    handleTopNavOpenSystemSetup,
+  } = useAppModalOrchestrator({
+    selectedGame,
+    gamesRef: gamesLatestRef,
+    connectedStorefrontsRef: prevConnectedStorefrontsRef,
+    isCatalogVaultHydrated,
+    isMatchManagerOpen,
+    isFixMatchModalOpen,
+    isManageCollectionsOpen,
+    onSetupStateChanged: handleSetupStateChanged,
+  });
 
   const lastExplicitlySavedCatalogRef = useRef<CanonicalGame[] | null>(games);
   const prevCommittedCatalogRef = useRef<CanonicalGame[]>(games);
@@ -767,15 +754,6 @@ export function App() {
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
-    const handleOpenDrawer = () => setIsDownloadDrawerOpen(true);
-    window.addEventListener('antigravity:open-download-drawer', handleOpenDrawer);
-    return () => {
-      window.removeEventListener('antigravity:open-download-drawer', handleOpenDrawer);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
     const onScrollOrWheel = () => markScrollActivity();
     window.addEventListener('scroll', onScrollOrWheel, { capture: true, passive: true });
     window.addEventListener('wheel', onScrollOrWheel, { passive: true });
@@ -785,7 +763,6 @@ export function App() {
     };
   }, []);
 
-  const prevConnectedStorefrontsRef = useRef<StorefrontId[]>([]);
   const connectedStorefronts = useMemo(() => {
     try {
       const integrations = loadIntegrations();
@@ -800,61 +777,6 @@ export function App() {
       return prevConnectedStorefrontsRef.current;
     }
   }, [games, isIntegrationsModalOpen, isSystemSetupOpen, gameRefreshKey]);
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const win = window as Window & {
-      requestIdleCallback?: (cb: () => void, opts?: { timeout?: number }) => number;
-      cancelIdleCallback?: (id: number) => void;
-    };
-    let idleHandle: number | null = null;
-    let timerHandle: ReturnType<typeof setTimeout> | null = null;
-    const preloadModals = () => {
-      void loadLibraryMatchManagerModal().catch(() => {});
-      void loadFixMatchWizardModal().catch(() => {});
-    };
-    if (typeof win.requestIdleCallback === 'function') {
-      idleHandle = win.requestIdleCallback(preloadModals, { timeout: 2500 });
-    } else {
-      timerHandle = setTimeout(preloadModals, 1500);
-    }
-    return () => {
-      if (idleHandle !== null && typeof win.cancelIdleCallback === 'function') {
-        win.cancelIdleCallback(idleHandle);
-      }
-      if (timerHandle !== null) {
-        clearTimeout(timerHandle);
-      }
-    };
-  }, []);
-
-  const isInteractiveModalBusy =
-    isMatchManagerOpen ||
-    isFixMatchModalOpen ||
-    isIntegrationsModalOpen ||
-    isSystemSetupOpen ||
-    isSettingsOpen;
-
-  useEffect(() => {
-    if (typeof window === 'undefined' || !window.electronAPI?.offlineVault) return;
-    const vault = window.electronAPI.offlineVault as typeof window.electronAPI.offlineVault & {
-      setModalBusy?: (busy: boolean) => Promise<unknown> | void;
-    };
-    const notifyBusy = (busy: boolean) => {
-      try {
-        const maybePromise = vault.setModalBusy?.(busy);
-        if (maybePromise && typeof (maybePromise as Promise<unknown>).catch === 'function') {
-          void (maybePromise as Promise<unknown>).catch(() => {});
-        }
-      } catch {}
-    };
-    notifyBusy(isInteractiveModalBusy);
-    return () => {
-      if (isInteractiveModalBusy) {
-        notifyBusy(false);
-      }
-    };
-  }, [isInteractiveModalBusy]);
 
   useLocalInstallSync({
     gamesRef: gamesLatestRef,
@@ -1103,28 +1025,8 @@ export function App() {
     [handleGamesBatchUpdated]
   );
 
-  const handleOpenAchievements = useCallback(
-    (gameToView?: CanonicalGame | null, storefrontId?: StorefrontId) => {
-      const targetGame = gameToView || selectedGame;
-      if (targetGame) {
-        setAchievementsModalGame(targetGame);
-        setAchievementsInitialStorefrontId(storefrontId);
-        setIsAchievementsModalOpen(true);
-      }
-    },
-    [selectedGame]
-  );
-
   const handleToggleInstalledOnly = useCallback(() => {
     setInstalledOnly((prev) => !prev);
-  }, []);
-
-  const handleOpenIntegrationsModal = useCallback(() => {
-    setIsIntegrationsModalOpen(true);
-  }, []);
-
-  const handleCloseIntegrationsModal = useCallback(() => {
-    setIsIntegrationsModalOpen(false);
   }, []);
 
   const handleTopNavOpenFixMatch = useCallback(() => {
@@ -1141,253 +1043,14 @@ export function App() {
     setFixMatchGame(null);
   }, [setFixMatchGame, setIsFixMatchModalOpen, setIsMatchManagerOpen]);
 
-  const handleTopNavOpenAchievements = useCallback(() => {
-    handleOpenAchievements();
-  }, [handleOpenAchievements]);
-
-  const handleOpenDownloadDrawer = useCallback(() => {
-    setIsDownloadDrawerOpen(true);
-  }, []);
-
-  const handleCloseDownloadDrawer = useCallback(() => {
-    setIsDownloadDrawerOpen(false);
-  }, []);
-
-  const computeSetupSessionSignature = useCallback((): string => {
-    const ws = environmentSetupService.getWizardState();
-    let connectedSig = '';
-    try {
-      connectedSig = loadIntegrations()
-        .filter((i) => i.isConnected)
-        .map((i) => i.storefrontId)
-        .join(',');
-    } catch {}
-    return `${ws?.completedAt ?? ''}|${(ws?.configuredComponents ?? []).join(',')}|${connectedSig}`;
-  }, []);
-
-  const handleOpenSystemSetup = useCallback(
-    (
-      mode: SetupWizardOpenMode = 'health_check',
-      initialStep?: SetupWizardStepId,
-      focusComponentId?: EnvironmentComponentId
-    ) => {
-      setupSessionBaselineSigRef.current = computeSetupSessionSignature();
-      setSystemSetupMode(mode);
-      setSystemSetupInitialStep(initialStep);
-      setSystemSetupFocusComponent(focusComponentId);
-      setIsSystemSetupOpen(true);
-    },
-    [computeSetupSessionSignature]
-  );
-
-  const handleCloseSystemSetup = useCallback(() => {
-    const didSetupOrAccountsChange =
-      computeSetupSessionSignature() !== setupSessionBaselineSigRef.current;
-    setIsSystemSetupOpen(false);
-    setSystemSetupInitialStep(undefined);
-    setSystemSetupFocusComponent(undefined);
-    if (didSetupOrAccountsChange) {
-      startTransition(() => {
-        setGameRefreshKey((k) => k + 1);
-      });
-    }
-  }, [computeSetupSessionSignature]);
-
-  const handleTopNavOpenSystemSetup = useCallback(() => {
-    handleOpenSystemSetup('health_check');
-  }, [handleOpenSystemSetup]);
-
-  const openGlobalSettings = useCallback((section?: string) => {
-    const normalizedSection: 'general' | 'macos_bottle' =
-      section === 'macos_bottle' ? 'macos_bottle' : 'general';
-    setSettingsInitialSection(normalizedSection);
-    setIsSettingsOpen(true);
-  }, []);
-
-  const handleTopNavOpenSettings = useCallback(() => {
-    openGlobalSettings('general');
-  }, [openGlobalSettings]);
-
-  const handleCloseSettingsModal = useCallback(() => {
-    setIsSettingsOpen(false);
-  }, []);
-
   const handleOpenRunnerSetupFromSettings = useCallback(() => {
-    setIsSettingsOpen(false);
+    handleCloseSettingsModal();
     const initialStep: SetupWizardStepId =
       launcherService.getHostCapabilities().supportsWindowsTranslation
         ? 'compatibility'
         : 'prerequisites';
     handleOpenSystemSetup('health_check', initialStep);
-  }, [handleOpenSystemSetup]);
-
-  const handleOpenIntegrationsFromSettings = useCallback(() => {
-    setIsSettingsOpen(false);
-    setIsIntegrationsModalOpen(true);
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
-
-    const handleOpenSettingsEvent = (event: Event) => {
-      const detail = (
-        event as CustomEvent<{ section?: 'general' | 'macos_bottle' | string } | undefined>
-      ).detail;
-      openGlobalSettings(detail?.section);
-    };
-
-    const handleSettingsKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented) return;
-      if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key === ',') {
-        event.preventDefault();
-        openGlobalSettings('general');
-      }
-    };
-
-    window.addEventListener('antigravity:open-settings', handleOpenSettingsEvent);
-    window.addEventListener('keydown', handleSettingsKeyDown);
-
-    const unsubscribeIpcOpenSettings = window.electronAPI?.onOpenSettings?.((section) => {
-      openGlobalSettings(section);
-    });
-
-    return () => {
-      window.removeEventListener('antigravity:open-settings', handleOpenSettingsEvent);
-      window.removeEventListener('keydown', handleSettingsKeyDown);
-      unsubscribeIpcOpenSettings?.();
-    };
-  }, [openGlobalSettings]);
-
-  useEffect(() => {
-    const syncAlertCount = () => {
-      const snap = environmentSetupService.getLastSnapshot();
-      const nextCount = snap
-        ? getRemovedComponents(snap).filter(
-            (comp) => !(snap.hostPlatform === 'darwin' && comp.id === 'rosetta2')
-          ).length
-        : 0;
-      setSystemSetupAlertCount((prev) => (prev === nextCount ? prev : nextCount));
-    };
-    syncAlertCount();
-    return environmentSetupService.subscribe(syncAlertCount);
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
-    const getDefaultCompatOrPrereqStep = (): SetupWizardStepId =>
-      launcherService.getHostCapabilities().supportsWindowsTranslation
-        ? 'compatibility'
-        : 'prerequisites';
-    const normalizeWizardStep = (step?: string): SetupWizardStepId | undefined => {
-      if (!step) return undefined;
-      if (step === 'compatibility_and_bottle' || step === 'compatibility') {
-        return getDefaultCompatOrPrereqStep();
-      }
-      if (
-        step === 'prerequisites' ||
-        step === 'accounts' ||
-        step === 'clients' ||
-        step === 'client_logins' ||
-        step === 'summary'
-      ) {
-        return step;
-      }
-      return undefined;
-    };
-    const handleOpenEvent = (event: Event) => {
-      const detail = (event as CustomEvent<OpenSystemSetupEventDetail | undefined>).detail;
-      handleOpenSystemSetup(
-        detail?.mode || 'health_check',
-        normalizeWizardStep(detail?.initialStep),
-        detail?.focusComponentId
-      );
-    };
-    const handleOpenSetupWizardEvent = (event: Event) => {
-      const detail = (
-        event as CustomEvent<
-          | {
-              mode?: SetupWizardOpenMode;
-              initialStep?: SetupWizardStepId | 'compatibility_and_bottle' | string;
-              focusComponentId?: EnvironmentComponentId;
-            }
-          | undefined
-        >
-      ).detail;
-      handleOpenSystemSetup(
-        detail?.mode || 'health_check',
-        normalizeWizardStep(detail?.initialStep) || getDefaultCompatOrPrereqStep(),
-        detail?.focusComponentId
-      );
-    };
-    window.addEventListener(OPEN_SYSTEM_SETUP_EVENT, handleOpenEvent);
-    window.addEventListener('antigravity:open-setup-wizard', handleOpenSetupWizardEvent);
-    return () => {
-      window.removeEventListener(OPEN_SYSTEM_SETUP_EVENT, handleOpenEvent);
-      window.removeEventListener('antigravity:open-setup-wizard', handleOpenSetupWizardEvent);
-    };
-  }, [handleOpenSystemSetup]);
-
-  useEffect(() => {
-    if (!isCatalogVaultHydrated || hasCheckedStartupWizardRef.current) return;
-    hasCheckedStartupWizardRef.current = true;
-
-    let cancelled = false;
-    let idleHandle: number | null = null;
-    let timerHandle: ReturnType<typeof setTimeout> | null = null;
-    const win =
-      typeof window !== 'undefined'
-        ? (window as Window & {
-            requestIdleCallback?: (cb: () => void, opts?: { timeout?: number }) => number;
-            cancelIdleCallback?: (id: number) => void;
-          })
-        : undefined;
-
-    void environmentSetupService
-      .loadWizardState()
-      .then((wizardState) => {
-        if (cancelled) return;
-        const isElectronRuntime =
-          typeof window !== 'undefined' && Boolean(window.electronAPI?.isElectron);
-        const shouldAutoOpen = shouldAutoOpenSetupWizardOnStartup({
-          wizardState,
-          connectedStorefrontsCount: connectedStorefronts.length,
-          catalogGamesCount: gamesLatestRef.current.length,
-          isElectronRuntime,
-        });
-
-        if (shouldAutoOpen) {
-          handleOpenSystemSetup('first_launch');
-          return;
-        }
-
-        if (
-          isElectronRuntime &&
-          typeof window !== 'undefined' &&
-          typeof window.electronAPI?.probeEnvironmentHealth === 'function'
-        ) {
-          const runIdleProbe = () => {
-            if (cancelled) return;
-            void environmentSetupService.probeHealth(connectedStorefronts).catch(() => {});
-          };
-          if (win && typeof win.requestIdleCallback === 'function') {
-            idleHandle = win.requestIdleCallback(runIdleProbe, { timeout: 4000 });
-          } else {
-            timerHandle = setTimeout(runIdleProbe, 3000);
-          }
-        }
-      })
-      .catch(() => {});
-
-    return () => {
-      cancelled = true;
-      if (idleHandle !== null && win && typeof win.cancelIdleCallback === 'function') {
-        win.cancelIdleCallback(idleHandle);
-      }
-      if (timerHandle !== null) {
-        clearTimeout(timerHandle);
-      }
-    };
-  }, [connectedStorefronts, handleOpenSystemSetup, isCatalogVaultHydrated]);
+  }, [handleCloseSettingsModal, handleOpenSystemSetup]);
 
   const handleMainScroll = useCallback(() => {
     if (mainContentRef.current) {
@@ -1470,12 +1133,6 @@ export function App() {
     setFixMatchGame(null);
   }, [setIsFixMatchModalOpen, setFixMatchGame]);
 
-  const handleCloseAchievementsModal = useCallback(() => {
-    setIsAchievementsModalOpen(false);
-    setAchievementsModalGame(null);
-    setAchievementsInitialStorefrontId(undefined);
-  }, []);
-
   const handleIntegrationsLibraryUpdated = useCallback(
     (newGames: CanonicalGame[]) => {
       gamesLatestRef.current = newGames;
@@ -1543,9 +1200,24 @@ export function App() {
     return sorted;
   }, [games]);
 
+  useDocumentTitle({
+    isHibernating,
+    runningGamesCount: runningGames.length,
+    isGridView,
+    selectedGameTitle: selectedGame?.title ?? null,
+    activeFilterLabel: activeFilter?.label ?? null,
+    activeFilterValue: activeFilter?.value ?? null,
+    activeGroupName: activeGroupData?.name ?? null,
+  });
+
   if (isHibernating) {
     return <InGameHibernationView runningGames={runningGames} onResumeFullUi={resumeFullUi} />;
   }
+
+  const livePoliteAnnouncement =
+    !isInteractiveModalBusy && syncNotice && syncNoticeTone !== 'warning' ? syncNotice : '';
+  const liveAssertiveAnnouncement =
+    !isInteractiveModalBusy && syncNotice && syncNoticeTone === 'warning' ? syncNotice : '';
 
   return (
     <div className="h-screen w-screen bg-[#0e141b] text-steam-text flex flex-col font-steam overflow-hidden">
@@ -1553,10 +1225,28 @@ export function App() {
         Skip to main content
       </a>
 
+      {/* Persistent app-shell live regions mounted outside conditionally rendered banners (WCAG 4.1.3) */}
+      <div
+        data-testid="app-live-region-polite"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="ol-visually-hidden"
+      >
+        {livePoliteAnnouncement}
+      </div>
+      <div
+        data-testid="app-live-region-assertive"
+        role="alert"
+        aria-live="assertive"
+        aria-atomic="true"
+        className="ol-visually-hidden"
+      >
+        {liveAssertiveAnnouncement}
+      </div>
+
       {/* Top Navigation Bar */}
       <TopNavBar
-        searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
         selectedPlatform={selectedPlatform}
         onSelectPlatform={setSelectedPlatform}
         installedOnly={installedOnly}
@@ -1566,7 +1256,7 @@ export function App() {
         isSyncing={isSyncing}
         onTriggerSync={handleTriggerSync}
         onOpenIntegrations={handleOpenIntegrationsModal}
-        onHomeClick={navigateHome}
+        onHomeClick={NOOP_TOP_NAV_HOME_CLICK}
         canGoBack={canGoBack}
         onGoBack={goBack}
         backTitle={backTitle}
@@ -1598,8 +1288,6 @@ export function App() {
       {syncNotice && (
         <div
           data-testid="sync-status-banner"
-          role="status"
-          aria-live="polite"
           className={`border-b py-1.5 px-4 text-center text-xs flex items-center justify-center gap-2 flex-shrink-0 transition-all ${
             syncNoticeTone === 'warning'
               ? 'bg-amber-950/90 border-amber-600/50 text-amber-200'
@@ -1607,9 +1295,9 @@ export function App() {
           }`}
         >
           {syncNoticeTone === 'warning' ? (
-            <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
+            <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" aria-hidden="true" />
           ) : (
-            <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" aria-hidden="true" />
           )}
           <span>{syncNotice}</span>
         </div>
@@ -1648,7 +1336,7 @@ export function App() {
           ref={mainContentRef}
           onScroll={handleMainScroll}
           style={{ overflowAnchor: 'none' }}
-          className="flex-1 h-full overflow-y-auto bg-[#0b0f14] relative focus:outline-none"
+          className="flex-1 h-full overflow-y-auto bg-[#0b0f14] relative focus:outline-none focus-visible:ring-2 focus-visible:ring-steam-accent focus-visible:ring-inset"
         >
           {isGridView || !selectedGame ? (
             <LibraryGridView
@@ -1692,22 +1380,28 @@ export function App() {
               ignoreLeadingTheWhenSorting={ignoreLeadingTheWhenSorting}
             />
           ) : (
-            <SteamStorePage
-              key={currentEntry.selectedGameId || selectedGame.id}
-              game={selectedGame}
-              collections={collections}
-              availableLibraryTags={libraryFilterIndex.tagCounts}
-              onBackToLibrary={navigateHome}
-              onManageCollections={handleStoreManageCollections}
-              onToggleInstallStatus={handleStoreToggleInstallStatus}
-              onApplyFilter={navigateApplyFilter}
-              onGameUpdated={handleGameUpdated}
-              connectedStorefronts={connectedStorefronts}
-              onOpenIntegrations={handleOpenIntegrationsModal}
-              onFixMatch={handleStoreFixMatch}
-              onHideGame={handleHideGame}
-              onViewAchievements={handleStoreViewAchievements}
-            />
+            <Suspense
+              fallback={
+                <div className="p-8 text-xs text-steam-subtext">Loading game details...</div>
+              }
+            >
+              <SteamStorePage
+                key={currentEntry.selectedGameId || selectedGame.id}
+                game={selectedGame}
+                collections={collections}
+                availableLibraryTags={libraryFilterIndex.tagCounts}
+                onBackToLibrary={navigateHome}
+                onManageCollections={handleStoreManageCollections}
+                onToggleInstallStatus={handleStoreToggleInstallStatus}
+                onApplyFilter={navigateApplyFilter}
+                onGameUpdated={handleGameUpdated}
+                connectedStorefronts={connectedStorefronts}
+                onOpenIntegrations={handleOpenIntegrationsModal}
+                onFixMatch={handleStoreFixMatch}
+                onHideGame={handleHideGame}
+                onViewAchievements={handleStoreViewAchievements}
+              />
+            </Suspense>
           )}
         </main>
       </div>

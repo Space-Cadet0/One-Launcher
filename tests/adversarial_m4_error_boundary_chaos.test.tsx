@@ -318,12 +318,15 @@ describe('Adversarial M4 Stress Test Harness: Error Boundary & Inert Chaos Tortu
         (globalThis as unknown as Record<string, { prototype?: object }>).HTMLElement?.prototype ?? {}
       );
 
-      // 1. Modal starts opening and acquires lock
+      // 1. Modal starts opening and acquires lock (native <dialog>.showModal() owns inertness, so #root[inert] is NOT set)
       acquireModalOverlayLock();
       expect(isModalOverlayOpen()).toBe(true);
-      expect(rootInert).toBe(true);
+      expect(rootInert).toBe(false);
       expect(openOverlayAttr).toBe('true');
       expect(modalOverlayEvents).toEqual([true]);
+
+      // Simulate a stray legacy #root[inert] attribute to confirm emergency recovery still clears it
+      rootInert = true;
 
       // 2. Fatal unhandled crash occurs inside the tree during render
       const boundary = new AppErrorBoundary({ children: <div>Tree</div> });
@@ -384,8 +387,11 @@ describe('Adversarial M4 Stress Test Harness: Error Boundary & Inert Chaos Tortu
       for (let i = 0; i < 5; i++) {
         acquireModalOverlayLock();
       }
-      expect(rootInert).toBe(true);
+      expect(rootInert).toBe(false);
       expect(openOverlayAttr).toBe('true');
+
+      // Simulate a stray #root[inert] attribute to confirm self-healing clears it defense-in-depth
+      rootInert = true;
 
       // Trigger self healing audit
       const isOpen = checkModalOverlaySelfHealing();
@@ -397,10 +403,15 @@ describe('Adversarial M4 Stress Test Harness: Error Boundary & Inert Chaos Tortu
 
     it('2.3 verifies checkModalOverlaySelfHealing preserves locks when a valid dialog is open in DOM', () => {
       let rootInert = false;
+      let openOverlayAttr: string | null = null;
       const docMock = {
         documentElement: {
-          setAttribute: vi.fn(),
-          removeAttribute: vi.fn(),
+          setAttribute: vi.fn((attr: string, val: string) => {
+            if (attr === 'data-modal-overlay-open') openOverlayAttr = val;
+          }),
+          removeAttribute: vi.fn((attr: string) => {
+            if (attr === 'data-modal-overlay-open') openOverlayAttr = null;
+          }),
         },
         getElementById: vi.fn((id: string) => {
           if (id === 'root') {
@@ -428,13 +439,25 @@ describe('Adversarial M4 Stress Test Harness: Error Boundary & Inert Chaos Tortu
         (globalThis as unknown as Record<string, { prototype?: object }>).HTMLElement?.prototype ?? {}
       );
 
-      acquireModalOverlayLock();
-      expect(rootInert).toBe(true);
+      const staleRelease = acquireModalOverlayLock();
+      expect(rootInert).toBe(false);
+      expect(openOverlayAttr).toBe('true');
 
       // Self healing should detect the open dialog and NOT reset the lock
       const isOpen = checkModalOverlaySelfHealing();
       expect(isOpen).toBe(true);
-      expect(rootInert).toBe(true);
+      expect(rootInert).toBe(false);
+      expect(openOverlayAttr).toBe('true');
+
+      // Verify lockGeneration guard: emergency reset invalidates staleRelease so it cannot decrement a newly opened modal's lock
+      emergencyResetModalOverlayLock();
+      expect(isModalOverlayOpen()).toBe(false);
+      const freshRelease = acquireModalOverlayLock();
+      expect(isModalOverlayOpen()).toBe(true);
+      staleRelease();
+      expect(isModalOverlayOpen()).toBe(true);
+      freshRelease();
+      expect(isModalOverlayOpen()).toBe(false);
     });
 
     it('2.4 subjects lock coordinator to 50 rapid alternating acquire/release/crash cycles', () => {

@@ -36,6 +36,8 @@ class AppErrorBoundaryClass extends Component<
   AppErrorBoundaryState
 > {
   private titleId = `app-error-boundary-title-${Math.random().toString(36).slice(2, 9)}`;
+  private copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
+  private isUnmounted = false;
 
   public override state: AppErrorBoundaryState = {
     hasError: false,
@@ -54,6 +56,14 @@ class AppErrorBoundaryClass extends Component<
     };
   }
 
+  public override componentWillUnmount(): void {
+    this.isUnmounted = true;
+    if (this.copiedResetTimer !== null) {
+      clearTimeout(this.copiedResetTimer);
+      this.copiedResetTimer = null;
+    }
+  }
+
   public override componentDidCatch(error: unknown, errorInfo: ErrorInfo): void {
     // Automatically release any stuck modal overlay locks or #root[inert] attribute
     // so user interaction is immediately restored even if a modal threw during unmount.
@@ -69,6 +79,10 @@ class AppErrorBoundaryClass extends Component<
   }
 
   public handleTryAgain = (): void => {
+    if (this.copiedResetTimer !== null) {
+      clearTimeout(this.copiedResetTimer);
+      this.copiedResetTimer = null;
+    }
     emergencyResetModalOverlayLock();
     this.setState((prev) => ({
       hasError: false,
@@ -137,9 +151,16 @@ class AppErrorBoundaryClass extends Component<
       navigator.clipboard
         .writeText(payload)
         .then(() => {
+          if (this.isUnmounted) return;
           this.setState({ copied: true });
-          setTimeout(() => {
-            this.setState({ copied: false });
+          if (this.copiedResetTimer !== null) {
+            clearTimeout(this.copiedResetTimer);
+          }
+          this.copiedResetTimer = setTimeout(() => {
+            this.copiedResetTimer = null;
+            if (!this.isUnmounted) {
+              this.setState({ copied: false });
+            }
           }, 2000);
         })
         .catch(() => {});
