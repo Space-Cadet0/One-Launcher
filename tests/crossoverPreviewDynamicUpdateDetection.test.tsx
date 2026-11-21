@@ -1067,6 +1067,7 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
       let openedPortalUrl = '';
       const directRes = await environmentProvisioner.installRunnerDirect('crossover_preview', {
         skipNetwork: true,
+        skipProcessCheck: true,
         openExternalFn: async (url: string) => {
           openedPortalUrl = url;
         },
@@ -4236,6 +4237,7 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
       });
 
       const res = await macNativeInstaller.installCompatibilityLayer('crossover_preview', 'auto', {
+        skipProcessCheck: true,
         mockDirectDownload: mockAlreadyUpToDateDirect,
       });
 
@@ -4397,6 +4399,7 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
       macNativeInstaller.clearCachedAuthenticatedPreviewUrl();
 
       const res = await macNativeInstaller.installCompatibilityLayer('crossover_preview', 'auto', {
+        skipProcessCheck: true,
         mockDirectDownload: vi.fn().mockResolvedValue({
           success: true,
           installed: false,
@@ -4424,6 +4427,7 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
 
     it('5.63 installRunnerDirect returns authenticated result cleanly even without authenticateOnly flag', async () => {
       const res = await environmentProvisioner.installRunnerDirect('crossover_preview', {
+        skipProcessCheck: true,
         capturePreviewDownloadFn: async () => ({
           authenticated: true,
           downloadUrl: 'https://www.codeweavers.com/preview/download/crossover-preview-20261111.zip',

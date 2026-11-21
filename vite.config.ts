@@ -402,7 +402,7 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api\/wikidata-sparql/, ''),
         headers: {
           'User-Agent':
-            'One-Launcher/0.2.8 (https://github.com/Space-Cadet0/One-Launcher; desktop library metadata bridge)',
+            'One-Launcher/0.3.0 (https://github.com/Space-Cadet0/One-Launcher; desktop library metadata bridge)',
         },
       },
       '/api/wikidata-api': {
@@ -411,7 +411,7 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api\/wikidata-api/, ''),
         headers: {
           'User-Agent':
-            'One-Launcher/0.2.8 (https://github.com/Space-Cadet0/One-Launcher; desktop library metadata bridge)',
+            'One-Launcher/0.3.0 (https://github.com/Space-Cadet0/One-Launcher; desktop library metadata bridge)',
         },
       },
     },

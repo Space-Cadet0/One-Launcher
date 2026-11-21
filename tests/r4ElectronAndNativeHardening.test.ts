@@ -2569,7 +2569,7 @@ describe('6. GOG Script, Cloud Save, Downloads, Offline Vault, Readiness Barrier
           },
         },
       },
-      app: { isPackaged: false, getVersion: () => '0.2.8' },
+      app: { isPackaged: false, getVersion: () => '0.3.0' },
       getMainWindow: () => mockMainWindow,
     });
     expect(headersListener).not.toBeNull();

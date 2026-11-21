@@ -126,7 +126,7 @@ runTest('Track 1.1: Quake III Arena .cfg in game dir with hostile 4K resolutions
 
     const res = macNativeInstaller.sanitizeWinePrefixDisplayConfigs(bottle.bottleDir, {
       installDir: path.join(bottle.cDrive, 'Games', 'Quake3'),
-      displayScalingMode: 'auto',
+      displayScalingMode: 'auto_fullscreen',
       maxWidth: 640,  // Hostile constraint: aggressive downscale clamp
       maxHeight: 480,
     });
@@ -167,7 +167,8 @@ runTest('Track 1.2: Unreal Engine .ini in Saved Games deeply nested with 8K reso
     const hashBefore = sha256(originalContent);
 
     const res = macNativeInstaller.sanitizeWinePrefixDisplayConfigs(bottle.bottleDir, {
-      displayScalingMode: 'integer',
+      displayScalingMode: 'force_fullscreen',
+      displayAspectRatio: 'integer',
       maxWidth: 1024,
       maxHeight: 768,
     });
@@ -180,9 +181,9 @@ runTest('Track 1.2: Unreal Engine .ini in Saved Games deeply nested with 8K reso
   }
 });
 
-runTest('Track 1.3: All universal scaling modes (auto, fit, stretch, integer, force_fullscreen, off, native_driver) bypass sanitization', () => {
-  const modes = ['auto', 'auto_fullscreen', 'force_fullscreen', 'fit', 'stretch', 'integer', 'native_driver', 'off'];
-  for (const mode of modes) {
+runTest('Track 1.3: Upscaler fullscreen modes (auto_fullscreen, force_fullscreen) bypass sanitization while non-upscaler modes (native_driver, off, virtual_desktop, windowed) enforce SUP-06 clamping', () => {
+  const bypassModes = ['auto_fullscreen', 'force_fullscreen'];
+  for (const mode of bypassModes) {
     const root = setupTempDir();
     try {
       const bottle = createSyntheticBottle(path.join(root, 'bottle'));
@@ -207,6 +208,37 @@ runTest('Track 1.3: All universal scaling modes (auto, fit, stretch, integer, fo
       assert.strictEqual(res.sanitizedFiles.length, 0, `Mode ${mode} must not sanitize files`);
       assert.strictEqual(sha256(fs.readFileSync(cfgFile)), sha256(originalCfg), `Mode ${mode} mutated .cfg`);
       assert.strictEqual(sha256(fs.readFileSync(iniFile)), sha256(originalIni), `Mode ${mode} mutated .ini`);
+    } finally {
+      cleanupTempDir();
+    }
+  }
+
+  const clampModes = ['native_driver', 'off', 'virtual_desktop', 'windowed'];
+  for (const mode of clampModes) {
+    const root = setupTempDir();
+    try {
+      const bottle = createSyntheticBottle(path.join(root, 'bottle'));
+      const gameDir = path.join(bottle.cDrive, 'Games', 'TestGame');
+      fs.mkdirSync(gameDir, { recursive: true });
+
+      const cfgFile = path.join(gameDir, 'display.cfg');
+      const originalCfg = Buffer.from('seta r_customwidth "3024"\nseta r_customheight "1964"\n', 'utf8');
+      fs.writeFileSync(cfgFile, originalCfg);
+
+      const iniFile = path.join(gameDir, 'display.ini');
+      const originalIni = Buffer.from('[Display]\nResolutionSizeX=3024\nResolutionSizeY=1964\n', 'utf8');
+      fs.writeFileSync(iniFile, originalIni);
+
+      const res = macNativeInstaller.sanitizeWinePrefixDisplayConfigs(bottle.bottleDir, {
+        installDir: gameDir,
+        displayScalingMode: mode,
+        maxWidth: 800,
+        maxHeight: 600,
+      });
+
+      assert.strictEqual(res.sanitizedFiles.length, 2, `SUP-06: Mode ${mode} must clamp out-of-bounds .cfg/.ini files`);
+      assert.match(fs.readFileSync(cfgFile, 'utf8'), /seta r_customwidth "800"/, `Mode ${mode} must clamp .cfg width`);
+      assert.match(fs.readFileSync(iniFile, 'utf8'), /ResolutionSizeX=800/, `Mode ${mode} must clamp .ini width`);
     } finally {
       cleanupTempDir();
     }
@@ -293,7 +325,7 @@ runTest('Track 1.6: UTF-8 BOM, mixed CRLF line endings, and uppercase extensions
 
     macNativeInstaller.sanitizeWinePrefixDisplayConfigs(bottle.bottleDir, {
       installDir: gameDir,
-      displayScalingMode: 'auto',
+      displayScalingMode: 'auto_fullscreen',
       maxWidth: 640,
       maxHeight: 480,
     });
