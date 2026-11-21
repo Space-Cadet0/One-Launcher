@@ -1,3 +1,6 @@
+// @ts-check
+'use strict';
+
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
@@ -19,6 +22,159 @@ const {
   isContainedWithinRoot,
   isStoreDisconnectedTombstoned,
 } = require('./securityAndPathUtils.cjs');
+
+const MAX_GOG_JSON_RESPONSE_BYTES = 32 * 1024 * 1024;
+const MAX_GOG_INFLATE_JSON_BYTES = 64 * 1024 * 1024;
+const MAX_GOG_CHUNK_INFLATE_BYTES = 256 * 1024 * 1024;
+const MAX_GOG_INFO_JSON_BYTES = 4 * 1024 * 1024;
+const MAX_GOG_RESUME_JSON_BYTES = 16 * 1024 * 1024;
+const MAX_GOG_AUTH_JSON_BYTES = 512 * 1024;
+const GOG_CHUNK_FETCH_TIMEOUT_MS = 60000;
+const FORBIDDEN_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * Validate a GOG product/game ID against strict allowlist (no leading `-`, no path traversal,
+ * no registry section delimiters).
+ *
+ * @param {unknown} rawId
+ * @returns {boolean}
+ */
+function isSafeGogProductId(rawId) {
+  return typeof rawId === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(rawId);
+}
+
+/**
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+function isExistingSymlinkSync(filePath) {
+  try {
+    return fs.lstatSync(filePath).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Bounded synchronous UTF-8 JSON read with optional symlink rejection.
+ *
+ * @param {string} filePath
+ * @param {number} maxBytes
+ * @param {{ rejectSymlink?: boolean }} [opts]
+ * @returns {any | null}
+ */
+function readJsonFileBoundedSync(filePath, maxBytes, opts = {}) {
+  if (!filePath || typeof filePath !== 'string' || filePath.includes('\0')) return null;
+  try {
+    const lst = fs.lstatSync(filePath);
+    if (opts.rejectSymlink && lst.isSymbolicLink()) return null;
+    const st = lst.isSymbolicLink() ? fs.statSync(filePath) : lst;
+    if (!st.isFile() || st.size > maxBytes) return null;
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Bounded async UTF-8 JSON read with optional symlink rejection.
+ *
+ * @param {string} filePath
+ * @param {number} maxBytes
+ * @param {{ rejectSymlink?: boolean }} [opts]
+ * @returns {Promise<any | null>}
+ */
+async function readJsonFileBoundedAsync(filePath, maxBytes, opts = {}) {
+  if (!filePath || typeof filePath !== 'string' || filePath.includes('\0')) return null;
+  try {
+    const lst = await fs.promises.lstat(filePath);
+    if (opts.rejectSymlink && lst.isSymbolicLink()) return null;
+    const st = lst.isSymbolicLink() ? await fs.promises.stat(filePath) : lst;
+    if (!st.isFile() || st.size > maxBytes) return null;
+    const raw = await fs.promises.readFile(filePath, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Atomic temp+rename write without creating a `.bak` sibling (suitable for game install roots
+ * and macOS `.app/Contents/Resources/` where `.bak` files must not be left behind).
+ *
+ * @param {string} filePath
+ * @param {string} content
+ * @returns {boolean}
+ */
+function atomicWriteNoBackupSync(filePath, content) {
+  if (!filePath || typeof filePath !== 'string' || filePath.includes('\0')) return false;
+  const hostPath = toHostFilesystemPath(filePath);
+  if (isExistingSymlinkSync(hostPath)) return false;
+  let tmpPath = '';
+  try {
+    fs.mkdirSync(path.dirname(hostPath), { recursive: true });
+    tmpPath = `${hostPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    fs.writeFileSync(tmpPath, content, { encoding: 'utf8', flag: 'wx' });
+    fs.renameSync(tmpPath, hostPath);
+    return true;
+  } catch {
+    if (tmpPath) {
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {}
+    }
+    return false;
+  }
+}
+
+/**
+ * Verify that the real (symlink-resolved) parent directory of `destPath` stays strictly inside
+ * `extractRootReal`, and unlink any pre-existing symlink at `destPath` before writing.
+ *
+ * @param {string} extractRootReal
+ * @param {string} destPath
+ * @param {string} platform
+ * @returns {Promise<boolean>}
+ */
+async function ensureRealParentContainedAndUnlinkSymlinkAsync(extractRootReal, destPath, platform) {
+  try {
+    const parentDir = path.dirname(destPath);
+    await fs.promises.mkdir(parentDir, { recursive: true });
+    const realParent = await fs.promises.realpath(parentDir);
+    if (!isContainedWithinRoot(extractRootReal, realParent, platform)) {
+      return false;
+    }
+    try {
+      const destLst = await fs.promises.lstat(destPath);
+      if (destLst.isSymbolicLink()) {
+        await fs.promises.unlink(destPath);
+      }
+    } catch {
+      // ENOENT is expected for new files
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Create a prototype-pollution-safe plain dictionary copy (null prototype).
+ *
+ * @param {unknown} rawObj
+ * @returns {Record<string, any>}
+ */
+function toSafeNullProtoDict(rawObj) {
+  /** @type {Record<string, any>} */
+  const dict = Object.create(null);
+  if (rawObj && typeof rawObj === 'object' && !Array.isArray(rawObj)) {
+    for (const [k, v] of Object.entries(rawObj)) {
+      if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
+      dict[k] = v;
+    }
+  }
+  return dict;
+}
 const {
   discoverWindowsGogGalaxyRegistryPaths,
 } = require('../utils/windowsRegistryDiscovery.cjs');
@@ -382,7 +538,11 @@ function upsertGogSqliteProduct(/** @type {string} */ targetDbPath, /** @type {a
 }
 
 function deleteGogSqliteProduct(/** @type {string} */ targetDbPath, /** @type {string} */ normId) {
-  if (!targetDbPath || !fs.existsSync(targetDbPath) || !/^\d+$/.test(String(normId))) {
+  if (!targetDbPath || !/^\d+$/.test(String(normId))) {
+    return false;
+  }
+  const hostDbPath = toHostFilesystemPath(targetDbPath);
+  if (!fs.existsSync(hostDbPath) || isExistingSymlinkSync(hostDbPath)) {
     return false;
   }
   const numericProductId = Number(normId);
@@ -392,7 +552,7 @@ function deleteGogSqliteProduct(/** @type {string} */ targetDbPath, /** @type {s
   let inTx = false;
   try {
     const { DatabaseSync } = require('node:sqlite');
-    db = new DatabaseSync(targetDbPath, { readBigInts: true });
+    db = new DatabaseSync(hostDbPath, { readBigInts: true });
     db.exec('PRAGMA busy_timeout = 5000;');
     db.exec('BEGIN IMMEDIATE;');
     inTx = true;
@@ -462,7 +622,7 @@ async function importWindowsGogRegistryAsync(
   /** @type {Array<[string, any]>} */ regEntries,
   /** @type {any} */ options = {}
 ) {
-  if (!cleanId || !/^[A-Za-z0-9_-]+$/.test(cleanId)) return false;
+  if (!isSafeGogProductId(cleanId)) return false;
   const execFileImpl =
     typeof options.execFileFn === 'function'
       ? options.execFileFn
@@ -487,12 +647,12 @@ async function importWindowsGogRegistryAsync(
 
   const tempRegPath = path.join(
     os.tmpdir(),
-    `ol-gog-reg-${cleanId}-${process.pid}-${crypto.randomBytes(4).toString('hex')}.reg`
+    `ol-gog-reg-${cleanId}-${process.pid}-${crypto.randomBytes(12).toString('hex')}.reg`
   );
 
   try {
     const utf16Buffer = Buffer.from('\uFEFF' + regLines.join('\r\n'), 'utf16le');
-    await fs.promises.writeFile(tempRegPath, utf16Buffer);
+    await fs.promises.writeFile(tempRegPath, utf16Buffer, { flag: 'wx', mode: 0o600 });
     return await new Promise((resolve) => {
       try {
         execFileImpl(
@@ -523,7 +683,7 @@ async function deleteWindowsGogRegistryAsync(
   /** @type {string} */ normId,
   /** @type {any} */ options = {}
 ) {
-  if (!normId || !/^[A-Za-z0-9_-]+$/.test(normId)) return false;
+  if (!isSafeGogProductId(normId)) return false;
   const execFileImpl =
     typeof options.execFileFn === 'function'
       ? options.execFileFn
@@ -579,7 +739,7 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
       .replace(/^gog[-_]/i, '')
       .trim();
     const installPath = record.installPath ? toLocalFsPath(record.installPath) : null;
-    if (!cleanId || !installPath || !fs.existsSync(installPath)) {
+    if (!isSafeGogProductId(cleanId) || !installPath || !fs.existsSync(installPath)) {
       return { synced: false };
     }
     if (!options.ignoreActiveDownloadGuard && isPathUnderActiveDownload(installPath)) {
@@ -642,12 +802,12 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
     const parsedInfoCandidates = [];
     for (const candidateInfo of candidateInfoPaths) {
       if (fs.existsSync(candidateInfo)) {
-        try {
-          const parsed = JSON.parse(fs.readFileSync(candidateInfo, 'utf8'));
-          if (parsed && typeof parsed === 'object') {
-            parsedInfoCandidates.push(parsed);
-          }
-        } catch {}
+        const parsed = readJsonFileBoundedSync(candidateInfo, MAX_GOG_INFO_JSON_BYTES, {
+          rejectSymlink: true,
+        });
+        if (parsed && typeof parsed === 'object') {
+          parsedInfoCandidates.push(parsed);
+        }
       }
     }
 
@@ -755,9 +915,9 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
 
     const baseDirForPlayTask = isCell2B ? installPath : galaxyInstallPath;
     let relativeExePath = '';
-    if (resolvedExe && resolvedExe.startsWith(baseDirForPlayTask)) {
+    if (resolvedExe && isContainedWithinRoot(baseDirForPlayTask, resolvedExe, platform)) {
       relativeExePath = path.relative(baseDirForPlayTask, resolvedExe);
-    } else if (resolvedExe && resolvedExe.startsWith(installPath)) {
+    } else if (resolvedExe && isContainedWithinRoot(installPath, resolvedExe, platform)) {
       relativeExePath = path.relative(installPath, resolvedExe);
     } else if (resolvedExe) {
       relativeExePath = path.basename(resolvedExe);
@@ -847,10 +1007,17 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
           'one_launcher_gog_cloud_configs.json'
         );
         if (fs.existsSync(cfgCacheFile)) {
-          const parsedCfgCache = JSON.parse(fs.readFileSync(cfgCacheFile, 'utf8'));
-          resolvedGameClientId = pickValidGogGameClientId(
-            parsedCfgCache?.__productClientIds?.[cleanId]
-          );
+          const parsedCfgCache = readJsonFileBoundedSync(cfgCacheFile, MAX_GOG_RESUME_JSON_BYTES, {
+            rejectSymlink: true,
+          });
+          const prodMap = parsedCfgCache?.__productClientIds;
+          if (
+            prodMap &&
+            typeof prodMap === 'object' &&
+            Object.prototype.hasOwnProperty.call(prodMap, cleanId)
+          ) {
+            resolvedGameClientId = pickValidGogGameClientId(prodMap[cleanId]);
+          }
         }
       } catch {}
     }
@@ -860,11 +1027,12 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
         ? String(info.playTasks[0].path)
         : '';
     const resolvedExistingTaskTarget = rawExistingTaskPath
-      ? path.join(baseDirForPlayTask, rawExistingTaskPath.replace(/\\/g, path.sep))
+      ? path.resolve(baseDirForPlayTask, rawExistingTaskPath.replace(/\\/g, path.sep))
       : '';
     const hasExistingValidPlayTasks = Boolean(
       rawExistingTaskPath &&
         resolvedExistingTaskTarget &&
+        isContainedWithinRoot(baseDirForPlayTask, resolvedExistingTaskTarget, platform) &&
         fs.existsSync(resolvedExistingTaskTarget) &&
         (!useWinBackslashes || !rawExistingTaskPath.includes('/'))
     );
@@ -905,12 +1073,15 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
     let activeInfoFilePath = infoFilePath;
     const writeIfChanged = (/** @type {string} */ targetFilePath, /** @type {string} */ content) => {
       try {
+        if (isExistingSymlinkSync(targetFilePath)) return false;
         if (fs.existsSync(targetFilePath)) {
-          const existingContent = fs.readFileSync(targetFilePath, 'utf8');
-          if (existingContent === content) return false;
+          const st = fs.statSync(targetFilePath);
+          if (st.isFile() && st.size <= MAX_GOG_INFO_JSON_BYTES) {
+            const existingContent = fs.readFileSync(targetFilePath, 'utf8');
+            if (existingContent === content) return false;
+          }
         }
-        fs.writeFileSync(targetFilePath, content, 'utf8');
-        return true;
+        return atomicWriteNoBackupSync(targetFilePath, content);
       } catch {
         return false;
       }
@@ -935,7 +1106,12 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
           activeInfoFilePath = macResourcesInfoPath;
           const rootHashDb = path.join(installPath, `goggame-${cleanId}.hashdb`);
           const resHashDb = path.join(macResourcesDir, `goggame-${cleanId}.hashdb`);
-          if (fs.existsSync(rootHashDb) && !fs.existsSync(resHashDb)) {
+          if (
+            fs.existsSync(rootHashDb) &&
+            !fs.existsSync(resHashDb) &&
+            !isExistingSymlinkSync(rootHashDb) &&
+            !isExistingSymlinkSync(resHashDb)
+          ) {
             fs.copyFileSync(rootHashDb, resHashDb);
           }
         } else if (fs.existsSync(macResourcesInfoPath)) {
@@ -944,8 +1120,12 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
 
         if (fs.existsSync(macResourcesInfoPath)) {
           try {
-            if (fs.existsSync(infoFilePath)) fs.unlinkSync(infoFilePath);
-            if (fs.existsSync(dotInfoFilePath)) fs.unlinkSync(dotInfoFilePath);
+            if (fs.existsSync(infoFilePath) && !isExistingSymlinkSync(infoFilePath)) {
+              fs.unlinkSync(infoFilePath);
+            }
+            if (fs.existsSync(dotInfoFilePath) && !isExistingSymlinkSync(dotInfoFilePath)) {
+              fs.unlinkSync(dotInfoFilePath);
+            }
           } catch {}
         }
       } else {
@@ -1010,10 +1190,15 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
         const winParentDir = toWineWindowsPath(path.dirname(installPath), targetBottleForGog);
 
         const bottleCfgPath = path.join(bottleGogDir, 'config.json');
-        if (fs.existsSync(bottleCfgPath) || fs.existsSync(bottleGogDir)) {
+        if (
+          (fs.existsSync(bottleCfgPath) || fs.existsSync(bottleGogDir)) &&
+          !isExistingSymlinkSync(bottleCfgPath)
+        ) {
           try {
             const cfg = fs.existsSync(bottleCfgPath)
-              ? JSON.parse(fs.readFileSync(bottleCfgPath, 'utf8')) || {}
+              ? readJsonFileBoundedSync(bottleCfgPath, MAX_GOG_INFO_JSON_BYTES, {
+                  rejectSymlink: true,
+                }) || {}
               : {};
             if (!Array.isArray(cfg.installationPaths)) cfg.installationPaths = [];
             if (
@@ -1073,9 +1258,12 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
         }
       }
     } else {
-      if (gogConfigPath && fs.existsSync(gogConfigPath)) {
+      if (gogConfigPath && fs.existsSync(gogConfigPath) && !isExistingSymlinkSync(gogConfigPath)) {
         try {
-          const cfg = JSON.parse(fs.readFileSync(gogConfigPath, 'utf8')) || {};
+          const cfg =
+            readJsonFileBoundedSync(gogConfigPath, MAX_GOG_INFO_JSON_BYTES, {
+              rejectSymlink: true,
+            }) || {};
           if (!Array.isArray(cfg.installationPaths)) {
             cfg.installationPaths = [];
           }
@@ -1094,7 +1282,7 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
             }
           }
           if (cfgChanged) {
-            fs.writeFileSync(gogConfigPath, JSON.stringify(cfg, null, 2), 'utf8');
+            atomicWriteFileSync(gogConfigPath, JSON.stringify(cfg, null, 2));
           }
         } catch {}
       }
@@ -1280,7 +1468,7 @@ function unregisterGogFirstPartyLauncher(
     const normId = String(cleanId || '')
       .replace(/^gog[-_]/i, '')
       .trim();
-    if (!normId) return { removed: false };
+    if (!isSafeGogProductId(normId)) return { removed: false };
     const { gogDbPath } = resolveGogFirstPartyPaths(options);
     const localInstall = installPath ? toLocalFsPath(installPath) : null;
 
@@ -1300,8 +1488,7 @@ function unregisterGogFirstPartyLauncher(
           if (
             hostRegisteredPath &&
             fs.existsSync(hostRegisteredPath) &&
-            path.resolve(hostRegisteredPath) !== path.resolve(localInstall) &&
-            !path.resolve(hostRegisteredPath).startsWith(path.resolve(localInstall) + path.sep)
+            !isContainedWithinRoot(localInstall, hostRegisteredPath, platform)
           ) {
             skipHostDeleteForCoInstalledApp = true;
           }
@@ -1387,7 +1574,7 @@ async function ensureGogdlAuthConfig(/** @type {any} */ options = {}) {
     !options.gogAccessToken;
   if (gogTombstoned) {
     try {
-      if (fs.existsSync(gogAuthPath)) {
+      if (fs.existsSync(gogAuthPath) && !isExistingSymlinkSync(gogAuthPath)) {
         fs.unlinkSync(gogAuthPath);
       }
     } catch {}
@@ -1427,10 +1614,12 @@ async function ensureGogdlAuthConfig(/** @type {any} */ options = {}) {
   let existingClientAuth = null;
   if (fs.existsSync(gogAuthPath)) {
     try {
-      const parsedAuth = JSON.parse(fs.readFileSync(gogAuthPath, 'utf8'));
+      const parsedAuth = readJsonFileBoundedSync(gogAuthPath, MAX_GOG_AUTH_JSON_BYTES, {
+        rejectSymlink: true,
+      });
       const rawClient = parsedAuth?.['46899977096215655'] || null;
       existingClientAuth = sanitizeGogEntry(rawClient, true);
-      if (rawClient && !existingClientAuth) {
+      if (rawClient && !existingClientAuth && !isExistingSymlinkSync(gogAuthPath)) {
         try {
           fs.unlinkSync(gogAuthPath);
         } catch {}
@@ -1454,7 +1643,10 @@ async function ensureGogdlAuthConfig(/** @type {any} */ options = {}) {
   for (const hcPath of candidateHeroicGogAuthPaths) {
     if (!fs.existsSync(hcPath)) continue;
     try {
-      const parsedHc = JSON.parse(fs.readFileSync(hcPath, 'utf8'));
+      const parsedHc = readJsonFileBoundedSync(hcPath, MAX_GOG_AUTH_JSON_BYTES, {
+        rejectSymlink: true,
+      });
+      if (!parsedHc || typeof parsedHc !== 'object') continue;
       const cleanedHc = sanitizeGogEntry(parsedHc?.['46899977096215655'] || parsedHc, true);
       if (cleanedHc) {
         externalHeroicGogCandidates.push(cleanedHc);
@@ -1607,8 +1799,11 @@ async function ensureGogdlAuthConfig(/** @type {any} */ options = {}) {
       const nextSerialized = JSON.stringify(authPayload, null, 2);
       let existingRaw = null;
       try {
-        if (fs.existsSync(gogAuthPath)) {
-          existingRaw = fs.readFileSync(gogAuthPath, 'utf8');
+        if (fs.existsSync(gogAuthPath) && !isExistingSymlinkSync(gogAuthPath)) {
+          const st = fs.statSync(gogAuthPath);
+          if (st.isFile() && st.size <= MAX_GOG_AUTH_JSON_BYTES) {
+            existingRaw = fs.readFileSync(gogAuthPath, 'utf8');
+          }
         }
       } catch {}
       if (existingRaw !== nextSerialized) {
@@ -1757,6 +1952,11 @@ async function ensureGogGalaxyBackgroundService(/** @type {any} */ options = {})
         stdio: 'ignore',
         windowsHide: !isDefaultClientMode,
       });
+      if (child && typeof child.on === 'function') {
+        child.on('error', (/** @type {any} */ err) => {
+          diagLog.debug('ensureGogGalaxyBackgroundService.winSpawnError', err, { clientPath });
+        });
+      }
       if (child && typeof child.unref === 'function') {
         child.unref();
       }
@@ -1776,6 +1976,11 @@ async function ensureGogGalaxyBackgroundService(/** @type {any} */ options = {})
         detached: true,
         stdio: 'ignore',
       });
+      if (child && typeof child.on === 'function') {
+        child.on('error', (/** @type {any} */ err) => {
+          diagLog.debug('ensureGogGalaxyBackgroundService.macSpawnError', err, { clientPath });
+        });
+      }
       if (child && typeof child.unref === 'function') {
         child.unref();
       }
@@ -1906,21 +2111,20 @@ function clearStaleGogdlManifestCache(/** @type {any} */ cleanId, /** @type {any
   const idStr = String(cleanId)
     .replace(/^gog[-_]/i, '')
     .trim();
-  if (!idStr) return;
+  if (!isSafeGogProductId(idStr)) return;
 
-  const candidateManifestPaths = [
-    path.join(homedir, 'Library/Application Support/heroic_gogdl/manifests', idStr),
-    path.join(homedir, '.config/heroic_gogdl/manifests', idStr),
-    path.join(
-      process.env.APPDATA || path.join(homedir, 'AppData/Roaming'),
-      'heroic_gogdl/manifests',
-      idStr
-    ),
+  const candidateManifestDirs = [
+    path.join(homedir, 'Library/Application Support/heroic_gogdl/manifests'),
+    path.join(homedir, '.config/heroic_gogdl/manifests'),
+    path.join(process.env.APPDATA || path.join(homedir, 'AppData/Roaming'), 'heroic_gogdl/manifests'),
   ];
 
-  for (const manifestPath of candidateManifestPaths) {
+  for (const manifestDir of candidateManifestDirs) {
+    const manifestPath = path.join(manifestDir, idStr);
+    if (!isContainedWithinRoot(manifestDir, manifestPath)) continue;
     try {
-      if (fs.existsSync(manifestPath) && fs.statSync(manifestPath).isFile()) {
+      const lst = fs.lstatSync(manifestPath);
+      if (!lst.isSymbolicLink() && lst.isFile()) {
         fs.unlinkSync(manifestPath);
       }
     } catch {}
@@ -1936,20 +2140,32 @@ async function fetchGogV1Json(
   const fetchFn = typeof fetchImpl === 'function' ? fetchImpl : fetch;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  if (typeof timer.unref === 'function') timer.unref();
   try {
     const res = await fetchFn(url, { headers, signal: controller.signal });
     clearTimeout(timer);
     if (!res || !res.ok) return null;
+    const contentLen =
+      typeof res.headers?.get === 'function' ? Number(res.headers.get('content-length') || 0) : 0;
+    if (contentLen > MAX_GOG_JSON_RESPONSE_BYTES) {
+      try {
+        await res.body?.cancel?.();
+      } catch {}
+      return null;
+    }
     if (typeof res.arrayBuffer !== 'function') {
       if (typeof res.json === 'function') {
         return await res.json();
       }
       if (typeof res.text === 'function') {
-        return JSON.parse(await res.text());
+        const txt = await res.text();
+        if (Buffer.byteLength(txt, 'utf8') > MAX_GOG_JSON_RESPONSE_BYTES) return null;
+        return JSON.parse(txt);
       }
       return null;
     }
     const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > MAX_GOG_JSON_RESPONSE_BYTES) return null;
     let text = '';
     try {
       text = buf.toString('utf8');
@@ -1958,10 +2174,14 @@ async function fetchGogV1Json(
       }
     } catch {}
     try {
-      return JSON.parse(zlib.inflateSync(buf).toString('utf8'));
+      return JSON.parse(
+        zlib.inflateSync(buf, { maxOutputLength: MAX_GOG_INFLATE_JSON_BYTES }).toString('utf8')
+      );
     } catch {}
     try {
-      return JSON.parse(zlib.gunzipSync(buf).toString('utf8'));
+      return JSON.parse(
+        zlib.gunzipSync(buf, { maxOutputLength: MAX_GOG_INFLATE_JSON_BYTES }).toString('utf8')
+      );
     } catch {}
     return JSON.parse(text);
   } catch {
@@ -1991,6 +2211,13 @@ async function downloadGogV1Depot(
   /** @type {any} */ options = {}
 ) {
   const platform = rawPlatform || options.platform || process.platform;
+  const safeCleanId = String(cleanId || '')
+    .replace(/^gog[-_]/i, '')
+    .trim();
+  if (!isSafeGogProductId(safeCleanId)) {
+    throw new Error(`Invalid GOG product ID for ${title}`);
+  }
+  cleanId = safeCleanId;
   const updateTask = (
     /** @type {string} */ id,
     /** @type {any} */ partial,
@@ -2064,9 +2291,13 @@ async function downloadGogV1Depot(
     throw new Error(`No GOG V1 depot manifest found for ${title}`);
   }
 
+  const manifestRef = String(depot.manifest || '').trim();
+  if (!manifestRef || manifestRef.includes('\0') || manifestRef.includes('..') || /^[a-z]+:/i.test(manifestRef)) {
+    throw new Error(`Invalid GOG V1 depot manifest reference for ${title}`);
+  }
   const manifestBaseUrl = build.link.slice(0, build.link.lastIndexOf('/'));
   const manifestJson = await fetchGogV1Json(
-    `${manifestBaseUrl}/${depot.manifest}`,
+    `${manifestBaseUrl}/${manifestRef.replace(/^\/+/, '')}`,
     {},
     8000,
     fetchFn
@@ -2079,13 +2310,18 @@ async function downloadGogV1Depot(
     manifestFiles.some((/** @type {any} */ f) => f && f.path && /^\/?Contents\//i.test(String(f.path)))
   ) {
     if (!finalInstallPath.toLowerCase().endsWith('.app')) {
-      const appFolderName = installDirectory.toLowerCase().endsWith('.app')
-        ? installDirectory
-        : `${installDirectory}.app`;
-      extractRoot = path.join(finalInstallPath, appFolderName);
+      const safeInstallDirName = sanitizeDirectoryName(installDirectory || title);
+      const appFolderName = safeInstallDirName.toLowerCase().endsWith('.app')
+        ? safeInstallDirName
+        : `${safeInstallDirName}.app`;
+      const candidateExtractRoot = path.join(finalInstallPath, appFolderName);
+      if (isContainedWithinRoot(finalInstallPath, candidateExtractRoot, platform)) {
+        extractRoot = candidateExtractRoot;
+      }
     }
   }
   await fs.promises.mkdir(extractRoot, { recursive: true });
+  const extractRootReal = await fs.promises.realpath(extractRoot);
 
   const buildLegacyId = build.legacy_build_id || build.build_id;
   const secureUrl = `https://content-system.gog.com/products/${encodeURIComponent(cleanId)}/secure_link?_version=2&generation=1&type=depot&path=/${encodeURIComponent(gogPlatformFlag)}/${encodeURIComponent(buildLegacyId)}`;
@@ -2371,6 +2607,9 @@ async function downloadGogV1Depot(
         }
 
         if (f.directory) {
+          if (!(await ensureRealParentContainedAndUnlinkSymlinkAsync(extractRootReal, destPath, platform))) {
+            continue;
+          }
           await fs.promises.mkdir(destPath, { recursive: true });
         } else if (f.symlinkType || (f.target && f.size === undefined)) {
           const targetStr = String(f.target || '');
@@ -2387,7 +2626,9 @@ async function downloadGogV1Depot(
             );
             continue;
           }
-          await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+          if (!(await ensureRealParentContainedAndUnlinkSymlinkAsync(extractRootReal, destPath, platform))) {
+            continue;
+          }
           try {
             await fs.promises.unlink(destPath).catch(() => {});
             await fs.promises.symlink(targetStr, destPath);
@@ -2395,7 +2636,14 @@ async function downloadGogV1Depot(
             diagLog.warn('downloadGogV1Depot.symlinkCreate', symErr, { destPath });
           }
         } else if (typeof f.size === 'number') {
-          await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+          if (!(await ensureRealParentContainedAndUnlinkSymlinkAsync(extractRootReal, destPath, platform))) {
+            diagLog.warn(
+              'downloadGogV1Depot.symlinkEscapeBlocked',
+              'Blocked V1 file write through symlinked parent',
+              { extractRoot, entryPath: rawEntryPath }
+            );
+            continue;
+          }
           const mode = f.executable || /\/MacOS\//i.test(relPath) ? 0o755 : 0o644;
           const fileOutFh = await fs.promises.open(destPath, 'w', mode);
           try {
@@ -2494,25 +2742,39 @@ async function downloadGogV1Depot(
             );
           }
           await new Promise((resolve) => {
-            const winChild = spawn(
-              resolvedGogdlBin,
-              [
-                '--auth-config-path',
-                resolvedAuthPath,
-                'download',
-                cleanId,
-                '--platform',
-                'windows',
-                '--path',
-                finalInstallPath,
-                includeDlcs ? '--with-dlcs' : '--skip-dlcs',
-                '--lang',
-                gogLocale || 'en-US',
-              ],
-              { stdio: 'ignore' }
-            );
-            winChild.on('error', () => resolve(undefined));
-            winChild.on('exit', () => resolve(undefined));
+            let settled = false;
+            const done = () => {
+              if (settled) return;
+              settled = true;
+              resolve(undefined);
+            };
+            const safeLangArg =
+              typeof gogLocale === 'string' && /^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{2,8})?$/.test(gogLocale.trim())
+                ? gogLocale.trim()
+                : 'en-US';
+            try {
+              const winChild = spawn(
+                resolvedGogdlBin,
+                [
+                  '--auth-config-path',
+                  resolvedAuthPath,
+                  'download',
+                  cleanId,
+                  '--platform',
+                  'windows',
+                  '--path',
+                  finalInstallPath,
+                  includeDlcs ? '--with-dlcs' : '--skip-dlcs',
+                  '--lang',
+                  safeLangArg,
+                ],
+                { stdio: 'ignore' }
+              );
+              winChild.on('error', () => done());
+              winChild.on('exit', () => done());
+            } catch {
+              done();
+            }
           });
         }
       }
@@ -3120,6 +3382,7 @@ async function fetchGogJsonWithStatus(
     timedOut = true;
     timeoutCtrl.abort();
   }, timeoutMs);
+  if (typeof timer.unref === 'function') timer.unref();
   const onExternalAbort = () => {
     timeoutCtrl.abort();
   };
@@ -3141,16 +3404,31 @@ async function fetchGogJsonWithStatus(
     if (!res.ok) {
       return { ok: false, status, data: null };
     }
+    const contentLen =
+      typeof res.headers?.get === 'function' ? Number(res.headers.get('content-length') || 0) : 0;
+    if (contentLen > MAX_GOG_JSON_RESPONSE_BYTES) {
+      try {
+        await res.body?.cancel?.();
+      } catch {}
+      return { ok: false, status, data: null };
+    }
     if (typeof res.arrayBuffer !== 'function') {
       if (typeof res.json === 'function') {
         return { ok: true, status, data: await res.json() };
       }
       if (typeof res.text === 'function') {
-        return { ok: true, status, data: JSON.parse(await res.text()) };
+        const txt = await res.text();
+        if (Buffer.byteLength(txt, 'utf8') > MAX_GOG_JSON_RESPONSE_BYTES) {
+          return { ok: false, status, data: null };
+        }
+        return { ok: true, status, data: JSON.parse(txt) };
       }
       return { ok: false, status, data: null };
     }
     const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > MAX_GOG_JSON_RESPONSE_BYTES) {
+      return { ok: false, status, data: null };
+    }
     let text = '';
     try {
       text = buf.toString('utf8');
@@ -3160,15 +3438,17 @@ async function fetchGogJsonWithStatus(
       }
     } catch {}
     try {
-      const inflated = await inflateAsync(buf);
+      const inflated = await inflateAsync(buf, { maxOutputLength: MAX_GOG_INFLATE_JSON_BYTES });
       return { ok: true, status, data: JSON.parse(inflated.toString('utf8')) };
     } catch {}
     try {
-      const gunzipped = await gunzipAsync(buf);
+      const gunzipped = await gunzipAsync(buf, { maxOutputLength: MAX_GOG_INFLATE_JSON_BYTES });
       return { ok: true, status, data: JSON.parse(gunzipped.toString('utf8')) };
     } catch {}
     try {
-      const rawInflated = await inflateRawAsync(buf);
+      const rawInflated = await inflateRawAsync(buf, {
+        maxOutputLength: MAX_GOG_INFLATE_JSON_BYTES,
+      });
       return { ok: true, status, data: JSON.parse(rawInflated.toString('utf8')) };
     } catch {}
     return { ok: true, status, data: JSON.parse(text) };
@@ -3195,6 +3475,10 @@ async function fetchGogJsonWithStatus(
 async function decompressGogV2ChunkAsync(rawBuf, chunkMeta) {
   const expectedUncompressedSize =
     typeof chunkMeta?.size === 'number' ? Number(chunkMeta.size) : -1;
+  const maxOutputLength =
+    expectedUncompressedSize >= 0
+      ? Math.min(MAX_GOG_CHUNK_INFLATE_BYTES, Math.max(64 * 1024 * 1024, expectedUncompressedSize + 4096))
+      : 128 * 1024 * 1024;
   if (
     !chunkMeta?.compressedMd5 &&
     chunkMeta?.compressedSize === undefined &&
@@ -3208,13 +3492,13 @@ async function decompressGogV2ChunkAsync(rawBuf, chunkMeta) {
     }
   }
   try {
-    return /** @type {Buffer} */ (await inflateAsync(rawBuf));
+    return /** @type {Buffer} */ (await inflateAsync(rawBuf, { maxOutputLength }));
   } catch (inflateErr) {
     try {
-      return /** @type {Buffer} */ (await gunzipAsync(rawBuf));
+      return /** @type {Buffer} */ (await gunzipAsync(rawBuf, { maxOutputLength }));
     } catch {
       try {
-        return /** @type {Buffer} */ (await inflateRawAsync(rawBuf));
+        return /** @type {Buffer} */ (await inflateRawAsync(rawBuf, { maxOutputLength }));
       } catch {
         if (expectedUncompressedSize >= 0 && rawBuf.length === expectedUncompressedSize) {
           return rawBuf;
@@ -3307,6 +3591,13 @@ async function downloadGogV2Depot(
   /** @type {any} */ options = {}
 ) {
   const platform = rawPlatform || options.platform || process.platform;
+  const safeCleanId = String(cleanId || '')
+    .replace(/^gog[-_]/i, '')
+    .trim();
+  if (!isSafeGogProductId(safeCleanId)) {
+    throw new Error(`Invalid GOG product ID for ${title}`);
+  }
+  cleanId = safeCleanId;
   const updateTask = (
     /** @type {string} */ id,
     /** @type {any} */ partial,
@@ -3789,17 +4080,25 @@ async function downloadGogV2Depot(
         const appFolderName = safeBundleBase.toLowerCase().endsWith('.app')
           ? safeBundleBase
           : `${safeBundleBase}.app`;
-        extractRoot = path.join(finalInstallPath, appFolderName);
+        const candidateExtractRoot = path.join(finalInstallPath, appFolderName);
+        if (isContainedWithinRoot(finalInstallPath, candidateExtractRoot, platform)) {
+          extractRoot = candidateExtractRoot;
+        }
       }
     }
 
     await fs.promises.mkdir(finalInstallPath, { recursive: true });
     await fs.promises.mkdir(extractRoot, { recursive: true });
+    const extractRootReal = await fs.promises.realpath(extractRoot);
 
     // Load or initialize `.onelauncher-gog-v2-resume.json`
     try {
       if (fs.existsSync(resumeJournalPath)) {
-        const parsedJournal = JSON.parse(await fs.promises.readFile(resumeJournalPath, 'utf8'));
+        const parsedJournal = await readJsonFileBoundedAsync(
+          resumeJournalPath,
+          MAX_GOG_RESUME_JSON_BYTES,
+          { rejectSymlink: true }
+        );
         if (
           parsedJournal &&
           typeof parsedJournal === 'object' &&
@@ -3807,14 +4106,8 @@ async function downloadGogV2Depot(
         ) {
           resumeState = {
             buildId: currentBuildId,
-            completedFiles:
-              parsedJournal.completedFiles && typeof parsedJournal.completedFiles === 'object'
-                ? { ...parsedJournal.completedFiles }
-                : {},
-            partialFileChunks:
-              parsedJournal.partialFileChunks && typeof parsedJournal.partialFileChunks === 'object'
-                ? { ...parsedJournal.partialFileChunks }
-                : {},
+            completedFiles: toSafeNullProtoDict(parsedJournal.completedFiles),
+            partialFileChunks: toSafeNullProtoDict(parsedJournal.partialFileChunks),
           };
         }
       }
@@ -3822,8 +4115,8 @@ async function downloadGogV2Depot(
     if (!resumeState) {
       resumeState = {
         buildId: currentBuildId,
-        completedFiles: {},
-        partialFileChunks: {},
+        completedFiles: Object.create(null),
+        partialFileChunks: Object.create(null),
       };
     }
 
@@ -3950,10 +4243,22 @@ async function downloadGogV2Depot(
 
     // Create all directories and contained symlinks
     for (const dirP of dirDestPaths) {
+      if (!(await ensureRealParentContainedAndUnlinkSymlinkAsync(extractRootReal, dirP, platform))) {
+        continue;
+      }
       await fs.promises.mkdir(dirP, { recursive: true });
     }
     for (const [, linkEntry] of linkEntriesMap.entries()) {
       try {
+        if (
+          !(await ensureRealParentContainedAndUnlinkSymlinkAsync(
+            extractRootReal,
+            linkEntry.destPath,
+            platform
+          ))
+        ) {
+          continue;
+        }
         await fs.promises.unlink(linkEntry.destPath).catch(() => {});
         await fs.promises.symlink(linkEntry.targetStr, linkEntry.destPath);
       } catch (symErr) {
@@ -4013,6 +4318,15 @@ async function downloadGogV2Depot(
     for (const f of allFiles) {
       if (f.completed || f.handledBySfc) continue;
       if (f.chunks.length === 0 && f.totalUncompressedSize === 0) {
+        if (
+          !(await ensureRealParentContainedAndUnlinkSymlinkAsync(
+            extractRootReal,
+            f.destPath,
+            platform
+          ))
+        ) {
+          continue;
+        }
         const emptyFh = await fs.promises.open(f.destPath, 'w', f.mode);
         await emptyFh.close();
         if (platform !== 'win32' && f.mode === 0o755) {
@@ -4022,7 +4336,9 @@ async function downloadGogV2Depot(
         }
         f.completed = true;
         f.remainingChunks = 0;
-        resumeState.completedFiles[f.relKey] = 0;
+        if (!FORBIDDEN_PROTO_KEYS.has(f.relKey)) {
+          resumeState.completedFiles[f.relKey] = 0;
+        }
         continue;
       }
 
@@ -4241,8 +4557,18 @@ async function downloadGogV2Depot(
           const chunkUrl = formatGogV2EndpointChunkUrl(ep, compressedMd5);
           if (!chunkUrl) continue;
 
+          const chunkCtrl = new AbortController();
+          let chunkTimedOut = false;
+          const chunkTimer = setTimeout(() => {
+            chunkTimedOut = true;
+            chunkCtrl.abort();
+          }, GOG_CHUNK_FETCH_TIMEOUT_MS);
+          if (typeof chunkTimer.unref === 'function') chunkTimer.unref();
+          const onParentAbort = () => chunkCtrl.abort();
+          controller.signal.addEventListener('abort', onParentAbort, { once: true });
+
           try {
-            const res = await fetchFn(chunkUrl, { signal: controller.signal });
+            const res = await fetchFn(chunkUrl, { signal: chunkCtrl.signal });
             if (!res || !res.ok) {
               const httpStatus = Number(res?.status || 0);
               if (httpStatus === 401 || httpStatus === 403) {
@@ -4251,7 +4577,24 @@ async function downloadGogV2Depot(
               lastEndpointErr = new Error(`GOG V2 CDN returned HTTP ${httpStatus || 'error'}`);
               continue;
             }
+            const contentLen =
+              typeof res.headers?.get === 'function'
+                ? Number(res.headers.get('content-length') || 0)
+                : 0;
+            if (contentLen > MAX_GOG_CHUNK_INFLATE_BYTES) {
+              try {
+                await res.body?.cancel?.();
+              } catch {}
+              lastEndpointErr = new Error(`GOG V2 CDN chunk exceeded safety cap (${contentLen} B)`);
+              continue;
+            }
             const rawChunkBuf = Buffer.from(await res.arrayBuffer());
+            if (rawChunkBuf.length > MAX_GOG_CHUNK_INFLATE_BYTES) {
+              lastEndpointErr = new Error(
+                `GOG V2 CDN chunk buffer exceeded safety cap (${rawChunkBuf.length} B)`
+              );
+              continue;
+            }
             if (chunkObj?.compressedMd5) {
               const actualCompMd5 = crypto
                 .createHash('md5')
@@ -4268,15 +4611,21 @@ async function downloadGogV2Depot(
             return rawChunkBuf;
           } catch (/** @type {any} */ fetchErr) {
             if (
-              ctrl.cancelRequested ||
-              ctrl.pausedByUser ||
-              controller.signal.aborted ||
-              fetchErr?.name === 'AbortError'
+              !chunkTimedOut &&
+              (ctrl.cancelRequested ||
+                ctrl.pausedByUser ||
+                controller.signal.aborted ||
+                fetchErr?.name === 'AbortError')
             ) {
               throwIfCancelledOrPaused();
               throw fetchErr;
             }
-            lastEndpointErr = fetchErr;
+            lastEndpointErr = chunkTimedOut
+              ? new Error(`GOG V2 chunk fetch timed out after ${GOG_CHUNK_FETCH_TIMEOUT_MS}ms`)
+              : fetchErr;
+          } finally {
+            clearTimeout(chunkTimer);
+            controller.signal.removeEventListener('abort', onParentAbort);
           }
         }
 
@@ -4345,7 +4694,20 @@ async function downloadGogV2Depot(
             throw new Error(`GOG V2 SFC file SHA-256 mismatch for ${f.relPath}`);
           }
         }
-        await fs.promises.mkdir(path.dirname(f.destPath), { recursive: true });
+        if (
+          !(await ensureRealParentContainedAndUnlinkSymlinkAsync(
+            extractRootReal,
+            f.partPath,
+            platform
+          )) ||
+          !(await ensureRealParentContainedAndUnlinkSymlinkAsync(
+            extractRootReal,
+            f.destPath,
+            platform
+          ))
+        ) {
+          throw new Error(`Blocked GOG V2 SFC write escaping extractRoot for ${f.relPath}`);
+        }
         const sfcFh = await fs.promises.open(f.partPath, 'w', f.mode);
         try {
           await writeFullBufferAtOffset(sfcFh, slice, 0);
@@ -4355,7 +4717,9 @@ async function downloadGogV2Depot(
         await atomicRenamePartToDest(f.partPath, f.destPath, f.mode, platform);
         f.completed = true;
         f.remainingChunks = 0;
-        resumeState.completedFiles[f.relKey] = f.totalUncompressedSize;
+        if (!FORBIDDEN_PROTO_KEYS.has(f.relKey)) {
+          resumeState.completedFiles[f.relKey] = f.totalUncompressedSize;
+        }
         maybeFlushResumeJournal();
       }
     }
@@ -4365,7 +4729,22 @@ async function downloadGogV2Depot(
       const acquireFilePartHandle = (/** @type {any} */ fileEntry) => {
         if (!fileEntry.openPromise) {
           fileEntry.openPromise = (async () => {
-            await fs.promises.mkdir(path.dirname(fileEntry.destPath), { recursive: true });
+            if (
+              !(await ensureRealParentContainedAndUnlinkSymlinkAsync(
+                extractRootReal,
+                fileEntry.partPath,
+                platform
+              )) ||
+              !(await ensureRealParentContainedAndUnlinkSymlinkAsync(
+                extractRootReal,
+                fileEntry.destPath,
+                platform
+              ))
+            ) {
+              throw new Error(
+                `Blocked GOG V2 chunk write escaping extractRoot for ${fileEntry.relPath}`
+              );
+            }
             const openFlags = fileEntry.hasResumedPartOnDisk ? 'r+' : 'w';
             const fh = await fs.promises.open(fileEntry.partPath, openFlags, fileEntry.mode);
             openFileHandles.set(fileEntry.partPath, fh);
@@ -4421,7 +4800,7 @@ async function downloadGogV2Depot(
                 : rawChunkBuf.length;
             bytesDownloaded += credit;
 
-            if (resumeState) {
+            if (resumeState && !FORBIDDEN_PROTO_KEYS.has(fEntry.relKey)) {
               let doneList = resumeState.partialFileChunks[fEntry.relKey];
               if (!Array.isArray(doneList)) {
                 doneList = [];
@@ -4436,7 +4815,7 @@ async function downloadGogV2Depot(
               await fh.close();
               await atomicRenamePartToDest(fEntry.partPath, fEntry.destPath, fEntry.mode, platform);
               fEntry.completed = true;
-              if (resumeState) {
+              if (resumeState && !FORBIDDEN_PROTO_KEYS.has(fEntry.relKey)) {
                 resumeState.completedFiles[fEntry.relKey] = fEntry.totalUncompressedSize;
                 delete resumeState.partialFileChunks[fEntry.relKey];
               }
@@ -4474,15 +4853,18 @@ async function downloadGogV2Depot(
     try {
       const manifestDir = resolveGogdlManifestDir(options);
       await fs.promises.mkdir(manifestDir, { recursive: true });
-      const hglManifestPayload = {
-        ...meta,
-        HGLInstallLanguage: gogLocale,
-        HGLdlcs: installedDlcs,
-      };
-      atomicWriteFileSync(
-        path.join(manifestDir, idStr),
-        JSON.stringify(hglManifestPayload, null, 2)
-      );
+      const manifestOutPath = path.join(manifestDir, idStr);
+      if (
+        isContainedWithinRoot(manifestDir, manifestOutPath, platform) &&
+        !isExistingSymlinkSync(manifestOutPath)
+      ) {
+        const hglManifestPayload = {
+          ...meta,
+          HGLInstallLanguage: gogLocale,
+          HGLdlcs: installedDlcs,
+        };
+        atomicWriteFileSync(manifestOutPath, JSON.stringify(hglManifestPayload, null, 2));
+      }
     } catch (manifestWriteErr) {
       diagLog.warn('downloadGogV2Depot.writeGogdlManifest', manifestWriteErr, { cleanId: idStr });
     }
@@ -4506,7 +4888,12 @@ async function downloadGogV2Depot(
 
     if (gogPlatformFlag === 'windows') {
       const rootInfoPath = path.join(finalInstallPath, `goggame-${idStr}.info`);
-      if (!fs.existsSync(rootInfoPath) && Array.isArray(meta.playTasks) && meta.playTasks.length > 0) {
+      if (
+        !fs.existsSync(rootInfoPath) &&
+        !isExistingSymlinkSync(rootInfoPath) &&
+        Array.isArray(meta.playTasks) &&
+        meta.playTasks.length > 0
+      ) {
         try {
           const baseProd = metaProductsList.find(
             (/** @type {any} */ p) => p && String(p.productId) === idStr
@@ -4522,7 +4909,7 @@ async function downloadGogV2Depot(
             playTasks: meta.playTasks,
             version: 1,
           };
-          atomicWriteFileSync(rootInfoPath, JSON.stringify(seededInfo, null, 2));
+          atomicWriteNoBackupSync(rootInfoPath, JSON.stringify(seededInfo, null, 2));
         } catch {}
       }
     }

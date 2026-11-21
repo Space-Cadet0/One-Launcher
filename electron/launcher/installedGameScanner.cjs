@@ -1,3 +1,6 @@
+// @ts-check
+'use strict';
+
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
@@ -5,10 +8,66 @@ const { DatabaseSync } = require('node:sqlite');
 
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
 const {
+  isContainedWithinRoot,
   recordImportedEpicInstall,
   discoverWindowsLocalDrivesAsync,
   refreshHostWindowsKnownFoldersAsync,
 } = require('./securityAndPathUtils.cjs');
+
+const MAX_SCANNER_MANIFEST_BYTES = 4 * 1024 * 1024;
+const MAX_SCANNER_INDEX_JSON_BYTES = 32 * 1024 * 1024;
+const MAX_GOG_SCAN_DIRS_VISITED = 4000;
+const FORBIDDEN_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * Prototype-pollution-safe own property getter.
+ *
+ * @param {any} obj
+ * @param {string} key
+ * @returns {any}
+ */
+function getOwnProp(obj, key) {
+  if (!obj || typeof obj !== 'object' || !key || FORBIDDEN_PROTO_KEYS.has(key)) {
+    return undefined;
+  }
+  return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+}
+
+/**
+ * Bounded read-only synchronous UTF-8 file reader (guards against OOM DoS and FIFOs/devices).
+ *
+ * @param {string} filePath
+ * @param {number} maxBytes
+ * @returns {string | null}
+ */
+function readTextFileBoundedSync(filePath, maxBytes) {
+  if (!filePath || typeof filePath !== 'string' || filePath.includes('\0')) return null;
+  try {
+    const st = fs.statSync(filePath);
+    if (!st.isFile() || st.size > maxBytes) return null;
+    return fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Bounded read-only asynchronous UTF-8 file reader (guards against OOM DoS and FIFOs/devices).
+ *
+ * @param {string} filePath
+ * @param {number} maxBytes
+ * @returns {Promise<string | null>}
+ */
+async function readTextFileBoundedAsync(filePath, maxBytes) {
+  if (!filePath || typeof filePath !== 'string' || filePath.includes('\0')) return null;
+  try {
+    const st = await fs.promises.stat(filePath);
+    if (!st.isFile() || st.size > maxBytes) return null;
+    return await fs.promises.readFile(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+}
 const {
   discoverWindowsEpicRegistryPaths,
   refreshWindowsStorefrontRegistryCacheAsync,
@@ -371,6 +430,9 @@ function loadChainedCatalogIndex(
     if (fs.existsSync(vaultDbPath)) {
       const vaultDb = new DatabaseSync(vaultDbPath, { readOnly: true });
       try {
+        try {
+          vaultDb.exec('PRAGMA busy_timeout = 3000;');
+        } catch {}
         // Project only lightweight columns in the full-table pass so thousands of uninstalled
         // library rows never trigger synchronous `zlib.inflateRawSync` on multi-KB `enriched_json`.
         const rows = vaultDb
@@ -678,15 +740,20 @@ function createScanContext(options, isDefaultProdScan, skipWin32BackgroundPrewar
         ['steam', 'gog', 'epic', 'xbox'].includes(record.platformId) &&
         Boolean(existing.isWindowsBinaryOnMac) !== Boolean(record.isWindowsBinaryOnMac)
       ) {
-        const platPrefixRe = new RegExp(`^${record.platformId}[-_]`, 'i');
-        const cleanId = String(
+        const platPrefix = `${String(record.platformId).toLowerCase()}`;
+        const rawCandidateId = String(
           record.storefrontAppId || record.appId || record.platformGameId || ''
-        ).replace(platPrefixRe, '');
+        );
+        const rawLower = rawCandidateId.toLowerCase();
+        const cleanId =
+          rawLower.startsWith(`${platPrefix}-`) || rawLower.startsWith(`${platPrefix}_`)
+            ? rawCandidateId.slice(platPrefix.length + 1)
+            : rawCandidateId;
         let rawSaved =
-          launchConfigs[`${record.platformId}-${cleanId}`] ||
-          launchConfigs[`${record.platformId}_${cleanId}`] ||
-          launchConfigs[String(record.platformGameId)] ||
-          launchConfigs[cleanId] ||
+          getOwnProp(launchConfigs, `${record.platformId}-${cleanId}`) ||
+          getOwnProp(launchConfigs, `${record.platformId}_${cleanId}`) ||
+          getOwnProp(launchConfigs, String(record.platformGameId)) ||
+          getOwnProp(launchConfigs, cleanId) ||
           null;
         if (!rawSaved && cleanId) {
           const lowerClean = cleanId.toLowerCase();
@@ -700,8 +767,7 @@ function createScanContext(options, isDefaultProdScan, skipWin32BackgroundPrewar
               String(cfgVal.gameId || '').toLowerCase() ===
                 `${record.platformId}-${lowerClean}` ||
               Boolean(
-                cfgVal.platformConfigs &&
-                  cfgVal.platformConfigs[record.platformId] &&
+                getOwnProp(cfgVal.platformConfigs, record.platformId) &&
                   kLower.includes(lowerClean)
               )
             ) {
@@ -795,9 +861,16 @@ function processSteamManifestRecord(
   // Skip Steamworks Common Redistributables
   if (parsed.appId === 228980) return;
 
+  const commonDir = path.join(steamappsDir, 'common');
   const installPath = parsed.installdir
-    ? path.join(steamappsDir, 'common', parsed.installdir)
-    : path.join(steamappsDir, 'common', String(parsed.appId));
+    ? path.resolve(commonDir, String(parsed.installdir))
+    : path.resolve(commonDir, String(parsed.appId));
+  if (
+    !isContainedWithinRoot(commonDir, installPath, platform) ||
+    path.resolve(installPath) === path.resolve(commonDir)
+  ) {
+    return;
+  }
 
   const dirExists = fs.existsSync(installPath);
   const stateFlags = parsed.StateFlags ? String(parsed.StateFlags).trim() : undefined;
@@ -853,8 +926,10 @@ function processSteamManifestRecord(
     ];
     for (const xmlPath of installerXmlCandidates) {
       if (!fs.existsSync(xmlPath)) continue;
+      const xmlRaw = readTextFileBoundedSync(xmlPath, MAX_SCANNER_MANIFEST_BYTES);
+      if (!xmlRaw) continue;
       try {
-        installerDataParsed = parseSteamEaInstallerDataXml(fs.readFileSync(xmlPath, 'utf8'));
+        installerDataParsed = parseSteamEaInstallerDataXml(xmlRaw);
         if (installerDataParsed) break;
       } catch {}
     }
@@ -1117,14 +1192,28 @@ function processGogInfoJson(
           launchArguments = primaryTask.arguments.trim();
         }
         const relTaskPath = primaryTask.path.replace(/\\/g, path.sep);
-        const candidates = [
-          path.join(installPath, relTaskPath),
-          path.join(path.dirname(infoFilePath), relTaskPath),
-          path.join(path.resolve(path.dirname(infoFilePath), '..', '..'), relTaskPath),
+        const infoDir = path.dirname(infoFilePath);
+        /** @type {Array<{ anchor: string, candidate: string }>} */
+        const anchoredCandidates = [
+          { anchor: installPath, candidate: path.resolve(installPath, relTaskPath) },
+          { anchor: infoDir, candidate: path.resolve(infoDir, relTaskPath) },
         ];
-        for (const c of candidates) {
+        if (normInfoDir.endsWith('/Contents/Resources')) {
+          const bundleRoot = path.resolve(infoDir, '..', '..');
+          anchoredCandidates.push({
+            anchor: bundleRoot,
+            candidate: path.resolve(bundleRoot, relTaskPath),
+          });
+        }
+        for (const { anchor, candidate: c } of anchoredCandidates) {
+          if (!isContainedWithinRoot(anchor, c, platform)) {
+            continue;
+          }
           if (fs.existsSync(c)) {
             const resolvedCand = c.endsWith('.app') ? resolveMacAppBundleBinary(c) : c;
+            if (resolvedCand && !isContainedWithinRoot(anchor, resolvedCand, platform)) {
+              continue;
+            }
             if (platform === 'darwin' && /[\\/]GOGLauncher$/i.test(String(resolvedCand || ''))) {
               continue;
             }
@@ -1227,7 +1316,17 @@ function processHeroicGogFileJson(
         preferWindowsExecutable: isWindowsGogItem,
         readOnly: true,
       });
-      const itemExeCandidate = item.executable ? toLocalFsPath(item.executable, customRoots) : '';
+      const rawItemExe = item.executable ? String(item.executable).replace(/\\/g, path.sep) : '';
+      const resolvedItemExe = rawItemExe
+        ? toLocalFsPath(
+            path.isAbsolute(rawItemExe) ? rawItemExe : path.resolve(installPath, rawItemExe),
+            customRoots
+          )
+        : '';
+      const itemExeCandidate =
+        resolvedItemExe && isContainedWithinRoot(installPath, resolvedItemExe, platform)
+          ? resolvedItemExe
+          : '';
       const rawHeroicExe =
         itemExeCandidate && fs.existsSync(itemExeCandidate)
           ? itemExeCandidate
@@ -1388,13 +1487,17 @@ function processEpicItemJson(
 
     if (item.LaunchExecutable) {
       const cleanLaunchExe = String(item.LaunchExecutable).replace(/\\/g, path.sep);
-      const candidateExe = path.join(installPath, cleanLaunchExe);
-      if (fs.existsSync(candidateExe)) {
-        executablePath =
-          (candidateExe.endsWith('.app')
-            ? resolveMacAppBundleBinary(candidateExe)
-            : candidateExe) || undefined;
-      } else {
+      const candidateExe = path.resolve(installPath, cleanLaunchExe);
+      const isContainedCand = isContainedWithinRoot(installPath, candidateExe, platform);
+      if (isContainedCand && fs.existsSync(candidateExe)) {
+        const resolvedCand = candidateExe.endsWith('.app')
+          ? resolveMacAppBundleBinary(candidateExe)
+          : candidateExe;
+        if (resolvedCand && isContainedWithinRoot(installPath, resolvedCand, platform)) {
+          executablePath = resolvedCand;
+        }
+      }
+      if (!executablePath) {
         const discovered = findPrimaryExecutable(installPath, {
           platform,
           hintName: title,
@@ -1564,8 +1667,13 @@ function processLegendaryFileJson(
       let executablePath = undefined;
       if (item.executable) {
         const cleanExe = String(item.executable).replace(/\\/g, path.sep);
-        const candidate = path.isAbsolute(cleanExe) ? cleanExe : path.join(installPath, cleanExe);
-        executablePath = toLocalFsPath(candidate, customRoots);
+        const candidate = path.isAbsolute(cleanExe)
+          ? cleanExe
+          : path.resolve(installPath, cleanExe);
+        const localCand = toLocalFsPath(candidate, customRoots);
+        if (localCand && isContainedWithinRoot(installPath, localCand, platform)) {
+          executablePath = localCand;
+        }
       }
       const discovered = findPrimaryExecutable(installPath, {
         platform,
@@ -2155,12 +2263,8 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
         for (const file of files) {
           if (!/^appmanifest_\d+\.acf$/i.test(file)) continue;
           const manifestPath = path.join(steamappsDir, file);
-          let rawAcf = '';
-          try {
-            rawAcf = fs.readFileSync(manifestPath, 'utf8');
-          } catch {
-            continue;
-          }
+          const rawAcf = readTextFileBoundedSync(manifestPath, MAX_SCANNER_MANIFEST_BYTES);
+          if (!rawAcf) continue;
           processSteamManifestRecord(ctx, steamappsDir, manifestPath, rawAcf, null);
         }
       }
@@ -2194,14 +2298,33 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
       );
       for (const cfgPath of gogGalaxyConfigs) {
         if (!fs.existsSync(cfgPath)) continue;
+        const rawCfg = readTextFileBoundedSync(cfgPath, MAX_SCANNER_MANIFEST_BYTES);
+        if (!rawCfg) continue;
         try {
-          applyGogGalaxyConfigJson(ctx, cfgPath, fs.readFileSync(cfgPath, 'utf8'), gogSearchDirs);
+          applyGogGalaxyConfigJson(ctx, cfgPath, rawCfg, gogSearchDirs);
         } catch {}
       }
 
+      /** @type {Set<string>} */
+      const visitedGogDirsSync = new Set();
+      let gogDirsVisitedCountSync = 0;
       const scanDirForGogInfoSync = (/** @type {string} */ dirPath, depth = 0) => {
-        if (depth > 3 || !dirPath || !fs.existsSync(dirPath)) return;
+        if (
+          depth > 3 ||
+          !dirPath ||
+          gogDirsVisitedCountSync >= MAX_GOG_SCAN_DIRS_VISITED ||
+          !fs.existsSync(dirPath)
+        ) {
+          return;
+        }
         if (isPathUnderActiveDownload(dirPath)) return;
+        let canonicalDir = path.resolve(dirPath);
+        try {
+          canonicalDir = fs.realpathSync(dirPath);
+        } catch {}
+        if (visitedGogDirsSync.has(canonicalDir)) return;
+        visitedGogDirsSync.add(canonicalDir);
+        gogDirsVisitedCountSync += 1;
         /** @type {fs.Dirent[]} */
         let entries = [];
         try {
@@ -2213,9 +2336,12 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
           if (entry.name.startsWith('.')) continue;
           const full = path.join(dirPath, entry.name);
           if (entry.isFile() && /^goggame-\d+\.info$/i.test(entry.name)) {
-            try {
-              processGogInfoJson(ctx, full, fs.readFileSync(full, 'utf8'));
-            } catch {}
+            const rawInfo = readTextFileBoundedSync(full, MAX_SCANNER_MANIFEST_BYTES);
+            if (rawInfo) {
+              try {
+                processGogInfoJson(ctx, full, rawInfo);
+              } catch {}
+            }
           } else if (entry.isDirectory()) {
             if (entry.name.toLowerCase().endsWith('.app')) {
               const resDir = path.join(full, 'Contents', 'Resources');
@@ -2225,9 +2351,12 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
                   for (const rf of resFiles) {
                     if (/^goggame-\d+\.info$/i.test(rf)) {
                       const rfPath = path.join(resDir, rf);
-                      try {
-                        processGogInfoJson(ctx, rfPath, fs.readFileSync(rfPath, 'utf8'));
-                      } catch {}
+                      const rawInfo = readTextFileBoundedSync(rfPath, MAX_SCANNER_MANIFEST_BYTES);
+                      if (rawInfo) {
+                        try {
+                          processGogInfoJson(ctx, rfPath, rawInfo);
+                        } catch {}
+                      }
                     }
                   }
                 } catch {}
@@ -2245,8 +2374,10 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
 
       for (const hgFile of heroicGogFiles) {
         if (!fs.existsSync(hgFile)) continue;
+        const rawHg = readTextFileBoundedSync(hgFile, MAX_SCANNER_INDEX_JSON_BYTES);
+        if (!rawHg) continue;
         try {
-          processHeroicGogFileJson(ctx, hgFile, fs.readFileSync(hgFile, 'utf8'));
+          processHeroicGogFileJson(ctx, hgFile, rawHg);
         } catch {}
       }
     } catch (stageErr) {
@@ -2280,8 +2411,10 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
         for (const file of files) {
           if (!file.toLowerCase().endsWith('.item')) continue;
           const itemPath = path.join(manifestDir, file);
+          const rawItem = readTextFileBoundedSync(itemPath, MAX_SCANNER_MANIFEST_BYTES);
+          if (!rawItem) continue;
           try {
-            processEpicItemJson(ctx, manifestBottleRoot, itemPath, fs.readFileSync(itemPath, 'utf8'));
+            processEpicItemJson(ctx, manifestBottleRoot, itemPath, rawItem);
           } catch {}
         }
       }
@@ -2289,16 +2422,20 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
       for (const datFile of launcherInstalledFiles) {
         if (!fs.existsSync(datFile)) continue;
         const datBottleRoot = extractBottleRootFromPath(datFile);
+        const rawDat = readTextFileBoundedSync(datFile, MAX_SCANNER_INDEX_JSON_BYTES);
+        if (!rawDat) continue;
         try {
-          processEpicDatJson(ctx, datFile, datBottleRoot, fs.readFileSync(datFile, 'utf8'));
+          processEpicDatJson(ctx, datFile, datBottleRoot, rawDat);
         } catch {}
       }
 
       for (const legFile of legendaryFiles) {
         if (!fs.existsSync(legFile)) continue;
         const isExternalLegFile = path.resolve(legFile) !== managedLegendaryInstalledPath;
+        const rawLeg = readTextFileBoundedSync(legFile, MAX_SCANNER_INDEX_JSON_BYTES);
+        if (!rawLeg) continue;
         try {
-          processLegendaryFileJson(ctx, legFile, isExternalLegFile, fs.readFileSync(legFile, 'utf8'));
+          processLegendaryFileJson(ctx, legFile, isExternalLegFile, rawLeg);
         } catch {}
       }
     } catch (stageErr) {
@@ -2467,28 +2604,34 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
         for (const file of files) {
           if (!/^appmanifest_\d+\.acf$/i.test(file)) continue;
           const manifestPath = path.join(steamappsDir, file);
-          let rawAcf = '';
-          try {
-            rawAcf = await fs.promises.readFile(manifestPath, 'utf8');
-          } catch {
-            continue;
-          }
+          const rawAcf = await readTextFileBoundedAsync(manifestPath, MAX_SCANNER_MANIFEST_BYTES);
+          if (!rawAcf) continue;
           // Pre-read EA installerdata.xml asynchronously when present
           let preloadedXml = '';
           try {
             const parsedPeek = parseSteamAcf(rawAcf);
             if (parsedPeek && parsedPeek.appId && parsedPeek.appId !== 228980) {
+              const commonDir = path.join(steamappsDir, 'common');
               const installPath = parsedPeek.installdir
-                ? path.join(steamappsDir, 'common', parsedPeek.installdir)
-                : path.join(steamappsDir, 'common', String(parsedPeek.appId));
-              for (const xmlPath of [
-                path.join(installPath, '__Installer', 'installerdata.xml'),
-                path.join(installPath, '__installer', 'installerdata.xml'),
-              ]) {
-                try {
-                  preloadedXml = await fs.promises.readFile(xmlPath, 'utf8');
-                  if (preloadedXml) break;
-                } catch {}
+                ? path.resolve(commonDir, String(parsedPeek.installdir))
+                : path.resolve(commonDir, String(parsedPeek.appId));
+              if (
+                isContainedWithinRoot(commonDir, installPath, platform) &&
+                path.resolve(installPath) !== path.resolve(commonDir)
+              ) {
+                for (const xmlPath of [
+                  path.join(installPath, '__Installer', 'installerdata.xml'),
+                  path.join(installPath, '__installer', 'installerdata.xml'),
+                ]) {
+                  const readXml = await readTextFileBoundedAsync(
+                    xmlPath,
+                    MAX_SCANNER_MANIFEST_BYTES
+                  );
+                  if (readXml) {
+                    preloadedXml = readXml;
+                    break;
+                  }
+                }
               }
             }
           } catch {}
@@ -2530,15 +2673,25 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
       );
       for (const cfgPath of gogGalaxyConfigs) {
         try {
-          const rawCfg = await fs.promises.readFile(cfgPath, 'utf8');
-          applyGogGalaxyConfigJson(ctx, cfgPath, rawCfg, gogSearchDirs);
+          const rawCfg = await readTextFileBoundedAsync(cfgPath, MAX_SCANNER_MANIFEST_BYTES);
+          if (rawCfg) {
+            applyGogGalaxyConfigJson(ctx, cfgPath, rawCfg, gogSearchDirs);
+          }
         } catch {}
       }
 
+      /** @type {Set<string>} */
+      const visitedGogDirsAsync = new Set();
       let gogVisited = 0;
       const scanDirForGogInfoAsync = async (/** @type {string} */ dirPath, depth = 0) => {
-        if (depth > 3 || !dirPath) return;
+        if (depth > 3 || !dirPath || gogVisited >= MAX_GOG_SCAN_DIRS_VISITED) return;
         if (isPathUnderActiveDownload(dirPath)) return;
+        let canonicalDir = path.resolve(dirPath);
+        try {
+          canonicalDir = await fs.promises.realpath(dirPath);
+        } catch {}
+        if (visitedGogDirsAsync.has(canonicalDir)) return;
+        visitedGogDirsAsync.add(canonicalDir);
         /** @type {fs.Dirent[]} */
         let entries = [];
         try {
@@ -2555,8 +2708,10 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
           const full = path.join(dirPath, entry.name);
           if (entry.isFile() && /^goggame-\d+\.info$/i.test(entry.name)) {
             try {
-              const rawInfo = await fs.promises.readFile(full, 'utf8');
-              processGogInfoJson(ctx, full, rawInfo);
+              const rawInfo = await readTextFileBoundedAsync(full, MAX_SCANNER_MANIFEST_BYTES);
+              if (rawInfo) {
+                processGogInfoJson(ctx, full, rawInfo);
+              }
             } catch {}
           } else if (entry.isDirectory()) {
             if (entry.name.toLowerCase().endsWith('.app')) {
@@ -2567,8 +2722,13 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
                   if (/^goggame-\d+\.info$/i.test(rf)) {
                     const rfPath = path.join(resDir, rf);
                     try {
-                      const rawInfo = await fs.promises.readFile(rfPath, 'utf8');
-                      processGogInfoJson(ctx, rfPath, rawInfo);
+                      const rawInfo = await readTextFileBoundedAsync(
+                        rfPath,
+                        MAX_SCANNER_MANIFEST_BYTES
+                      );
+                      if (rawInfo) {
+                        processGogInfoJson(ctx, rfPath, rawInfo);
+                      }
                     } catch {}
                   }
                 }
@@ -2586,8 +2746,10 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
 
       for (const hgFile of heroicGogFiles) {
         try {
-          const rawHg = await fs.promises.readFile(hgFile, 'utf8');
-          processHeroicGogFileJson(ctx, hgFile, rawHg);
+          const rawHg = await readTextFileBoundedAsync(hgFile, MAX_SCANNER_INDEX_JSON_BYTES);
+          if (rawHg) {
+            processHeroicGogFileJson(ctx, hgFile, rawHg);
+          }
         } catch {}
       }
     } catch (stageErr) {
@@ -2624,8 +2786,10 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
           if (!file.toLowerCase().endsWith('.item')) continue;
           const itemPath = path.join(manifestDir, file);
           try {
-            const rawItem = await fs.promises.readFile(itemPath, 'utf8');
-            processEpicItemJson(ctx, manifestBottleRoot, itemPath, rawItem);
+            const rawItem = await readTextFileBoundedAsync(itemPath, MAX_SCANNER_MANIFEST_BYTES);
+            if (rawItem) {
+              processEpicItemJson(ctx, manifestBottleRoot, itemPath, rawItem);
+            }
           } catch {}
           epicProcessed += 1;
           if (epicProcessed % ASYNC_SCAN_YIELD_CHUNK === 0) {
@@ -2637,16 +2801,20 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
       for (const datFile of launcherInstalledFiles) {
         const datBottleRoot = extractBottleRootFromPath(datFile);
         try {
-          const rawDat = await fs.promises.readFile(datFile, 'utf8');
-          processEpicDatJson(ctx, datFile, datBottleRoot, rawDat);
+          const rawDat = await readTextFileBoundedAsync(datFile, MAX_SCANNER_INDEX_JSON_BYTES);
+          if (rawDat) {
+            processEpicDatJson(ctx, datFile, datBottleRoot, rawDat);
+          }
         } catch {}
       }
 
       for (const legFile of legendaryFiles) {
         const isExternalLegFile = path.resolve(legFile) !== managedLegendaryInstalledPath;
         try {
-          const rawLeg = await fs.promises.readFile(legFile, 'utf8');
-          processLegendaryFileJson(ctx, legFile, isExternalLegFile, rawLeg);
+          const rawLeg = await readTextFileBoundedAsync(legFile, MAX_SCANNER_INDEX_JSON_BYTES);
+          if (rawLeg) {
+            processLegendaryFileJson(ctx, legFile, isExternalLegFile, rawLeg);
+          }
         } catch {}
       }
     } catch (stageErr) {
