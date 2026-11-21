@@ -1,6 +1,8 @@
 import { GameCollection } from '../../contracts/collection';
 import type { CanonicalGame } from '../../contracts/game';
 import { normalizeTitleKey, stripEditionSuffix } from '../common/titleUtils';
+import { getSafeLocalStorage } from '../common/runtimeEnv';
+import { loadCurrentCatalog } from '../integrations/integrationStorage';
 
 const STORAGE_KEY = 'antigravity_user_collections';
 const CATALOG_STORAGE_KEYS = [
@@ -48,16 +50,35 @@ export const DEFAULT_COLLECTIONS: GameCollection[] = [
   },
 ];
 
+function cloneDefaultCollections(): GameCollection[] {
+  return DEFAULT_COLLECTIONS.map((col) => ({
+    ...col,
+    gameIds: [...col.gameIds],
+  }));
+}
+
 function buildOwnedSlugResolutionMap(
   ownedGames?: ReadonlyArray<Pick<CanonicalGame, 'id' | 'title'>>
 ): Map<string, string> {
   const bySlugOrNorm = new Map<string, string>();
   let sourceGames = ownedGames;
 
-  if (!sourceGames && typeof window !== 'undefined' && typeof localStorage !== 'undefined') {
+  if (!sourceGames) {
+    try {
+      const activeCatalog = loadCurrentCatalog();
+      if (Array.isArray(activeCatalog) && activeCatalog.length > 0) {
+        sourceGames = activeCatalog;
+      }
+    } catch {
+      // Fall back to legacy storage keys if active catalog is unavailable
+    }
+  }
+
+  const storage = getSafeLocalStorage();
+  if (!sourceGames && storage) {
     for (const key of CATALOG_STORAGE_KEYS) {
       try {
-        const raw = localStorage.getItem(key);
+        const raw = storage.getItem(key);
         if (!raw) continue;
         const parsed: unknown = JSON.parse(raw);
         if (Array.isArray(parsed) && parsed.length > 0) {
@@ -179,11 +200,12 @@ export function resolveCollectionGameIdsAgainstCatalog(
 export function loadCollections(
   ownedGames?: ReadonlyArray<Pick<CanonicalGame, 'id' | 'title'>>
 ): GameCollection[] {
-  if (typeof window === 'undefined') return DEFAULT_COLLECTIONS;
+  const storage = getSafeLocalStorage();
+  if (!storage) return cloneDefaultCollections();
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = storage.getItem(STORAGE_KEY);
     if (!raw) {
-      return DEFAULT_COLLECTIONS;
+      return cloneDefaultCollections();
     }
     const parsed: unknown = JSON.parse(raw);
     if (Array.isArray(parsed) && parsed.length > 0) {
@@ -194,16 +216,17 @@ export function loadCollections(
       }
       return sanitized;
     }
-    return DEFAULT_COLLECTIONS;
+    return cloneDefaultCollections();
   } catch {
-    return DEFAULT_COLLECTIONS;
+    return cloneDefaultCollections();
   }
 }
 
 export function saveCollections(collections: GameCollection[]): void {
-  if (typeof window === 'undefined') return;
+  const storage = getSafeLocalStorage();
+  if (!storage) return;
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(collections));
+    storage.setItem(STORAGE_KEY, JSON.stringify(collections));
   } catch (err) {
     console.error('Failed to save collections to localStorage', err);
   }
