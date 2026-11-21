@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { SteamEnrichedMetadata, SteamReviewSummary } from '../../contracts/steam';
-import { CriticScoreData, CriticSource, CriticTier } from '../../contracts/critic';
+import { CriticScoreData } from '../../contracts/critic';
 import { UserGameOverride } from '../../contracts/override';
 import { StorefrontId } from '../../contracts/platform';
 import { toOlMediaUrl, unwrapOlMediaUrl } from '../../contracts/network';
@@ -28,9 +28,9 @@ import {
 } from '../../services/hltb/howLongToBeat';
 import { criticScoreService } from '../../services/critic/criticScoreService';
 import {
-  calculateTier,
   getReviewSourceAuthorityRank,
   normalizeCriticTitleKey,
+  parseVaultCriticScore,
 } from '../../services/critic/criticUtils';
 import {
   buildVerifiedSteamMetacriticAnchor,
@@ -573,99 +573,11 @@ function parseVaultHltb(raw: unknown): HltbData | null {
   };
 }
 
-const VALID_VAULT_CRITIC_SOURCES: ReadonlySet<CriticSource> = new Set<CriticSource>([
-  'opencritic',
-  'metacritic',
-  'metacritic_user',
-  'steam',
-  'gog',
-  'epic',
-  'xbox',
-  'custom',
-]);
-
-const VALID_VAULT_CRITIC_TIERS: ReadonlySet<CriticTier> = new Set<CriticTier>([
-  'Mighty',
-  'Strong',
-  'Fair',
-  'Weak',
-]);
-
-function isXboxVaultHostUrl(url?: string): boolean {
-  if (!url) return false;
-  try {
-    const host = new URL(url).hostname.toLowerCase();
-    return host === 'xbox.com' || host.endsWith('.xbox.com');
-  } catch {
-    return false;
-  }
-}
-
-function parseVaultCriticScore(raw: unknown): CriticScoreData | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const candidate = raw as Record<string, unknown>;
-  const rawScore = candidate.score;
-  if (typeof rawScore !== 'number' || !Number.isFinite(rawScore) || rawScore <= 0) {
-    return null;
-  }
-
-  const rawId = candidate.id;
-  const rawUrl = typeof candidate.url === 'string' ? candidate.url.trim() : '';
-  const rawSource = candidate.source;
-  const resolvedSource: CriticSource =
-    typeof rawSource === 'string' && VALID_VAULT_CRITIC_SOURCES.has(rawSource as CriticSource)
-      ? (rawSource as CriticSource)
-      : String(rawId || '').toLowerCase().startsWith('xbox-') || isXboxVaultHostUrl(rawUrl)
-      ? 'xbox'
-      : 'metacritic';
-
-  const rawPercent = candidate.percentRecommended;
-  const percentRecommended =
-    typeof rawPercent === 'number' && Number.isFinite(rawPercent) ? rawPercent : undefined;
-
-  const rawTier = candidate.tier;
-  const resolvedTier: CriticTier =
-    typeof rawTier === 'string' && VALID_VAULT_CRITIC_TIERS.has(rawTier as CriticTier)
-      ? (rawTier as CriticTier)
-      : calculateTier(rawScore, percentRecommended);
-
-  const rawUserScore = candidate.userScoreRaw;
-  const rawStarRating = candidate.starRatingRaw;
-  const rawNumReviews = candidate.numReviews;
-  const rawPercentile = candidate.percentile;
-  const rawSummary = candidate.summary;
-  const rawVerified = candidate.isVerified;
-  const rawSynthetic = candidate.isSynthetic;
-
-  return {
-    ...(typeof rawId === 'string' || typeof rawId === 'number' ? { id: rawId } : {}),
-    source: resolvedSource,
-    score: rawScore,
-    tier: resolvedTier,
-    ...(typeof rawUserScore === 'number' && Number.isFinite(rawUserScore)
-      ? { userScoreRaw: rawUserScore }
-      : {}),
-    ...(typeof rawStarRating === 'number' && Number.isFinite(rawStarRating)
-      ? { starRatingRaw: rawStarRating }
-      : {}),
-    ...(typeof rawNumReviews === 'number' && Number.isFinite(rawNumReviews)
-      ? { numReviews: rawNumReviews }
-      : {}),
-    ...(percentRecommended !== undefined ? { percentRecommended } : {}),
-    ...(typeof rawPercentile === 'number' && Number.isFinite(rawPercentile)
-      ? { percentile: rawPercentile }
-      : {}),
-    url: rawUrl,
-    ...(typeof rawSummary === 'string' ? { summary: rawSummary } : {}),
-    isVerified:
-      typeof rawVerified === 'boolean'
-        ? rawVerified
-        : resolvedSource === 'metacritic' || resolvedSource === 'opencritic',
-    ...(typeof rawSynthetic === 'boolean' ? { isSynthetic: rawSynthetic } : {}),
-  };
-}
-
-function buildVaultCriticSignature(gameId: string, score: CriticScoreData | null): string {
+function buildVaultCriticSignature(
+  gameId: string,
+  score: CriticScoreData | null,
+  isExplicitOverride = false
+): string {
   if (!score || typeof score.score !== 'number' || !Number.isFinite(score.score) || score.score <= 0) {
     return '';
   }
@@ -677,7 +589,65 @@ function buildVaultCriticSignature(gameId: string, score: CriticScoreData | null
     score.starRatingRaw ?? '',
     score.numReviews ?? '',
     score.url || '',
+    isExplicitOverride ? 'override' : 'auto',
   ].join('|');
+}
+
+export function shouldAcceptCriticUpdateEvent(
+  detail: {
+    gameId?: string;
+    title?: string;
+    steamAppId?: number;
+    appId?: number;
+  },
+  target: {
+    gameId: string;
+    gameSteamAppId?: number;
+    currentSteamAppId?: number;
+    effectiveSteamId?: number;
+    resolvedSteamAppId?: number | null;
+    lowerGameTitle: string;
+    normalizedGameTitle: string;
+  }
+): boolean {
+  const rawDetailSteamAppId = detail.steamAppId ?? detail.appId;
+  const detailSteamAppId =
+    typeof rawDetailSteamAppId === 'number' &&
+    Number.isInteger(rawDetailSteamAppId) &&
+    rawDetailSteamAppId > 0
+      ? rawDetailSteamAppId
+      : undefined;
+  const effectiveCurrentSteamAppId =
+    typeof target.resolvedSteamAppId === 'number' &&
+    Number.isInteger(target.resolvedSteamAppId) &&
+    target.resolvedSteamAppId > 0
+      ? target.resolvedSteamAppId
+      : undefined;
+  const matchesGameId = Boolean(detail.gameId && detail.gameId === target.gameId);
+  const matchesSteamId = Boolean(
+    detailSteamAppId &&
+      (detailSteamAppId === target.gameSteamAppId ||
+        detailSteamAppId === target.currentSteamAppId ||
+        detailSteamAppId === target.effectiveSteamId ||
+        detailSteamAppId === effectiveCurrentSteamAppId)
+  );
+  if (
+    !matchesGameId &&
+    !matchesSteamId &&
+    detailSteamAppId !== undefined &&
+    effectiveCurrentSteamAppId !== undefined &&
+    detailSteamAppId !== effectiveCurrentSteamAppId
+  ) {
+    return false;
+  }
+  const detailTitleTrimmed = typeof detail.title === 'string' ? detail.title.trim() : '';
+  const matchesTitle = Boolean(
+    detailTitleTrimmed &&
+      (detailTitleTrimmed.toLowerCase() === target.lowerGameTitle ||
+        (target.normalizedGameTitle &&
+          normalizeCriticTitleKey(detailTitleTrimmed) === target.normalizedGameTitle))
+  );
+  return matchesGameId || matchesSteamId || matchesTitle;
 }
 
 function hasRealSteamReviewSummary(
@@ -1301,6 +1271,20 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           steamIdToSave && steamIdToSave !== game.steamAppId
             ? { ...game, steamAppId: steamIdToSave }
             : game;
+        const activeOverrideRoute = currentOverride
+          ? inferReviewRouteFromOverride(currentOverride)
+          : undefined;
+        const isUnratedOverride =
+          activeOverrideRoute?.mode === 'unrated' || currentOverride?.reviewScoreOverride === null;
+        const isExplicitCriticOverride =
+          !isUnratedOverride &&
+          Boolean(
+            activeOverrideRoute?.mode === 'static' ||
+              activeOverrideRoute?.mode === 'routed' ||
+              (currentOverride?.reviewScoreOverride &&
+                typeof currentOverride.reviewScoreOverride.score === 'number' &&
+                currentOverride.reviewScoreOverride.score > 0)
+          );
         const resolvedCritic = resolveGameReviewScore(targetGameSnapshot, {
           liveMetadata: enrichedForVault,
           liveReviewSummary: resolvedReviewSummary,
@@ -1314,14 +1298,24 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           resolvedReviewSummary?.totalReviews ?? 0,
           resolvedReviewSummary?.positivePercent ?? 0,
           enrichedForVault.metacritic?.score ?? 0,
-          resolvedCritic ? `${resolvedCritic.source}:${resolvedCritic.score}` : '',
+          isUnratedOverride
+            ? 'unrated'
+            : resolvedCritic
+            ? `${resolvedCritic.source}:${resolvedCritic.score}:${isExplicitCriticOverride ? 'ov' : 'auto'}`
+            : '',
         ].join('|');
         if (metaSig === lastPersistedVaultMetaSigRef.current) {
           return;
         }
         lastPersistedVaultMetaSigRef.current = metaSig;
-        if (resolvedCritic && resolvedCritic.score > 0) {
-          lastPersistedVaultCriticSigRef.current = buildVaultCriticSignature(game.id, resolvedCritic);
+        if (isUnratedOverride) {
+          lastPersistedVaultCriticSigRef.current = `${game.id}|__unrated__`;
+        } else if (resolvedCritic && resolvedCritic.score > 0) {
+          lastPersistedVaultCriticSigRef.current = buildVaultCriticSignature(
+            game.id,
+            resolvedCritic,
+            isExplicitCriticOverride
+          );
         }
         try {
           void window.electronAPI.offlineVault
@@ -1330,8 +1324,13 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
               steamAppId: steamIdToSave ?? game.steamAppId ?? null,
               canonicalTitle: game.title,
               enrichedMetadata: enrichedForVault,
-              ...(resolvedCritic && resolvedCritic.score > 0
-                ? { criticScore: { ...resolvedCritic } as unknown as Record<string, unknown> }
+              ...(isUnratedOverride
+                ? { clearCriticScore: true }
+                : resolvedCritic && resolvedCritic.score > 0
+                ? {
+                    criticScore: { ...resolvedCritic } as unknown as Record<string, unknown>,
+                    ...(isExplicitCriticOverride ? { forceCriticScore: true } : {}),
+                  }
                 : {}),
             })
             ?.catch?.(() => {});
@@ -2247,23 +2246,17 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         return;
       }
 
-      const detailSteamAppId = detail.steamAppId ?? detail.appId;
-      const matchesGameId = Boolean(detail.gameId && detail.gameId === game.id);
-      const matchesSteamId = Boolean(
-        detailSteamAppId &&
-          (detailSteamAppId === game.steamAppId ||
-            detailSteamAppId === currentSteamAppId ||
-            detailSteamAppId === effectiveSteamId)
-      );
-      const detailTitleTrimmed = typeof detail.title === 'string' ? detail.title.trim() : '';
-      const matchesTitle = Boolean(
-        detailTitleTrimmed &&
-          (detailTitleTrimmed.toLowerCase() === lowerGameTitle ||
-            (normalizedGameTitle &&
-              normalizeCriticTitleKey(detailTitleTrimmed) === normalizedGameTitle))
-      );
-
-      if (!matchesGameId && !matchesSteamId && !matchesTitle) {
+      if (
+        !shouldAcceptCriticUpdateEvent(detail, {
+          gameId: game.id,
+          gameSteamAppId: game.steamAppId,
+          currentSteamAppId,
+          effectiveSteamId,
+          resolvedSteamAppId,
+          lowerGameTitle,
+          normalizedGameTitle,
+        })
+      ) {
         return;
       }
 
@@ -2308,6 +2301,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     game.title,
     currentSteamAppId,
     effectiveSteamId,
+    resolvedSteamAppId,
     metadata,
     reviewSummary,
     userOverride?.updatedAt,
@@ -2317,14 +2311,6 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
 
   useEffect(() => {
     if (
-      !openCriticData ||
-      typeof openCriticData.score !== 'number' ||
-      !Number.isFinite(openCriticData.score) ||
-      openCriticData.score <= 0
-    ) {
-      return;
-    }
-    if (
       typeof window === 'undefined' ||
       typeof window.electronAPI?.offlineVault?.saveGameDetail !== 'function'
     ) {
@@ -2332,11 +2318,46 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     }
     const activeOverride = getUserOverrideForGame(activeReviewGame);
     const activeRoute = activeOverride ? inferReviewRouteFromOverride(activeOverride) : undefined;
-    if (activeRoute?.mode === 'unrated') {
+    const isUnratedOverride =
+      activeRoute?.mode === 'unrated' || activeOverride?.reviewScoreOverride === null;
+
+    if (isUnratedOverride) {
+      const unratedSig = `${game.id}|__unrated__`;
+      if (lastPersistedVaultCriticSigRef.current === unratedSig) {
+        return;
+      }
+      lastPersistedVaultCriticSigRef.current = unratedSig;
+      try {
+        void window.electronAPI.offlineVault
+          .saveGameDetail({
+            gameId: game.id,
+            steamAppId: resolvedSteamAppId ?? null,
+            canonicalTitle: game.title,
+            clearCriticScore: true,
+          })
+          ?.catch?.(() => {});
+      } catch {
+        // Ignore vault persistence error
+      }
       return;
     }
-    const isExplicitOverride =
-      activeRoute?.mode === 'static' || activeRoute?.mode === 'routed';
+
+    if (
+      !openCriticData ||
+      typeof openCriticData.score !== 'number' ||
+      !Number.isFinite(openCriticData.score) ||
+      openCriticData.score <= 0
+    ) {
+      return;
+    }
+
+    const isExplicitOverride = Boolean(
+      activeRoute?.mode === 'static' ||
+        activeRoute?.mode === 'routed' ||
+        (activeOverride?.reviewScoreOverride &&
+          typeof activeOverride.reviewScoreOverride.score === 'number' &&
+          activeOverride.reviewScoreOverride.score > 0)
+    );
     const anchorSlug = buildVerifiedSteamMetacriticAnchor(
       activeReviewGame,
       metadata
@@ -2352,7 +2373,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     ) {
       return;
     }
-    const nextSig = buildVaultCriticSignature(game.id, openCriticData);
+    const nextSig = buildVaultCriticSignature(game.id, openCriticData, isExplicitOverride);
     if (!nextSig || nextSig === lastPersistedVaultCriticSigRef.current) {
       return;
     }
@@ -2376,6 +2397,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           steamAppId: resolvedSteamAppId ?? null,
           canonicalTitle: game.title,
           criticScore: { ...openCriticData } as unknown as Record<string, unknown>,
+          ...(isExplicitOverride ? { forceCriticScore: true } : {}),
           ...(persistableEnrichedMetadata
             ? { enrichedMetadata: persistableEnrichedMetadata }
             : {}),
@@ -2390,8 +2412,10 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     game.title,
     metadata,
     openCriticData,
+    overrideTick,
     resolvedSteamAppId,
     reviewSummary,
+    userOverride?.updatedAt,
   ]);
 
   const syncInlineVideoPlayback = () => {

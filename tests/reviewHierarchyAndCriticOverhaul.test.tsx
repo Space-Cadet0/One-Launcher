@@ -1,4 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import React from 'react';
+import { renderToString } from 'react-dom/server';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createRequire } from 'node:module';
 
 const { mockStorage } = vi.hoisted(() => {
   class MemoryStorage implements Storage {
@@ -61,6 +67,8 @@ const { mockStorage } = vi.hoisted(() => {
 
 import type { CriticScoreData, CriticSource } from '../src/contracts/critic';
 import type { CanonicalGame } from '../src/contracts/game';
+import type { UserGameOverride } from '../src/contracts/override';
+import type { StorefrontId } from '../src/contracts/platform';
 import {
   extractParentheticalReleaseYear,
   isIntermediateNumeralSubtitleMatch,
@@ -74,6 +82,7 @@ import {
   calculateTier,
   getReviewSourceAuthorityRank,
   getReviewSourceDisplayMeta,
+  parseVaultCriticScore,
   type ReviewSourceShortTag,
 } from '../src/services/critic/criticUtils';
 import {
@@ -109,6 +118,45 @@ import {
   loadStagedCache,
   saveStagedCache,
 } from '../src/services/storage/stagedCacheService';
+import {
+  saveUserOverride,
+  removeUserOverride,
+} from '../src/services/storage/userOverrideStorage';
+import { scheduleLazySteamAnchorVaultRecovery } from '../src/services/integrations/integrationStorage';
+import { buildLibraryFilterIndex } from '../src/services/filter/libraryFilterIndex';
+import { OpenCriticCard } from '../src/components/SteamStoreDetail/OpenCriticCard';
+import { SteamHeroDetails } from '../src/components/SteamStoreDetail/SteamHeroDetails';
+import { SteamLibraryActionBar } from '../src/components/SteamStoreDetail/SteamLibraryActionBar';
+import { shouldAcceptCriticUpdateEvent } from '../src/components/SteamStoreDetail/SteamStorePage';
+import { renderLibraryGridCard } from '../src/components/Library/Grid/LibraryGridCard';
+import { renderGameHoverPopout } from '../src/components/Library/Grid/GameHoverPopout';
+
+const cjsRequire = createRequire(import.meta.url);
+const offlineVaultMod = cjsRequire('../electron/launcher/offlineVaultService.cjs') as {
+  createOfflineVaultService: (options: Record<string, unknown>) => {
+    saveGameDetail: (payload: Record<string, unknown>) => { success: boolean; error?: string };
+    getGameDetail: (gameId: string) => {
+      criticScore?: Record<string, unknown> | null;
+      enrichedMetadata?: Record<string, unknown> | null;
+    } | null;
+    getCatalogSnapshot: () => {
+      success: boolean;
+      games?: unknown[];
+      details?: Record<string, { criticScore?: Record<string, unknown> | null }>;
+    };
+    saveUserOverride: (
+      gameId: string,
+      record?: Record<string, unknown>,
+      extraKeys?: string[]
+    ) => { success: boolean; invalidated: number };
+    removeUserOverride: (
+      gameId: string,
+      extraKeys?: string[]
+    ) => { success: boolean; invalidated: number };
+    shutdown: () => void;
+  };
+  getCriticAuthorityRank: (criticObj: unknown, options?: { isUserOverride?: boolean }) => number;
+};
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -1347,6 +1395,980 @@ describe('Review Hierarchy & Critic Resolver Overhaul — Hermetic End-to-End Re
       expect(loadStagedCache<CriticScoreData>('antigravity_critic_v8_id:1091500').data?.score).toBe(
         86
       );
+    });
+  });
+
+  // =========================================================================
+  // 7. Wave 3 Adversarial Remediation Suite (P1-1, P1-2, P1-3, P2-1, P2-2, P2-4, P2-6, P2-7)
+  // =========================================================================
+  describe('Wave 3 Adversarial Remediation: SQLite Override Latch, Authority Parity, Service/UI Edge Cases & All-8 UI Render', () => {
+    it('[P1-1] persists SQLite override downgrades (MC 90 -> routed steam / static custom), unrated clears, and override removal without cold-boot zombie resurrection', () => {
+      const sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-p1-1-vault-'));
+      let vault = offlineVaultMod.createOfflineVaultService({
+        userDataDir: sandboxDir,
+        disableJitter: true,
+      });
+
+      try {
+        // 1. Seed authentic MC 90 (rank 4) into SQLite vault_games.critic_json
+        const mc90: CriticScoreData = {
+          id: 'mc-metro-2033-redux',
+          source: 'metacritic',
+          score: 90,
+          tier: 'Mighty',
+          numReviews: 5,
+          url: 'https://www.metacritic.com/game/metro-2033-redux/critic-reviews/',
+          isVerified: true,
+        };
+        const steam78: CriticScoreData = {
+          id: 'steam-286690',
+          source: 'steam',
+          score: 78,
+          tier: 'Strong',
+          numReviews: 500,
+          url: 'https://store.steampowered.com/app/286690',
+          isVerified: false,
+          isSynthetic: true,
+        };
+        const custom83: CriticScoreData = {
+          id: 'custom-286690',
+          source: 'custom',
+          score: 83,
+          tier: 'Strong',
+          url: 'https://example.com/manual',
+          isVerified: true,
+        };
+
+        vault.saveGameDetail({
+          gameId: 'steam-286690',
+          steamAppId: 286690,
+          canonicalTitle: 'Metro 2033 Redux',
+          criticScore: mc90,
+        });
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.score).toBe(90);
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.source).toBe('metacritic');
+
+        // 2. Automatic (non-forced) lower-rank write MUST still be rejected by monotonic latch
+        vault.saveGameDetail({
+          gameId: 'steam-286690',
+          steamAppId: 286690,
+          canonicalTitle: 'Metro 2033 Redux',
+          criticScore: steam78,
+        });
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.source).toBe('metacritic');
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.score).toBe(90);
+
+        // 3. Explicit user override downgrade (MC 90 -> routed Steam 78) with forceCriticScore: true MUST overwrite
+        vault.saveGameDetail({
+          gameId: 'steam-286690',
+          steamAppId: 286690,
+          canonicalTitle: 'Metro 2033 Redux',
+          criticScore: steam78,
+          forceCriticScore: true,
+        });
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.source).toBe('steam');
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.score).toBe(78);
+
+        // 4. Restore MC 90, then verify saveUserOverride with static custom 83 overwrites MC 90 directly
+        vault.saveGameDetail({
+          gameId: 'steam-286690',
+          steamAppId: 286690,
+          canonicalTitle: 'Metro 2033 Redux',
+          criticScore: mc90,
+          forceCriticScore: true,
+        });
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.score).toBe(90);
+
+        // Cover-only override (no reviewRoute/reviewScoreOverride) MUST preserve authentic MC 90
+        vault.saveUserOverride('steam-286690', {
+          gameId: 'steam-286690',
+          capsuleImage: 'https://cdn.example.invalid/custom-cover.jpg',
+        });
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.score).toBe(90);
+
+        vault.saveUserOverride('steam-286690', {
+          gameId: 'steam-286690',
+          reviewRoute: { mode: 'static', source: 'custom' },
+          reviewScoreOverride: custom83,
+        });
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.source).toBe('custom');
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.score).toBe(83);
+
+        // 5. Pending routed override (without resolved reviewScoreOverride yet) clears stale higher-rank MC 90
+        vault.saveGameDetail({
+          gameId: 'steam-286690',
+          steamAppId: 286690,
+          canonicalTitle: 'Metro 2033 Redux',
+          criticScore: mc90,
+          forceCriticScore: true,
+        });
+        vault.saveUserOverride('steam-286690', {
+          gameId: 'steam-286690',
+          reviewRoute: { mode: 'routed', source: 'steam', steamAppId: 286690 },
+        });
+        expect(vault.getGameDetail('steam-286690')?.criticScore ?? null).toBeNull();
+
+        // 6. Explicit unrated override clears critic_json via BOTH saveUserOverride and saveGameDetail({ clearCriticScore: true })
+        vault.saveGameDetail({
+          gameId: 'steam-286690',
+          steamAppId: 286690,
+          canonicalTitle: 'Metro 2033 Redux',
+          criticScore: mc90,
+          forceCriticScore: true,
+        });
+        vault.saveUserOverride('steam-286690', {
+          gameId: 'steam-286690',
+          reviewRoute: { mode: 'unrated' },
+          reviewScoreOverride: null,
+        });
+        expect(vault.getGameDetail('steam-286690')?.criticScore ?? null).toBeNull();
+
+        vault.saveGameDetail({
+          gameId: 'steam-286690',
+          steamAppId: 286690,
+          canonicalTitle: 'Metro 2033 Redux',
+          criticScore: mc90,
+          forceCriticScore: true,
+        });
+        vault.saveGameDetail({
+          gameId: 'steam-286690',
+          clearCriticScore: true,
+        });
+        expect(vault.getGameDetail('steam-286690')?.criticScore ?? null).toBeNull();
+
+        // 7. Override removal clears wrong-game high-rank MC 95 override -> ZERO cold-boot zombie resurrection!
+        vault.saveGameDetail({
+          gameId: 'steam-286690',
+          steamAppId: 286690,
+          canonicalTitle: 'Metro 2033 Redux',
+          criticScore: {
+            ...mc90,
+            score: 95,
+            isUserOverride: true,
+          },
+          forceCriticScore: true,
+        });
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.score).toBe(95);
+
+        const removeRes = vault.removeUserOverride('steam-286690', ['steam:286690']);
+        expect(removeRes.success).toBe(true);
+        expect(vault.getGameDetail('steam-286690')?.criticScore ?? null).toBeNull();
+
+        // Simulate cold boot by shutting down and reopening SQLite vault from disk
+        vault.shutdown();
+        vault = offlineVaultMod.createOfflineVaultService({
+          userDataDir: sandboxDir,
+          disableJitter: true,
+        });
+        const snap = vault.getCatalogSnapshot();
+        expect(snap.details?.['steam-286690']?.criticScore ?? null).toBeNull();
+
+        // Authentic lower-rank STM 78 can now be written cleanly without being blocked by deleted override
+        vault.saveGameDetail({
+          gameId: 'steam-286690',
+          steamAppId: 286690,
+          canonicalTitle: 'Metro 2033 Redux',
+          criticScore: steam78,
+        });
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.source).toBe('steam');
+        expect(vault.getGameDetail('steam-286690')?.criticScore?.score).toBe(78);
+
+        // 8. Verify CriticScoreService.handleUserOverride & onOverrideRemoved drive SQLite saveGameDetail flags end-to-end
+        const saveDetailSpy = vi.fn(async (payload: Record<string, unknown>) =>
+          vault.saveGameDetail(payload)
+        );
+        (window as unknown as { electronAPI?: unknown }).electronAPI = {
+          offlineVault: {
+            saveGameDetail: saveDetailSpy,
+          },
+        };
+        const service = new CriticScoreService();
+        service.initEventListeners();
+        try {
+          // Seed MC 90 first
+          vault.saveGameDetail({
+            gameId: 'steam-286690',
+            steamAppId: 286690,
+            canonicalTitle: 'Metro 2033 Redux',
+            criticScore: mc90,
+            forceCriticScore: true,
+          });
+
+          // Routed steam override writes with forceCriticScore: true -> overwrites MC 90 in SQLite
+          service.handleUserOverride({
+            gameId: 'steam-286690',
+            steamAppId: 286690,
+            title: 'Metro 2033 Redux',
+            matchedStore: 'steam',
+            reviewRoute: { mode: 'routed', source: 'steam', steamAppId: 286690 },
+            reviewScoreOverride: steam78,
+            updatedAt: new Date().toISOString(),
+          });
+          expect(saveDetailSpy).toHaveBeenLastCalledWith(
+            expect.objectContaining({
+              gameId: 'steam-286690',
+              forceCriticScore: true,
+              criticScore: expect.objectContaining({ source: 'steam', score: 78 }),
+            })
+          );
+          expect(vault.getGameDetail('steam-286690')?.criticScore?.source).toBe('steam');
+          expect(vault.getGameDetail('steam-286690')?.criticScore?.score).toBe(78);
+
+          // Unrated override writes clearCriticScore: true -> clears SQLite critic_json
+          service.handleUserOverride({
+            gameId: 'steam-286690',
+            steamAppId: 286690,
+            title: 'Metro 2033 Redux',
+            matchedStore: 'steam',
+            reviewRoute: { mode: 'unrated' },
+            reviewScoreOverride: null,
+            updatedAt: new Date().toISOString(),
+          });
+          expect(saveDetailSpy).toHaveBeenLastCalledWith(
+            expect.objectContaining({
+              gameId: 'steam-286690',
+              clearCriticScore: true,
+            })
+          );
+          expect(vault.getGameDetail('steam-286690')?.criticScore ?? null).toBeNull();
+
+          // Re-seed wrong-game MC 95, then dispatch override-removed event -> clears SQLite critic_json
+          vault.saveGameDetail({
+            gameId: 'steam-286690',
+            steamAppId: 286690,
+            canonicalTitle: 'Metro 2033 Redux',
+            criticScore: { ...mc90, score: 95 },
+            forceCriticScore: true,
+          });
+          window.dispatchEvent(
+            new CustomEvent('antigravity:user-override-removed', {
+              detail: {
+                gameId: 'steam-286690',
+                removedOverride: {
+                  gameId: 'steam-286690',
+                  steamAppId: 286690,
+                  title: 'Metro 2033 Redux',
+                },
+              },
+            })
+          );
+          expect(saveDetailSpy).toHaveBeenLastCalledWith(
+            expect.objectContaining({
+              gameId: 'steam-286690',
+              clearCriticScore: true,
+            })
+          );
+          expect(vault.getGameDetail('steam-286690')?.criticScore ?? null).toBeNull();
+        } finally {
+          service.disposeEventListeners();
+        }
+      } finally {
+        try {
+          vault.shutdown();
+        } catch {}
+        fs.rmSync(sandboxDir, { recursive: true, force: true });
+      }
+    });
+
+    it('[P1-2] scheduleLazySteamAnchorVaultRecovery never clobbers SQLite critic_json when an active user review override exists', async () => {
+      const saveGameDetailSpy = vi.fn().mockResolvedValue({ success: true });
+      (window as unknown as { electronAPI?: unknown }).electronAPI = {
+        offlineVault: {
+          saveGameDetail: saveGameDetailSpy,
+        },
+      };
+
+      const gameUnrated = makeCanonicalGame({
+        id: 'steam-601001',
+        title: 'Override Shield Alpha',
+        steamAppId: 601001,
+        platforms: [{ platformId: 'steam', platformGameId: '601001', installed: false }],
+      });
+      const gameRoutedWithMeta = makeCanonicalGame({
+        id: 'steam-601002',
+        title: 'Override Shield Beta',
+        steamAppId: 601002,
+        platforms: [{ platformId: 'steam', platformGameId: '601002', installed: false }],
+        enrichedMetadata: {
+          appId: 601002,
+          name: 'Override Shield Beta',
+          shortDescription: 'Existing rich metadata without metacritic anchor',
+          detailedDescription: '',
+          aboutTheGame: '',
+          headerImage: '',
+          capsuleImage: '',
+          iconUrl: '',
+          developers: ['Dev'],
+          publishers: ['Pub'],
+          releaseDate: '2020-01-01',
+          genres: ['RPG'],
+          tags: [],
+          categories: [],
+          screenshots: [],
+          movies: [],
+          systemRequirements: {},
+          enrichedSource: 'steam',
+          reviewSummary: {
+            reviewScore: 8,
+            reviewScoreDesc: 'Very Positive',
+            totalPositive: 800,
+            totalNegative: 100,
+            totalReviews: 900,
+            positivePercent: 89,
+          },
+        },
+      });
+      const gameNormal = makeCanonicalGame({
+        id: 'steam-601003',
+        title: 'Normal Recovery Gamma',
+        steamAppId: 601003,
+        platforms: [{ platformId: 'steam', platformGameId: '601003', installed: false }],
+      });
+
+      saveUserOverride({
+        gameId: gameUnrated.id,
+        steamAppId: 601001,
+        title: gameUnrated.title,
+        matchedStore: 'steam',
+        reviewRoute: { mode: 'unrated' },
+        reviewScoreOverride: null,
+        updatedAt: new Date().toISOString(),
+      });
+      saveUserOverride({
+        gameId: gameRoutedWithMeta.id,
+        steamAppId: 601002,
+        title: gameRoutedWithMeta.title,
+        matchedStore: 'steam',
+        reviewRoute: { mode: 'routed', source: 'steam', steamAppId: 601002 },
+        reviewScoreOverride: {
+          id: 'steam-601002',
+          source: 'steam',
+          score: 79,
+          tier: 'Strong',
+          numReviews: 900,
+          url: 'https://store.steampowered.com/app/601002',
+          isVerified: false,
+          isSynthetic: true,
+        },
+        updatedAt: new Date().toISOString(),
+      });
+
+      vi.spyOn(storefrontReviewHarvester, 'recoverSteamAnchorFromVault').mockImplementation(
+        async (appId) => {
+          const num = Number(appId);
+          if (num === 601001) {
+            return {
+              storefront: 'steam',
+              metacriticScore: 88,
+              metacriticSlug: 'override-shield-alpha',
+              metacriticUrl: 'https://www.metacritic.com/game/override-shield-alpha/critic-reviews/',
+              isVerifiedGroundTruth: true,
+            };
+          }
+          if (num === 601002) {
+            return {
+              storefront: 'steam',
+              metacriticScore: 91,
+              metacriticSlug: 'override-shield-beta',
+              metacriticUrl: 'https://www.metacritic.com/game/override-shield-beta/critic-reviews/',
+              isVerifiedGroundTruth: true,
+            };
+          }
+          if (num === 601003) {
+            return {
+              storefront: 'steam',
+              metacriticScore: 87,
+              metacriticSlug: 'normal-recovery-gamma',
+              metacriticUrl: 'https://www.metacritic.com/game/normal-recovery-gamma/critic-reviews/',
+              isVerifiedGroundTruth: true,
+            };
+          }
+          return null;
+        }
+      );
+
+      try {
+        // Clear any saveGameDetail calls emitted during saveUserOverride setup so we strictly assert
+        // what scheduleLazySteamAnchorVaultRecovery itself persists.
+        saveGameDetailSpy.mockClear();
+
+        scheduleLazySteamAnchorVaultRecovery([gameUnrated, gameRoutedWithMeta, gameNormal]);
+        await new Promise((resolve) => setTimeout(resolve, 40));
+
+        // Game A (unrated, no enrichedMetadata): must NOT call saveGameDetail at all
+        const callsForUnrated = saveGameDetailSpy.mock.calls.filter(
+          ([payload]) => (payload as { gameId?: string })?.gameId === gameUnrated.id
+        );
+        expect(callsForUnrated).toHaveLength(0);
+
+        // Game B (routed steam override, has enrichedMetadata): may persist enrichedMetadata, NEVER criticScore!
+        const callsForRouted = saveGameDetailSpy.mock.calls.filter(
+          ([payload]) => (payload as { gameId?: string })?.gameId === gameRoutedWithMeta.id
+        );
+        for (const [payload] of callsForRouted) {
+          expect((payload as { criticScore?: unknown }).criticScore).toBeUndefined();
+        }
+
+        // Game C (no override): DOES upgrade and persist recovered MC 87
+        expect(saveGameDetailSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            gameId: gameNormal.id,
+            steamAppId: 601003,
+            criticScore: expect.objectContaining({ source: 'metacritic', score: 87 }),
+          })
+        );
+      } finally {
+        removeUserOverride(gameUnrated.id);
+        removeUserOverride(gameRoutedWithMeta.id);
+      }
+    });
+
+    it('[P1-3 & P2-7] maintains 100% authority rank parity between TS getReviewSourceAuthorityRank and CJS offlineVaultService.getCriticAuthorityRank, and validates shared parseVaultCriticScore', () => {
+      const parityCases: Array<{
+        label: string;
+        input: unknown;
+        options?: { isUserOverride?: boolean };
+        expected: number;
+      }> = [
+        { label: 'null', input: null, expected: 0 },
+        { label: 'undefined', input: undefined, expected: 0 },
+        { label: 'array', input: [], expected: 0 },
+        { label: 'empty object', input: {}, expected: 0 },
+        { label: 'zero score', input: { source: 'metacritic', score: 0 }, expected: 0 },
+        { label: 'negative score', input: { source: 'metacritic', score: -5 }, expected: 0 },
+        { label: 'NaN score', input: { source: 'metacritic', score: Number.NaN }, expected: 0 },
+        { label: 'Infinity score', input: { source: 'metacritic', score: Number.POSITIVE_INFINITY }, expected: 0 },
+        { label: 'zero score override', input: { source: 'metacritic', score: 0, isUserOverride: true }, expected: 0 },
+        { label: 'string score', input: { source: 'metacritic', score: '90' }, expected: 0 },
+        { label: 'untagged legacy object', input: { score: 85 }, expected: 1 },
+        { label: 'numeric id without OC url', input: { score: 85, id: 957 }, expected: 1 },
+        { label: 'untagged with OC url', input: { score: 85, url: 'https://opencritic.com/game/957/metro-2033-redux' }, expected: 3 },
+        { label: 'numeric id + OC url', input: { score: 85, id: 957, url: 'https://www.opencritic.com/game/957/metro-2033-redux' }, expected: 3 },
+        { label: 'untagged xbox id', input: { score: 85, id: 'xbox-9NBLGGH12345' }, expected: 1 },
+        { label: 'untagged xbox url', input: { score: 85, url: 'https://www.xbox.com/en-US/games/store/sample/9NBLGGH12345' }, expected: 1 },
+        { label: 'override via isUserOverride flag', input: { source: 'custom', score: 88, tier: 'Mighty', isUserOverride: true }, expected: 5 },
+        { label: 'override via userOverride flag', input: { source: 'steam', score: 76, userOverride: true }, expected: 5 },
+        { label: 'override via tier=override', input: { source: 'custom', score: 88, tier: 'override' }, expected: 5 },
+        { label: 'override via options arg', input: { source: 'custom', score: 80 }, options: { isUserOverride: true }, expected: 5 },
+        { label: 'metacritic', input: { source: 'metacritic', score: 90, numReviews: 5 }, expected: 4 },
+        { label: 'opencritic', input: { source: 'opencritic', score: 84, numReviews: 16 }, expected: 3 },
+        { label: 'metacritic_user >= 25', input: { source: 'metacritic_user', score: 78, numReviews: 25 }, expected: 2 },
+        { label: 'metacritic_user < 25', input: { source: 'metacritic_user', score: 78, numReviews: 24 }, expected: 1 },
+        { label: 'steam >= 10', input: { source: 'steam', score: 82, numReviews: 10 }, expected: 2 },
+        { label: 'steam < 10', input: { source: 'steam', score: 82, numReviews: 9 }, expected: 1 },
+        { label: 'steam reviewCount alias >= 10', input: { source: 'steam', score: 82, reviewCount: 25 }, expected: 2 },
+        { label: 'gog', input: { source: 'gog', score: 84, numReviews: 300 }, expected: 1 },
+        { label: 'epic', input: { source: 'epic', score: 86, numReviews: 120 }, expected: 1 },
+        { label: 'xbox', input: { source: 'xbox', score: 82, numReviews: 150 }, expected: 1 },
+        { label: 'custom', input: { source: 'custom', score: 95 }, expected: 1 },
+        { label: 'unknown source without OC url', input: { source: 'legacy_vendor', score: 80 }, expected: 1 },
+        { label: 'unknown source with OC url', input: { source: 'legacy_vendor', score: 80, url: 'https://opencritic.com/game/1/sample' }, expected: 3 },
+      ];
+
+      for (const tc of parityCases) {
+        const tsRank = getReviewSourceAuthorityRank(
+          tc.input as CriticScoreData | null | undefined,
+          tc.options
+        );
+        const cjsRank = offlineVaultMod.getCriticAuthorityRank(tc.input, tc.options);
+        expect(tsRank, `TS rank mismatch for "${tc.label}"`).toBe(tc.expected);
+        expect(cjsRank, `CJS rank mismatch for "${tc.label}"`).toBe(tc.expected);
+        expect(tsRank, `TS vs CJS divergence for "${tc.label}"`).toBe(cjsRank);
+      }
+
+      // Shared parseVaultCriticScore consistency check
+      expect(parseVaultCriticScore(null)).toBeNull();
+      expect(parseVaultCriticScore({ score: 0 })).toBeNull();
+      expect(parseVaultCriticScore({ score: 85 })?.source).toBe('custom');
+      expect(
+        parseVaultCriticScore({
+          score: 84,
+          url: 'https://opencritic.com/game/957/metro-2033-redux',
+        })?.source
+      ).toBe('opencritic');
+      expect(
+        parseVaultCriticScore({
+          score: 90,
+          url: 'https://www.metacritic.com/game/metro-2033-redux/critic-reviews/',
+        })?.source
+      ).toBe('metacritic');
+      expect(
+        parseVaultCriticScore({
+          id: 'xbox-9NBLGGH12345',
+          score: 86,
+          starRatingRaw: 4.3,
+        })?.source
+      ).toBe('xbox');
+    });
+
+    it('[P2-1] promotes higher-authority sibling stagedCache entries on cold boot when primary id:<appId> has lower-rank STM or negative null', () => {
+      // Case A: primary id:286690 has valid STM 82 (rank 2), sibling title key has valid MC 90 (rank 4)
+      saveStagedCache<CriticScoreData>(
+        'antigravity_critic_v8_id:286690',
+        {
+          id: 'steam-286690',
+          source: 'steam',
+          score: 82,
+          tier: 'Strong',
+          numReviews: 50000,
+          url: 'https://store.steampowered.com/app/286690',
+          isVerified: false,
+          isSynthetic: true,
+        },
+        MutabilityTier.TIER_2_MATURE,
+        { source: 'steam', isVerified: false, dynamicResolved: true }
+      );
+      saveStagedCache<CriticScoreData>(
+        'antigravity_critic_v8_title:metro 2033 redux',
+        {
+          id: 'mc-metro-2033-redux',
+          source: 'metacritic',
+          score: 90,
+          tier: 'Mighty',
+          numReviews: 5,
+          url: 'https://www.metacritic.com/game/metro-2033-redux/critic-reviews/',
+          isVerified: true,
+        },
+        MutabilityTier.TIER_1_IMMUTABLE,
+        { source: 'metacritic', isVerified: true, dynamicResolved: true }
+      );
+
+      // Case B: primary id:554433 has negative null (rank 0), sibling title key has valid OC 84 (rank 3)
+      saveStagedCache<CriticScoreData>(
+        'antigravity_critic_v8_id:554433',
+        null,
+        MutabilityTier.TIER_3_FRESH,
+        { dynamicResolved: true }
+      );
+      saveStagedCache<CriticScoreData>(
+        'antigravity_critic_v8_title:cold boot sibling quest',
+        {
+          id: 554433,
+          source: 'opencritic',
+          score: 84,
+          tier: 'Strong',
+          percentRecommended: 83,
+          numReviews: 22,
+          url: 'https://opencritic.com/game/554433/cold-boot-sibling-quest',
+          isVerified: true,
+        },
+        MutabilityTier.TIER_1_IMMUTABLE,
+        { source: 'opencritic', isVerified: true, dynamicResolved: true }
+      );
+
+      // Fresh service simulates cold boot (empty inMemoryCache, v16 already completed)
+      const coldService = new CriticScoreService();
+      try {
+        const promotedMc = coldService.getCriticScore(
+          286690,
+          'Metro 2033 Redux',
+          undefined,
+          '2014-08-26',
+          undefined,
+          false,
+          true
+        );
+        expect(promotedMc?.source).toBe('metacritic');
+        expect(promotedMc?.score).toBe(90);
+
+        const promotedOc = coldService.getCriticScore(
+          554433,
+          'Cold Boot Sibling Quest',
+          undefined,
+          '2020-01-01',
+          undefined,
+          false,
+          true
+        );
+        expect(promotedOc?.source).toBe('opencritic');
+        expect(promotedOc?.score).toBe(84);
+      } finally {
+        coldService.disposeEventListeners();
+      }
+    });
+
+    it('[P2-2] blocks stale vault game.criticScore fallback in resolveGameReviewScore while a routed override is still unresolved', () => {
+      vi.spyOn(openCriticModule, 'getOpenCriticData').mockReturnValue(null);
+
+      const gameWithStaleVaultCritic = makeCanonicalGame({
+        id: 'steam-286690',
+        title: 'Metro 2033 Redux',
+        steamAppId: 286690,
+      }) as CanonicalGame & { criticScore?: CriticScoreData | null };
+      gameWithStaleVaultCritic.criticScore = {
+        id: 'mc-metro-2033-redux',
+        source: 'metacritic',
+        score: 90,
+        tier: 'Mighty',
+        numReviews: 5,
+        url: 'https://www.metacritic.com/game/metro-2033-redux/critic-reviews/',
+        isVerified: true,
+      };
+
+      const routedOverride: UserGameOverride = {
+        gameId: 'steam-286690',
+        steamAppId: 286690,
+        title: 'Metro 2033 Redux',
+        matchedStore: 'steam',
+        reviewRoute: {
+          mode: 'routed',
+          source: 'steam',
+          steamAppId: 286690,
+        },
+        updatedAt: new Date().toISOString(),
+      };
+
+      // Explicit userOverride option -> blocked
+      expect(
+        resolveGameReviewScore(gameWithStaleVaultCritic, {
+          skipBackgroundTrigger: true,
+          userOverride: routedOverride,
+        })
+      ).toBeNull();
+
+      // Persisted override discovered via findMatchingUserOverride -> also blocked
+      saveUserOverride(routedOverride);
+      try {
+        expect(
+          resolveGameReviewScore(gameWithStaleVaultCritic, {
+            skipBackgroundTrigger: true,
+          })
+        ).toBeNull();
+      } finally {
+        removeUserOverride(routedOverride.gameId);
+      }
+
+      // Positive control: without any review override, semantically valid vault criticScore IS returned
+      expect(
+        resolveGameReviewScore(gameWithStaleVaultCritic, {
+          skipBackgroundTrigger: true,
+        })?.score
+      ).toBe(90);
+    });
+
+    it('[P2-4] rejects cross-AppID critic update events on shared game titles (Prey 2006 vs Prey 2017) while accepting title-only and same-gameId events', () => {
+      const prey2017Target = {
+        gameId: 'steam-480490',
+        gameSteamAppId: 480490,
+        currentSteamAppId: 480490,
+        effectiveSteamId: 480490,
+        resolvedSteamAppId: 480490,
+        lowerGameTitle: 'prey',
+        normalizedGameTitle: normalizeTitleKey('Prey'),
+      };
+
+      // Prey (2006, AppID 3970) MUST NOT bleed onto Prey (2017, AppID 480490) via shared title
+      expect(
+        shouldAcceptCriticUpdateEvent(
+          { title: 'Prey', steamAppId: 3970 },
+          prey2017Target
+        )
+      ).toBe(false);
+
+      // Matching AppID IS accepted
+      expect(
+        shouldAcceptCriticUpdateEvent(
+          { title: 'Prey', steamAppId: 480490 },
+          prey2017Target
+        )
+      ).toBe(true);
+
+      // Title-only event (no steamAppId) IS still accepted
+      expect(
+        shouldAcceptCriticUpdateEvent(
+          { title: 'Prey' },
+          prey2017Target
+        )
+      ).toBe(true);
+
+      // Explicit gameId match IS accepted even if steamAppId differs (e.g. Fix Match re-link)
+      expect(
+        shouldAcceptCriticUpdateEvent(
+          { gameId: 'steam-480490', title: 'Prey', steamAppId: 3970 },
+          prey2017Target
+        )
+      ).toBe(true);
+    });
+
+    it('[P2-6] passes entitlement context and gogId to storefrontStarResolver so Steam-only games fire 0 fetchXboxProductMetadata IPC calls', async () => {
+      const fetchXboxSpy = vi.fn().mockResolvedValue({ success: false, product: null });
+      (window as unknown as { electronAPI?: unknown }).electronAPI = {
+        fetchXboxProductMetadata: fetchXboxSpy,
+      };
+
+      vi.spyOn(storefrontReviewHarvester, 'getStorefrontAnchor').mockResolvedValue(null);
+      vi.spyOn(metacriticResolver, 'resolveMetacritic').mockResolvedValue({
+        critic: null,
+        user: null,
+      });
+      vi.spyOn(wikidataBridge, 'resolveForGame').mockResolvedValue(null);
+      vi.spyOn(openCriticResolver, 'resolveForGame').mockResolvedValue(null);
+      vi.spyOn(steamReviewResolver, 'resolveScore').mockResolvedValue(null);
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ products: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      );
+
+      const starSpy = vi.spyOn(storefrontStarResolver, 'resolveStorefrontScore');
+
+      await criticScoreService.resolveDynamicScore(
+        'Obscure Steam Exclusive Indie',
+        9998887,
+        2024,
+        null,
+        {
+          gameId: 'steam-9998887',
+          platforms: [{ platformId: 'steam', platformGameId: '9998887' }],
+        }
+      );
+
+      expect(fetchXboxSpy).toHaveBeenCalledTimes(0);
+      expect(starSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          context: {
+            gameId: 'steam-9998887',
+            platforms: [{ platformId: 'steam', platformGameId: '9998887' }],
+          },
+        }),
+        {
+          gameId: 'steam-9998887',
+          platforms: [{ platformId: 'steam', platformGameId: '9998887' }],
+        }
+      );
+
+      // GOG game forwards gogId + context for exact GOG ID lookup
+      starSpy.mockClear();
+      await criticScoreService.resolveDynamicScore(
+        'Obscure GOG Classic Indie',
+        null,
+        2010,
+        null,
+        {
+          gameId: 'gog-1207659999',
+          platforms: [{ platformId: 'gog', platformGameId: '1207659999' }],
+        }
+      );
+      expect(fetchXboxSpy).toHaveBeenCalledTimes(0);
+      expect(starSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          gogId: '1207659999',
+          context: {
+            gameId: 'gog-1207659999',
+            platforms: [{ platformId: 'gog', platformGameId: '1207659999' }],
+          },
+        }),
+        {
+          gameId: 'gog-1207659999',
+          platforms: [{ platformId: 'gog', platformGameId: '1207659999' }],
+        }
+      );
+    });
+
+    it('[P2-7] renders all 8 CriticSource tags (MC, OC, MCU, STM, GOG, EGS, XBX, CST) accurately across OpenCriticCard, SteamHeroDetails, SteamLibraryActionBar, LibraryGridCard, and GameHoverPopout', () => {
+      const allEightScores: Array<{ tag: ReviewSourceShortTag; data: CriticScoreData }> = [
+        {
+          tag: 'MC',
+          data: {
+            id: 'mc-test',
+            source: 'metacritic',
+            score: 90,
+            tier: 'Mighty',
+            numReviews: 45,
+            url: 'https://www.metacritic.com/game/metro-2033-redux/critic-reviews/',
+            isVerified: true,
+          },
+        },
+        {
+          tag: 'OC',
+          data: {
+            id: 957,
+            source: 'opencritic',
+            score: 84,
+            tier: 'Mighty',
+            percentRecommended: 86,
+            numReviews: 16,
+            url: 'https://opencritic.com/game/957/metro-2033-redux',
+            isVerified: true,
+          },
+        },
+        {
+          tag: 'MCU',
+          data: {
+            id: 'mcu-test',
+            source: 'metacritic_user',
+            score: 78,
+            userScoreRaw: 7.8,
+            tier: 'Strong',
+            numReviews: 112,
+            url: 'https://www.metacritic.com/game/metro-2033-redux/user-reviews/',
+            isVerified: false,
+          },
+        },
+        {
+          tag: 'STM',
+          data: {
+            id: 'steam-286690',
+            source: 'steam',
+            score: 88,
+            tier: 'Mighty',
+            percentRecommended: 93,
+            numReviews: 2400,
+            url: 'https://store.steampowered.com/app/286690',
+            isVerified: false,
+            isSynthetic: true,
+          },
+        },
+        {
+          tag: 'GOG',
+          data: {
+            id: 'gog-1207659068',
+            source: 'gog',
+            score: 84,
+            starRatingRaw: 4.2,
+            tier: 'Strong',
+            numReviews: 310,
+            url: 'https://www.gog.com/en/game/deus_ex_invisible_war',
+            isVerified: false,
+          },
+        },
+        {
+          tag: 'EGS',
+          data: {
+            id: 'epic-alan-wake-2',
+            source: 'epic',
+            score: 88,
+            starRatingRaw: 4.4,
+            tier: 'Mighty',
+            numReviews: 95,
+            url: 'https://store.epicgames.com/p/alan-wake-2',
+            isVerified: false,
+          },
+        },
+        {
+          tag: 'XBX',
+          data: {
+            id: 'xbox-9NBLGGH12345',
+            source: 'xbox',
+            score: 86,
+            starRatingRaw: 4.3,
+            tier: 'Mighty',
+            numReviews: 140,
+            url: 'https://www.xbox.com/en-US/games/store/sample/9NBLGGH12345',
+            isVerified: false,
+          },
+        },
+        {
+          tag: 'CST',
+          data: {
+            id: 'custom-override',
+            source: 'custom',
+            score: 95,
+            tier: 'Mighty',
+            url: 'https://example.com/custom-review',
+            isVerified: false,
+          },
+        },
+      ];
+
+      const sampleGame = makeCanonicalGame({
+        id: 'steam-286690',
+        title: 'Metro 2033 Redux',
+        steamAppId: 286690,
+        platforms: [{ platformId: 'steam', platformGameId: '286690', installed: true }],
+      });
+      const filterIndex = buildLibraryFilterIndex([sampleGame], { hostPlatform: 'darwin' });
+      const connectedSet = new Set<StorefrontId>(['steam']);
+      const noop = () => {};
+
+      for (const { tag, data } of allEightScores) {
+        const meta = getReviewSourceDisplayMeta(data);
+
+        // 1. OpenCriticCard
+        const cardHtml = renderToString(
+          React.createElement(OpenCriticCard, { openCritic: data, gameTitle: sampleGame.title })
+        );
+        expect(cardHtml).toContain(`data-critic-source="${tag}"`);
+        expect(cardHtml).toContain(meta.cardHeading);
+        expect(cardHtml).toContain(`>${tag}<`);
+
+        // 2. SteamHeroDetails
+        const heroHtml = renderToString(
+          React.createElement(SteamHeroDetails, {
+            title: sampleGame.title,
+            openCritic: data,
+            gameId: sampleGame.id,
+            steamAppId: sampleGame.steamAppId,
+          })
+        );
+        expect(heroHtml).toContain(`data-critic-source="${tag}"`);
+        expect(heroHtml).toContain(meta.ariaLabel);
+        expect(heroHtml).toContain(`${meta.shortLabel}:`);
+
+        // 3. SteamLibraryActionBar
+        const actionBarHtml = renderToString(
+          React.createElement(SteamLibraryActionBar, {
+            game: sampleGame,
+            openCriticData: data,
+          })
+        );
+        expect(actionBarHtml).toContain(`data-critic-source="${tag}"`);
+        expect(actionBarHtml).toContain(meta.ariaLabel);
+        expect(actionBarHtml).toContain(`>${tag}<`);
+        expect(actionBarHtml).toContain(`>${meta.shortLabel}<`);
+
+        // 4. LibraryGridCard
+        const gridCardHtml = renderToString(
+          renderLibraryGridCard({
+            game: sampleGame,
+            idx: 0,
+            sortBy: 'rating',
+            userOverridesMap: {},
+            coverOverrides: {},
+            connectedSet,
+            effectiveFilterIndex: filterIndex,
+            contextMenuOpenRef: { current: false },
+            onDismissContextMenu: noop,
+            onSelectGame: noop,
+            onNeedCoverLookup: noop,
+            onMouseEnter: noop,
+            onMouseLeave: noop,
+            onContextMenu: noop,
+            resolveGameCriticData: () => data,
+          })
+        );
+        expect(gridCardHtml).toContain(meta.ariaLabel);
+        expect(gridCardHtml).toContain(`>${tag}<`);
+        expect(gridCardHtml).toContain(`>${data.score}<`);
+
+        // 5. GameHoverPopout
+        const ocSpy = vi.spyOn(openCriticModule, 'getOpenCriticData').mockReturnValue(data);
+        try {
+          const hoverHtml = renderToString(
+            renderGameHoverPopout({
+              hoveredGame: sampleGame,
+              previewPos: { x: 100, y: 100, align: 'right' },
+              popoutRef: { current: null },
+              userOverridesMap: {},
+              connectedSet,
+              dynamicBlurb: null,
+              hoverHeaderFailed: false,
+              onSetHoverHeaderFailed: noop,
+              onPopoutMouseEnter: noop,
+              onPopoutMouseLeave: noop,
+              onSelectGame: noop,
+              onContextMenu: noop,
+            })
+          );
+          expect(hoverHtml).toContain(meta.ariaLabel);
+          expect(hoverHtml).toContain(`>${tag}<`);
+          expect(hoverHtml).toContain(meta.shortLabel);
+          expect(hoverHtml).toContain(`>${data.score}<`);
+        } finally {
+          ocSpy.mockRestore();
+        }
+      }
     });
   });
 });

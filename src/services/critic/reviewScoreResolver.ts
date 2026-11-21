@@ -174,7 +174,7 @@ export function resolveGameReviewScore(
     return options?.userOverride?.reviewScoreOverride ?? null;
   }
 
-  // Fallback to vault-hydrated game.criticScore when semantically valid and no unrated override is active
+  // Fallback to vault-hydrated game.criticScore when semantically valid and no review override/route is active
   const embeddedCriticScore = (game as CanonicalGameWithVaultCritic).criticScore;
   if (
     embeddedCriticScore &&
@@ -191,7 +191,7 @@ export function resolveGameReviewScore(
         game.platforms
       );
     const activeRoute = activeOverride ? inferReviewRouteFromOverride(activeOverride) : undefined;
-    if (activeRoute?.mode === 'unrated') {
+    if (activeRoute !== undefined || activeOverride?.reviewScoreOverride !== undefined) {
       return null;
     }
     if (

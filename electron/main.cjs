@@ -962,8 +962,15 @@ if (!gotTheLock) {
 
     const STANDARD_CHROME_UA =
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-    const WIKIMEDIA_METADATA_UA =
-      'One-Launcher/0.2.8 (https://github.com/Space-Cadet0/One-Launcher; desktop library metadata bridge)';
+    let wikimediaAppVersion = '0.2.8';
+    try {
+      const resolvedAppVersion =
+        typeof app?.getVersion === 'function' ? String(app.getVersion() || '').trim() : '';
+      if (resolvedAppVersion) {
+        wikimediaAppVersion = resolvedAppVersion;
+      }
+    } catch {}
+    const WIKIMEDIA_METADATA_UA = `One-Launcher/${wikimediaAppVersion} (https://github.com/Space-Cadet0/One-Launcher; desktop library metadata bridge)`;
 
     const setHeaderCaseInsensitive = (
       /** @type {Record<string, any>} */ headers,
