@@ -319,23 +319,40 @@ function migrateLegacyHudConfig(cfg) {
     return cfg;
   }
   /** @type {Record<string, any>} */
-  const migrated = { ...cfg };
-  const existing = sanitizePerformanceHudMode(migrated.performanceHud);
-  if (existing) {
-    migrated.performanceHud = existing;
-  } else if (migrated.metalHud === true || migrated.dxvkHud === true) {
-    migrated.performanceHud = 'on';
-  } else {
-    migrated.performanceHud = 'default';
+  const rawRecord = cfg;
+  const existing = sanitizePerformanceHudMode(rawRecord.performanceHud);
+  /** @type {PerformanceHudMode} */
+  const resolvedHud = existing
+    ? existing
+    : rawRecord.metalHud === true || rawRecord.dxvkHud === true
+      ? 'on'
+      : 'default';
+
+  let platformConfigsChanged = false;
+  /** @type {Record<string, any> | undefined} */
+  let nextPlatformConfigs;
+  if (isPlainRecord(rawRecord.platformConfigs)) {
+    nextPlatformConfigs = {};
+    for (const [platId, prof] of Object.entries(rawRecord.platformConfigs)) {
+      if (FORBIDDEN_OBJECT_KEYS.has(platId)) {
+        platformConfigsChanged = true;
+        continue;
+      }
+      const nextProf = isPlainRecord(prof) ? migrateLegacyHudConfig(prof) : prof;
+      if (nextProf !== prof) {
+        platformConfigsChanged = true;
+      }
+      nextPlatformConfigs[platId] = nextProf;
+    }
   }
 
-  if (isPlainRecord(migrated.platformConfigs)) {
-    /** @type {Record<string, any>} */
-    const nextPlatformConfigs = {};
-    for (const [platId, prof] of Object.entries(migrated.platformConfigs)) {
-      if (FORBIDDEN_OBJECT_KEYS.has(platId)) continue;
-      nextPlatformConfigs[platId] = isPlainRecord(prof) ? migrateLegacyHudConfig(prof) : prof;
-    }
+  if (rawRecord.performanceHud === resolvedHud && !platformConfigsChanged) {
+    return cfg;
+  }
+
+  /** @type {Record<string, any>} */
+  const migrated = { ...rawRecord, performanceHud: resolvedHud };
+  if (nextPlatformConfigs !== undefined && platformConfigsChanged) {
     migrated.platformConfigs = nextPlatformConfigs;
   }
 

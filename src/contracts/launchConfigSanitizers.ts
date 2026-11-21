@@ -248,24 +248,39 @@ export function migrateLegacyHudConfig<T extends Partial<StorefrontLaunchProfile
   if (!isPlainRecord(cfg)) {
     return cfg as T & { performanceHud: PerformanceHudMode };
   }
-  const migrated: Record<string, unknown> = { ...cfg };
-  const existing = sanitizePerformanceHudMode(migrated.performanceHud);
-  if (existing) {
-    migrated.performanceHud = existing;
-  } else if (migrated.metalHud === true || migrated.dxvkHud === true) {
-    migrated.performanceHud = 'on';
-  } else {
-    migrated.performanceHud = 'default';
-  }
+  const rawRecord = cfg as Record<string, unknown>;
+  const existing = sanitizePerformanceHudMode(rawRecord.performanceHud);
+  const resolvedHud: PerformanceHudMode = existing
+    ? existing
+    : rawRecord.metalHud === true || rawRecord.dxvkHud === true
+      ? 'on'
+      : 'default';
 
-  if (isPlainRecord(migrated.platformConfigs)) {
-    const nextPlatformConfigs: Record<string, unknown> = {};
-    for (const [platId, prof] of Object.entries(migrated.platformConfigs)) {
-      if (FORBIDDEN_OBJECT_KEYS.has(platId)) continue;
-      nextPlatformConfigs[platId] = isPlainRecord(prof)
+  let platformConfigsChanged = false;
+  let nextPlatformConfigs: Record<string, unknown> | undefined;
+  if (isPlainRecord(rawRecord.platformConfigs)) {
+    nextPlatformConfigs = {};
+    for (const [platId, prof] of Object.entries(rawRecord.platformConfigs)) {
+      if (FORBIDDEN_OBJECT_KEYS.has(platId)) {
+        platformConfigsChanged = true;
+        continue;
+      }
+      const nextProf = isPlainRecord(prof)
         ? migrateLegacyHudConfig(prof as Partial<StorefrontLaunchProfile>)
         : prof;
+      if (nextProf !== prof) {
+        platformConfigsChanged = true;
+      }
+      nextPlatformConfigs[platId] = nextProf;
     }
+  }
+
+  if (rawRecord.performanceHud === resolvedHud && !platformConfigsChanged) {
+    return cfg as T & { performanceHud: PerformanceHudMode };
+  }
+
+  const migrated: Record<string, unknown> = { ...rawRecord, performanceHud: resolvedHud };
+  if (nextPlatformConfigs !== undefined && platformConfigsChanged) {
     migrated.platformConfigs = nextPlatformConfigs;
   }
 

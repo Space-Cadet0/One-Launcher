@@ -383,17 +383,25 @@ function createMainWindow() {
   });
 
   mainWindow.on('enter-full-screen', () => {
-    lifecycle.sendOrBufferRendererEvent('window:fullscreen-changed', true);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('window:fullscreen-changed', true);
+    }
   });
   mainWindow.on('leave-full-screen', () => {
-    lifecycle.sendOrBufferRendererEvent('window:fullscreen-changed', false);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('window:fullscreen-changed', false);
+    }
   });
 
   mainWindow.on('maximize', () => {
-    lifecycle.sendOrBufferRendererEvent('window:maximized-changed', true);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('window:maximized-changed', true);
+    }
   });
   mainWindow.on('unmaximize', () => {
-    lifecycle.sendOrBufferRendererEvent('window:maximized-changed', false);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('window:maximized-changed', false);
+    }
   });
 
   mainWindow.on('closed', () => {
