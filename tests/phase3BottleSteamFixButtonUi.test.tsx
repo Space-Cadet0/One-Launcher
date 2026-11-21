@@ -67,35 +67,71 @@ function extractText(node: unknown): string {
   return '';
 }
 
+function isLiveRegionProps(props: Record<string, unknown>): boolean {
+  const role = props.role;
+  const ariaLive = props['aria-live'];
+  return (
+    role === 'alert' ||
+    role === 'status' ||
+    role === 'log' ||
+    role === 'marquee' ||
+    role === 'timer' ||
+    ariaLive === 'polite' ||
+    ariaLive === 'assertive'
+  );
+}
+
 function auditModernWebAndA11y(tree: unknown): string[] {
   const violations: string[] = [];
-  const elements = findVNodes(tree, (n) => typeof n.type === 'string');
   const ids = new Map<string, VNodeElement>();
 
-  for (const el of elements) {
-    const tag = String(el.type);
-    const props = el.props ?? {};
-    const id = props.id;
-    if (typeof id === 'string' && id.trim()) {
-      if (ids.has(id)) {
-        violations.push(`duplicate-id:${id}`);
-      } else {
-        ids.set(id, el);
-      }
+  const visit = (node: unknown, insideLiveRegion: boolean): void => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, insideLiveRegion);
+      return;
     }
-    if (tag === 'button') {
-      const btnType = props.type;
-      if (btnType !== 'button' && btnType !== 'submit' && btnType !== 'reset') {
-        violations.push(`button-missing-type:${String(props['data-testid'] ?? extractText(el))}`);
-      }
-    }
-    if (tag === 'svg') {
-      if (props['aria-hidden'] !== 'true' && props['aria-hidden'] !== true) {
-        violations.push(`svg-missing-aria-hidden:${String(props.className ?? '')}`);
-      }
-    }
-  }
+    if (!isVNodeElement(node)) return;
 
+    let nextInsideLiveRegion = insideLiveRegion;
+    if (typeof node.type === 'string') {
+      const tag = node.type;
+      const props = node.props ?? {};
+      const id = props.id;
+      if (typeof id === 'string' && id.trim()) {
+        if (ids.has(id)) {
+          violations.push(`duplicate-id:${id}`);
+        } else {
+          ids.set(id, node);
+        }
+      }
+      if (tag === 'button') {
+        const btnType = props.type;
+        if (btnType !== 'button' && btnType !== 'submit' && btnType !== 'reset') {
+          violations.push(`button-missing-type:${String(props['data-testid'] ?? extractText(node))}`);
+        }
+      }
+      if (tag === 'svg') {
+        if (props['aria-hidden'] !== 'true' && props['aria-hidden'] !== true) {
+          violations.push(`svg-missing-aria-hidden:${String(props.className ?? '')}`);
+        }
+      }
+      if (isLiveRegionProps(props)) {
+        if (insideLiveRegion) {
+          violations.push(
+            `nested-live-region:${String(props['data-testid'] ?? props.role ?? props['aria-live'])}`
+          );
+        }
+        nextInsideLiveRegion = true;
+      }
+    }
+
+    if (node.props?.children !== undefined) {
+      visit(node.props.children, nextInsideLiveRegion);
+    }
+  };
+
+  visit(tree, false);
   return violations;
 }
 
@@ -947,5 +983,457 @@ describe('Phase 3 — Launch Config Modal & ActionBar 1-Click Bottle Steam Fix U
     expect(findByTestId(tree, 'bottle-steam-launch-error-banner')).toBeUndefined();
     expect(extractText(tree)).toContain('Linked installed Steam games into "OneLauncher-arm64".');
     renderer.unmount();
+  });
+
+  it('6. P1-1: uninitialized target bottle (bottleDetails: {}, availableBottles: []) shows No Steam chip, missing-Steam alert banner, and 1-click Install button', async () => {
+    const installPath =
+      '/tmp/ol-p3-ui-test/CrossOver/Bottles/OneLauncher/drive_c/Program Files (x86)/Steam/steamapps/common/SynthQuest';
+    const executablePath = `${installPath}/SynthQuest.exe`;
+    const game = makeCanonicalGameFixture({
+      id: 'steam-990042',
+      title: 'Synth Quest',
+      steamAppId: 990042,
+      platforms: [
+        {
+          platformId: 'steam',
+          platformGameId: '990042',
+          installed: true,
+          installPath,
+          executablePath,
+          isWindowsBinaryOnMac: true,
+        },
+      ],
+    });
+    const installedRec: InstalledGameRecord = {
+      platformId: 'steam',
+      platformGameId: '990042',
+      appId: 990042,
+      title: 'Synth Quest',
+      installPath,
+      executablePath,
+      isWindowsBinaryOnMac: true,
+    };
+
+    const uninitializedArm64Layer: CompatibilityLayerInfo = {
+      id: 'crossover_preview_arm64',
+      type: 'crossover_preview_arm64',
+      name: 'CrossOver Preview (arm64 / FEX)',
+      binaryPath: '/Applications/CrossOver Preview ARM64.app/Contents/SharedSupport/CrossOver/bin/wine',
+      appPath: '/Applications/CrossOver Preview ARM64.app',
+      bottlesDir: '/tmp/ol-p3-ui-test/CrossOver Preview/Bottles',
+      availableBottles: [],
+      available: true,
+      version: '26.1.0-arm64',
+      hostArch: 'arm64',
+      previewBranch: 'arm64',
+      supportedBottleArches: ['arm64'],
+      bottleDetails: {},
+    };
+    const layers = [uninitializedArm64Layer, makeLayerFixtures()[2]];
+
+    vi.spyOn(launcherService, 'getHostPlatform').mockReturnValue('darwin');
+    vi.spyOn(launcherService, 'getHostArch').mockReturnValue('arm64');
+    vi.spyOn(launcherService, 'getCompatibilityLayers').mockReturnValue(layers);
+    vi.spyOn(launcherService, 'detectCompatibilityLayers').mockResolvedValue(layers);
+    vi.spyOn(launcherService, 'checkCompatibilityLayerUpdates').mockResolvedValue({});
+    vi.spyOn(launcherService, 'getRunnerUpdates').mockReturnValue({});
+    vi.spyOn(launcherService, 'detectInstalledStorefrontClients').mockResolvedValue({
+      steam: true,
+      gog: false,
+      epic: false,
+    });
+    vi.spyOn(launcherService, 'getInstalledRecordForGame').mockReturnValue(installedRec);
+    vi.spyOn(launcherService, 'getLaunchConfig').mockReturnValue({
+      gameId: game.id,
+      preferredPlatformId: 'steam',
+      launchMethod: 'compatibility_layer',
+      compatibilityLayer: 'crossover_preview_arm64',
+    });
+
+    const renderer = createDomain12DeepRenderer(GameLaunchConfigModal, {
+      isOpen: true,
+      game,
+      initialPlatformId: 'steam',
+      onClose: vi.fn(),
+    });
+    renderer.render();
+    await Promise.resolve();
+    const tree = renderer.render();
+
+    expect(auditModernWebAndA11y(tree)).toEqual([]);
+    const chip = findByTestId(tree, 'compat-bottle-steam-readiness-chip');
+    expect(chip?.props?.['data-steam-readiness']).toBe('missing');
+    expect(extractText(chip)).toContain('No Steam in Bottle');
+    const missingBanner = findByTestId(tree, 'compat-bottle-steam-missing-warning');
+    expect(missingBanner?.props?.role).toBe('alert');
+    const installBtn = findByTestId(missingBanner, 'compat-fix-install-bottle-steam-btn');
+    expect(installBtn).toBeDefined();
+    expect(extractText(installBtn)).toContain('Install & Set Up Steam in OneLauncher-arm64');
+    renderer.unmount();
+  });
+
+  it('7. P1-3 & P2-4: disables runner/bottle/Save (keeping Cancel enabled) during active fix, cancels provisioning on modal close/unmount & ActionBar unmount/game-switch', async () => {
+    const installPath =
+      '/tmp/ol-p3-ui-test/CrossOver Preview/Bottles/OneLauncher/drive_c/Program Files (x86)/Steam/steamapps/common/SynthQuest';
+    const executablePath = `${installPath}/SynthQuest.exe`;
+    const gameA = makeCanonicalGameFixture({
+      id: 'steam-990042',
+      title: 'Synth Quest',
+      steamAppId: 990042,
+      platforms: [
+        {
+          platformId: 'steam',
+          platformGameId: '990042',
+          installed: true,
+          installPath,
+          executablePath,
+          isWindowsBinaryOnMac: true,
+        },
+      ],
+    });
+    const gameB = makeCanonicalGameFixture({
+      id: 'steam-990043',
+      title: 'Synth Quest II',
+      steamAppId: 990043,
+      platforms: [
+        {
+          platformId: 'steam',
+          platformGameId: '990043',
+          installed: true,
+          installPath,
+          executablePath,
+          isWindowsBinaryOnMac: true,
+        },
+      ],
+    });
+    const installedRec: InstalledGameRecord = {
+      platformId: 'steam',
+      platformGameId: '990042',
+      appId: 990042,
+      title: 'Synth Quest',
+      installPath,
+      executablePath,
+      isWindowsBinaryOnMac: true,
+    };
+    const initialLayers = makeLayerFixtures({
+      hasSteam: false,
+      steamSignedIn: false,
+      installedSteamAppIds: [],
+    });
+
+    vi.spyOn(launcherService, 'getHostPlatform').mockReturnValue('darwin');
+    vi.spyOn(launcherService, 'getHostArch').mockReturnValue('arm64');
+    vi.spyOn(launcherService, 'getCompatibilityLayers').mockReturnValue(initialLayers);
+    vi.spyOn(launcherService, 'detectCompatibilityLayers').mockResolvedValue(initialLayers);
+    vi.spyOn(launcherService, 'checkCompatibilityLayerUpdates').mockResolvedValue({});
+    vi.spyOn(launcherService, 'getRunnerUpdates').mockReturnValue({});
+    vi.spyOn(launcherService, 'detectInstalledStorefrontClients').mockResolvedValue({
+      steam: true,
+      gog: false,
+      epic: false,
+    });
+    vi.spyOn(launcherService, 'getInstalledRecordForGame').mockReturnValue(installedRec);
+    vi.spyOn(launcherService, 'getLaunchConfig').mockReturnValue({
+      gameId: gameA.id,
+      preferredPlatformId: 'steam',
+      launchMethod: 'compatibility_layer',
+      compatibilityLayer: 'crossover_preview_arm64',
+    });
+
+    const deferredModalFix = createDeferred<{
+      success: boolean;
+      installed: boolean;
+      authenticated: boolean;
+      message: string;
+    }>();
+    vi.spyOn(environmentSetupService, 'provisionAndSignInBottleSteam').mockReturnValueOnce(
+      deferredModalFix.promise
+    );
+    const cancelSpy = vi
+      .spyOn(environmentSetupService, 'cancelBottleSteamProvisioning')
+      .mockResolvedValue(undefined);
+
+    const modalRenderer = createDomain12DeepRenderer(GameLaunchConfigModal, {
+      isOpen: true,
+      game: gameA,
+      initialPlatformId: 'steam',
+      onClose: vi.fn(),
+    });
+    modalRenderer.render();
+    await Promise.resolve();
+    let modalTree = modalRenderer.render();
+
+    const installBtn = findByTestId(modalTree, 'compat-fix-install-bottle-steam-btn');
+    const modalFixPromise = (installBtn?.props?.onClick as () => Promise<void>)();
+    modalTree = modalRenderer.render();
+
+    // P2-4: runner select, bottle control, Reset, and Save disabled while Cancel remains enabled
+    expect(auditModernWebAndA11y(modalTree)).toEqual([]);
+    expect(findByTestId(modalTree, 'compat-runner-select')?.props?.disabled).toBe(true);
+    const bottleControl = findVNodes(
+      modalTree,
+      (n) => (n.type === 'select' || n.type === 'input') && n.props?.id === 'compat-target-bottle-control'
+    )[0];
+    expect(bottleControl?.props?.disabled).toBe(true);
+    expect(findByTestId(modalTree, 'launch-config-save-btn')?.props?.disabled).toBe(true);
+    expect(findByTestId(modalTree, 'reset-launch-config-btn')?.props?.disabled).toBe(true);
+    expect(findByTestId(modalTree, 'launch-config-cancel-btn')?.props?.disabled).toBeFalsy();
+
+    // P1-3a: closing modal (isOpen=false) cancels active provisioning cleanly
+    modalRenderer.render({ isOpen: false });
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+
+    deferredModalFix.resolve({
+      success: true,
+      installed: true,
+      authenticated: true,
+      message: 'Late stale resolution.',
+    });
+    await modalFixPromise;
+    modalRenderer.unmount();
+
+    // P1-3b: ActionBar game-switch cancels active quick-fix & ActionBar unmount cancels active quick-fix
+    vi.spyOn(launcherService, 'isGameInstalled').mockReturnValue(true);
+    vi.spyOn(launcherService, 'isGameRunning').mockReturnValue(false);
+    vi.spyOn(launcherService, 'getRunningGames').mockReturnValue([]);
+    vi.spyOn(launcherService, 'isWindowsHost').mockReturnValue(false);
+    vi.spyOn(launcherService, 'launchGame').mockResolvedValue({
+      success: false,
+      errorCode: 'BOTTLE_STEAM_NOT_INSTALLED',
+      targetBottleName: 'OneLauncher-arm64',
+      chosenRunnerType: 'crossover_preview_arm64',
+      error: 'Windows Steam is missing.',
+    });
+
+    const deferredBarSwitch = createDeferred<{
+      success: boolean;
+      installed: boolean;
+      authenticated: boolean;
+      message: string;
+    }>();
+    vi.spyOn(environmentSetupService, 'provisionAndSignInBottleSteam').mockReturnValueOnce(
+      deferredBarSwitch.promise
+    );
+    cancelSpy.mockClear();
+
+    const barRenderer = createDomain12DeepRenderer(SteamLibraryActionBar, {
+      game: gameA,
+      collections: [],
+    });
+    let barTree = barRenderer.render();
+    const playBtn = findVNodes(
+      barTree,
+      (n) => n.type === 'button' && extractText(n).trim() === 'Play'
+    )[0];
+    await (playBtn.props?.onClick as () => Promise<void>)();
+    barTree = barRenderer.render();
+    const qfBtn = findByTestId(barTree, 'bottle-steam-quick-fix-btn');
+    const switchFixRun = (qfBtn?.props?.onClick as () => Promise<void>)();
+    barRenderer.render();
+
+    // Switching game cancels active quick fix
+    barRenderer.render({ game: gameB });
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+    deferredBarSwitch.resolve({
+      success: true,
+      installed: true,
+      authenticated: true,
+      message: 'Stale after game switch.',
+    });
+    await switchFixRun;
+
+    // Now start another quick-fix on gameB and unmount mid-flight -> cancels & no post-unmount timer leak
+    const deferredBarUnmount = createDeferred<{
+      success: boolean;
+      installed: boolean;
+      authenticated: boolean;
+      message: string;
+    }>();
+    vi.spyOn(environmentSetupService, 'provisionAndSignInBottleSteam').mockReturnValueOnce(
+      deferredBarUnmount.promise
+    );
+    cancelSpy.mockClear();
+
+    barTree = barRenderer.render();
+    const playBtnB = findVNodes(
+      barTree,
+      (n) => n.type === 'button' && extractText(n).trim() === 'Play'
+    )[0];
+    await (playBtnB.props?.onClick as () => Promise<void>)();
+    barTree = barRenderer.render();
+    const qfBtnB = findByTestId(barTree, 'bottle-steam-quick-fix-btn');
+    const unmountFixRun = (qfBtnB?.props?.onClick as () => Promise<void>)();
+    barRenderer.render();
+
+    barRenderer.unmount();
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+    deferredBarUnmount.resolve({
+      success: true,
+      installed: true,
+      authenticated: true,
+      message: 'Stale after unmount.',
+    });
+    await unmountFixRun;
+  });
+
+  it('8. P1-4 & P3-2: link_only returns failure (truthful authenticated) when requiredAppId is still unlinked, ActionBar keeps error banner, and LaunchConfig reuses returned detectedLayers', async () => {
+    const fallbackSnap = buildFallbackEnvironmentSnapshot(['steam']);
+    const unlinkedUnsignedLayers = makeLayerFixtures({
+      hasSteam: true,
+      steamSignedIn: false,
+      installedSteamAppIds: [],
+    });
+    const linkedReadyLayers = makeLayerFixtures({
+      hasSteam: true,
+      steamSignedIn: true,
+      installedSteamAppIds: [990042],
+    });
+
+    vi.spyOn(environmentSetupService, 'runSetupTasks').mockResolvedValue({
+      success: true,
+      runId: 'run-link-empty',
+      outcomes: [
+        {
+          componentId: 'bottle_steam',
+          action: 'install_client',
+          status: 'skipped',
+          message: 'Windows Steam is already installed in "OneLauncher-arm64".',
+        },
+      ],
+      snapshot: fallbackSnap,
+    });
+    vi.spyOn(launcherService, 'detectCompatibilityLayers').mockResolvedValue(unlinkedUnsignedLayers);
+    vi.spyOn(launcherService, 'detectInstalledStorefrontClients').mockResolvedValue({
+      steam: true,
+      gog: false,
+      epic: false,
+    });
+
+    // P1-4a: provisionAndSignInBottleSteam returns success=false & authenticated=false when AppID 990042 is absent
+    const linkFailRes = await environmentSetupService.provisionAndSignInBottleSteam({
+      runnerType: 'crossover_preview_arm64',
+      bottleName: 'OneLauncher-arm64',
+      needsInstall: false,
+      needsSignIn: false,
+      requiredAppId: 990042,
+    });
+    expect(linkFailRes.success).toBe(false);
+    expect(linkFailRes.installed).toBe(true);
+    expect(linkFailRes.authenticated).toBe(false);
+    expect(linkFailRes.error).toContain(
+      'Could not find an installed local copy of AppID 990042 in another bottle to link into "OneLauncher-arm64".'
+    );
+    expect(linkFailRes.detectedLayers).toEqual(unlinkedUnsignedLayers);
+
+    // P1-4b: ActionBar does NOT dismiss bottle-steam-launch-error-banner when link_only fails
+    const steamGame = makeCanonicalGameFixture({
+      id: 'steam-990042',
+      title: 'Synth Quest',
+      steamAppId: 990042,
+      platforms: [
+        {
+          platformId: 'steam',
+          platformGameId: '990042',
+          installed: true,
+          installPath: '/tmp/ol-p3-ui-test/CrossOver/Bottles/OneLauncher/drive_c/Games/SynthQuest',
+          executablePath:
+            '/tmp/ol-p3-ui-test/CrossOver/Bottles/OneLauncher/drive_c/Games/SynthQuest/game.exe',
+          isWindowsBinaryOnMac: true,
+        },
+      ],
+    });
+    vi.spyOn(launcherService, 'isGameInstalled').mockReturnValue(true);
+    vi.spyOn(launcherService, 'isGameRunning').mockReturnValue(false);
+    vi.spyOn(launcherService, 'getRunningGames').mockReturnValue([]);
+    vi.spyOn(launcherService, 'isWindowsHost').mockReturnValue(false);
+    vi.spyOn(launcherService, 'launchGame').mockResolvedValueOnce({
+      success: false,
+      errorCode: 'BOTTLE_STEAM_APP_NOT_IN_TARGET_BOTTLE',
+      targetBottleName: 'OneLauncher-arm64',
+      chosenRunnerType: 'crossover_preview_arm64',
+      error: 'Steam in bottle "OneLauncher-arm64" does not have AppID 990042 linked.',
+    });
+
+    const barRenderer = createDomain12DeepRenderer(SteamLibraryActionBar, {
+      game: steamGame,
+      collections: [],
+    });
+    let barTree = barRenderer.render();
+    const playBtn = findVNodes(
+      barTree,
+      (n) => n.type === 'button' && extractText(n).trim() === 'Play'
+    )[0];
+    await (playBtn.props?.onClick as () => Promise<void>)();
+    barTree = barRenderer.render();
+    const linkQfBtn = findByTestId(barTree, 'bottle-steam-quick-fix-btn');
+    await (linkQfBtn?.props?.onClick as () => Promise<void>)();
+    barTree = barRenderer.render();
+
+    expect(findByTestId(barTree, 'bottle-steam-launch-error-banner')).toBeDefined();
+    expect(extractText(barTree)).toContain(
+      'Could not find an installed local copy of AppID 990042'
+    );
+    barRenderer.unmount();
+
+    // P3-2: Launch Config handleFixBottleSteam reuses returned detectedLayers without redundant detectCompatibilityLayers IPC
+    const installedRec: InstalledGameRecord = {
+      platformId: 'steam',
+      platformGameId: '990042',
+      appId: 990042,
+      title: 'Synth Quest',
+      installPath:
+        '/tmp/ol-p3-ui-test/CrossOver Preview/Bottles/OneLauncher/drive_c/Program Files (x86)/Steam/steamapps/common/SynthQuest',
+      executablePath:
+        '/tmp/ol-p3-ui-test/CrossOver Preview/Bottles/OneLauncher/drive_c/Program Files (x86)/Steam/steamapps/common/SynthQuest/game.exe',
+      isWindowsBinaryOnMac: true,
+    };
+    const initialMissingLayers = makeLayerFixtures({
+      hasSteam: false,
+      steamSignedIn: false,
+      installedSteamAppIds: [],
+    });
+    vi.spyOn(launcherService, 'getHostPlatform').mockReturnValue('darwin');
+    vi.spyOn(launcherService, 'getHostArch').mockReturnValue('arm64');
+    vi.spyOn(launcherService, 'getCompatibilityLayers').mockReturnValue(initialMissingLayers);
+    const detectSpy = vi
+      .spyOn(launcherService, 'detectCompatibilityLayers')
+      .mockResolvedValue(initialMissingLayers);
+    vi.spyOn(launcherService, 'checkCompatibilityLayerUpdates').mockResolvedValue({});
+    vi.spyOn(launcherService, 'getRunnerUpdates').mockReturnValue({});
+    vi.spyOn(launcherService, 'getInstalledRecordForGame').mockReturnValue(installedRec);
+    vi.spyOn(launcherService, 'getLaunchConfig').mockReturnValue({
+      gameId: steamGame.id,
+      preferredPlatformId: 'steam',
+      launchMethod: 'compatibility_layer',
+      compatibilityLayer: 'crossover_preview_arm64',
+    });
+    vi.spyOn(environmentSetupService, 'provisionAndSignInBottleSteam').mockResolvedValueOnce({
+      success: true,
+      installed: true,
+      authenticated: true,
+      detectedLayers: linkedReadyLayers,
+      message: 'Steam is ready in "OneLauncher-arm64".',
+    });
+
+    const modalRenderer = createDomain12DeepRenderer(GameLaunchConfigModal, {
+      isOpen: true,
+      game: steamGame,
+      initialPlatformId: 'steam',
+      onClose: vi.fn(),
+    });
+    modalRenderer.render();
+    await Promise.resolve();
+    let modalTree = modalRenderer.render();
+    detectSpy.mockClear();
+
+    const installBtn = findByTestId(modalTree, 'compat-fix-install-bottle-steam-btn');
+    await (installBtn?.props?.onClick as () => Promise<void>)();
+    modalTree = modalRenderer.render();
+
+    expect(detectSpy).not.toHaveBeenCalled();
+    expect(findByTestId(modalTree, 'compat-bottle-steam-readiness-chip')?.props?.['data-steam-readiness']).toBe(
+      'ready'
+    );
+    modalRenderer.unmount();
   });
 });

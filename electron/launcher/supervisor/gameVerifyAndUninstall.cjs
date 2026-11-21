@@ -11,6 +11,7 @@ const {
   isContainedWithinRoot,
 } = require('../securityAndPathUtils.cjs');
 const {
+  resolveDriveCPathCaseInsensitive,
   stageWindowsClientlessXboxBridgeDlls,
   restoreWindowsClientlessXboxBridgeDlls,
   prepareXboxBottleEnvironment,
@@ -60,6 +61,7 @@ const {
   discoverSteamLocations,
   extractBottleRootFromPath,
   listBottleSubdirectories,
+  listAllInitializedBottlePaths,
   removeSteamAppFromLibraryFoldersVdf,
   cleanupCrossOverSteamShortcuts,
   detectCompatibilityLayers,
@@ -702,29 +704,69 @@ async function uninstallGame(/** @type {any} */ payload = {}, /** @type {any} */
       }
 
       const candidateSteamappsDirs = new Set();
+      const seenSteamappsRealKeys = new Set();
+      /** @param {string | null | undefined} candidateDir */
+      const addCandidateSteamappsDir = (candidateDir) => {
+        if (!candidateDir || typeof candidateDir !== 'string') return;
+        if (!fs.existsSync(candidateDir)) return;
+        let key = path.resolve(candidateDir).toLowerCase();
+        try {
+          key = fs.realpathSync(candidateDir).toLowerCase();
+        } catch {}
+        if (seenSteamappsRealKeys.has(key)) return;
+        seenSteamappsRealKeys.add(key);
+        candidateSteamappsDirs.add(candidateDir);
+      };
+
       try {
         const { steamappsDirs } = discoverSteamLocations(options);
         for (const d of steamappsDirs) {
-          if (d) candidateSteamappsDirs.add(d);
+          addCandidateSteamappsDir(d);
         }
       } catch {}
 
       if (localInstall && /steamapps[\\/]common[\\/]/i.test(localInstall)) {
-        candidateSteamappsDirs.add(path.resolve(localInstall, '..', '..'));
+        addCandidateSteamappsDir(path.resolve(localInstall, '..', '..'));
       }
+
+      /** @param {string | null | undefined} bPath */
+      const addBottleSteamappsCandidates = (bPath) => {
+        if (!bPath || typeof bPath !== 'string') return;
+        const resolvedBottle = path.resolve(bPath);
+        discoveredBottleDirs.add(resolvedBottle);
+        const driveCRoot =
+          resolveDriveCPathCaseInsensitive(resolvedBottle, ['drive_c']) ||
+          path.join(resolvedBottle, 'drive_c');
+        const steamRoots = [
+          resolveDriveCPathCaseInsensitive(driveCRoot, ['Program Files (x86)', 'Steam']),
+          resolveDriveCPathCaseInsensitive(driveCRoot, ['Program Files', 'Steam']),
+          path.join(driveCRoot, 'Program Files (x86)', 'Steam'),
+          path.join(driveCRoot, 'Program Files', 'Steam'),
+        ];
+        for (const sRoot of steamRoots) {
+          if (!sRoot) continue;
+          const ciSteamapps = resolveDriveCPathCaseInsensitive(sRoot, ['steamapps']);
+          if (ciSteamapps) addCandidateSteamappsDir(ciSteamapps);
+          addCandidateSteamappsDir(path.join(sRoot, 'steamapps'));
+          addCandidateSteamappsDir(path.join(sRoot, 'SteamApps'));
+        }
+      };
 
       try {
         const layers = detectCompatibilityLayers(options);
         for (const layer of layers) {
           if (layer && layer.bottlesDir && fs.existsSync(layer.bottlesDir)) {
-            for (const bottle of listBottleSubdirectories(layer.bottlesDir)) {
-              const bPath = path.join(layer.bottlesDir, bottle);
-              discoveredBottleDirs.add(bPath);
-              const s1 = path.join(bPath, 'drive_c/Program Files (x86)/Steam/steamapps');
-              const s2 = path.join(bPath, 'drive_c/Program Files/Steam/steamapps');
-              if (fs.existsSync(s1)) candidateSteamappsDirs.add(s1);
-              if (fs.existsSync(s2)) candidateSteamappsDirs.add(s2);
+            for (const bottle of listBottleSubdirectories(layer.bottlesDir, options)) {
+              addBottleSteamappsCandidates(path.join(layer.bottlesDir, bottle));
             }
+          }
+        }
+      } catch {}
+
+      try {
+        if (typeof listAllInitializedBottlePaths === 'function') {
+          for (const bPath of listAllInitializedBottlePaths(options)) {
+            addBottleSteamappsCandidates(bPath);
           }
         }
       } catch {}
@@ -761,7 +803,10 @@ async function uninstallGame(/** @type {any} */ payload = {}, /** @type {any} */
               installdir !== '..' &&
               !installdir.includes('..')
             ) {
-              const acfCommonDir = path.join(steamappsDir, 'common', installdir);
+              const commonDir =
+                resolveDriveCPathCaseInsensitive(steamappsDir, ['common']) ||
+                path.join(steamappsDir, 'common');
+              const acfCommonDir = path.join(commonDir, installdir);
               /** @type {fs.Stats | null} */
               let commonLstat = null;
               try {

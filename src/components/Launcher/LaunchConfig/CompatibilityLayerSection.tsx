@@ -573,6 +573,9 @@ function CompatibilityLayerSectionImpl(
     const trimmed = bottleName.trim();
     if (!trimmed) return undefined;
     const lower = trimmed.toLowerCase();
+    const normalizeDir = (dir?: string): string =>
+      (dir || '').trim().replace(/[\\/]+$/, '').toLowerCase();
+    const effectiveDir = normalizeDir(effectiveActiveLayer?.bottlesDir);
     const readFromLayer = (layer?: CompatibilityLayerInfo) => {
       const details = layer?.bottleDetails;
       if (!details) return undefined;
@@ -588,6 +591,10 @@ function CompatibilityLayerSectionImpl(
     if (fromEffective) return fromEffective;
     for (const layer of layersForBottleLookup) {
       if (!layer || layer === effectiveActiveLayer) continue;
+      if (effectiveDir) {
+        const layerDir = normalizeDir(layer.bottlesDir);
+        if (layerDir && layerDir !== effectiveDir) continue;
+      }
       const found = readFromLayer(layer);
       if (found) return found;
     }

@@ -119,13 +119,27 @@ export function renderCompatRunnerAndBottleControls({
       effectiveSelectedBottleName &&
       installBottleName.toLowerCase() !== effectiveSelectedBottleName.toLowerCase()
   );
+  const isUninitializedBottleOnProbedLayer = Boolean(
+    effectiveActiveLayer &&
+      effectiveActiveLayer.available !== false &&
+      effectiveActiveLayer.bottleDetails !== undefined &&
+      effectiveSelectedBottleName &&
+      !targetBottleDetails &&
+      !hasBottleArchMismatch
+  );
+  const effectiveBottleHasSteam: boolean | undefined =
+    typeof targetBottleDetails?.hasSteam === 'boolean'
+      ? targetBottleDetails.hasSteam
+      : isUninitializedBottleOnProbedLayer
+        ? false
+        : undefined;
   const showSteamReadinessChip = Boolean(
-    platformId === 'steam' && typeof targetBottleDetails?.hasSteam === 'boolean'
+    platformId === 'steam' && typeof effectiveBottleHasSteam === 'boolean'
   );
   const isBottleSteamMissing = Boolean(
     platformId === 'steam' &&
       !isFastDirectActive &&
-      targetBottleDetails?.hasSteam === false
+      effectiveBottleHasSteam === false
   );
   const isBottleSteamSignInNeeded = Boolean(
     platformId === 'steam' &&
@@ -212,6 +226,7 @@ export function renderCompatRunnerAndBottleControls({
             id="compat-runner-select"
             data-testid="compat-runner-select"
             aria-label="Compatibility Layer"
+            disabled={isBottleSteamFixActive}
             value={effectiveCompatSelectValue}
             onChange={(e) =>
               onSelectCompatibilityLayer(e.target.value as CompatibilityLayerType)
@@ -241,6 +256,7 @@ export function renderCompatRunnerAndBottleControls({
               <LaunchSelect
                 id="compat-target-bottle-control"
                 aria-label="Target Bottle Name"
+                disabled={isBottleSteamFixActive}
                 value={effectiveBottleControlValue}
                 onChange={(e) => onChangeWineBottleName(e.target.value)}
               >
@@ -268,6 +284,7 @@ export function renderCompatRunnerAndBottleControls({
                 id="compat-target-bottle-control"
                 type="text"
                 aria-label="Target Bottle Name"
+                disabled={isBottleSteamFixActive}
                 value={effectiveBottleControlValue}
                 onChange={(e) => onChangeWineBottleName(e.target.value)}
                 placeholder={bottlePlaceholder}
@@ -335,7 +352,7 @@ export function renderCompatRunnerAndBottleControls({
               </span>
             )}
             {showSteamReadinessChip &&
-              (targetBottleDetails?.hasSteam === false ? (
+              (effectiveBottleHasSteam === false ? (
                 <span
                   data-testid="compat-bottle-steam-readiness-chip"
                   data-steam-readiness="missing"
@@ -413,167 +430,173 @@ export function renderCompatRunnerAndBottleControls({
       )}
 
       {hasInstallBottleMismatch && installBottleName && (
-        <div
-          data-testid="compat-install-bottle-mismatch-warning"
-          role="status"
-          aria-live="polite"
-          className="flex flex-col gap-2 rounded-lg bg-amber-950/45 border border-amber-500/45 px-3 py-2 text-xs text-amber-100"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-start gap-2 min-w-0 flex-1">
-              <Info className="w-3.5 h-3.5 text-amber-300 shrink-0 mt-0.5" aria-hidden="true" />
-              <span className="leading-snug">
-                {platformId === 'steam' &&
-                isSteamAppLinkedInTargetBottle &&
-                targetBottleDetails?.steamSignedIn !== false ? (
-                  <>
-                    Installed in bottle{' '}
-                    <strong className="text-white">&ldquo;{installBottleName}&rdquo;</strong>, while
-                    the selected target bottle is{' '}
-                    <strong className="text-white">
-                      &ldquo;{effectiveSelectedBottleName}&rdquo;
-                    </strong>
-                    . This game &amp; Steam Cloud are linked in &ldquo;
-                    {effectiveSelectedBottleName}&rdquo; (non-cloud local files remain separate from
-                    &ldquo;{installBottleName}&rdquo;).
-                  </>
-                ) : (
-                  <>
-                    Installed in bottle{' '}
-                    <strong className="text-white">&ldquo;{installBottleName}&rdquo;</strong>, while
-                    the selected target bottle is{' '}
-                    <strong className="text-white">
-                      &ldquo;{effectiveSelectedBottleName}&rdquo;
-                    </strong>
-                    . Local saves and storefront installs in &ldquo;{installBottleName}&rdquo; are
-                    isolated from &ldquo;{effectiveSelectedBottleName}&rdquo;.
-                  </>
-                )}
-              </span>
-            </div>
-            {(canLinkSteamAppIntoTargetBottle && canTriggerBottleSteamFix) ||
-            (recommendedInstallRunner && onAlignToInstallBottle) ? (
-              <div className="flex flex-wrap items-center gap-1.5 shrink-0">
-                {canLinkSteamAppIntoTargetBottle && canTriggerBottleSteamFix && (
-                  <button
-                    type="button"
-                    data-testid="compat-fix-link-steam-game-btn"
-                    disabled={isBottleSteamFixActive}
-                    onClick={() =>
-                      onFixBottleSteam?.({
-                        mode: 'link_only',
-                        runnerType: effectiveCompatSelectValue,
-                        bottleName: effectiveSelectedBottleName,
-                      })
-                    }
-                    className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/55 text-[11px] font-semibold text-emerald-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
-                  >
-                    <Link2 className="w-3 h-3 shrink-0" aria-hidden="true" />
-                    <span>Link Game into {effectiveSelectedBottleName}</span>
-                  </button>
-                )}
-                {recommendedInstallRunner && onAlignToInstallBottle && (
-                  <button
-                    type="button"
-                    data-testid="compat-align-install-bottle-btn"
-                    disabled={isBottleSteamFixActive}
-                    onClick={() =>
-                      onAlignToInstallBottle(recommendedInstallRunner.type, installBottleName)
-                    }
-                    className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-[11px] font-semibold text-sky-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
-                  >
-                    <span>
-                      Switch to {recommendedInstallRunnerLabel || recommendedInstallRunner.name} (
-                      {installBottleName})
-                    </span>
-                  </button>
-                )}
+        <div className="space-y-1.5">
+          <div
+            data-testid="compat-install-bottle-mismatch-warning"
+            role="status"
+            aria-live="polite"
+            className="flex flex-col gap-2 rounded-lg bg-amber-950/45 border border-amber-500/45 px-3 py-2 text-xs text-amber-100"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-start gap-2 min-w-0 flex-1">
+                <Info className="w-3.5 h-3.5 text-amber-300 shrink-0 mt-0.5" aria-hidden="true" />
+                <span className="leading-snug">
+                  {platformId === 'steam' &&
+                  isSteamAppLinkedInTargetBottle &&
+                  targetBottleDetails?.steamSignedIn !== false ? (
+                    <>
+                      Installed in bottle{' '}
+                      <strong className="text-white">&ldquo;{installBottleName}&rdquo;</strong>, while
+                      the selected target bottle is{' '}
+                      <strong className="text-white">
+                        &ldquo;{effectiveSelectedBottleName}&rdquo;
+                      </strong>
+                      . This game &amp; Steam Cloud are linked in &ldquo;
+                      {effectiveSelectedBottleName}&rdquo; (non-cloud local files remain separate from
+                      &ldquo;{installBottleName}&rdquo;).
+                    </>
+                  ) : (
+                    <>
+                      Installed in bottle{' '}
+                      <strong className="text-white">&ldquo;{installBottleName}&rdquo;</strong>, while
+                      the selected target bottle is{' '}
+                      <strong className="text-white">
+                        &ldquo;{effectiveSelectedBottleName}&rdquo;
+                      </strong>
+                      . Local saves and storefront installs in &ldquo;{installBottleName}&rdquo; are
+                      isolated from &ldquo;{effectiveSelectedBottleName}&rdquo;.
+                    </>
+                  )}
+                </span>
               </div>
-            ) : null}
+              {(canLinkSteamAppIntoTargetBottle && canTriggerBottleSteamFix) ||
+              (recommendedInstallRunner && onAlignToInstallBottle) ? (
+                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                  {canLinkSteamAppIntoTargetBottle && canTriggerBottleSteamFix && (
+                    <button
+                      type="button"
+                      data-testid="compat-fix-link-steam-game-btn"
+                      disabled={isBottleSteamFixActive}
+                      onClick={() =>
+                        onFixBottleSteam?.({
+                          mode: 'link_only',
+                          runnerType: effectiveCompatSelectValue,
+                          bottleName: effectiveSelectedBottleName,
+                        })
+                      }
+                      className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/55 text-[11px] font-semibold text-emerald-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+                    >
+                      <Link2 className="w-3 h-3 shrink-0" aria-hidden="true" />
+                      <span>Link Game into {effectiveSelectedBottleName}</span>
+                    </button>
+                  )}
+                  {recommendedInstallRunner && onAlignToInstallBottle && (
+                    <button
+                      type="button"
+                      data-testid="compat-align-install-bottle-btn"
+                      disabled={isBottleSteamFixActive}
+                      onClick={() =>
+                        onAlignToInstallBottle(recommendedInstallRunner.type, installBottleName)
+                      }
+                      className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-[11px] font-semibold text-sky-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+                    >
+                      <span>
+                        Switch to {recommendedInstallRunnerLabel || recommendedInstallRunner.name} (
+                        {installBottleName})
+                      </span>
+                    </button>
+                  )}
+                </div>
+              ) : null}
+            </div>
           </div>
           {isBottleSteamFixActive && progressOwner === 'mismatch' && renderInlineFixProgress()}
         </div>
       )}
 
       {isBottleSteamMissing && (
-        <div
-          data-testid="compat-bottle-steam-missing-warning"
-          role="alert"
-          className="flex flex-col gap-2 rounded-lg bg-rose-950/55 border border-rose-500/50 px-3 py-2.5 text-xs text-rose-100"
-        >
-          <div className="flex flex-wrap items-start justify-between gap-2">
-            <div className="flex items-start gap-2 min-w-0 flex-1">
-              <AlertTriangle
-                className="w-4 h-4 text-rose-400 shrink-0 mt-0.5"
-                aria-hidden="true"
-              />
-              <span className="leading-snug">
-                <strong className="text-rose-200">No Steam in Bottle:</strong> Bottle &ldquo;
-                {effectiveSelectedBottleName}&rdquo; does not have Windows Steam installed. Steam
-                Client &amp; Steam Cloud Saves will not work until you switch to a bottle with
-                Steam, install Windows Steam into &ldquo;{effectiveSelectedBottleName}&rdquo;, or
-                enable Fast Bottle Launch (disables Steam Cloud).
-              </span>
+        <div className="space-y-1.5">
+          <div
+            data-testid="compat-bottle-steam-missing-warning"
+            role="alert"
+            className="flex flex-col gap-2 rounded-lg bg-rose-950/55 border border-rose-500/50 px-3 py-2.5 text-xs text-rose-100"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="flex items-start gap-2 min-w-0 flex-1">
+                <AlertTriangle
+                  className="w-4 h-4 text-rose-400 shrink-0 mt-0.5"
+                  aria-hidden="true"
+                />
+                <span className="leading-snug">
+                  <strong className="text-rose-200">No Steam in Bottle:</strong> Bottle &ldquo;
+                  {effectiveSelectedBottleName}&rdquo; does not have Windows Steam installed. Steam
+                  Client &amp; Steam Cloud Saves will not work until you switch to a bottle with
+                  Steam, install Windows Steam into &ldquo;{effectiveSelectedBottleName}&rdquo;, or
+                  enable Fast Bottle Launch (disables Steam Cloud).
+                </span>
+              </div>
+              {canTriggerBottleSteamFix && (
+                <button
+                  type="button"
+                  data-testid="compat-fix-install-bottle-steam-btn"
+                  disabled={isBottleSteamFixActive}
+                  onClick={() =>
+                    onFixBottleSteam?.({
+                      mode: 'install_and_signin',
+                      runnerType: effectiveCompatSelectValue,
+                      bottleName: effectiveSelectedBottleName,
+                    })
+                  }
+                  className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/55 text-[11px] font-semibold text-emerald-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+                >
+                  <Download className="w-3 h-3 shrink-0" aria-hidden="true" />
+                  <span>Install &amp; Set Up Steam in {effectiveSelectedBottleName}</span>
+                </button>
+              )}
             </div>
-            {canTriggerBottleSteamFix && (
-              <button
-                type="button"
-                data-testid="compat-fix-install-bottle-steam-btn"
-                disabled={isBottleSteamFixActive}
-                onClick={() =>
-                  onFixBottleSteam?.({
-                    mode: 'install_and_signin',
-                    runnerType: effectiveCompatSelectValue,
-                    bottleName: effectiveSelectedBottleName,
-                  })
-                }
-                className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/55 text-[11px] font-semibold text-emerald-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
-              >
-                <Download className="w-3 h-3 shrink-0" aria-hidden="true" />
-                <span>Install &amp; Set Up Steam in {effectiveSelectedBottleName}</span>
-              </button>
-            )}
           </div>
           {isBottleSteamFixActive && progressOwner === 'missing' && renderInlineFixProgress()}
         </div>
       )}
 
       {isBottleSteamSignInNeeded && (
-        <div
-          data-testid="compat-bottle-steam-signin-warning"
-          role="alert"
-          className="flex flex-col gap-2 rounded-lg bg-amber-950/55 border border-amber-500/50 px-3 py-2.5 text-xs text-amber-100"
-        >
-          <div className="flex flex-wrap items-start justify-between gap-2">
-            <div className="flex items-start gap-2 min-w-0 flex-1">
-              <AlertTriangle
-                className="w-4 h-4 text-amber-400 shrink-0 mt-0.5"
-                aria-hidden="true"
-              />
-              <span className="leading-snug">
-                <strong className="text-amber-200">Steam Sign-In Needed:</strong> Windows Steam is
-                installed in &ldquo;{effectiveSelectedBottleName}&rdquo; but is not signed in yet.
-                Sign in once to enable game launches and Steam Cloud Saves in this bottle.
-              </span>
+        <div className="space-y-1.5">
+          <div
+            data-testid="compat-bottle-steam-signin-warning"
+            role="alert"
+            className="flex flex-col gap-2 rounded-lg bg-amber-950/55 border border-amber-500/50 px-3 py-2.5 text-xs text-amber-100"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="flex items-start gap-2 min-w-0 flex-1">
+                <AlertTriangle
+                  className="w-4 h-4 text-amber-400 shrink-0 mt-0.5"
+                  aria-hidden="true"
+                />
+                <span className="leading-snug">
+                  <strong className="text-amber-200">Steam Sign-In Needed:</strong> Windows Steam is
+                  installed in &ldquo;{effectiveSelectedBottleName}&rdquo; but is not signed in yet.
+                  Sign in once to enable game launches and Steam Cloud Saves in this bottle.
+                </span>
+              </div>
+              {canTriggerBottleSteamFix && (
+                <button
+                  type="button"
+                  data-testid="compat-fix-signin-bottle-steam-btn"
+                  disabled={isBottleSteamFixActive}
+                  onClick={() =>
+                    onFixBottleSteam?.({
+                      mode: 'signin_only',
+                      runnerType: effectiveCompatSelectValue,
+                      bottleName: effectiveSelectedBottleName,
+                    })
+                  }
+                  className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/55 text-[11px] font-semibold text-amber-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+                >
+                  <LogIn className="w-3 h-3 shrink-0" aria-hidden="true" />
+                  <span>Sign In to Steam ({effectiveSelectedBottleName})</span>
+                </button>
+              )}
             </div>
-            {canTriggerBottleSteamFix && (
-              <button
-                type="button"
-                data-testid="compat-fix-signin-bottle-steam-btn"
-                disabled={isBottleSteamFixActive}
-                onClick={() =>
-                  onFixBottleSteam?.({
-                    mode: 'signin_only',
-                    runnerType: effectiveCompatSelectValue,
-                    bottleName: effectiveSelectedBottleName,
-                  })
-                }
-                className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/55 text-[11px] font-semibold text-amber-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
-              >
-                <LogIn className="w-3 h-3 shrink-0" aria-hidden="true" />
-                <span>Sign In to Steam ({effectiveSelectedBottleName})</span>
-              </button>
-            )}
           </div>
           {isBottleSteamFixActive && progressOwner === 'signin' && renderInlineFixProgress()}
         </div>

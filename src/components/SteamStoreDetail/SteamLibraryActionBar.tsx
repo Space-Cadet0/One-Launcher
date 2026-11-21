@@ -97,6 +97,8 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   const manageDropdownRef = useRef<HTMLDivElement | null>(null);
   const pendingManageFocusRef = useRef<'first' | 'last' | null>(null);
   const bottleSteamQuickFixActiveRef = useRef<boolean>(false);
+  const quickFixRunTokenRef = useRef<number>(0);
+  const isMountedRef = useRef<boolean>(true);
   const quickFixGameIdRef = useRef<string>(game.id);
   quickFixGameIdRef.current = game.id;
 
@@ -104,6 +106,11 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
     if (feedbackTimerRef.current) {
       clearTimeout(feedbackTimerRef.current);
       feedbackTimerRef.current = null;
+    }
+    quickFixRunTokenRef.current += 1;
+    if (bottleSteamQuickFixActiveRef.current) {
+      bottleSteamQuickFixActiveRef.current = false;
+      void environmentSetupService.cancelBottleSteamProvisioning();
     }
     setIsManageMenuOpen(false);
     setShowPlaytimePopover(false);
@@ -113,8 +120,23 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
     setIsFullscreenTogglePending(false);
     setActionFeedback(null);
     setBottleSteamLaunchError(null);
-    bottleSteamQuickFixActiveRef.current = false;
     setBottleSteamQuickFix({ active: false, statusText: '' });
+  }, []);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      quickFixRunTokenRef.current += 1;
+      if (feedbackTimerRef.current) {
+        clearTimeout(feedbackTimerRef.current);
+        feedbackTimerRef.current = null;
+      }
+      if (bottleSteamQuickFixActiveRef.current) {
+        bottleSteamQuickFixActiveRef.current = false;
+        void environmentSetupService.cancelBottleSteamProvisioning();
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -315,12 +337,14 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   }, [isManageMenuOpen, focusManageMenuItem]);
 
   const showTempFeedback = useCallback((msg: string, durationMs = 4000) => {
+    if (!isMountedRef.current) return;
     if (feedbackTimerRef.current) {
       clearTimeout(feedbackTimerRef.current);
     }
     setActionFeedback(msg);
     feedbackTimerRef.current = setTimeout(() => {
       feedbackTimerRef.current = null;
+      if (!isMountedRef.current) return;
       setActionFeedback((prev) => (prev === msg ? null : prev));
     }, durationMs);
   }, []);
@@ -382,11 +406,27 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
     if (!targetBottleName || !chosenRunnerType || chosenRunnerType === 'native') return;
 
     const activeGameId = game.id;
+    const runToken = ++quickFixRunTokenRef.current;
+    const isCurrentRun = (): boolean =>
+      isMountedRef.current &&
+      quickFixGameIdRef.current === activeGameId &&
+      quickFixRunTokenRef.current === runToken;
+
     const needsInstall = errorCode === 'BOTTLE_STEAM_NOT_INSTALLED';
     const needsSignIn = needsInstall;
     const initialStatus = needsInstall
       ? `Installing Windows Steam into "${targetBottleName}"...`
       : `Linking installed Steam games into "${targetBottleName}"...`;
+
+    const resolvedRequiredAppId =
+      typeof targetSteamAppId === 'number' &&
+      Number.isInteger(targetSteamAppId) &&
+      targetSteamAppId > 0
+        ? targetSteamAppId
+        : typeof activePlatform?.platformGameId === 'string' &&
+            /^\d+$/.test(activePlatform.platformGameId.trim())
+          ? Number.parseInt(activePlatform.platformGameId.trim(), 10)
+          : undefined;
 
     bottleSteamQuickFixActiveRef.current = true;
     setBottleSteamQuickFix({ active: true, statusText: initialStatus });
@@ -397,17 +437,15 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
         bottleName: targetBottleName,
         needsInstall,
         needsSignIn,
+        ...(resolvedRequiredAppId ? { requiredAppId: resolvedRequiredAppId } : {}),
         onPhaseChange: (msg: string) => {
-          if (
-            quickFixGameIdRef.current !== activeGameId ||
-            !bottleSteamQuickFixActiveRef.current
-          ) {
+          if (!isCurrentRun() || !bottleSteamQuickFixActiveRef.current) {
             return;
           }
           setBottleSteamQuickFix((prev) => (prev.active ? { ...prev, statusText: msg } : prev));
         },
       });
-      if (quickFixGameIdRef.current !== activeGameId) return;
+      if (!isCurrentRun()) return;
 
       if (res.success) {
         setBottleSteamLaunchError(null);
@@ -430,21 +468,24 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
         );
       }
     } catch (err: unknown) {
-      if (quickFixGameIdRef.current !== activeGameId) return;
+      if (!isCurrentRun()) return;
       const errMsg =
         err instanceof Error && err.message
           ? err.message
           : `Could not complete Steam setup in "${targetBottleName}".`;
       showTempFeedback(errMsg, 6000);
     } finally {
-      bottleSteamQuickFixActiveRef.current = false;
-      if (quickFixGameIdRef.current === activeGameId) {
+      if (quickFixRunTokenRef.current === runToken) {
+        bottleSteamQuickFixActiveRef.current = false;
+      }
+      if (isCurrentRun()) {
         setBottleSteamQuickFix({ active: false, statusText: '' });
       }
     }
   };
 
   const handleCancelBottleSteamQuickFix = async () => {
+    if (!isMountedRef.current) return;
     setBottleSteamQuickFix((prev) =>
       prev.active ? { ...prev, statusText: 'Cancelling Steam setup...' } : prev
     );
@@ -1251,69 +1292,73 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
       {/* Persistent Bottle Steam Launch Recovery Banner */}
       {bottleSteamLaunchError && (
-        <div
-          data-testid="bottle-steam-launch-error-banner"
-          data-error-code={bottleSteamLaunchError.errorCode}
-          role="alert"
-          className="mt-3 px-3 py-2.5 rounded-lg bg-rose-950/65 border border-rose-500/55 text-xs text-rose-100 flex flex-col gap-2"
-        >
-          <div className="flex flex-wrap items-start justify-between gap-2.5">
-            <div className="flex items-start gap-2 min-w-0 flex-1">
-              <AlertTriangle
-                className="w-4 h-4 text-rose-400 shrink-0 mt-0.5"
-                aria-hidden="true"
-              />
-              <span className="leading-relaxed break-words">{bottleSteamLaunchError.message}</span>
-            </div>
-            <div className="flex flex-wrap items-center gap-1.5 shrink-0">
-              {bottleSteamLaunchError.chosenRunnerType &&
-                bottleSteamLaunchError.chosenRunnerType !== 'native' &&
-                bottleSteamLaunchError.targetBottleName && (
-                  <button
-                    type="button"
-                    data-testid="bottle-steam-quick-fix-btn"
-                    disabled={bottleSteamQuickFix.active}
-                    onClick={handleBottleSteamQuickFix}
-                    className="min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/55 text-[11px] font-semibold text-emerald-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
-                  >
-                    {bottleSteamLaunchError.errorCode === 'BOTTLE_STEAM_NOT_INSTALLED' ? (
-                      <>
-                        <Download className="w-3 h-3 shrink-0" aria-hidden="true" />
-                        <span>
-                          Install &amp; Set Up Steam in {bottleSteamLaunchError.targetBottleName}
-                        </span>
-                      </>
-                    ) : (
-                      <>
-                        <Link2 className="w-3 h-3 shrink-0" aria-hidden="true" />
-                        <span>Link Game into {bottleSteamLaunchError.targetBottleName}</span>
-                      </>
-                    )}
-                  </button>
-                )}
-              <button
-                type="button"
-                data-testid="bottle-steam-open-launch-config-btn"
-                disabled={bottleSteamQuickFix.active}
-                onPointerEnter={prefetchGameLaunchConfigModal}
-                onFocus={prefetchGameLaunchConfigModal}
-                onClick={() => setIsLaunchConfigOpen(true)}
-                className="min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-[11px] font-semibold text-sky-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
-              >
-                <Settings className="w-3 h-3 shrink-0" aria-hidden="true" />
-                <span>Open Launch Config</span>
-              </button>
-              <button
-                type="button"
-                data-testid="bottle-steam-dismiss-error-btn"
-                aria-label="Dismiss launch error"
-                disabled={bottleSteamQuickFix.active}
-                onClick={() => setBottleSteamLaunchError(null)}
-                className="min-h-6 inline-flex items-center gap-1 px-2 py-1 rounded bg-white/5 hover:bg-white/15 border border-rose-400/35 text-[11px] font-semibold text-rose-200 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
-              >
-                <X className="w-3 h-3 shrink-0" aria-hidden="true" />
-                <span>Dismiss</span>
-              </button>
+        <div className="mt-3 space-y-2">
+          <div
+            data-testid="bottle-steam-launch-error-banner"
+            data-error-code={bottleSteamLaunchError.errorCode}
+            role="alert"
+            className="px-3 py-2.5 rounded-lg bg-rose-950/65 border border-rose-500/55 text-xs text-rose-100 flex flex-col gap-2"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-2.5">
+              <div className="flex items-start gap-2 min-w-0 flex-1">
+                <AlertTriangle
+                  className="w-4 h-4 text-rose-400 shrink-0 mt-0.5"
+                  aria-hidden="true"
+                />
+                <span className="leading-relaxed break-words">
+                  {bottleSteamLaunchError.message}
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                {bottleSteamLaunchError.chosenRunnerType &&
+                  bottleSteamLaunchError.chosenRunnerType !== 'native' &&
+                  bottleSteamLaunchError.targetBottleName && (
+                    <button
+                      type="button"
+                      data-testid="bottle-steam-quick-fix-btn"
+                      disabled={bottleSteamQuickFix.active}
+                      onClick={handleBottleSteamQuickFix}
+                      className="min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/55 text-[11px] font-semibold text-emerald-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+                    >
+                      {bottleSteamLaunchError.errorCode === 'BOTTLE_STEAM_NOT_INSTALLED' ? (
+                        <>
+                          <Download className="w-3 h-3 shrink-0" aria-hidden="true" />
+                          <span>
+                            Install &amp; Set Up Steam in {bottleSteamLaunchError.targetBottleName}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <Link2 className="w-3 h-3 shrink-0" aria-hidden="true" />
+                          <span>Link Game into {bottleSteamLaunchError.targetBottleName}</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                <button
+                  type="button"
+                  data-testid="bottle-steam-open-launch-config-btn"
+                  disabled={bottleSteamQuickFix.active}
+                  onPointerEnter={prefetchGameLaunchConfigModal}
+                  onFocus={prefetchGameLaunchConfigModal}
+                  onClick={() => setIsLaunchConfigOpen(true)}
+                  className="min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-[11px] font-semibold text-sky-100 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+                >
+                  <Settings className="w-3 h-3 shrink-0" aria-hidden="true" />
+                  <span>Open Launch Config</span>
+                </button>
+                <button
+                  type="button"
+                  data-testid="bottle-steam-dismiss-error-btn"
+                  aria-label="Dismiss launch error"
+                  disabled={bottleSteamQuickFix.active}
+                  onClick={() => setBottleSteamLaunchError(null)}
+                  className="min-h-6 inline-flex items-center gap-1 px-2 py-1 rounded bg-white/5 hover:bg-white/15 border border-rose-400/35 text-[11px] font-semibold text-rose-200 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
+                >
+                  <X className="w-3 h-3 shrink-0" aria-hidden="true" />
+                  <span>Dismiss</span>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -1322,7 +1367,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
               data-testid="bottle-steam-quick-fix-progress"
               role="status"
               aria-live="polite"
-              className="flex flex-wrap items-center justify-between gap-2 rounded bg-[#0d1520]/85 border border-sky-400/40 px-2.5 py-1.5 text-[11px] text-sky-100"
+              className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[#0d1520]/90 border border-sky-400/40 px-3 py-2 text-[11px] text-sky-100"
             >
               <div className="flex items-center gap-2 min-w-0 flex-1">
                 <Loader2
