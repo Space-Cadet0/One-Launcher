@@ -705,7 +705,7 @@ describe('Library Match & Overrides Studio Blank-Screen Fix & Edge-Case Regressi
       const path = await import('node:path');
       const scannerPath = path.resolve(
         process.cwd(),
-        'electron/storefronts/xbox/xboxCatalogAndGamePass.cjs'
+        'electron/storefronts/xbox/catalog/xboxCatalogGatesAndMapper.cjs'
       );
 
       const scannerContent = fs.readFileSync(scannerPath, 'utf8');

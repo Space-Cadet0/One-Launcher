@@ -36,19 +36,163 @@ const {
 
 const GAMING_SERVICES_REG_CACHE_TTL_MS = 15_000;
 
+const APPX_IDENTITY_NAME_RE = /^[A-Za-z0-9.-]{3,50}$/;
+const APPX_PFN_RE = /^[A-Za-z0-9.-]{3,50}_[0-9a-hjkmnp-tv-z]{13}$/i;
+const DEFAULT_APPX_SELECT_FIELDS = [
+  'Name',
+  'PackageFamilyName',
+  'PackageFullName',
+  'InstallLocation',
+  'Status',
+];
+const ALLOWED_APPX_SELECT_FIELDS_MAP = new Map([
+  ['name', 'Name'],
+  ['publisher', 'Publisher'],
+  ['architecture', 'Architecture'],
+  ['resourceid', 'ResourceId'],
+  ['version', 'Version'],
+  ['packagefullname', 'PackageFullName'],
+  ['installlocation', 'InstallLocation'],
+  ['isframework', 'IsFramework'],
+  ['packagefamilyname', 'PackageFamilyName'],
+  ['publisherid', 'PublisherId'],
+  ['isresourcepackage', 'IsResourcePackage'],
+  ['isbundle', 'IsBundle'],
+  ['isdevelopmentmode', 'IsDevelopmentMode'],
+  ['nonremovable', 'NonRemovable'],
+  ['ispartiallystaged', 'IsPartiallyStaged'],
+  ['signaturekind', 'SignatureKind'],
+  ['status', 'Status'],
+]);
+
+const QUERY_TARGETED_APPX_PS_SCRIPT =
+  '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
+  "$props = @($env:OL_SELECT_FIELDS -split ',' | Where-Object { $_ }); " +
+  'Get-AppxPackage -ErrorAction SilentlyContinue | ' +
+  'Where-Object { $_.Name -eq $env:OL_IDENTITY -and ([string]::IsNullOrEmpty($env:OL_PFN) -or $_.PackageFamilyName -eq $env:OL_PFN) } | ' +
+  'Select-Object -First 1 -Property $props | ConvertTo-Json -Compress';
+
+const REMOVE_TARGETED_APPX_PS_SCRIPT =
+  '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
+  "$ErrorActionPreference = 'Stop'; " +
+  '$pkgs = @(Get-AppxPackage | Where-Object { $_.Name -eq $env:OL_IDENTITY -and ([string]::IsNullOrEmpty($env:OL_PFN) -or $_.PackageFamilyName -eq $env:OL_PFN) }); ' +
+  'foreach ($p in $pkgs) { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop }';
+
+const REGISTER_APPX_MANIFEST_PS_SCRIPT =
+  '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
+  "$ErrorActionPreference = 'Stop'; " +
+  "if ((Get-Command Add-AppxPackage -ErrorAction Stop).Parameters.ContainsKey('LiteralPath')) { " +
+  'Add-AppxPackage -Register -LiteralPath $env:OL_APPX_MANIFEST -DisableDevelopmentMode -ErrorAction Stop ' +
+  '} else { ' +
+  'Add-AppxPackage -Register -Path $env:OL_APPX_MANIFEST -DisableDevelopmentMode -ErrorAction Stop ' +
+  '}';
+
 /** @type {{ timestamp: number, output: string, inFlight: Promise<string> | null }} */
 let gamingServicesRegCache = {
   timestamp: 0,
   output: '',
   inFlight: null,
 };
+let gamingServicesRegCacheGeneration = 0;
 
 registerExternalCacheInvalidator(() => {
+  gamingServicesRegCacheGeneration += 1;
   gamingServicesRegCache = { timestamp: 0, output: '', inFlight: null };
 });
 
 /**
+ * Resolves the absolute path to a built-in Windows system binary under `%SystemRoot%\System32`
+ * to prevent PATH hijacking.
+ *
+ * @param {'powershell' | 'reg' | 'tasklist'} kind
+ * @param {Record<string, any>} [options]
+ * @returns {string}
+ */
+function resolveWindowsSystemBinary(kind, options = {}) {
+  const env = options?.env || process.env;
+  const rawRoot = String(env.SystemRoot || env.SYSTEMROOT || env.windir || '').trim();
+  const sysRoot =
+    rawRoot && /^[A-Za-z]:\\/.test(rawRoot) && !/[\x00-\x1f\x7f]/.test(rawRoot)
+      ? rawRoot.replace(/\\+$/, '')
+      : 'C:\\Windows';
+  if (kind === 'powershell') {
+    return path.win32.join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  }
+  if (kind === 'reg') {
+    return path.win32.join(sysRoot, 'System32', 'reg.exe');
+  }
+  return path.win32.join(sysRoot, 'System32', 'tasklist.exe');
+}
+
+/**
+ * Validates an Appx `Identity.Name` against the strict allowlist (`/^[A-Za-z0-9.-]{3,50}$/`).
+ *
+ * @param {unknown} rawIdentity
+ * @returns {string}
+ */
+function validateAppxIdentityName(rawIdentity) {
+  const clean = String(rawIdentity ?? '').trim();
+  if (!clean || clean.includes('..') || !APPX_IDENTITY_NAME_RE.test(clean)) {
+    return '';
+  }
+  return clean;
+}
+
+/**
+ * Validates an Appx `PackageFamilyName` against the strict allowlist
+ * (`/^[A-Za-z0-9.-]{3,50}_[0-9a-hjkmnp-tv-z]{13}$/i`).
+ *
+ * @param {unknown} rawPfn
+ * @returns {string}
+ */
+function validateAppxPackageFamilyName(rawPfn) {
+  const clean = String(rawPfn ?? '').trim();
+  if (!clean || clean.includes('..') || !APPX_PFN_RE.test(clean)) {
+    return '';
+  }
+  return clean;
+}
+
+/**
+ * Validates comma-separated or array `selectFields` strictly against the allowlisted
+ * `AppxPackage` property names. Returns `null` if any requested field is not allowlisted.
+ *
+ * @param {string | string[] | undefined} rawSelectFields
+ * @returns {string[] | null}
+ */
+function validateAppxSelectFields(rawSelectFields) {
+  if (rawSelectFields === undefined || rawSelectFields === null || rawSelectFields === '') {
+    return DEFAULT_APPX_SELECT_FIELDS.slice();
+  }
+  const rawList = Array.isArray(rawSelectFields)
+    ? rawSelectFields
+    : typeof rawSelectFields === 'string'
+      ? rawSelectFields.split(',')
+      : null;
+  if (!rawList) return null;
+
+  /** @type {string[]} */
+  const validated = [];
+  const seen = new Set();
+  for (const item of rawList) {
+    const token = String(item ?? '').trim();
+    if (!token) continue;
+    const canonical = ALLOWED_APPX_SELECT_FIELDS_MAP.get(token.toLowerCase());
+    if (!canonical) {
+      return null;
+    }
+    if (!seen.has(canonical)) {
+      seen.add(canonical);
+      validated.push(canonical);
+    }
+  }
+  return validated.length > 0 ? validated : null;
+}
+
+/**
  * Safely escape a string for PowerShell single-quoted literals (`'` -> `''`).
+ * Retained for backward-compatible export parity; Appx PowerShell commands pass all dynamic
+ * values strictly via environment variables rather than script interpolation.
  */
 function escapePowerShellSingleQuoted(raw) {
   return String(raw ?? '')
@@ -91,7 +235,9 @@ function parseGamingServicesRegistryRoots(regOutput) {
         if (val) roots.push(val);
       }
       if (roots.length > 0) return roots;
-    } catch {}
+    } catch (parseErr) {
+      diagLog.debug('parseGamingServicesRegistryRoots.jsonFallback', parseErr);
+    }
   }
 
   for (const line of regOutput.split(/\r?\n/)) {
@@ -151,39 +297,60 @@ async function primeXboxDiscoveryCachesAsync(/** @type {any} */ options = {}) {
     return;
   }
 
+  const runGeneration = gamingServicesRegCacheGeneration;
+  /** @type {(value: string) => void} */
+  let resolveReg = () => {};
+  /** @type {Promise<string>} */
   const regPromise = new Promise((resolve) => {
-    try {
-      execFileFn(
-        'reg.exe',
-        [
-          'query',
-          'HKLM\\SOFTWARE\\Microsoft\\GamingServices\\PackageRepository\\Package',
-          '/s',
-          '/v',
-          'Root',
-        ],
-        { encoding: 'utf8', timeout: 2000, windowsHide: true, maxBuffer: 2 * 1024 * 1024 },
-        (/** @type {any} */ err, /** @type {any} */ stdout) => {
-          const out = !err ? String(stdout || '') : '';
+    resolveReg = resolve;
+  });
+  // Assign `inFlight` BEFORE invoking `execFileFn` so synchronous callbacks/throws cannot leave a stale handle
+  gamingServicesRegCache.inFlight = regPromise;
+
+  const clearInFlightIfCurrent = () => {
+    if (
+      runGeneration === gamingServicesRegCacheGeneration &&
+      gamingServicesRegCache.inFlight === regPromise
+    ) {
+      gamingServicesRegCache.inFlight = null;
+    }
+  };
+
+  try {
+    execFileFn(
+      resolveWindowsSystemBinary('reg', options),
+      [
+        'query',
+        'HKLM\\SOFTWARE\\Microsoft\\GamingServices\\PackageRepository\\Package',
+        '/s',
+        '/v',
+        'Root',
+      ],
+      { encoding: 'utf8', timeout: 2000, windowsHide: true, maxBuffer: 2 * 1024 * 1024 },
+      (/** @type {any} */ err, /** @type {any} */ stdout) => {
+        if (err) {
+          diagLog.warn('primeXboxDiscoveryCachesAsync.regQueryError', err);
+          clearInFlightIfCurrent();
+          resolveReg('');
+          return;
+        }
+        const out = String(stdout || '');
+        if (runGeneration === gamingServicesRegCacheGeneration) {
           gamingServicesRegCache = {
             timestamp: Date.now(),
             output: out,
             inFlight: null,
           };
-          resolve(out);
         }
-      );
-    } catch {
-      gamingServicesRegCache = {
-        timestamp: Date.now(),
-        output: '',
-        inFlight: null,
-      };
-      resolve('');
-    }
-  });
+        resolveReg(out);
+      }
+    );
+  } catch (syncErr) {
+    diagLog.warn('primeXboxDiscoveryCachesAsync.regSpawnError', syncErr);
+    clearInFlightIfCurrent();
+    resolveReg('');
+  }
 
-  gamingServicesRegCache.inFlight = regPromise;
   await regPromise;
 }
 
@@ -226,7 +393,9 @@ function isXboxChildGameFolder(dirPath) {
         return true;
       }
     }
-  } catch {}
+  } catch (err) {
+    diagLog.debug('isXboxChildGameFolder.probeError', err, { dirPath: clean });
+  }
   return false;
 }
 
@@ -246,7 +415,10 @@ function findBestX86OrX64WindowsExe(rootDir, options = {}) {
     let entries;
     try {
       entries = fs.readdirSync(currentDir, { withFileTypes: true });
-    } catch {
+    } catch (/** @type {any} */ readErr) {
+      if (readErr?.code !== 'ENOENT') {
+        diagLog.debug('findBestX86OrX64WindowsExe.readdirError', readErr, { currentDir });
+      }
       return;
     }
     for (const ent of entries) {
@@ -416,7 +588,9 @@ function resolveXboxDiscoveryLocations(/** @type {any} */ options = {}) {
         if (fs.existsSync(modApps)) {
           modifiableRoots.add(modApps);
         }
-      } catch {}
+      } catch (driveErr) {
+        diagLog.warn('resolveXboxDiscoveryLocations.driveProbeError', driveErr, { driveRoot });
+      }
     }
 
     if (!options.homedir && fs.existsSync('C:\\XboxGames')) {
@@ -486,7 +660,9 @@ function collectXboxScanDirectories(/** @type {any} */ options = {}) {
           libraryRoots.add(bottleXbox);
         }
       }
-    } catch {}
+    } catch (bottleErr) {
+      diagLog.warn('collectXboxScanDirectories.bottleProbeError', bottleErr);
+    }
   }
 
   for (const libRoot of libraryRoots) {
@@ -500,7 +676,9 @@ function collectXboxScanDirectories(/** @type {any} */ options = {}) {
         if (!ent.isDirectory() || ent.name.startsWith('.')) continue;
         candidateGameDirs.add(path.join(libRoot, ent.name));
       }
-    } catch {}
+    } catch (libRootErr) {
+      diagLog.warn('collectXboxScanDirectories.libRootReadError', libRootErr, { libRoot });
+    }
   }
 
   return Array.from(candidateGameDirs);
@@ -528,7 +706,8 @@ function inspectInstalledXboxGameDir(gameDir, /** @type {any} */ options = {}) {
         hasReceiptFile = true;
         try {
           receipt = JSON.parse(fs.readFileSync(rp, 'utf8'));
-        } catch {
+        } catch (receiptErr) {
+          diagLog.warn('inspectInstalledXboxGameDir.receiptParseError', receiptErr, { rp });
           receipt = null;
         }
         break;
@@ -782,27 +961,43 @@ function inspectInstalledXboxGameDir(gameDir, /** @type {any} */ options = {}) {
 }
 
 /**
- * Targeted `Get-AppxPackage -Name '<identityName>'` query (~60ms vs ~4,000ms full scan).
+ * Targeted exact-match `Get-AppxPackage` query using static env-var parameterized PowerShell
+ * (zero string interpolation, strict allowlist validation on identityName/pfn/selectFields,
+ * exact `-eq` filtering, and fail-closed JSON parse handling).
  */
 async function queryTargetedAppxPackageAsync(
-  /** @type {{ identityName?: string, packageFamilyName?: string, selectFields?: string }} */ targetInfo = {},
+  /** @type {{ identityName?: string, packageFamilyName?: string, selectFields?: string | string[] }} */ targetInfo = {},
   /** @type {any} */ options = {}
 ) {
-  const pfn = String(targetInfo.packageFamilyName || '').trim();
-  const identityName = deriveAppxIdentityName(targetInfo.identityName || pfn);
-  if (!identityName) {
-    return { found: false, pkg: null, stdout: '', stderr: '', error: null };
+  const rawPfn = String(targetInfo.packageFamilyName || '').trim();
+  const pfn = rawPfn ? validateAppxPackageFamilyName(rawPfn) : '';
+  if (rawPfn && !pfn) {
+    diagLog.warn('queryTargetedAppxPackageAsync.invalidPfn', 'Rejected invalid Appx PFN', {
+      pfn: rawPfn.slice(0, 64),
+    });
+    return { found: false, pkg: null, stdout: '', stderr: '', error: 'invalid_package_family_name' };
   }
 
-  const escapedName = escapePowerShellSingleQuoted(identityName);
-  const selectFields = targetInfo.selectFields || 'Name,PackageFamilyName,PackageFullName,InstallLocation,Status';
-  const pfnFilter = pfn
-    ? ` | Where-Object { $_.PackageFamilyName -eq '${escapePowerShellSingleQuoted(pfn)}' }`
-    : '';
-  const psCommand =
-    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
-    `Get-AppxPackage -Name '${escapedName}' -ErrorAction SilentlyContinue${pfnFilter} | ` +
-    `Select-Object -First 1 ${selectFields} | ConvertTo-Json -Compress`;
+  const rawIdentity = deriveAppxIdentityName(targetInfo.identityName || pfn);
+  if (!rawIdentity) {
+    return { found: false, pkg: null, stdout: '', stderr: '', error: null };
+  }
+  const identityName = validateAppxIdentityName(rawIdentity);
+  if (!identityName) {
+    diagLog.warn('queryTargetedAppxPackageAsync.invalidIdentity', 'Rejected invalid Appx identity', {
+      identityName: rawIdentity.slice(0, 64),
+    });
+    return { found: false, pkg: null, stdout: '', stderr: '', error: 'invalid_identity_name' };
+  }
+
+  const validatedSelectFields = validateAppxSelectFields(targetInfo.selectFields);
+  if (!validatedSelectFields) {
+    diagLog.warn(
+      'queryTargetedAppxPackageAsync.invalidSelectFields',
+      'Rejected non-allowlisted Appx selectFields'
+    );
+    return { found: false, pkg: null, stdout: '', stderr: '', error: 'invalid_select_fields' };
+  }
 
   const execFileImpl =
     typeof options.execFileImpl === 'function'
@@ -814,13 +1009,14 @@ async function queryTargetedAppxPackageAsync(
   return new Promise((resolve) => {
     try {
       execFileImpl(
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-Command', psCommand],
+        resolveWindowsSystemBinary('powershell', options),
+        ['-NoProfile', '-NonInteractive', '-Command', QUERY_TARGETED_APPX_PS_SCRIPT],
         {
           env: {
             ...process.env,
-            ...(pfn ? { OL_PFN: pfn } : {}),
+            OL_PFN: pfn,
             OL_IDENTITY: identityName,
+            OL_SELECT_FIELDS: validatedSelectFields.join(','),
           },
           timeout: Number(options.timeoutMs || 8000),
           windowsHide: true,
@@ -829,6 +1025,7 @@ async function queryTargetedAppxPackageAsync(
           const outStr = String(stdout || '').trim();
           const errStr = String(stderr || '').trim();
           if (err) {
+            diagLog.warn('queryTargetedAppxPackageAsync.execError', err, { stderr: errStr });
             resolve({
               found: false,
               pkg: null,
@@ -845,25 +1042,30 @@ async function queryTargetedAppxPackageAsync(
           try {
             const parsed = JSON.parse(outStr);
             const pkg = Array.isArray(parsed) ? parsed[0] || null : parsed;
+            const isValidPkg = Boolean(pkg && typeof pkg === 'object' && !Array.isArray(pkg));
             resolve({
-              found: Boolean(pkg && typeof pkg === 'object'),
-              pkg,
+              found: isValidPkg,
+              pkg: isValidPkg ? pkg : null,
               stdout: outStr,
               stderr: errStr,
               error: null,
             });
-          } catch {
+          } catch (parseErr) {
+            diagLog.warn('queryTargetedAppxPackageAsync.jsonParseError', parseErr, {
+              stdout: outStr.slice(0, 200),
+            });
             resolve({
               found: false,
               pkg: null,
               stdout: outStr,
               stderr: errStr,
-              error: null,
+              error: 'appx_query_json_parse_failed',
             });
           }
         }
       );
     } catch (/** @type {any} */ syncErr) {
+      diagLog.warn('queryTargetedAppxPackageAsync.spawnError', syncErr);
       resolve({
         found: false,
         pkg: null,
@@ -876,28 +1078,31 @@ async function queryTargetedAppxPackageAsync(
 }
 
 /**
- * Targeted `Remove-AppxPackage` with mandatory post-condition verification via `Get-AppxPackage -Name`.
- * Returns `{ removed: false, error }` if the package remains installed after removal.
+ * Targeted `Remove-AppxPackage` using env-var parameterized exact `-eq` filtering and
+ * strictly fail-closed post-condition verification via `queryTargetedAppxPackageAsync`.
  */
 async function removeTargetedAppxPackageVerifiedAsync(
   /** @type {{ identityName?: string, packageFamilyName?: string }} */ targetInfo = {},
   /** @type {any} */ options = {}
 ) {
-  const pfn = String(targetInfo.packageFamilyName || '').trim();
-  const identityName = deriveAppxIdentityName(targetInfo.identityName || pfn);
-  if (!identityName) {
-    return { removed: false, error: 'Missing Appx IdentityName / PackageFamilyName.' };
+  const rawPfn = String(targetInfo.packageFamilyName || '').trim();
+  const pfn = rawPfn ? validateAppxPackageFamilyName(rawPfn) : '';
+  if (rawPfn && !pfn) {
+    return {
+      removed: false,
+      stillInstalled: false,
+      error: 'Invalid Appx PackageFamilyName.',
+    };
   }
 
-  const escapedName = escapePowerShellSingleQuoted(identityName);
-  const pfnFilter = pfn
-    ? ` | Where-Object { $_.PackageFamilyName -eq '${escapePowerShellSingleQuoted(pfn)}' }`
-    : '';
-  const removeCmd =
-    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
-    `$ErrorActionPreference = 'Stop'; ` +
-    `$pkgs = @(Get-AppxPackage -Name '${escapedName}'${pfnFilter}); ` +
-    'foreach ($p in $pkgs) { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop }';
+  const rawIdentity = deriveAppxIdentityName(targetInfo.identityName || pfn);
+  if (!rawIdentity) {
+    return { removed: false, stillInstalled: false, error: 'Missing Appx IdentityName / PackageFamilyName.' };
+  }
+  const identityName = validateAppxIdentityName(rawIdentity);
+  if (!identityName) {
+    return { removed: false, stillInstalled: false, error: 'Invalid Appx IdentityName.' };
+  }
 
   const execFileImpl =
     typeof options.execFileImpl === 'function'
@@ -909,18 +1114,23 @@ async function removeTargetedAppxPackageVerifiedAsync(
   const removeRes = await new Promise((resolve) => {
     try {
       execFileImpl(
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-Command', removeCmd],
+        resolveWindowsSystemBinary('powershell', options),
+        ['-NoProfile', '-NonInteractive', '-Command', REMOVE_TARGETED_APPX_PS_SCRIPT],
         {
           env: {
             ...process.env,
-            ...(pfn ? { OL_PFN: pfn } : {}),
+            OL_PFN: pfn,
             OL_IDENTITY: identityName,
           },
           timeout: 45000,
           windowsHide: true,
         },
         (/** @type {any} */ err, /** @type {any} */ stdout, /** @type {any} */ stderr) => {
+          if (err) {
+            diagLog.warn('removeTargetedAppxPackageVerifiedAsync.execError', err, {
+              stderr: String(stderr || '').trim(),
+            });
+          }
           resolve({
             err,
             stdout: String(stdout || '').trim(),
@@ -929,6 +1139,7 @@ async function removeTargetedAppxPackageVerifiedAsync(
         }
       );
     } catch (/** @type {any} */ syncErr) {
+      diagLog.warn('removeTargetedAppxPackageVerifiedAsync.spawnError', syncErr);
       resolve({
         err: syncErr,
         stdout: '',
@@ -955,11 +1166,21 @@ async function removeTargetedAppxPackageVerifiedAsync(
     };
   }
 
-  if (removeRes.err && !postCheck.stdout && postCheck.error) {
+  // Strictly FAIL-CLOSED: any post-check verification error (including JSON parse failure)
+  // OR any Remove-AppxPackage execution error MUST report `removed: false`.
+  if (postCheck.error) {
     return {
       removed: false,
       stillInstalled: false,
-      error: removeRes.stderr || removeRes.err.message || postCheck.error,
+      error: postCheck.error || removeRes.stderr || removeRes.err?.message || 'appx_post_remove_verify_failed',
+    };
+  }
+
+  if (removeRes.err) {
+    return {
+      removed: false,
+      stillInstalled: false,
+      error: removeRes.stderr || removeRes.err?.message || String(removeRes.err),
     };
   }
 
@@ -971,6 +1192,7 @@ async function removeTargetedAppxPackageVerifiedAsync(
 }
 
 const WINDOWS_AUMID_ACTIVATE_PS_SCRIPT = `
+$ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.CompilerServices;
@@ -979,18 +1201,27 @@ namespace OneLauncherXbox {
   public enum ActivateOptions { None = 0x00000000, NoErrorUI = 0x00000002 }
   [ComImport, Guid("2e941141-7f97-4756-ba1d-9decde894a3d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
   public interface IApplicationActivationManager {
-    IntPtr ActivateApplication([In] String appUserModelId, [In] String arguments, [In] ActivateOptions options, [Out] out UInt32 processId);
+    [PreserveSig]
+    int ActivateApplication([In, MarshalAs(UnmanagedType.LPWStr)] String appUserModelId, [In, MarshalAs(UnmanagedType.LPWStr)] String arguments, [In] ActivateOptions options, [Out] out UInt32 processId);
   }
   [ComImport, Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C")]
   public class ApplicationActivationManager : IApplicationActivationManager {
+    [PreserveSig]
     [MethodImpl(MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
-    public extern IntPtr ActivateApplication([In] String appUserModelId, [In] String arguments, [In] ActivateOptions options, [Out] out UInt32 processId);
+    public extern int ActivateApplication([In, MarshalAs(UnmanagedType.LPWStr)] String appUserModelId, [In, MarshalAs(UnmanagedType.LPWStr)] String arguments, [In] ActivateOptions options, [Out] out UInt32 processId);
   }
 }
 "@
 $mgr = New-Object OneLauncherXbox.ApplicationActivationManager
 [uint32]$pidOut = 0
-$null = $mgr.ActivateApplication($env:OL_AUMID, $env:OL_ARGS, [OneLauncherXbox.ActivateOptions]::None, [ref]$pidOut)
+[int]$hr = $mgr.ActivateApplication($env:OL_AUMID, $env:OL_ARGS, [OneLauncherXbox.ActivateOptions]::None, [ref]$pidOut)
+if ($hr -lt 0) {
+  $hexHr = ('0x{0:X8}' -f ($hr -band 0xFFFFFFFF))
+  $comEx = [System.Runtime.InteropServices.Marshal]::GetExceptionForHR($hr)
+  $msg = if ($comEx) { $comEx.Message } else { 'COM ActivateApplication failed' }
+  [Console]::Error.WriteLine("HRESULT=$hexHr ($hr): $msg")
+  exit 1
+}
 Write-Output $pidOut
 `.trim();
 
@@ -1003,7 +1234,8 @@ async function isWindowsXboxAppRunning(/** @type {any} */ options = {}) {
     try {
       const out = await options.getProcessListOutput();
       return /\bXboxPcApp\.exe\b/i.test(String(out || ''));
-    } catch {
+    } catch (procErr) {
+      diagLog.warn('isWindowsXboxAppRunning.getProcessListError', procErr);
       return false;
     }
   }
@@ -1014,14 +1246,18 @@ async function isWindowsXboxAppRunning(/** @type {any} */ options = {}) {
   return new Promise((resolve) => {
     try {
       execFileImpl(
-        'tasklist.exe',
+        resolveWindowsSystemBinary('tasklist', options),
         ['/FI', 'IMAGENAME eq XboxPcApp.exe', '/NH'],
         { timeout: 2000, windowsHide: true },
         (/** @type {any} */ err, /** @type {any} */ stdout) => {
+          if (err) {
+            diagLog.debug('isWindowsXboxAppRunning.tasklistError', err);
+          }
           resolve(!err && /\bXboxPcApp\.exe\b/i.test(String(stdout || '')));
         }
       );
-    } catch {
+    } catch (syncErr) {
+      diagLog.warn('isWindowsXboxAppRunning.tasklistSpawnError', syncErr);
       resolve(false);
     }
   });
@@ -1043,7 +1279,7 @@ async function activateWindowsXboxApplication(
   return new Promise((resolve) => {
     try {
       execFileImpl(
-        'powershell.exe',
+        resolveWindowsSystemBinary('powershell', options),
         ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_AUMID_ACTIVATE_PS_SCRIPT],
         {
           timeout: 12000,
@@ -1055,21 +1291,47 @@ async function activateWindowsXboxApplication(
           },
         },
         (/** @type {any} */ err, /** @type {any} */ stdout, /** @type {any} */ stderr) => {
+          const outStr = String(stdout || '').trim();
+          const errStr = String(stderr || '').trim();
+          const hrMatch = /HRESULT\s*=\s*(0x[0-9a-f]{8})/i.exec(`${errStr}\n${err?.message || ''}`);
+          const hresult = hrMatch ? `0x${hrMatch[1].slice(2).toUpperCase()}` : undefined;
+
           if (err) {
+            const detail = String(errStr || err.message || 'aumid_activation_failed').trim();
+            diagLog.warn('activateWindowsXboxApplication.failed', detail, {
+              aumid: cleanAumid,
+              ...(hresult ? { hresult } : {}),
+            });
             resolve({
               activated: false,
               pid: 0,
-              error: String(stderr || err.message || 'aumid_activation_failed').trim(),
+              error: detail,
+              ...(hresult ? { hresult } : {}),
             });
             return;
           }
-          const m = /(\d+)/.exec(String(stdout || '').trim());
+          const m = /(\d+)/.exec(outStr);
           const pid = m ? Number(m[1]) : 0;
-          resolve({ activated: pid > 0, pid });
+          if (pid <= 0) {
+            const detail = errStr || 'aumid_activation_returned_zero_pid';
+            diagLog.warn('activateWindowsXboxApplication.zeroPid', detail, {
+              aumid: cleanAumid,
+              ...(hresult ? { hresult } : {}),
+            });
+            resolve({
+              activated: false,
+              pid: 0,
+              error: detail,
+              ...(hresult ? { hresult } : {}),
+            });
+            return;
+          }
+          resolve({ activated: true, pid });
         }
       );
     } catch (/** @type {any} */ syncErr) {
-      resolve({ activated: false, pid: 0, error: syncErr.message });
+      diagLog.warn('activateWindowsXboxApplication.spawnError', syncErr, { aumid: cleanAumid });
+      resolve({ activated: false, pid: 0, error: String(syncErr?.message || syncErr) });
     }
   });
 }
@@ -1078,9 +1340,20 @@ function resolveXboxClientBinaryPath(/** @type {any} */ options = {}) {
   const platform = options.platform || process.platform;
   if (platform !== 'win32') return null;
 
+  const isExistingRegularFile = (/** @type {string} */ candidatePath) => {
+    try {
+      return fs.statSync(candidatePath).isFile();
+    } catch (/** @type {any} */ statErr) {
+      if (statErr?.code !== 'ENOENT') {
+        diagLog.debug('resolveXboxClientBinaryPath.statError', statErr, { candidatePath });
+      }
+      return false;
+    }
+  };
+
   if (typeof options.xboxClientBinaryPath === 'string' && options.xboxClientBinaryPath.trim()) {
     const custom = options.xboxClientBinaryPath.trim();
-    return fs.existsSync(custom) ? custom : null;
+    return isExistingRegularFile(custom) ? custom : null;
   }
 
   const homedir = options.homedir || os.homedir();
@@ -1099,14 +1372,11 @@ function resolveXboxClientBinaryPath(/** @type {any} */ options = {}) {
       'Microsoft.GamingApp_8wekyb3d8bbwe',
       'XboxPcApp.exe'
     ),
-    path.join(localAppData, 'Packages', 'Microsoft.GamingApp_8wekyb3d8bbwe'),
   ];
   for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate)) {
-        return candidate;
-      }
-    } catch {}
+    if (isExistingRegularFile(candidate)) {
+      return candidate;
+    }
   }
   return null;
 }
@@ -1139,8 +1409,8 @@ function findAppxManifestFileInInstallDir(installDir) {
 /**
  * Checks whether a Windows Xbox package is registered with OS `GamingServices` / Appx, and when
  * `GamingServices` IS installed on Windows but a loose MSIXVC extraction has an `AppxManifest.xml`
- * that isn't registered yet, attempts non-admin `Add-AppxPackage -Register "<AppxManifest.xml>"`
- * so native `GamingServices` owns runtime & `wgs` cloud saves cleanly without app-local bridge DLLs.
+ * that isn't registered yet, attempts non-admin `Add-AppxPackage -Register` via `$env:OL_APPX_MANIFEST`
+ * and strictly fail-closed post-registration verification.
  *
  * @param {{ installDir?: string, identityName?: string, packageFamilyName?: string, manifestPath?: string }} [targetInfo]
  * @param {any} [options]
@@ -1221,7 +1491,7 @@ async function ensureWindowsXboxAppxRegisteredAsync(targetInfo = {}, options = {
     }
   }
 
-  if (!manifestPath || !fs.existsSync(manifestPath)) {
+  if (!manifestPath || /[\x00-\x1f\x7f]/.test(manifestPath) || !fs.existsSync(manifestPath)) {
     return {
       gamingServicesInstalled: true,
       registered: false,
@@ -1247,6 +1517,7 @@ async function ensureWindowsXboxAppxRegisteredAsync(targetInfo = {}, options = {
         error: customRes?.error || null,
       };
     } catch (/** @type {any} */ customErr) {
+      diagLog.warn('ensureWindowsXboxAppxRegisteredAsync.customRegisterError', customErr);
       return {
         gamingServicesInstalled: true,
         registered: false,
@@ -1259,25 +1530,27 @@ async function ensureWindowsXboxAppxRegisteredAsync(targetInfo = {}, options = {
   }
 
   const execFileImpl = options.execFileImpl || options.execFileFn || execFile;
-  const registerPsCmd =
-    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
-    "$ErrorActionPreference = 'Stop'; " +
-    'Add-AppxPackage -Register -LiteralPath $env:OL_APPX_MANIFEST -DisableDevelopmentMode -ErrorAction Stop';
 
   const regOutcome = await new Promise((resolve) => {
     try {
       execFileImpl(
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-Command', registerPsCmd],
+        resolveWindowsSystemBinary('powershell', options),
+        ['-NoProfile', '-NonInteractive', '-Command', REGISTER_APPX_MANIFEST_PS_SCRIPT],
         {
           timeout: Number(options.registerTimeoutMs || 25000),
           windowsHide: true,
           env: {
             ...process.env,
             OL_APPX_MANIFEST: manifestPath,
+            OL_PACKAGE_PATH: manifestPath,
           },
         },
         (/** @type {any} */ err, /** @type {any} */ stdout, /** @type {any} */ stderr) => {
+          if (err) {
+            diagLog.warn('ensureWindowsXboxAppxRegisteredAsync.addAppxError', err, {
+              stderr: String(stderr || '').trim(),
+            });
+          }
           resolve({
             ok: !err,
             stdout: String(stdout || '').trim(),
@@ -1287,6 +1560,7 @@ async function ensureWindowsXboxAppxRegisteredAsync(targetInfo = {}, options = {
         }
       );
     } catch (/** @type {any} */ syncErr) {
+      diagLog.warn('ensureWindowsXboxAppxRegisteredAsync.addAppxSpawnError', syncErr);
       resolve({
         ok: false,
         stdout: '',
@@ -1307,6 +1581,8 @@ async function ensureWindowsXboxAppxRegisteredAsync(targetInfo = {}, options = {
     };
   }
 
+  // Strictly FAIL-CLOSED post-register verification: only return `registered: true`
+  // when targeted query positively confirms the package is now registered!
   if (identityName || pfn) {
     const verified = await queryTargetedAppxPackageAsync(
       { identityName, packageFamilyName: pfn },
@@ -1322,15 +1598,23 @@ async function ensureWindowsXboxAppxRegisteredAsync(targetInfo = {}, options = {
         error: null,
       };
     }
+    return {
+      gamingServicesInstalled: true,
+      registered: false,
+      attemptedRegister: true,
+      manifestPath,
+      pkg: null,
+      error: verified.error || 'appx_post_register_verification_failed',
+    };
   }
 
   return {
     gamingServicesInstalled: true,
-    registered: true,
+    registered: false,
     attemptedRegister: true,
     manifestPath,
     pkg: null,
-    error: null,
+    error: 'appx_post_register_identity_unavailable',
   };
 }
 
