@@ -388,8 +388,7 @@ function buildSyntheticEncryptedNtfsOnlyXvd(options: {
   hdr.writeUInt32LE(3, 0x20c);
   hdr.writeBigUInt64LE(BigInt(driveSize), 0x218);
   msixvcXvdParser.writeGuidLE(vduidGuid, hdr, 0x220);
-  // Non-zero `topHashBlockHash` at 0x240..0x260 activates strict L0 SHA-256 page verification
-  crypto.createHash('sha256').update('synthetic-top-hash-block').digest().copy(hdr, 0x240);
+  // Real SHA-256 `topHashBlockHash` is computed into 0x240..0x260 after L0 hash entries are populated below
   hdr.writeUInt32LE(0, 0x280); // Fixed XVD
   hdr.writeUInt32LE(userDataBuf.length, 0x28c);
   hdr.writeUInt32LE(xvcDataLength, 0x290);
@@ -541,6 +540,13 @@ function buildSyntheticEncryptedNtfsOnlyXvd(options: {
     l0Hash20.copy(container, entryByteOff);
     container.writeUInt32LE(dataUnit, entryByteOff + 20);
   }
+
+  // Compute authentic XVD Merkle root (`header.topHashBlockHash` at 0x240..0x260) over the populated top hash block
+  const topHashBlock = container.subarray(
+    layout.hashTree.level0ByteOffset,
+    layout.hashTree.level0ByteOffset + msixvcXvdParser.XVD_PAGE_SIZE
+  );
+  crypto.createHash('sha256').update(topHashBlock).digest().copy(container, 0x240);
 
   return {
     container,

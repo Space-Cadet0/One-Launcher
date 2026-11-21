@@ -1,3 +1,4 @@
+// @ts-check
 'use strict';
 
 /**
@@ -11,6 +12,7 @@
  */
 
 const crypto = require('node:crypto');
+const path = require('node:path');
 
 const APPX_BASE32_ALPHABET = '0123456789abcdefghjkmnpqrstvwxyz';
 
@@ -32,12 +34,40 @@ const HELPER_EXE_BASENAMES = new Set([
   'touchup.exe',
 ]);
 
+/**
+ * Normalizes a container-relative POSIX path, rejecting NUL/control characters, Windows drive-letter
+ * prefixes, and any `..` traversal segments both before and after `path.posix.normalize`.
+ *
+ * @param {unknown} rawPath
+ * @returns {string}
+ */
 function normalizeContainerRelPath(rawPath) {
-  return String(rawPath || '')
-    .replace(/\\/g, '/')
+  const raw = String(rawPath || '').trim();
+  if (!raw || /[\x00-\x1f\x7f]/.test(raw)) return '';
+  const slashed = raw.replace(/\\/g, '/');
+  if (/^[a-zA-Z]:/.test(slashed)) return '';
+  const stripped = slashed.replace(/^\/+/, '').replace(/\/+/g, '/');
+  if (!stripped) return '';
+  if (stripped.split('/').some((seg) => seg === '..')) return '';
+  const normalized = path.posix
+    .normalize(stripped)
     .replace(/^\/+/, '')
-    .replace(/\/+/g, '/')
-    .trim();
+    .replace(/\/+$/, '');
+  if (!normalized || normalized === '.') return '';
+  if (normalized.split('/').some((seg) => !seg || seg === '.' || seg === '..')) {
+    return '';
+  }
+  return normalized;
+}
+
+/**
+ * Escapes all RegExp metacharacters in a literal string for safe dynamic `new RegExp(...)` usage.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
@@ -54,6 +84,7 @@ function stripXmlComments(xml) {
 /**
  * Decodes XML character entities (`&lt;`, `&gt;`, `&quot;`, `&apos;`, `&amp;`, `&#DEC;`, `&#xHEX;`)
  * in a single pass so sequences like `&amp;lt;` become `&lt;` without double-unescaping.
+ * Strictly validates numeric codepoints (`0x01 <= cp <= 0x10FFFF`, excluding UTF-16 surrogates).
  *
  * @param {string} raw
  * @returns {string}
@@ -62,12 +93,12 @@ function decodeXmlEntities(raw) {
   const str = String(raw || '');
   if (!str.includes('&')) return str;
   return str.replace(
-    /&(?:#x([0-9a-fA-F]{1,6})|#(\d{1,7})|(lt|gt|quot|apos|amp));/gi,
+    /&(?:#x([0-9a-fA-F]{1,8})|#(\d{1,10})|(lt|gt|quot|apos|amp));/gi,
     (full, hexCp, decCp, named) => {
       if (hexCp !== undefined || decCp !== undefined) {
         const cp = hexCp !== undefined ? parseInt(hexCp, 16) : parseInt(decCp, 10);
         if (
-          Number.isInteger(cp) &&
+          Number.isSafeInteger(cp) &&
           cp >= 0x01 &&
           cp <= 0x10ffff &&
           !(cp >= 0xd800 && cp <= 0xdfff)
@@ -98,17 +129,33 @@ function decodeXmlEntities(raw) {
   );
 }
 
+/**
+ * @param {string} tagText
+ * @param {string} attrName
+ * @returns {string}
+ */
 function extractXmlAttr(tagText, attrName) {
-  const re = new RegExp(`\\b${attrName}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, 'i');
-  const m = re.exec(tagText);
+  const cleanAttr = String(attrName || '').trim();
+  if (!cleanAttr) return '';
+  const escapedAttr = escapeRegExp(cleanAttr);
+  const re = new RegExp(`(?:^|[\\s<"'])${escapedAttr}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, 'i');
+  const m = re.exec(String(tagText || ''));
   if (!m) return '';
   const rawVal = m[1] !== undefined ? m[1] : m[2] || '';
   return decodeXmlEntities(rawVal).trim();
 }
 
+/**
+ * @param {string} xml
+ * @param {string} tagName
+ * @returns {string}
+ */
 function extractXmlTagText(xml, tagName) {
-  const re = new RegExp(`<${tagName}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tagName}>`, 'i');
-  const m = re.exec(xml);
+  const cleanTag = String(tagName || '').trim();
+  if (!cleanTag) return '';
+  const escapedTag = escapeRegExp(cleanTag);
+  const re = new RegExp(`<${escapedTag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escapedTag}>`, 'i');
+  const m = re.exec(String(xml || ''));
   return m ? decodeXmlEntities(m[1]).trim() : '';
 }
 
@@ -431,6 +478,7 @@ function parseMicrosoftGameConfigXml(xmlInput) {
     const rawExeName = extractXmlAttr(attrs, 'Name');
     if (!rawExeName) continue;
     const normExePath = normalizeContainerRelPath(rawExeName);
+    if (!normExePath) continue;
     const deviceFamily = extractXmlAttr(attrs, 'TargetDeviceFamily');
     if (/^(?:XboxOne|Scarlett|Console)$/i.test(deviceFamily)) continue;
 
@@ -442,7 +490,7 @@ function parseMicrosoftGameConfigXml(xmlInput) {
       : '';
     const alias = extractXmlAttr(attrs, 'Alias') || undefined;
 
-    const baseName = normExePath.split('/').pop().toLowerCase();
+    const baseName = (normExePath.split('/').pop() || '').toLowerCase();
     executables.push({
       name: normExePath,
       id: extractXmlAttr(attrs, 'Id'),
