@@ -128,18 +128,50 @@ export function useManualLibrarySyncActions({
     trophySyncInFlightRef.current = true;
     setIsSyncingTrophies(true);
     showSyncNotice(
-      'Syncing trophies & achievements across Steam, GOG.com, Epic Games Store, and Xbox...'
+      'Syncing trophies & achievements across Steam, GOG.com, Epic Games Store, and Xbox...',
+      4000
     );
 
+    let unsubscribeTrophyCancel: (() => void) | null = null;
+    let announcedCancellation = false;
     try {
-      await runStorefrontTrophySync({
+      const { syncJobManager } = await import('../services/network/syncJobManager');
+      const priorJobId = syncJobManager.getState()?.id ?? null;
+      unsubscribeTrophyCancel = syncJobManager.subscribe((jobState) => {
+        if (
+          !announcedCancellation &&
+          jobState &&
+          jobState.type === 'achievements' &&
+          jobState.id !== priorJobId &&
+          jobState.status === 'cancelled'
+        ) {
+          announcedCancellation = true;
+          if (isMountedRef.current) {
+            showSyncNotice('Trophy sync cancelled.', 4000);
+          }
+        }
+      });
+
+      const result = await runStorefrontTrophySync({
         gamesRef,
         setGames,
         setGameRefreshKey,
         onCatalogPersisted,
-        showSyncNotice,
+        showSyncNotice: (message, durationMs, tone) => {
+          // If cancellation was already announced immediately when the user clicked Cancel,
+          // avoid flashing a duplicate completion/cancellation notice once the runner winds down.
+          if (announcedCancellation && message) {
+            return;
+          }
+          showSyncNotice(message, durationMs, tone);
+        },
         isMountedRef,
       });
+
+      if (result?.cancelled && !announcedCancellation && isMountedRef.current) {
+        announcedCancellation = true;
+        showSyncNotice('Trophy sync cancelled.', 4000);
+      }
     } catch (err: unknown) {
       if (isMountedRef.current) {
         showSyncNotice(
@@ -148,6 +180,10 @@ export function useManualLibrarySyncActions({
         );
       }
     } finally {
+      if (unsubscribeTrophyCancel) {
+        unsubscribeTrophyCancel();
+        unsubscribeTrophyCancel = null;
+      }
       trophySyncInFlightRef.current = false;
       if (isMountedRef.current) {
         setIsSyncingTrophies(false);
@@ -270,25 +306,52 @@ export function useManualLibrarySyncActions({
     const updatedGameIds = new Set<string>();
     try {
       const { syncJobManager } = await import('../services/network/syncJobManager');
-      await syncJobManager.startStoreMediaSync(
-        gamesRef.current,
-        (updatedGame) => {
-          if (!isMountedRef.current) return;
-          updatedGameIds.add(updatedGame.id);
-          pendingMediaUpdates.set(updatedGame.id, updatedGame);
-          if (isVitest) {
-            flushMediaBatch();
-          } else if (mediaFlushTimerRef.current === null) {
-            mediaFlushTimerRef.current = setTimeout(flushMediaBatch, 350);
-          }
-        },
-        { isManualSync: true }
-      );
+      const priorJobId = syncJobManager.getState()?.id ?? null;
+      let mediaSyncCancelled = false;
+      const unsubscribeMediaCancel = syncJobManager.subscribe((jobState) => {
+        if (
+          jobState &&
+          jobState.type === 'store_media' &&
+          jobState.id !== priorJobId &&
+          jobState.status === 'cancelled'
+        ) {
+          mediaSyncCancelled = true;
+        }
+      });
+      try {
+        await syncJobManager.startStoreMediaSync(
+          gamesRef.current,
+          (updatedGame) => {
+            if (!isMountedRef.current) return;
+            updatedGameIds.add(updatedGame.id);
+            pendingMediaUpdates.set(updatedGame.id, updatedGame);
+            if (isVitest) {
+              flushMediaBatch();
+            } else if (mediaFlushTimerRef.current === null) {
+              mediaFlushTimerRef.current = setTimeout(flushMediaBatch, 350);
+            }
+          },
+          { isManualSync: true }
+        );
+      } finally {
+        unsubscribeMediaCancel();
+      }
+      const latestMediaJob = syncJobManager.getState();
+      if (
+        latestMediaJob &&
+        latestMediaJob.type === 'store_media' &&
+        latestMediaJob.id !== priorJobId &&
+        latestMediaJob.status === 'cancelled'
+      ) {
+        mediaSyncCancelled = true;
+      }
       clearPendingMediaFlushTimer();
       flushMediaBatch();
       if (isMountedRef.current) {
         const updatedCount = updatedGameIds.size;
-        if (updatedCount > 0) {
+        if (mediaSyncCancelled) {
+          showSyncNotice('Store media sync cancelled.', 4000);
+        } else if (updatedCount > 0) {
           showSyncNotice(
             `Store media sync complete! Updated ${updatedCount} ${updatedCount === 1 ? 'title' : 'titles'} (trailers, screenshots, descriptions & specs).`,
             5000
@@ -329,10 +392,35 @@ export function useManualLibrarySyncActions({
 
     try {
       const { syncJobManager } = await import('../services/network/syncJobManager');
-      await syncJobManager.startCriticScoreSync(gamesRef.current, {
-        forceRefresh: true,
-        isBackgroundWarmup: false,
+      const priorJobId = syncJobManager.getState()?.id ?? null;
+      let scoresSyncCancelled = false;
+      const unsubscribeScoresCancel = syncJobManager.subscribe((jobState) => {
+        if (
+          jobState &&
+          jobState.type === 'critic_scores' &&
+          jobState.id !== priorJobId &&
+          jobState.status === 'cancelled'
+        ) {
+          scoresSyncCancelled = true;
+        }
       });
+      try {
+        await syncJobManager.startCriticScoreSync(gamesRef.current, {
+          forceRefresh: true,
+          isBackgroundWarmup: false,
+        });
+      } finally {
+        unsubscribeScoresCancel();
+      }
+      const latestScoreJob = syncJobManager.getState();
+      if (
+        latestScoreJob &&
+        latestScoreJob.type === 'critic_scores' &&
+        latestScoreJob.id !== priorJobId &&
+        latestScoreJob.status === 'cancelled'
+      ) {
+        scoresSyncCancelled = true;
+      }
 
       if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
         window.dispatchEvent(
@@ -343,7 +431,12 @@ export function useManualLibrarySyncActions({
       }
 
       if (isMountedRef.current) {
-        showSyncNotice('Critic scores refreshed across your library.', 5000);
+        showSyncNotice(
+          scoresSyncCancelled
+            ? 'Critic score refresh cancelled.'
+            : 'Critic scores refreshed across your library.',
+          scoresSyncCancelled ? 4000 : 5000
+        );
       }
     } catch (err: unknown) {
       console.warn('Score refresh error:', err);

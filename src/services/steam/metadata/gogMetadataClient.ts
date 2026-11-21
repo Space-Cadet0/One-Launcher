@@ -87,6 +87,15 @@ export interface GogMetadataFetchOptions {
   synopsisOnly?: boolean;
 }
 
+export function sanitizeGogCatalogLikeQuery(raw: string): string {
+  return String(raw || '')
+    .replace(/^like:/i, '')
+    .replace(/[™®©]/g, '')
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function mapGogScreenshots(rawShots: GogRawScreenshot[]): SteamScreenshot[] {
   return rawShots
     .map((s: GogRawScreenshot, idx: number) => {
@@ -298,10 +307,10 @@ export async function fetchGogProductMetadata(
           : undefined;
 
       let catProd: GogCatalogProduct | null = null;
-      if (lookupTitle || purchaseSlug) {
+      const sanitizedCatalogQuery = sanitizeGogCatalogLikeQuery(lookupTitle || purchaseSlug || '');
+      if (sanitizedCatalogQuery) {
         try {
-          const q = (lookupTitle || purchaseSlug || '').replace(/^like:/i, '').trim();
-          const likeParam = encodeURIComponent(`like:${q}`);
+          const likeParam = encodeURIComponent(`like:${sanitizedCatalogQuery}`);
           const catUrl = `${gogCatalogBaseUrl}/v1/catalog?query=${likeParam}&limit=5&productType=in:game,pack`;
           const catRes = await requestScheduler.schedule(
             `https://catalog.gog.com/v1/catalog?query=${likeParam}&limit=5&productType=in:game,pack`,

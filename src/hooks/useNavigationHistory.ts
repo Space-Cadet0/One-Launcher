@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { ActiveGameFilter } from '../contracts/filter';
+import type { ActiveGameFilter, LibraryFilterState } from '../contracts/filter';
 
 export interface NavHistoryEntry {
   id: string;
@@ -9,6 +9,16 @@ export interface NavHistoryEntry {
   activeGroupId: string | null;
   title: string;
   scrollY?: number;
+  libraryFilterState?: LibraryFilterState;
+}
+
+function areLibraryFilterStatesEqual(
+  a?: LibraryFilterState,
+  b?: LibraryFilterState
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 interface HistoryState {
@@ -123,7 +133,8 @@ export function useNavigationHistory(
         current.selectedGameId === entry.selectedGameId &&
         current.activeGroupId === entry.activeGroupId &&
         current.activeFilter?.type === entry.activeFilter?.type &&
-        current.activeFilter?.value === entry.activeFilter?.value
+        current.activeFilter?.value === entry.activeFilter?.value &&
+        areLibraryFilterStatesEqual(current.libraryFilterState, entry.libraryFilterState)
       ) {
         return;
       }
@@ -261,6 +272,28 @@ export function useNavigationHistory(
     };
   }, [canGoBack, canGoForward, goBack, goForward]);
 
+  const updateCurrentEntry = useCallback(
+    (
+      patch: Partial<Pick<NavHistoryEntry, 'libraryFilterState' | 'activeFilter' | 'title'>>
+    ) => {
+      const prev = historyStateRef.current;
+      const current = prev.entries[prev.index];
+      if (!current) return;
+      const updatedEntries = [...prev.entries];
+      updatedEntries[prev.index] = {
+        ...current,
+        ...patch,
+      };
+      const nextState: HistoryState = {
+        entries: updatedEntries,
+        index: prev.index,
+      };
+      historyStateRef.current = nextState;
+      setHistoryState(nextState);
+    },
+    []
+  );
+
   const getLastAllGamesScrollY = useCallback(() => {
     return lastAllGamesScrollY.current;
   }, []);
@@ -272,6 +305,7 @@ export function useNavigationHistory(
     canGoForward,
     forwardTitle,
     pushEntry,
+    updateCurrentEntry,
     goBack,
     goForward,
     saveCurrentScroll,

@@ -32,6 +32,10 @@ export interface RunStorefrontTrophySyncParams {
   isMountedRef: MutableRefObject<boolean>;
 }
 
+export interface RunStorefrontTrophySyncResult {
+  cancelled: boolean;
+}
+
 /**
  * Runs dedicated cross-storefront trophy synchronization via `syncJobManager.startTrophySync(...)`
  * directly — intentionally NOT wrapped in `beginPriorityScope` so `startTrophySync` never
@@ -44,7 +48,7 @@ export async function runStorefrontTrophySync({
   onCatalogPersisted,
   showSyncNotice,
   isMountedRef,
-}: RunStorefrontTrophySyncParams): Promise<void> {
+}: RunStorefrontTrophySyncParams): Promise<RunStorefrontTrophySyncResult> {
   const [
     { syncJobManager },
     { steamAchievementsService },
@@ -66,6 +70,7 @@ export async function runStorefrontTrophySync({
   const gogAchs: Record<string, CachedAchievementEntry> = {};
   const epicAchs: Record<string, CachedAchievementEntry> = {};
   const xboxAchs: Record<string, CachedAchievementEntry> = {};
+  let wasCancelled = false;
 
   await syncJobManager.startTrophySync(5, async (updateProgress, checkCancelled) => {
     updateProgress(0, 5, 'Scanning Local Steam Trophy Cache');
@@ -76,7 +81,10 @@ export async function runStorefrontTrophySync({
         cacheUserSteamAchievements(steamAchs);
       }
     } catch {}
-    if (checkCancelled()) return;
+    if (checkCancelled()) {
+      wasCancelled = true;
+      return;
+    }
 
     updateProgress(1, 5, 'Syncing Steam Cloud Achievements');
     try {
@@ -134,7 +142,10 @@ export async function runStorefrontTrophySync({
     } catch (err) {
       console.warn('Steam trophy sync warning:', err);
     }
-    if (checkCancelled()) return;
+    if (checkCancelled()) {
+      wasCancelled = true;
+      return;
+    }
 
     updateProgress(2, 5, 'Syncing GOG Galaxy Achievements');
     try {
@@ -160,7 +171,10 @@ export async function runStorefrontTrophySync({
     } catch (err) {
       console.warn('GOG trophy sync warning:', err);
     }
-    if (checkCancelled()) return;
+    if (checkCancelled()) {
+      wasCancelled = true;
+      return;
+    }
 
     updateProgress(3, 5, 'Syncing Epic Games Store Trophies');
     try {
@@ -181,7 +195,10 @@ export async function runStorefrontTrophySync({
     } catch (err) {
       console.warn('Epic trophy sync warning:', err);
     }
-    if (checkCancelled()) return;
+    if (checkCancelled()) {
+      wasCancelled = true;
+      return;
+    }
 
     updateProgress(4, 5, 'Syncing Xbox Live Achievements & Gamerscore');
     try {
@@ -214,9 +231,21 @@ export async function runStorefrontTrophySync({
     } catch (err) {
       console.warn('Xbox trophy sync warning:', err);
     }
+    if (checkCancelled()) {
+      wasCancelled = true;
+      return;
+    }
 
     updateProgress(5, 5, 'Reconciling Storefront Trophies');
   });
+
+  if (
+    !wasCancelled &&
+    syncJobManager.getState()?.type === 'achievements' &&
+    syncJobManager.getState()?.status === 'cancelled'
+  ) {
+    wasCancelled = true;
+  }
 
   if (onlineLifecycleManager.isOnline()) {
     achievementDetailService.clearCache();
@@ -272,9 +301,15 @@ export async function runStorefrontTrophySync({
 
   if (isMountedRef.current) {
     setGameRefreshKey((k) => k + 1);
-    showSyncNotice(
-      `Trophies synced across Steam, GOG, Epic & Xbox! (${gamesWithTrophies} titles with achievement data updated)`,
-      5000
-    );
+    if (wasCancelled) {
+      showSyncNotice('Trophy sync cancelled.', 4000);
+    } else {
+      showSyncNotice(
+        `Trophies synced across Steam, GOG, Epic & Xbox! (${gamesWithTrophies} titles with achievement data updated)`,
+        5000
+      );
+    }
   }
+
+  return { cancelled: wasCancelled };
 }

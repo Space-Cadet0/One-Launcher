@@ -26,6 +26,8 @@ import {
   extractXboxBigId,
   buildCandidateStoreUrl,
   cleanSearchQuery,
+  extractReleaseYear,
+  sanitizeGogCatalogLikeQuery,
   isNonGameAddonTitle,
   getSteamHeaderUrl,
   resolveSteamCandidateCapsuleUrl,
@@ -222,7 +224,7 @@ async function searchGogStorefront(
               title: entry.title,
               gogId: entry.slug || id,
             }),
-            year: entry.releaseDate ? entry.releaseDate.substring(0, 4) : undefined,
+            year: extractReleaseYear(entry.releaseDate),
             capsuleImage: entry.coverVertical || entry.coverHorizontal,
             headerImage: entry.coverHorizontal || entry.coverVertical,
             description: entry.shortDescription || entry.aboutTheGame,
@@ -232,22 +234,26 @@ async function searchGogStorefront(
       }
     }
 
-    // Live GOG Catalog API search with GOG v1 `like:` filter syntax + 0-match recommendation guard
-    const cleanGogLike = rawQuery.replace(/^like:/i, '').trim();
-    const gogCatalogUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(`like:${cleanGogLike}`)}&limit=20&productType=in:game,pack`;
-    const gogRes = await requestScheduler.schedule(
-      gogCatalogUrl,
-      () =>
-        fetch(gogCatalogUrl, {
-          headers: { Accept: 'application/json' },
-          signal:
-            typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
-              ? AbortSignal.timeout(4000)
-              : undefined,
-        }),
-      Priority.P0_INTERACTIVE,
-      'catalog.gog.com'
-    );
+    // Live GOG Catalog API search with GOG v1 `like:` filter syntax + punctuation sanitization + 0-match recommendation guard
+    const cleanGogLike = sanitizeGogCatalogLikeQuery(rawQuery);
+    const gogCatalogUrl = cleanGogLike
+      ? `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(`like:${cleanGogLike}`)}&limit=20&productType=in:game,pack`
+      : '';
+    const gogRes = gogCatalogUrl
+      ? await requestScheduler.schedule(
+          gogCatalogUrl,
+          () =>
+            fetch(gogCatalogUrl, {
+              headers: { Accept: 'application/json' },
+              signal:
+                typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
+                  ? AbortSignal.timeout(4000)
+                  : undefined,
+            }),
+          Priority.P0_INTERACTIVE,
+          'catalog.gog.com'
+        )
+      : null;
     if (gogRes && gogRes.ok) {
       const gogJson = (await gogRes.json()) as {
         productCount?: number;
@@ -295,7 +301,7 @@ async function searchGogStorefront(
               title: prod.title,
               gogId: prod.slug || prod.id,
             }),
-          year: prod.releaseDate ? String(prod.releaseDate).slice(0, 4) : undefined,
+          year: extractReleaseYear(prod.releaseDate),
           capsuleImage: prod.coverVertical || prod.coverHorizontal,
           headerImage: prod.coverHorizontal || prod.coverVertical,
           confidenceScore: Math.min(100, score),
@@ -425,7 +431,7 @@ async function searchXboxStorefront(
                 title: prodTitle,
                 xboxProductId: resolvedProdBigId,
               }),
-            year: sanitizedDate ? sanitizedDate.slice(0, 4) : undefined,
+            year: extractReleaseYear(sanitizedDate || prod.releaseDate),
             capsuleImage:
               prod.capsuleImage ||
               prod.posterUrl ||

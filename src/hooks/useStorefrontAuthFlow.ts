@@ -623,6 +623,15 @@ export function useStorefrontAuthFlow({
         }
       }
 
+      const targetIntegration =
+        integrations.find((i) => i.storefrontId === storefrontId) || currentIntegration;
+      const savedSteamId =
+        storefrontId === 'steam'
+          ? targetIntegration?.credentials?.steamId || targetIntegration?.accountId || undefined
+          : undefined;
+      const resolvedSteamId =
+        storefrontId === 'steam' ? steamInput.trim() || savedSteamId : undefined;
+
       const manualCredsPayload: StorefrontCredentialsInput = {};
       if (storefrontId === 'steam') {
         if (steamInput.trim()) manualCredsPayload.steamId = steamInput.trim();
@@ -639,10 +648,15 @@ export function useStorefrontAuthFlow({
         manualCredsPayload.forceRefresh = true;
       }
       const hasManualCreds = Object.keys(manualCredsPayload).length > 0;
+      const ipcSyncPayload: StorefrontCredentialsInput | undefined = hasManualCreds
+        ? manualCredsPayload
+        : storefrontId === 'steam' && resolvedSteamId
+          ? { steamId: resolvedSteamId }
+          : undefined;
 
       try {
-        const res = hasManualCreds
-          ? await window.electronAPI.syncStore(storefrontId, manualCredsPayload)
+        const res = ipcSyncPayload
+          ? await window.electronAPI.syncStore(storefrontId, ipcSyncPayload)
           : await window.electronAPI.syncStore(storefrontId);
         if (res?.success) {
           handleNativeSyncSuccess(storefrontId, {
@@ -652,7 +666,12 @@ export function useStorefrontAuthFlow({
               | undefined,
           });
           return;
-        } else if (res?.error && (!currentIntegration.isConnected || hasManualCreds)) {
+        } else if (
+          res?.error &&
+          (!targetIntegration.isConnected ||
+            hasManualCreds ||
+            (storefrontId === 'steam' && !steamApiKey.trim()))
+        ) {
           setErrorMsg(res.error);
           setIsSubmitting(false);
           return;
@@ -663,6 +682,8 @@ export function useStorefrontAuthFlow({
     }
 
     try {
+      const targetIntegration =
+        integrations.find((i) => i.storefrontId === storefrontId) || currentIntegration;
       let resultGames: CanonicalGame[] = [];
       let accountName = 'Verified User';
 
@@ -674,9 +695,18 @@ export function useStorefrontAuthFlow({
         resultGames = games;
         accountName = integration.accountName || 'GOG Account';
       } else if (storefrontId === 'steam') {
+        const savedSteamApiKey =
+          targetIntegration?.credentials?.apiKey &&
+          targetIntegration.credentials.apiKey !== 'saved_in_electron'
+            ? targetIntegration.credentials.apiKey
+            : undefined;
         const { integration, games } = await connectSteamIntegration({
-          steamId: steamInput.trim() || undefined,
-          apiKey: steamApiKey.trim() || undefined,
+          steamId:
+            steamInput.trim() ||
+            targetIntegration?.credentials?.steamId ||
+            targetIntegration?.accountId ||
+            undefined,
+          apiKey: steamApiKey.trim() || savedSteamApiKey,
         });
         resultGames = games;
         accountName = integration.accountName || 'Steam User';
@@ -816,6 +846,16 @@ export function useStorefrontAuthFlow({
     setErrorMsg(null);
     setSuccessMsg(null);
 
+    const targetIntegration =
+      integrations.find((i) => i.storefrontId === storefrontId) || currentIntegration;
+    const resolvedSteamId =
+      storefrontId === 'steam'
+        ? steamInput.trim() ||
+          targetIntegration?.credentials?.steamId ||
+          targetIntegration?.accountId ||
+          undefined
+        : undefined;
+
     if (
       typeof window !== 'undefined' &&
       window.electronAPI?.isElectron &&
@@ -824,7 +864,7 @@ export function useStorefrontAuthFlow({
       try {
         const credsPayload: StorefrontCredentialsInput = {};
         if (storefrontId === 'steam') {
-          if (steamInput.trim()) credsPayload.steamId = steamInput.trim();
+          if (resolvedSteamId) credsPayload.steamId = resolvedSteamId;
           if (steamApiKey.trim()) credsPayload.steamApiKey = steamApiKey.trim();
         } else if (storefrontId === 'epic' && epicInput.trim()) {
           credsPayload.epicAccountId = epicInput.trim();
@@ -843,6 +883,15 @@ export function useStorefrontAuthFlow({
               | undefined,
           });
           return;
+        } else if (
+          syncRes?.error &&
+          storefrontId === 'steam' &&
+          targetIntegration.isConnected &&
+          !steamApiKey.trim()
+        ) {
+          setErrorMsg(syncRes.error);
+          setIsSubmitting(false);
+          return;
         }
       } catch {
         // Fall through to renderer quick connect fallback
@@ -852,9 +901,14 @@ export function useStorefrontAuthFlow({
     try {
       let resultGames: CanonicalGame[] = [];
       if (storefrontId === 'steam') {
+        const savedSteamApiKey =
+          targetIntegration?.credentials?.apiKey &&
+          targetIntegration.credentials.apiKey !== 'saved_in_electron'
+            ? targetIntegration.credentials.apiKey
+            : undefined;
         const { games } = await connectSteamIntegration({
-          steamId: steamInput.trim() || undefined,
-          apiKey: steamApiKey.trim() || undefined,
+          steamId: resolvedSteamId,
+          apiKey: steamApiKey.trim() || savedSteamApiKey,
         });
         resultGames = games;
       } else if (storefrontId === 'gog') {

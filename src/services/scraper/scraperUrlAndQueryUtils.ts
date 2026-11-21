@@ -220,6 +220,32 @@ export function buildCandidateStoreUrl(params: {
 }
 
 /**
+ * Extracts a 4-digit release year (`1900`–`2099`) from ISO (`2010-06-03`),
+ * dot-separated (`2010.06.03`), or non-ISO human-readable dates (`3 Jun 2010`,
+ * `Nov 19, 2024`). Returns `undefined` for `TBA` or unparseable dates.
+ */
+export function extractReleaseYear(rawDate?: string | number | null): string | undefined {
+  if (rawDate === null || rawDate === undefined) return undefined;
+  const text = String(rawDate).trim();
+  if (!text) return undefined;
+  const match = text.match(/\b(19\d{2}|20\d{2})\b/);
+  return match ? match[1] : undefined;
+}
+
+/**
+ * Sanitizes a query string for GOG v1 Catalog `query=like:<term>` syntax,
+ * stripping hyphens and punctuation that cause `catalog.gog.com` to return HTTP 400.
+ */
+export function sanitizeGogCatalogLikeQuery(raw: string): string {
+  return String(raw || '')
+    .replace(/^like:/i, '')
+    .replace(/[™®©]/g, '')
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
  * Cleans a user or game search query by stripping punctuation and trademark noise.
  */
 export function cleanSearchQuery(query: string): string {

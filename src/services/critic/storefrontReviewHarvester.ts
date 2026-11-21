@@ -332,6 +332,8 @@ function extractGogPageReviewAnchors(html: string): {
 const STEAM_ENRICHED_ANCHOR_MAP: Record<string, EnrichedSteamAnchorRecord> = steamEnrichedCache;
 const GOG_ENRICHED_ANCHOR_MAP: Record<string, EnrichedGogAnchorRecord> = gogEnrichedCache;
 
+const EPIC_GRAPHQL_400_COOLDOWN_MS = 30 * 60 * 1000;
+
 export class StorefrontReviewHarvester {
   private anchorCache = new Map<string, AnchorCacheEntry>();
   private inFlight = new Map<string, Promise<StorefrontReviewAnchor | null>>();
@@ -339,6 +341,7 @@ export class StorefrontReviewHarvester {
   private transientErrorKeys = new LruSet<string>(MAX_ANCHOR_CACHE_ENTRIES);
   private cacheEpoch = 0;
   private keyEpochs = new Map<string, number>();
+  private epicGraphqlSchemaRejectedUntil = 0;
 
   constructor() {
     try {
@@ -1044,79 +1047,93 @@ export class StorefrontReviewHarvester {
       }
     }`;
 
-      for (const sku of candidateSkus) {
-        try {
-          const gqlUrl = getEpicGraphQLBaseUrl();
-          const res = await requestScheduler.schedule(
-            gqlUrl,
-            () =>
-              fetch(gqlUrl, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  Accept: 'application/json',
-                },
-                body: JSON.stringify({ query: graphqlQuery, variables: { sku } }),
-                signal: createTimeoutSignal(6000),
-              }),
-            Priority.P1_VIEWPORT,
-            'launcher.store.epicgames.com'
-          );
+      if (Date.now() >= this.epicGraphqlSchemaRejectedUntil) {
+        for (const sku of candidateSkus) {
+          try {
+            const gqlUrl = getEpicGraphQLBaseUrl();
+            const res = await requestScheduler.schedule(
+              gqlUrl,
+              () =>
+                fetch(gqlUrl, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json',
+                  },
+                  body: JSON.stringify({
+                    operationName: 'productReviewsQuery',
+                    query: graphqlQuery,
+                    variables: { sku },
+                  }),
+                  signal: createTimeoutSignal(6000),
+                }),
+              Priority.P1_VIEWPORT,
+              'launcher.store.epicgames.com'
+            );
 
-          const isWaf = isWafOrChallengeResponse(res.status, '', res.headers, true);
-          if (!res.ok || isWaf) {
-            if (isWaf || res.status === 429 || res.status >= 500) {
-              sawTransientError = true;
+            const isWaf = isWafOrChallengeResponse(res.status, '', res.headers, true);
+            if (!res.ok || isWaf) {
+              if (res.status === 400) {
+                // Epic Store GraphQL returns HTTP 400 when the ad-hoc `OpenCritic.productReviews`
+                // schema/persisted-query check rejects the request; trip a session cooldown
+                // immediately instead of issuing dozens of repeated 400s across SKUs and games.
+                this.epicGraphqlSchemaRejectedUntil = Date.now() + EPIC_GRAPHQL_400_COOLDOWN_MS;
+                break;
+              }
+              if (isWaf || res.status === 429 || res.status >= 500) {
+                sawTransientError = true;
+              }
+              continue;
             }
-            continue;
-          }
 
-          const rawJson: unknown = await res.json();
-          const rev = (
-            rawJson as {
-              data?: {
-                OpenCritic?: {
-                  productReviews?: {
-                    id?: unknown;
-                    name?: unknown;
-                    openCriticScore?: unknown;
-                    openCriticUrl?: unknown;
+            const rawJson: unknown = await res.json();
+            const rev = (
+              rawJson as {
+                data?: {
+                  OpenCritic?: {
+                    productReviews?: {
+                      id?: unknown;
+                      name?: unknown;
+                      openCriticScore?: unknown;
+                      openCriticUrl?: unknown;
+                    };
                   };
                 };
+              } | null
+            )?.data?.OpenCritic?.productReviews;
+
+            if (
+              rev &&
+              (typeof rev.openCriticScore === 'number' ||
+                typeof rev.openCriticUrl === 'string' ||
+                typeof rev.id === 'number')
+            ) {
+              const ocId = typeof rev.id === 'number' ? rev.id : undefined;
+              const ocScore =
+                typeof rev.openCriticScore === 'number' ? rev.openCriticScore : undefined;
+              const revName = typeof rev.name === 'string' ? rev.name : '';
+              const ocUrl =
+                (typeof rev.openCriticUrl === 'string' && rev.openCriticUrl) ||
+                (ocId
+                  ? `https://opencritic.com/game/${ocId}/${revName ? revName.toLowerCase().replace(/[^a-z0-9]+/g, '-') : 'game'}`
+                  : undefined);
+
+              const storeSlug = sku.replace(/^EPIC_/i, '');
+              const anchor: StorefrontReviewAnchor = {
+                storefront: 'epic',
+                openCriticId: ocId,
+                openCriticScore: ocScore,
+                openCriticUrl: ocUrl,
+                rawStoreUrl: `https://store.epicgames.com/p/${storeSlug}`,
+                isVerifiedGroundTruth: true,
               };
-            } | null
-          )?.data?.OpenCritic?.productReviews;
-
-          if (
-            rev &&
-            (typeof rev.openCriticScore === 'number' ||
-              typeof rev.openCriticUrl === 'string' ||
-              typeof rev.id === 'number')
-          ) {
-            const ocId = typeof rev.id === 'number' ? rev.id : undefined;
-            const ocScore = typeof rev.openCriticScore === 'number' ? rev.openCriticScore : undefined;
-            const revName = typeof rev.name === 'string' ? rev.name : '';
-            const ocUrl =
-              (typeof rev.openCriticUrl === 'string' && rev.openCriticUrl) ||
-              (ocId
-                ? `https://opencritic.com/game/${ocId}/${revName ? revName.toLowerCase().replace(/[^a-z0-9]+/g, '-') : 'game'}`
-                : undefined);
-
-            const storeSlug = sku.replace(/^EPIC_/i, '');
-            const anchor: StorefrontReviewAnchor = {
-              storefront: 'epic',
-              openCriticId: ocId,
-              openCriticScore: ocScore,
-              openCriticUrl: ocUrl,
-              rawStoreUrl: `https://store.epicgames.com/p/${storeSlug}`,
-              isVerifiedGroundTruth: true,
-            };
-            this.setAnchorCacheBounded(cacheKey, anchor, capturedEpoch, capturedKeyEpoch);
-            return anchor;
-          }
-        } catch (err: unknown) {
-          if (classifyNetworkError(err).status === 'transient_error') {
-            sawTransientError = true;
+              this.setAnchorCacheBounded(cacheKey, anchor, capturedEpoch, capturedKeyEpoch);
+              return anchor;
+            }
+          } catch (err: unknown) {
+            if (classifyNetworkError(err).status === 'transient_error') {
+              sawTransientError = true;
+            }
           }
         }
       }
@@ -1552,6 +1569,7 @@ export class StorefrontReviewHarvester {
     this.inFlight.clear();
     this.storeInFlight.clear();
     this.transientErrorKeys.clear();
+    this.epicGraphqlSchemaRejectedUntil = 0;
   }
 }
 
