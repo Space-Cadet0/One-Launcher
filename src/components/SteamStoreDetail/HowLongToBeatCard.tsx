@@ -17,12 +17,14 @@ interface HowLongToBeatCardProps {
   hltb?: HltbData;
 }
 
-export const HowLongToBeatCard: React.FC<HowLongToBeatCardProps> = ({
+const EMPTY_STRINGS: string[] = [];
+
+const HowLongToBeatCardImpl: React.FC<HowLongToBeatCardProps> = ({
   gameId,
   gameTitle,
   appId,
-  genres = [],
-  tags = [],
+  genres = EMPTY_STRINGS,
+  tags = EMPTY_STRINGS,
   hltb: initialHltb,
 }) => {
   const [hltb, setHltb] = useState<HltbData | null>(() =>
@@ -233,3 +235,5 @@ export const HowLongToBeatCard: React.FC<HowLongToBeatCardProps> = ({
     </div>
   );
 };
+
+export const HowLongToBeatCard: React.FC<HowLongToBeatCardProps> = React.memo(HowLongToBeatCardImpl);

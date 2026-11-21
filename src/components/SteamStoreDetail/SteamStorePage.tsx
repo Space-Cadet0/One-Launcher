@@ -1,41 +1,19 @@
 import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 import { CanonicalGame } from '../../contracts/game';
-import { SteamEnrichedMetadata, SteamReviewSummary } from '../../contracts/steam';
-import { CriticScoreData } from '../../contracts/critic';
-import { UserGameOverride } from '../../contracts/override';
+import { SteamEnrichedMetadata } from '../../contracts/steam';
 import { StorefrontId } from '../../contracts/platform';
-import { toOlMediaUrl, unwrapOlMediaUrl } from '../../contracts/network';
+import { toOlMediaUrl } from '../../contracts/network';
 import { getStorefrontDisplayName } from '../Common/StorefrontIcon';
-import { steamApi, SteamStoreBrowseAssets } from '../../services/steam/steamApi';
+import { steamApi } from '../../services/steam/steamApi';
 import { steamMatcher } from '../../services/steam/steamMatcher';
-import { RequestPriority } from '../../services/network/requestScheduler';
-import {
-  fallbackMetadataProvider,
-  isGenericPlaceholderSynopsis,
-  stripHtmlToPlainSynopsis,
-} from '../../services/steam/fallbackMetadataProvider';
+import { isGenericPlaceholderSynopsis } from '../../services/steam/fallbackMetadataProvider';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
 import { onlineLifecycleManager } from '../../services/network/onlineLifecycleManager';
-import { sanitizeSafeDomFragment } from '../../utils/safeHtmlSanitizer';
+import { isModalOverlayOpen } from '../../utils/modalOverlayLock';
 import { MediaGallery, prefersReducedMotion } from './MediaGallery';
 import { SteamHeroDetails } from './SteamHeroDetails';
 import { SteamLibraryActionBar } from './SteamLibraryActionBar';
 import { HowLongToBeatCard } from './HowLongToBeatCard';
-import {
-  getHowLongToBeat,
-  seedHltbFromVaultIfMissing,
-  type HltbData,
-} from '../../services/hltb/howLongToBeat';
-import { criticScoreService } from '../../services/critic/criticScoreService';
-import {
-  getReviewSourceAuthorityRank,
-  normalizeCriticTitleKey,
-  parseVaultCriticScore,
-} from '../../services/critic/criticUtils';
-import {
-  buildVerifiedSteamMetacriticAnchor,
-  resolveGameReviewScore,
-} from '../../services/critic/reviewScoreResolver';
 import { OpenCriticCard } from './OpenCriticCard';
 import { SystemRequirements } from './SystemRequirements';
 import { PlatformBadges } from './PlatformBadges';
@@ -48,12 +26,9 @@ import { SteamLanguagesTable } from './SteamLanguagesTable';
 import { SteamFeaturesList } from './SteamFeaturesList';
 import { SteamSidebarNotices } from './SteamSidebarNotices';
 import { isGameOwnedOnSteam } from '../../services/steam/steamFeatureNormalizer';
-import { steamAchievementsService } from '../../services/steam/steamAchievementsService';
 import {
   getUserOverrideForGame,
   inferMetadataRouteFromOverride,
-  inferReviewRouteFromOverride,
-  updateRoutedMetadataSnapshot,
 } from '../../services/storage/userOverrideStorage';
 import {
   USER_TAG_OVERRIDES_UPDATED_EVENT,
@@ -63,16 +38,30 @@ import {
 } from '../../services/storage/userTagStorage';
 import { resolveEffectiveGameTags } from '../../services/tags/gameTagResolver';
 import type { TagFacetCount } from '../../contracts/tags';
-import {
-  Sparkles,
-  ArrowLeft,
-  AlertCircle,
-  Activity,
-  CheckCircle2,
-} from 'lucide-react';
+import { Sparkles, AlertCircle, Activity, CheckCircle2 } from 'lucide-react';
 import { ActiveGameFilter } from '../../contracts/filter';
 import { GameCollection } from '../../contracts/collection';
 import { launcherService } from '../../services/launcher/launcherService';
+import {
+  EMPTY_MOVIES,
+  EMPTY_SCREENSHOTS,
+  EMPTY_STRINGS,
+  RICH_HTML_DESC_RE,
+  isMicrosoftStoreAssetUrl,
+  isSentinelReleaseDate,
+  isSkeletonMetadata,
+  resolveInitialDetailPlatformId,
+  shouldAcceptCriticUpdateEvent,
+} from './StorePage/steamDetailUtils';
+import { AboutThisGameHtml } from './StorePage/AboutThisGameHtml';
+import { StoreDetailBreadcrumb } from './StorePage/StoreDetailBreadcrumb';
+import { useGameDetailMetadata } from './StorePage/useGameDetailMetadata';
+import { useGameDetailCritic, useVaultCriticAdoption } from './StorePage/useGameDetailCritic';
+
+export { shouldAcceptCriticUpdateEvent };
+
+const MemoMediaGallery = React.memo(MediaGallery);
+const MemoSteamLanguagesTable = React.memo(SteamLanguagesTable);
 
 export interface SteamStorePageProps {
   game: CanonicalGame;
@@ -88,613 +77,6 @@ export interface SteamStorePageProps {
   onFixMatch?: () => void;
   onHideGame?: (game: CanonicalGame, targetPlatformId?: StorefrontId) => void;
   onViewAchievements?: (storefrontId?: StorefrontId) => void;
-}
-
-const RICH_HTML_DESC_RE = /<(video|img|p|h[1-6]|div|ul)\b/i;
-
-function isSkeletonMetadata(meta?: SteamEnrichedMetadata | null): boolean {
-  return Boolean(meta && meta.metadataQuality === 'skeleton_fallback');
-}
-
-function hasRichMetadata(meta?: SteamEnrichedMetadata | null): boolean {
-  return Boolean(
-    meta && meta.metadataQuality !== 'skeleton_fallback' && !meta.__quotaSlimmed
-  );
-}
-
-function isAuthoritativeSteamMetadata(
-  meta?: SteamEnrichedMetadata | null,
-  expectedAppId?: number | null
-): boolean {
-  return (
-    Boolean(meta) &&
-    !meta!.__quotaSlimmed &&
-    Number(meta!.appId) > 0 &&
-    (!expectedAppId || Number(meta!.appId) === Number(expectedAppId)) &&
-    meta!.metadataQuality !== 'storefront_native' &&
-    meta!.metadataQuality !== 'skeleton_fallback' &&
-    meta!.metadataQuality !== 'local_federated' &&
-    meta!.enrichedSource !== 'xbox'
-  );
-}
-
-function isSentinelReleaseDate(raw?: string | null): boolean {
-  if (!raw) return false;
-  const match = raw.match(/\b(\d{4})\b/);
-  if (!match) return false;
-  const year = Number(match[1]);
-  const maxValidYear = new Date().getFullYear() + 10;
-  return Number.isFinite(year) && (year < 1975 || year > maxValidYear);
-}
-
-function isMicrosoftStoreAssetUrl(url?: string | null): boolean {
-  if (!url) return false;
-  try {
-    const normalized = url.trim().startsWith('//') ? `https:${url.trim()}` : url.trim();
-    const unwrapped = normalized.startsWith('ol-media://')
-      ? unwrapOlMediaUrl(normalized)
-      : normalized;
-    const host = new URL(unwrapped).hostname.toLowerCase();
-    return (
-      host === 's-microsoft.com' ||
-      host.endsWith('.s-microsoft.com') ||
-      host === 'xboxlive.com' ||
-      host.endsWith('.xboxlive.com')
-    );
-  } catch {
-    return false;
-  }
-}
-
-function mergePreservingXboxHints(
-  incoming: SteamEnrichedMetadata | null | undefined,
-  baseline?: SteamEnrichedMetadata | null
-): SteamEnrichedMetadata | null {
-  if (!incoming) return null;
-  if (baseline?.xboxDeliveryHints && !incoming.xboxDeliveryHints) {
-    return {
-      ...incoming,
-      xboxDeliveryHints: baseline.xboxDeliveryHints,
-    };
-  }
-  return incoming;
-}
-
-function normalizeProtocolRelativeUrl(raw?: string | null): string {
-  if (!raw) return '';
-  const trimmed = raw.trim();
-  if (trimmed.startsWith('//') && !trimmed.startsWith('///')) {
-    return `https:${trimmed}`;
-  }
-  return trimmed;
-}
-
-function normalizeSrcsetUrls(rawSrcset?: string | null): string {
-  if (!rawSrcset) return '';
-  return rawSrcset
-    .split(',')
-    .map((entry) => {
-      const trimmed = entry.trim();
-      if (!trimmed) return '';
-      const parts = trimmed.split(/\s+/);
-      const normalizedUrl = normalizeProtocolRelativeUrl(parts[0]);
-      if (!normalizedUrl) return '';
-      return parts.length > 1 ? `${normalizedUrl} ${parts.slice(1).join(' ')}` : normalizedUrl;
-    })
-    .filter(Boolean)
-    .join(', ');
-}
-
-interface AboutThisGameHtmlProps {
-  html: string;
-  isOnline: boolean;
-  onlineGeneration: number;
-  gameId: string;
-  steamAppId?: number | string | null;
-  gogId?: string | null;
-  epicAppName?: string | null;
-  xboxProductId?: string | null;
-  packageFamilyName?: string | null;
-  xboxTitleId?: string | null;
-  onMountedDom?: () => void;
-}
-
-const AboutThisGameHtml: React.FC<AboutThisGameHtmlProps> = ({
-  html,
-  isOnline,
-  onlineGeneration,
-  gameId,
-  steamAppId,
-  gogId,
-  epicAppName,
-  xboxProductId,
-  packageFamilyName,
-  xboxTitleId,
-  onMountedDom,
-}) => {
-  const descRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    const container = descRef.current;
-    if (!container || typeof container.replaceChildren !== 'function') return;
-
-    const fragment = sanitizeSafeDomFragment(html);
-    if (!fragment) return;
-    const reducedMotion = prefersReducedMotion();
-
-    const collapseBrokenElement = (el: HTMLElement) => {
-      el.style.display = 'none';
-      const wrapper = typeof el.closest === 'function' ? el.closest('.bb_img_ctn') : null;
-      if (wrapper && wrapper instanceof HTMLElement) {
-        const hasVisibleChild = Array.from(wrapper.children).some(
-          (child) => child !== el && (child as HTMLElement).style?.display !== 'none'
-        );
-        if (!hasVisibleChild && !(wrapper.textContent || '').trim()) {
-          wrapper.style.display = 'none';
-        }
-      }
-    };
-
-    const attachImgFallbackOrCollapse = (targetImg: HTMLElement) => {
-      targetImg.addEventListener(
-        'error',
-        () => {
-          const currentAttrSrc = (
-            targetImg.getAttribute('src') ||
-            (targetImg as HTMLImageElement).src ||
-            ''
-          ).trim();
-          const alreadyRetried =
-            targetImg.dataset?.retriedDirect === '1' ||
-            targetImg.getAttribute('data-retried-direct') === '1';
-          if (
-            !alreadyRetried &&
-            currentAttrSrc.startsWith('ol-media://') &&
-            onlineLifecycleManager.isOnline()
-          ) {
-            const directUrl = unwrapOlMediaUrl(currentAttrSrc);
-            if (directUrl && directUrl !== currentAttrSrc && /^https?:\/\//i.test(directUrl)) {
-              if (targetImg.dataset) {
-                targetImg.dataset.retriedDirect = '1';
-              }
-              targetImg.setAttribute('data-retried-direct', '1');
-              targetImg.addEventListener('error', () => collapseBrokenElement(targetImg), {
-                once: true,
-              });
-              targetImg.setAttribute('src', directUrl);
-              return;
-            }
-          }
-          collapseBrokenElement(targetImg);
-        },
-        { once: true }
-      );
-    };
-
-    // Rewrite inline <img> sources via ol-media://, apply below-the-fold lazy loading, and hide broken assets
-    const images = Array.from(fragment.querySelectorAll('img'));
-    images.forEach((imgEl, idx) => {
-      const rawSrc = normalizeProtocolRelativeUrl(imgEl.getAttribute('src'));
-      const rawSrcset = imgEl.getAttribute('srcset');
-      if (rawSrcset !== null) {
-        if (!isOnline) {
-          imgEl.removeAttribute('srcset');
-        } else {
-          const normalizedSrcset = normalizeSrcsetUrls(rawSrcset);
-          if (normalizedSrcset) {
-            imgEl.setAttribute('srcset', normalizedSrcset);
-          } else {
-            imgEl.removeAttribute('srcset');
-          }
-        }
-      }
-      if (!rawSrc) {
-        collapseBrokenElement(imgEl);
-        return;
-      }
-      if (/^https?:\/\//i.test(rawSrc) || rawSrc.startsWith('ol-media://')) {
-        imgEl.setAttribute(
-          'src',
-          toOlMediaUrl({
-            url: rawSrc,
-            gameId,
-            role: 'inline_img',
-            ordinal: idx,
-            steamAppId,
-            gogId,
-            epicAppName,
-            xboxProductId,
-            packageFamilyName,
-            xboxTitleId,
-          })
-        );
-      } else {
-        imgEl.setAttribute('src', rawSrc);
-      }
-      imgEl.setAttribute('loading', 'lazy');
-      imgEl.setAttribute('decoding', 'async');
-      imgEl.removeAttribute('fetchpriority');
-      attachImgFallbackOrCollapse(imgEl);
-    });
-
-    // Handle inline <video> elements: replace with static cached poster when offline, or attach graceful fallback when online
-    const videos = Array.from(fragment.querySelectorAll('video'));
-    videos.forEach((videoEl, vIdx) => {
-      const rawPoster = normalizeProtocolRelativeUrl(videoEl.getAttribute('poster'));
-      const resolvedPoster =
-        rawPoster && (/^https?:\/\//i.test(rawPoster) || rawPoster.startsWith('ol-media://'))
-          ? toOlMediaUrl({
-              url: rawPoster,
-              gameId,
-              role: 'inline_poster',
-              ordinal: vIdx,
-              steamAppId,
-              gogId,
-              epicAppName,
-              xboxProductId,
-              packageFamilyName,
-              xboxTitleId,
-            })
-          : rawPoster;
-
-      const buildPosterImg = (): HTMLImageElement | null => {
-        if (
-          !resolvedPoster ||
-          typeof document === 'undefined' ||
-          typeof document.createElement !== 'function'
-        ) {
-          return null;
-        }
-        const posterImg = document.createElement('img');
-        posterImg.setAttribute('src', resolvedPoster);
-        posterImg.setAttribute('alt', videoEl.getAttribute('title') || '');
-        posterImg.setAttribute('loading', 'lazy');
-        posterImg.setAttribute('decoding', 'async');
-        posterImg.className = 'bb_img';
-        attachImgFallbackOrCollapse(posterImg);
-        return posterImg;
-      };
-
-      if (!isOnline) {
-        const posterImg = buildPosterImg();
-        if (posterImg) {
-          videoEl.replaceWith(posterImg);
-        } else {
-          const wrapper =
-            typeof videoEl.closest === 'function' ? videoEl.closest('.bb_img_ctn') : null;
-          videoEl.remove();
-          if (
-            wrapper &&
-            wrapper instanceof HTMLElement &&
-            wrapper.children.length === 0 &&
-            !(wrapper.textContent || '').trim()
-          ) {
-            wrapper.style.display = 'none';
-          }
-        }
-        return;
-      }
-
-      const rawVideoSrc = normalizeProtocolRelativeUrl(videoEl.getAttribute('src'));
-      if (rawVideoSrc) {
-        videoEl.setAttribute('src', rawVideoSrc);
-      } else if (videoEl.hasAttribute('src')) {
-        videoEl.removeAttribute('src');
-      }
-
-      const rawSources = Array.from(videoEl.querySelectorAll('source'));
-      const validSources: HTMLSourceElement[] = [];
-      rawSources.forEach((sourceEl) => {
-        const normalizedSourceSrc = normalizeProtocolRelativeUrl(sourceEl.getAttribute('src'));
-        if (normalizedSourceSrc) {
-          sourceEl.setAttribute('src', normalizedSourceSrc);
-          validSources.push(sourceEl);
-        } else {
-          sourceEl.remove();
-        }
-      });
-
-      if (!rawVideoSrc && validSources.length === 0) {
-        const posterImg = buildPosterImg();
-        if (posterImg) {
-          videoEl.replaceWith(posterImg);
-        } else {
-          collapseBrokenElement(videoEl);
-        }
-        return;
-      }
-
-      if (resolvedPoster) {
-        videoEl.setAttribute('poster', resolvedPoster);
-      }
-      videoEl.muted = true;
-      (videoEl as HTMLVideoElement).defaultMuted = true;
-      (videoEl as HTMLVideoElement).loop = true;
-      (videoEl as HTMLVideoElement).playsInline = true;
-      videoEl.setAttribute('muted', '');
-      videoEl.setAttribute('playsinline', '');
-      videoEl.setAttribute('loop', '');
-      if (reducedMotion) {
-        videoEl.autoplay = false;
-        videoEl.removeAttribute('autoplay');
-        videoEl.controls = true;
-        videoEl.setAttribute('controls', '');
-      } else {
-        videoEl.autoplay = true;
-        videoEl.setAttribute('autoplay', '');
-      }
-
-      const replaceFailedVideoWithPoster = () => {
-        if (!videoEl.isConnected) return;
-        const posterImg = buildPosterImg();
-        if (posterImg) {
-          videoEl.replaceWith(posterImg);
-        } else {
-          collapseBrokenElement(videoEl);
-        }
-      };
-
-      if (validSources.length > 0) {
-        const lastSource = validSources[validSources.length - 1];
-        lastSource.addEventListener('error', replaceFailedVideoWithPoster, { once: true });
-      } else {
-        videoEl.addEventListener('error', replaceFailedVideoWithPoster, { once: true });
-      }
-    });
-
-    // Mount sanitized & transformed DOM nodes directly without re-serializing to HTML strings (prevents mXSS)
-    container.replaceChildren(fragment);
-
-    let videoObserver: IntersectionObserver | null = null;
-    if (typeof container.querySelectorAll === 'function') {
-      const mountedVideos = Array.from(container.querySelectorAll('video'));
-      const canAutoplayNow =
-        isOnline &&
-        !reducedMotion &&
-        !(typeof document !== 'undefined' && Boolean(document.hidden)) &&
-        !launcherService.isInGameHibernating() &&
-        launcherService.getRunningGames().length === 0;
-
-      if (canAutoplayNow) {
-        mountedVideos.forEach((videoEl) => {
-          videoEl.play()?.catch?.(() => {});
-        });
-      }
-
-      if (mountedVideos.length > 0 && typeof IntersectionObserver === 'function') {
-        videoObserver = new IntersectionObserver(
-          (entries) => {
-            const shouldHibernateNow =
-              !onlineLifecycleManager.isOnline() ||
-              prefersReducedMotion() ||
-              (typeof document !== 'undefined' && Boolean(document.hidden)) ||
-              launcherService.isInGameHibernating() ||
-              launcherService.getRunningGames().length > 0;
-
-            for (const entry of entries) {
-              const targetVideo = entry.target as HTMLVideoElement;
-              if (!entry.isIntersecting) {
-                if (targetVideo.dataset) {
-                  targetVideo.dataset.offscreenPaused = '1';
-                }
-                if (!targetVideo.paused) {
-                  try {
-                    targetVideo.pause();
-                  } catch {
-                    // Ignore pause errors
-                  }
-                }
-              } else {
-                if (targetVideo.dataset) {
-                  delete targetVideo.dataset.offscreenPaused;
-                }
-                if (!shouldHibernateNow && targetVideo.autoplay && targetVideo.paused) {
-                  targetVideo.play()?.catch?.(() => {});
-                }
-              }
-            }
-          },
-          { rootMargin: '150px 0px' }
-        );
-        mountedVideos.forEach((videoEl) => videoObserver?.observe(videoEl));
-      }
-    }
-
-    onMountedDom?.();
-
-    return () => {
-      videoObserver?.disconnect();
-      if (typeof container.querySelectorAll === 'function') {
-        container.querySelectorAll('video').forEach((v) => {
-          try {
-            v.pause();
-            v.removeAttribute('src');
-            if (typeof v.querySelectorAll === 'function') {
-              v.querySelectorAll('source').forEach((s) => {
-                s.removeAttribute('src');
-                s.remove();
-              });
-            }
-            v.load?.();
-          } catch {
-            // Ignore teardown errors
-          }
-        });
-      }
-      container.replaceChildren();
-    };
-  }, [
-    html,
-    isOnline,
-    onlineGeneration,
-    gameId,
-    steamAppId,
-    gogId,
-    epicAppName,
-    xboxProductId,
-    packageFamilyName,
-    xboxTitleId,
-  ]);
-
-  return (
-    <div
-      ref={descRef}
-      data-testid="about-this-game-content"
-      className="steam-description-content text-sm space-y-3 leading-relaxed"
-    />
-  );
-};
-
-function parseVaultHltb(raw: unknown): HltbData | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const candidate = raw as Partial<HltbData> & { unmatched?: boolean };
-  if (candidate.isAccurate === false || candidate.unmatched === true) return null;
-  const mainStoryHours = typeof candidate.mainStoryHours === 'number' ? candidate.mainStoryHours : 0;
-  const mainExtraHours = typeof candidate.mainExtraHours === 'number' ? candidate.mainExtraHours : 0;
-  const completionistHours =
-    typeof candidate.completionistHours === 'number' ? candidate.completionistHours : 0;
-  const allStylesHours = typeof candidate.allStylesHours === 'number' ? candidate.allStylesHours : 0;
-  if (
-    mainStoryHours <= 0 &&
-    mainExtraHours <= 0 &&
-    completionistHours <= 0 &&
-    allStylesHours <= 0
-  ) {
-    return null;
-  }
-  return {
-    mainStoryHours,
-    mainExtraHours,
-    completionistHours,
-    allStylesHours,
-    gameplayType: typeof candidate.gameplayType === 'string' ? candidate.gameplayType : undefined,
-    hltbGameId: typeof candidate.hltbGameId === 'number' ? candidate.hltbGameId : undefined,
-    isAccurate: true,
-  };
-}
-
-function buildVaultCriticSignature(
-  gameId: string,
-  score: CriticScoreData | null,
-  isExplicitOverride = false
-): string {
-  if (!score || typeof score.score !== 'number' || !Number.isFinite(score.score) || score.score <= 0) {
-    return '';
-  }
-  return [
-    gameId,
-    score.source,
-    score.score,
-    score.userScoreRaw ?? '',
-    score.starRatingRaw ?? '',
-    score.numReviews ?? '',
-    score.url || '',
-    isExplicitOverride ? 'override' : 'auto',
-  ].join('|');
-}
-
-export function shouldAcceptCriticUpdateEvent(
-  detail: {
-    gameId?: string;
-    title?: string;
-    steamAppId?: number;
-    appId?: number;
-  },
-  target: {
-    gameId: string;
-    gameSteamAppId?: number;
-    currentSteamAppId?: number;
-    effectiveSteamId?: number;
-    resolvedSteamAppId?: number | null;
-    lowerGameTitle: string;
-    normalizedGameTitle: string;
-  }
-): boolean {
-  const rawDetailSteamAppId = detail.steamAppId ?? detail.appId;
-  const detailSteamAppId =
-    typeof rawDetailSteamAppId === 'number' &&
-    Number.isInteger(rawDetailSteamAppId) &&
-    rawDetailSteamAppId > 0
-      ? rawDetailSteamAppId
-      : undefined;
-  const effectiveCurrentSteamAppId =
-    typeof target.resolvedSteamAppId === 'number' &&
-    Number.isInteger(target.resolvedSteamAppId) &&
-    target.resolvedSteamAppId > 0
-      ? target.resolvedSteamAppId
-      : undefined;
-  const matchesGameId = Boolean(detail.gameId && detail.gameId === target.gameId);
-  const matchesSteamId = Boolean(
-    detailSteamAppId &&
-      (detailSteamAppId === target.gameSteamAppId ||
-        detailSteamAppId === target.currentSteamAppId ||
-        detailSteamAppId === target.effectiveSteamId ||
-        detailSteamAppId === effectiveCurrentSteamAppId)
-  );
-  if (
-    !matchesGameId &&
-    !matchesSteamId &&
-    detailSteamAppId !== undefined &&
-    effectiveCurrentSteamAppId !== undefined &&
-    detailSteamAppId !== effectiveCurrentSteamAppId
-  ) {
-    return false;
-  }
-  const detailTitleTrimmed = typeof detail.title === 'string' ? detail.title.trim() : '';
-  const matchesTitle = Boolean(
-    detailTitleTrimmed &&
-      (detailTitleTrimmed.toLowerCase() === target.lowerGameTitle ||
-        (target.normalizedGameTitle &&
-          normalizeCriticTitleKey(detailTitleTrimmed) === target.normalizedGameTitle))
-  );
-  return matchesGameId || matchesSteamId || matchesTitle;
-}
-
-function hasRealSteamReviewSummary(
-  summary?: SteamReviewSummary | null
-): summary is SteamReviewSummary {
-  return Boolean(
-    summary &&
-      (summary.totalReviews > 0 ||
-        (summary.positivePercent > 0 &&
-          summary.reviewScoreDesc &&
-          !/no user reviews/i.test(summary.reviewScoreDesc)))
-  );
-}
-
-function selectPreferredCriticScore(
-  resolved: CriticScoreData | null,
-  vaultFallback: CriticScoreData | null,
-  userOverride?: UserGameOverride | null
-): CriticScoreData | null {
-  const overrideRoute = userOverride ? inferReviewRouteFromOverride(userOverride) : undefined;
-  if (overrideRoute?.mode === 'unrated') {
-    return null;
-  }
-  if (overrideRoute?.mode === 'static' || overrideRoute?.mode === 'routed') {
-    return resolved ?? userOverride?.reviewScoreOverride ?? null;
-  }
-  if (!vaultFallback) {
-    return resolved;
-  }
-  const resolvedRank = getReviewSourceAuthorityRank(resolved);
-  const vaultRank = getReviewSourceAuthorityRank(vaultFallback);
-  return vaultRank > resolvedRank ? vaultFallback : resolved;
-}
-
-function resolveInitialDetailPlatformId(targetGame: CanonicalGame): StorefrontId {
-  const persisted = launcherService.getSelectedStorefrontForGame(targetGame.id);
-  const validPersisted =
-    persisted && (targetGame.platforms || []).some((p) => p.platformId === persisted)
-      ? persisted
-      : undefined;
-  return (
-    validPersisted ||
-    launcherService.getSelectedStorefrontForGame(targetGame) ||
-    launcherService.getEffectivePlatformForGame(targetGame)?.platformId ||
-    targetGame.platforms?.[0]?.platformId ||
-    (targetGame.steamAppId ? 'steam' : 'custom')
-  );
 }
 
 export const SteamStorePage: React.FC<SteamStorePageProps> = ({
@@ -713,169 +95,56 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   onViewAchievements,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const [currentGame, setCurrentGame] = useState<CanonicalGame>(game);
   const [activePlatformId, setActivePlatformId] = useState<StorefrontId>(() =>
     resolveInitialDetailPlatformId(game)
   );
   const [, setLauncherTick] = useState(0);
-  const [metadata, setMetadata] = useState<SteamEnrichedMetadata | null>(
-    game.enrichedMetadata || null
-  );
-  const [vaultHltb, setVaultHltb] = useState<HltbData | null>(null);
-  const [vaultCriticState, setVaultCriticState] = useState<{
-    gameId: string;
-    data: CriticScoreData;
-  } | null>(null);
-  const vaultCriticScore =
-    vaultCriticState && vaultCriticState.gameId === game.id ? vaultCriticState.data : null;
-  const [currentSteamAppId, setCurrentSteamAppId] = useState<number | undefined>(game.steamAppId);
-  const [isLoading, setIsLoading] = useState(!game.enrichedMetadata);
-  const [isOnline, setIsOnline] = useState<boolean>(() => onlineLifecycleManager.isOnline());
-  const [onlineGeneration, setOnlineGeneration] = useState<number>(() =>
-    onlineLifecycleManager.getOnlineGeneration()
-  );
-  const [reloadTrigger, setReloadTrigger] = useState<number>(0);
+  const [overrideTick, setOverrideTick] = useState(0);
+  const [tagOverridesTick, setTagOverridesTick] = useState(0);
 
   const isCooldown = steamApi.isStoreRateLimited();
-  const activeGameIdRef = useRef<string>(game.id);
-  const latestGameRef = useRef<CanonicalGame>(game);
-  latestGameRef.current = game;
-  const lastPersistedVaultCriticSigRef = useRef<string>('');
-  const lastPersistedVaultMetaSigRef = useRef<string>('');
-  const latestRichMetadataRef = useRef<SteamEnrichedMetadata | null>(
-    hasRichMetadata(game.enrichedMetadata) ? game.enrichedMetadata! : null
-  );
-
-  const adoptVaultCriticScore = useCallback(
-    (
-      rawCritic: unknown,
-      targetGame: CanonicalGame,
-      metaForAnchor?: SteamEnrichedMetadata | null
-    ): CriticScoreData | null => {
-      const parsed = parseVaultCriticScore(rawCritic);
-      if (!parsed) return null;
-
-      const activeOverride = getUserOverrideForGame(targetGame);
-      const activeRoute = activeOverride
-        ? inferReviewRouteFromOverride(activeOverride)
-        : undefined;
-      if (activeRoute || activeOverride?.reviewScoreOverride !== undefined) {
-        return null;
-      }
-
-      const targetSteamAppId =
-        steamMatcher.getEffectiveSteamAppId(targetGame) ?? targetGame.steamAppId;
-      const anchorSlug = buildVerifiedSteamMetacriticAnchor(
-        targetGame,
-        metaForAnchor
-      )?.metacriticSlug;
-      if (
-        !criticScoreService.isScoreSemanticallyCompatible(
-          targetGame.title,
-          parsed,
-          targetSteamAppId,
-          anchorSlug
-        )
-      ) {
-        return null;
-      }
-
-      const currentResolved = resolveGameReviewScore(targetGame, {
-        liveMetadata: metaForAnchor,
-        liveReviewSummary: metaForAnchor?.reviewSummary ?? targetGame.reviewSummary,
-        userOverride: activeOverride,
-        skipBackgroundTrigger: true,
-      });
-      const currentRank = getReviewSourceAuthorityRank(currentResolved);
-      const vaultRank = getReviewSourceAuthorityRank(parsed);
-
-      const vaultSig = buildVaultCriticSignature(targetGame.id, parsed);
-      if (vaultRank >= currentRank) {
-        lastPersistedVaultCriticSigRef.current = vaultSig;
-      }
-
-      if (vaultRank > currentRank) {
-        criticScoreService.seedFromVaultIfMissing(
-          targetSteamAppId,
-          targetGame.title,
-          parsed,
-          metaForAnchor?.releaseDate ?? targetGame.releaseDate,
-          targetGame.genres,
-          { gameId: targetGame.id, platforms: targetGame.platforms }
-        );
-        return parsed;
-      }
-
-      return null;
-    },
-    []
-  );
 
   useEffect(() => {
-    setIsOnline(onlineLifecycleManager.isOnline());
-    setOnlineGeneration(onlineLifecycleManager.getOnlineGeneration());
-
-    const offConn = onlineLifecycleManager.onConnectivityChange((online, generation) => {
-      setIsOnline(online);
-      setOnlineGeneration(generation);
-      if (online && !isAuthoritativeSteamMetadata(latestRichMetadataRef.current, game.steamAppId)) {
-        setReloadTrigger((t) => t + 1);
-      }
-    });
-
-    const offHydrated = onlineLifecycleManager.onGameHydrated((payload) => {
-      if (payload.gameId !== game.id) return;
-      if (payload.detail?.hltb) {
-        const hydratedVaultHltb = parseVaultHltb(payload.detail.hltb);
-        if (hydratedVaultHltb) {
-          seedHltbFromVaultIfMissing(game.title, game.steamAppId, hydratedVaultHltb);
-          setVaultHltb(hydratedVaultHltb);
-        }
-      }
-      if (payload.detail?.criticScore) {
-        const adoptedHydratedCritic = adoptVaultCriticScore(
-          payload.detail.criticScore,
-          latestGameRef.current,
-          payload.detail?.enrichedMetadata ??
-            latestRichMetadataRef.current ??
-            latestGameRef.current.enrichedMetadata
-        );
-        if (adoptedHydratedCritic) {
-          setVaultCriticState({ gameId: game.id, data: adoptedHydratedCritic });
-          setOpenCriticData((prev) =>
-            getReviewSourceAuthorityRank(prev) >=
-            getReviewSourceAuthorityRank(adoptedHydratedCritic)
-              ? prev
-              : adoptedHydratedCritic
-          );
-        }
-      }
-      const hydratedMeta = payload.detail?.enrichedMetadata;
-      if (hydratedMeta && hasRichMetadata(hydratedMeta)) {
-        if (
-          isAuthoritativeSteamMetadata(latestRichMetadataRef.current) &&
-          !isAuthoritativeSteamMetadata(hydratedMeta)
-        ) {
-          return;
-        }
-        const mergedHydrated =
-          mergePreservingXboxHints(
-            hydratedMeta,
-            latestRichMetadataRef.current || game.enrichedMetadata
-          ) || hydratedMeta;
-        latestRichMetadataRef.current = mergedHydrated;
-        setMetadata(mergedHydrated);
-        setIsLoading(false);
-      } else {
-        setReloadTrigger((t) => t + 1);
-      }
-    });
-
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return undefined;
+    }
+    const handleOverrideEvent = () => setOverrideTick((t) => t + 1);
+    const handleTagOverrideEvent = () => setTagOverridesTick((t) => t + 1);
+    window.addEventListener('antigravity:user-override-updated', handleOverrideEvent);
+    window.addEventListener('antigravity:user-override-removed', handleOverrideEvent);
+    window.addEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagOverrideEvent);
     return () => {
-      offConn();
-      offHydrated();
+      window.removeEventListener('antigravity:user-override-updated', handleOverrideEvent);
+      window.removeEventListener('antigravity:user-override-removed', handleOverrideEvent);
+      window.removeEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagOverrideEvent);
     };
-  }, [game.id, adoptVaultCriticScore]);
+  }, []);
+
+  const userOverride = useMemo(() => getUserOverrideForGame(game), [game, overrideTick]);
+  const metadataRoute = useMemo(
+    () => inferMetadataRouteFromOverride(userOverride),
+    [userOverride]
+  );
+
+  const activeStoreSupportsMacRef = useRef(false);
+  const vaultCritic = useVaultCriticAdoption(game.id);
+
+  const {
+    currentGame,
+    metadata,
+    vaultHltb,
+    currentSteamAppId,
+    isLoading,
+    isOnline,
+    onlineGeneration,
+  } = useGameDetailMetadata({
+    game,
+    userOverride,
+    metadataRoute,
+    activeStoreSupportsMacRef,
+    onGameUpdated,
+    vaultCritic,
+  });
 
   useEffect(() => {
     setActivePlatformId(resolveInitialDetailPlatformId(game));
@@ -905,6 +174,8 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   const activeStoreSupportsMac =
     activeStoreNativePlatforms.includes('mac') ||
     (activePlatformId === 'steam' && metadata?.platforms?.mac === true);
+  activeStoreSupportsMacRef.current = activeStoreSupportsMac;
+
   const activeStoreSupportsLinux = useMemo(() => {
     if (activePlatformId === 'xbox') return false;
     if (typeof activePlatformEntry?.platforms?.linux === 'boolean') {
@@ -936,13 +207,14 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     metadata?.linuxRequirements?.recommended,
   ]);
 
+  // Only re-render page header status on session/install/storefront transitions (NOT 1Hz download progress ticks!)
   useEffect(() => {
     const computePageLauncherSig = () => {
       const sess = launcherService.getActiveSession(game.id);
       const dl = launcherService.getActiveDownload(game.id);
       const selPlat = launcherService.getSelectedStorefrontForGame(game.id) || '';
       const rec = launcherService.getInstalledRecordForGame(game);
-      return `${sess?.sessionId || ''}:${sess?.status || ''}|${dl?.taskId || ''}:${dl?.status || ''}:${Math.round(dl?.progressPercent || 0)}|${selPlat}|${rec?.platformId || ''}:${rec?.installPath || ''}:${rec?.executablePath || ''}`;
+      return `${sess?.sessionId || ''}:${sess?.status || ''}|${dl?.taskId || ''}:${dl?.status || ''}|${selPlat}|${rec?.platformId || ''}:${rec?.installPath || ''}:${rec?.executablePath || ''}`;
     };
     let prevSig = computePageLauncherSig();
     return launcherService.subscribe(() => {
@@ -954,33 +226,8 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     });
   }, [game]);
 
-  const [overrideTick, setOverrideTick] = useState(0);
-  const [tagOverridesTick, setTagOverridesTick] = useState(0);
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
-      return undefined;
-    }
-    const handleOverrideEvent = () => setOverrideTick((t) => t + 1);
-    const handleTagOverrideEvent = () => setTagOverridesTick((t) => t + 1);
-    window.addEventListener('antigravity:user-override-updated', handleOverrideEvent);
-    window.addEventListener('antigravity:user-override-removed', handleOverrideEvent);
-    window.addEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagOverrideEvent);
-    return () => {
-      window.removeEventListener('antigravity:user-override-updated', handleOverrideEvent);
-      window.removeEventListener('antigravity:user-override-removed', handleOverrideEvent);
-      window.removeEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagOverrideEvent);
-    };
-  }, []);
-
-  const userOverride = useMemo(() => getUserOverrideForGame(game), [game, overrideTick]);
-  const metadataRoute = useMemo(
-    () => inferMetadataRouteFromOverride(userOverride),
-    [userOverride]
-  );
-  const activeOverrideStampRef = useRef<string | undefined>(userOverride?.updatedAt);
-
   const connectedSet = useMemo(() => {
-    if (connectedStorefronts && connectedStorefronts.length > 0) {
+    if (connectedStorefronts !== undefined) {
       return new Set<StorefrontId>(connectedStorefronts);
     }
     try {
@@ -1007,966 +254,6 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     launcherService.isGameInstalled(currentGame, activeStoreId) ||
     Boolean(effectivePlatform?.installed) ||
     currentGame.platforms.some((p) => p.installed);
-
-  useEffect(() => {
-    setCurrentGame(game);
-    if (game.enrichedMetadata) {
-      if (hasRichMetadata(game.enrichedMetadata)) {
-        if (
-          isAuthoritativeSteamMetadata(latestRichMetadataRef.current) &&
-          !isAuthoritativeSteamMetadata(game.enrichedMetadata)
-        ) {
-          const preserved =
-            mergePreservingXboxHints(latestRichMetadataRef.current, game.enrichedMetadata) ||
-            latestRichMetadataRef.current!;
-          latestRichMetadataRef.current = preserved;
-          setMetadata(preserved);
-        } else {
-          const mergedIncoming =
-            mergePreservingXboxHints(game.enrichedMetadata, latestRichMetadataRef.current) ||
-            game.enrichedMetadata;
-          latestRichMetadataRef.current = mergedIncoming;
-          setMetadata((prev) =>
-            prev && hasRichMetadata(prev)
-              ? mergePreservingXboxHints({ ...prev, ...mergedIncoming }, prev) || {
-                  ...prev,
-                  ...mergedIncoming,
-                }
-              : mergedIncoming
-          );
-        }
-      } else {
-        setMetadata((prev) => (hasRichMetadata(prev) ? prev : game.enrichedMetadata!));
-      }
-      setIsLoading(false);
-    }
-  }, [game]);
-
-  useEffect(() => {
-    let isMounted = true;
-    const isNewGame = activeGameIdRef.current !== game.id;
-    const isOverrideUpdated = activeOverrideStampRef.current !== userOverride?.updatedAt;
-    activeGameIdRef.current = game.id;
-    activeOverrideStampRef.current = userOverride?.updatedAt;
-
-    if (isNewGame) {
-      setVaultHltb(null);
-      setVaultCriticState(null);
-      lastPersistedVaultCriticSigRef.current = '';
-      lastPersistedVaultMetaSigRef.current = '';
-      latestRichMetadataRef.current = hasRichMetadata(game.enrichedMetadata)
-        ? game.enrichedMetadata!
-        : null;
-    }
-
-    if (isNewGame || isOverrideUpdated) {
-      setMetadata(game.enrichedMetadata || null);
-      setCurrentSteamAppId(game.steamAppId);
-      if (isNewGame && !game.enrichedMetadata) {
-        setIsLoading(true);
-      }
-    }
-
-    async function loadData() {
-      let existingRichMeta: SteamEnrichedMetadata | null = hasRichMetadata(game.enrichedMetadata)
-        ? game.enrichedMetadata!
-        : !isNewGame && hasRichMetadata(latestRichMetadataRef.current)
-        ? latestRichMetadataRef.current
-        : null;
-
-      // Hydrate cached detail from SQLite offlineVault when enrichedMetadata, HLTB, or criticScore is missing/upgradable
-      const vaultCheckOverride = getUserOverrideForGame(game);
-      const vaultCheckRoute = vaultCheckOverride
-        ? inferReviewRouteFromOverride(vaultCheckOverride)
-        : undefined;
-      const hasUserCriticOverride = Boolean(
-        vaultCheckRoute || vaultCheckOverride?.reviewScoreOverride !== undefined
-      );
-      const currentResolvedCritic = resolveGameReviewScore(game, {
-        liveMetadata: existingRichMeta,
-        liveReviewSummary: existingRichMeta?.reviewSummary ?? game.reviewSummary,
-        userOverride: vaultCheckOverride,
-        skipBackgroundTrigger: true,
-      });
-      const needsRichMetaFromVault =
-        !existingRichMeta || !isAuthoritativeSteamMetadata(existingRichMeta, game.steamAppId);
-      const needsHltbFromVault = !getHowLongToBeat(game.title, game.steamAppId);
-      const needsCriticFromVault =
-        !hasUserCriticOverride && getReviewSourceAuthorityRank(currentResolvedCritic) < 4;
-      if (
-        (needsRichMetaFromVault || needsHltbFromVault || needsCriticFromVault) &&
-        typeof window !== 'undefined' &&
-        window.electronAPI?.offlineVault?.getGameDetail
-      ) {
-        try {
-          const vaultDetail = await window.electronAPI.offlineVault.getGameDetail(game.id);
-          if (vaultDetail?.hltb) {
-            const hydratedVaultHltb = parseVaultHltb(vaultDetail.hltb);
-            if (hydratedVaultHltb) {
-              seedHltbFromVaultIfMissing(game.title, game.steamAppId, hydratedVaultHltb);
-              if (isMounted) {
-                setVaultHltb(hydratedVaultHltb);
-              }
-            }
-          }
-          if (
-            needsRichMetaFromVault &&
-            vaultDetail?.enrichedMetadata &&
-            hasRichMetadata(vaultDetail.enrichedMetadata)
-          ) {
-            const shouldAdoptVault =
-              !existingRichMeta ||
-              (isAuthoritativeSteamMetadata(vaultDetail.enrichedMetadata) &&
-                !isAuthoritativeSteamMetadata(existingRichMeta));
-            if (shouldAdoptVault) {
-              const mergedVault =
-                mergePreservingXboxHints(
-                  vaultDetail.enrichedMetadata,
-                  game.enrichedMetadata || existingRichMeta
-                ) || vaultDetail.enrichedMetadata;
-              existingRichMeta = mergedVault;
-              latestRichMetadataRef.current = mergedVault;
-              if (isMounted) {
-                setMetadata(mergedVault);
-                setIsLoading(false);
-              }
-            }
-          }
-          if (vaultDetail?.criticScore) {
-            const adoptedVaultCritic = adoptVaultCriticScore(
-              vaultDetail.criticScore,
-              game,
-              vaultDetail.enrichedMetadata ?? existingRichMeta
-            );
-            if (adoptedVaultCritic && isMounted) {
-              setVaultCriticState({ gameId: game.id, data: adoptedVaultCritic });
-              setOpenCriticData((prev) =>
-                getReviewSourceAuthorityRank(prev) >=
-                getReviewSourceAuthorityRank(adoptedVaultCritic)
-                  ? prev
-                  : adoptedVaultCritic
-              );
-            }
-          }
-        } catch {
-          // Ignore vault read error
-        }
-      }
-
-      const currentOverride = getUserOverrideForGame(game);
-      const route = inferMetadataRouteFromOverride(currentOverride);
-      const isXboxCustomRoute =
-        route?.source === 'custom' &&
-        (String(route.matchedId || '').toLowerCase().startsWith('xbox-') ||
-          /^[A-Z0-9]{12}$/i.test(String(route.matchedId || '').trim()));
-      const isRoutedToNonSteamStore =
-        route?.source === 'gog' || route?.source === 'epic' || isXboxCustomRoute;
-
-      const resolveSafeMetadata = (
-        incoming: SteamEnrichedMetadata | null | undefined,
-        expectedSteamAppId?: number | null
-      ): { resolved: SteamEnrichedMetadata | null; canPersistMetadata: boolean } => {
-        if (incoming && !isSkeletonMetadata(incoming) && !incoming.__quotaSlimmed) {
-          if (
-            !isOverrideUpdated &&
-            !isRoutedToNonSteamStore &&
-            isAuthoritativeSteamMetadata(existingRichMeta, expectedSteamAppId) &&
-            !isAuthoritativeSteamMetadata(incoming, expectedSteamAppId)
-          ) {
-            const kept =
-              mergePreservingXboxHints(existingRichMeta, incoming || game.enrichedMetadata) ||
-              existingRichMeta!;
-            latestRichMetadataRef.current = kept;
-            return { resolved: kept, canPersistMetadata: false };
-          }
-          const mergedIncoming =
-            mergePreservingXboxHints(incoming, game.enrichedMetadata || existingRichMeta) ||
-            incoming;
-          latestRichMetadataRef.current = mergedIncoming;
-          return { resolved: mergedIncoming, canPersistMetadata: true };
-        }
-        // Non-destructive guard: NEVER overwrite existing rich metadata or persist skeleton_fallback over catalog data
-        if (existingRichMeta && !isOverrideUpdated) {
-          return { resolved: existingRichMeta, canPersistMetadata: false };
-        }
-        return { resolved: incoming || existingRichMeta || null, canPersistMetadata: false };
-      };
-
-      let targetAppId =
-        route?.source === 'steam' && route.steamAppId
-          ? route.steamAppId
-          : game.steamAppId;
-
-      // If user explicitly unlinked from Steam (steamAppId === null) or routed metadata to a non-Steam source
-      const isExplicitNonSteam =
-        game.isExplicitNonSteam === true ||
-        currentOverride?.steamAppId === null ||
-        currentOverride?.isExplicitNonSteam === true ||
-        isRoutedToNonSteamStore ||
-        route?.source === 'igdb';
-
-      if (!targetAppId && !isExplicitNonSteam) {
-        const instantEffective = steamMatcher.getEffectiveSteamAppId(game);
-        if (instantEffective) {
-          targetAppId = instantEffective;
-          if (isMounted) {
-            setCurrentSteamAppId(instantEffective);
-          }
-        }
-      }
-
-      // If no Steam App ID is set, intelligently search Steam Store for match with P0 priority & corroboration
-      if (!targetAppId && !isExplicitNonSteam) {
-        try {
-          const matchOptions = {
-            releaseYear: game.releaseDate,
-            developers: game.developers,
-            priority: RequestPriority.P0_INTERACTIVE,
-          };
-          const matched = await steamMatcher.matchGameToSteam(game.title, matchOptions);
-          if (matched && isMounted) {
-            targetAppId = matched;
-            setCurrentSteamAppId(matched);
-          }
-        } catch (e) {
-          console.warn('Steam matching failed:', e);
-        }
-      }
-
-      const rawGameAny = game as CanonicalGame & {
-        customCoverUrl?: string;
-        hasCustomArtwork?: boolean;
-      };
-      const hasUserCoverOverride = Boolean(
-        currentOverride?.capsuleImage ||
-          rawGameAny.customCoverUrl ||
-          rawGameAny.hasCustomArtwork
-      );
-      const hasUserHeaderOverride = Boolean(
-        currentOverride?.headerImage || rawGameAny.hasCustomArtwork
-      );
-
-      const persistDetailToVault = (
-        metaToSave: SteamEnrichedMetadata | null | undefined,
-        steamIdToSave: number | null | undefined
-      ) => {
-        if (
-          !metaToSave ||
-          isSkeletonMetadata(metaToSave) ||
-          metaToSave.__quotaSlimmed ||
-          typeof window === 'undefined' ||
-          typeof window.electronAPI?.offlineVault?.saveGameDetail !== 'function'
-        ) {
-          return;
-        }
-        const resolvedReviewSummary = hasRealSteamReviewSummary(metaToSave.reviewSummary)
-          ? metaToSave.reviewSummary
-          : hasRealSteamReviewSummary(game.reviewSummary)
-          ? game.reviewSummary
-          : undefined;
-        const enrichedForVault: SteamEnrichedMetadata = resolvedReviewSummary
-          ? { ...metaToSave, reviewSummary: resolvedReviewSummary }
-          : metaToSave;
-        const targetGameSnapshot: CanonicalGame =
-          steamIdToSave && steamIdToSave !== game.steamAppId
-            ? { ...game, steamAppId: steamIdToSave }
-            : game;
-        const activeOverrideRoute = currentOverride
-          ? inferReviewRouteFromOverride(currentOverride)
-          : undefined;
-        const isUnratedOverride =
-          activeOverrideRoute?.mode === 'unrated' || currentOverride?.reviewScoreOverride === null;
-        const isExplicitCriticOverride =
-          !isUnratedOverride &&
-          Boolean(
-            activeOverrideRoute?.mode === 'static' ||
-              activeOverrideRoute?.mode === 'routed' ||
-              (currentOverride?.reviewScoreOverride &&
-                typeof currentOverride.reviewScoreOverride.score === 'number' &&
-                currentOverride.reviewScoreOverride.score > 0)
-          );
-        const resolvedCritic = resolveGameReviewScore(targetGameSnapshot, {
-          liveMetadata: enrichedForVault,
-          liveReviewSummary: resolvedReviewSummary,
-          userOverride: currentOverride,
-          skipBackgroundTrigger: true,
-        });
-        const metaSig = [
-          game.id,
-          enrichedForVault.appId || 0,
-          enrichedForVault.metadataQuality || '',
-          resolvedReviewSummary?.totalReviews ?? 0,
-          resolvedReviewSummary?.positivePercent ?? 0,
-          enrichedForVault.metacritic?.score ?? 0,
-          isUnratedOverride
-            ? 'unrated'
-            : resolvedCritic
-            ? `${resolvedCritic.source}:${resolvedCritic.score}:${isExplicitCriticOverride ? 'ov' : 'auto'}`
-            : '',
-        ].join('|');
-        if (metaSig === lastPersistedVaultMetaSigRef.current) {
-          return;
-        }
-        lastPersistedVaultMetaSigRef.current = metaSig;
-        if (isUnratedOverride) {
-          lastPersistedVaultCriticSigRef.current = `${game.id}|__unrated__`;
-        } else if (resolvedCritic && resolvedCritic.score > 0) {
-          lastPersistedVaultCriticSigRef.current = buildVaultCriticSignature(
-            game.id,
-            resolvedCritic,
-            isExplicitCriticOverride
-          );
-        }
-        try {
-          void window.electronAPI.offlineVault
-            .saveGameDetail({
-              gameId: game.id,
-              steamAppId: steamIdToSave ?? game.steamAppId ?? null,
-              canonicalTitle: game.title,
-              enrichedMetadata: enrichedForVault,
-              ...(isUnratedOverride
-                ? { clearCriticScore: true }
-                : resolvedCritic && resolvedCritic.score > 0
-                ? {
-                    criticScore: { ...resolvedCritic } as unknown as Record<string, unknown>,
-                    ...(isExplicitCriticOverride ? { forceCriticScore: true } : {}),
-                  }
-                : {}),
-            })
-            ?.catch?.(() => {});
-        } catch {
-          // Ignore vault persistence error
-        }
-      };
-
-      const buildEnrichedTopLevelFields = (
-        meta?: SteamEnrichedMetadata | null,
-        browseAssets?: SteamStoreBrowseAssets | null
-      ) => {
-        if (!meta || isSkeletonMetadata(meta)) {
-          return {
-            nextShortDescription: game.shortDescription,
-            nextDetailedDescription: game.detailedDescription,
-            nextDevelopers: game.developers,
-            nextPublishers: game.publishers,
-            nextReleaseDate: game.releaseDate,
-            nextHeaderImage: game.headerImage,
-            nextCapsuleImage: game.capsuleImage,
-            nextReviewSummary: game.reviewSummary,
-            topLevelChanged: false,
-          };
-        }
-
-        const cleanMetaShort = meta.shortDescription
-          ? stripHtmlToPlainSynopsis(meta.shortDescription)
-          : '';
-        const cleanGameShort = game.shortDescription
-          ? stripHtmlToPlainSynopsis(game.shortDescription)
-          : '';
-        const incomingShort =
-          cleanMetaShort && !isGenericPlaceholderSynopsis(cleanMetaShort, game.title)
-            ? cleanMetaShort
-            : undefined;
-        const shouldUpgradeShortFromSteam =
-          !currentOverride?.shortDescription &&
-          Boolean(incomingShort) &&
-          (!cleanGameShort ||
-            isGenericPlaceholderSynopsis(cleanGameShort, game.title) ||
-            (Number(meta.appId) > 0 && !isAuthoritativeSteamMetadata(game.enrichedMetadata)));
-        const nextShortDescription = shouldUpgradeShortFromSteam
-          ? incomingShort
-          : cleanGameShort || game.shortDescription;
-
-        const incomingDetailed = meta.detailedDescription || meta.aboutTheGame || '';
-        const metaHasRichHtmlOrSteam =
-          RICH_HTML_DESC_RE.test(incomingDetailed) || Number(meta.appId) > 0;
-        const existingHasRichHtml = RICH_HTML_DESC_RE.test(game.detailedDescription || '');
-        const preferredMetaDetailed =
-          RICH_HTML_DESC_RE.test(meta.detailedDescription || '')
-            ? meta.detailedDescription
-            : RICH_HTML_DESC_RE.test(meta.aboutTheGame || '')
-            ? meta.aboutTheGame
-            : meta.detailedDescription || meta.aboutTheGame;
-        const nextDetailedDescription =
-          !currentOverride?.detailedDescription &&
-          preferredMetaDetailed &&
-          (!game.detailedDescription ||
-            isGenericPlaceholderSynopsis(game.detailedDescription, game.title) ||
-            (metaHasRichHtmlOrSteam && !existingHasRichHtml) ||
-            (isAuthoritativeSteamMetadata(meta) &&
-              !isAuthoritativeSteamMetadata(game.enrichedMetadata)))
-            ? preferredMetaDetailed
-            : game.detailedDescription || meta.detailedDescription || meta.aboutTheGame;
-
-        const validIncomingDevs =
-          meta.developers?.filter((d) => d && d !== 'Unknown Developer') || [];
-        const nextDevelopers =
-          (!game.developers || game.developers.length === 0) && validIncomingDevs.length > 0
-            ? validIncomingDevs
-            : game.developers;
-        const validIncomingPubs =
-          meta.publishers?.filter((p) => p && p !== 'Unknown Publisher') || [];
-        const nextPublishers =
-          (!game.publishers || game.publishers.length === 0) && validIncomingPubs.length > 0
-            ? validIncomingPubs
-            : game.publishers;
-
-        const gameHasMissingOrSentinelDate =
-          !game.releaseDate ||
-          game.releaseDate === 'TBA' ||
-          isSentinelReleaseDate(game.releaseDate);
-        const validMetaReleaseDate =
-          meta.releaseDate && !isSentinelReleaseDate(meta.releaseDate)
-            ? meta.releaseDate
-            : undefined;
-        const nextReleaseDate = gameHasMissingOrSentinelDate
-          ? validMetaReleaseDate ||
-            (isSentinelReleaseDate(game.releaseDate) ? 'TBA' : game.releaseDate)
-          : game.releaseDate;
-
-        const candidateSteamHeader = browseAssets?.headerImage || meta.headerImage;
-        const nextHeaderImage =
-          !hasUserHeaderOverride &&
-          (!game.headerImage || isMicrosoftStoreAssetUrl(game.headerImage)) &&
-          candidateSteamHeader &&
-          !isMicrosoftStoreAssetUrl(candidateSteamHeader)
-            ? candidateSteamHeader
-            : game.headerImage;
-
-        const candidateSteamCapsule = browseAssets?.capsuleImage || meta.capsuleImage;
-        const nextCapsuleImage =
-          !hasUserCoverOverride &&
-          (!game.capsuleImage || isMicrosoftStoreAssetUrl(game.capsuleImage)) &&
-          candidateSteamCapsule &&
-          !isMicrosoftStoreAssetUrl(candidateSteamCapsule)
-            ? candidateSteamCapsule
-            : game.capsuleImage;
-
-        const baselineMeta = existingRichMeta || game.enrichedMetadata;
-        const richerScreenshots =
-          (meta.screenshots?.length || 0) > (baselineMeta?.screenshots?.length || 0);
-        const richerMovies =
-          (meta.movies?.length || 0) > (baselineMeta?.movies?.length || 0);
-        const upgradedPlaceholderSynopsis =
-          Boolean(baselineMeta?.shortDescription) &&
-          isGenericPlaceholderSynopsis(baselineMeta?.shortDescription, game.title) &&
-          Boolean(nextShortDescription) &&
-          !isGenericPlaceholderSynopsis(nextShortDescription, game.title);
-        const updatedAbout =
-          Boolean(meta.aboutTheGame) && meta.aboutTheGame !== baselineMeta?.aboutTheGame;
-        const updatedLanguages =
-          Boolean(
-            meta.supportedLanguages &&
-              meta.supportedLanguages !== baselineMeta?.supportedLanguages
-          ) ||
-          Boolean(
-            (meta.languageOptions?.length || 0) > 0 &&
-              (meta.languageOptions?.length !== baselineMeta?.languageOptions?.length ||
-                JSON.stringify(meta.languageOptions) !==
-                  JSON.stringify(baselineMeta?.languageOptions))
-          ) ||
-          Boolean(
-            meta.languageTableSchema &&
-              meta.languageTableSchema !== baselineMeta?.languageTableSchema
-          );
-        const hasReqText = (req?: { minimum?: string; recommended?: string }) =>
-          Boolean(req?.minimum?.trim() || req?.recommended?.trim());
-        const updatedSystemRequirements =
-          hasReqText(meta.systemRequirements) &&
-          (meta.systemRequirements?.minimum !== baselineMeta?.systemRequirements?.minimum ||
-            meta.systemRequirements?.recommended !== baselineMeta?.systemRequirements?.recommended);
-        const updatedMacRequirements =
-          hasReqText(meta.macRequirements) &&
-          (meta.macRequirements?.minimum !== baselineMeta?.macRequirements?.minimum ||
-            meta.macRequirements?.recommended !== baselineMeta?.macRequirements?.recommended);
-        const updatedLinuxRequirements =
-          hasReqText(meta.linuxRequirements) &&
-          (meta.linuxRequirements?.minimum !== baselineMeta?.linuxRequirements?.minimum ||
-            meta.linuxRequirements?.recommended !== baselineMeta?.linuxRequirements?.recommended);
-
-        const existingReviewCount = game.reviewSummary?.totalReviews ?? 0;
-        const incomingReviewCount = meta.reviewSummary?.totalReviews ?? 0;
-        const shouldUpdateReviewSummary =
-          hasRealSteamReviewSummary(meta.reviewSummary) &&
-          (!game.reviewSummary ||
-            incomingReviewCount > existingReviewCount ||
-            (incomingReviewCount === existingReviewCount &&
-              (meta.reviewSummary!.positivePercent !== game.reviewSummary.positivePercent ||
-                meta.reviewSummary!.reviewScoreDesc !== game.reviewSummary.reviewScoreDesc)));
-        const nextReviewSummary = shouldUpdateReviewSummary
-          ? meta.reviewSummary
-          : game.reviewSummary;
-
-        const topLevelChanged =
-          nextShortDescription !== game.shortDescription ||
-          nextDetailedDescription !== game.detailedDescription ||
-          nextDevelopers !== game.developers ||
-          nextReleaseDate !== game.releaseDate ||
-          nextHeaderImage !== game.headerImage ||
-          nextCapsuleImage !== game.capsuleImage ||
-          nextReviewSummary !== game.reviewSummary ||
-          richerScreenshots ||
-          richerMovies ||
-          upgradedPlaceholderSynopsis ||
-          updatedAbout ||
-          updatedLanguages ||
-          updatedSystemRequirements ||
-          updatedMacRequirements ||
-          updatedLinuxRequirements;
-
-        return {
-          nextShortDescription,
-          nextDetailedDescription,
-          nextDevelopers,
-          nextPublishers,
-          nextReleaseDate,
-          nextHeaderImage,
-          nextCapsuleImage,
-          nextReviewSummary,
-          topLevelChanged,
-        };
-      };
-
-      // Case A: User explicitly routed Step 4 metadata to GOG or Epic
-      if (isRoutedToNonSteamStore) {
-        const crossSteamAppId = game.steamAppId || route?.steamAppId;
-        const [rawFallbackData, liveAchs] = await Promise.all([
-          fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game, currentOverride),
-          game.steamAppId
-            ? steamAchievementsService.fetchPlayerGameAchievements(game.steamAppId)
-            : Promise.resolve(null),
-        ]);
-
-        let fallbackData = rawFallbackData;
-        if (
-          fallbackData &&
-          !isSkeletonMetadata(fallbackData) &&
-          (!fallbackData.movies || fallbackData.movies.length === 0)
-        ) {
-          if (existingRichMeta?.movies && existingRichMeta.movies.length > 0) {
-            fallbackData = {
-              ...fallbackData,
-              movies: existingRichMeta.movies,
-            };
-          } else if (crossSteamAppId) {
-            try {
-              const steamMetaForMovies = await steamApi.fetchGameMetadata(
-                crossSteamAppId,
-                RequestPriority.P0_INTERACTIVE
-              );
-              if (steamMetaForMovies?.movies && steamMetaForMovies.movies.length > 0) {
-                fallbackData = {
-                  ...fallbackData,
-                  movies: steamMetaForMovies.movies,
-                };
-              }
-            } catch {
-              // Ignore cross-store movie fallback error
-            }
-          }
-        }
-
-        const { resolved, canPersistMetadata } = resolveSafeMetadata(fallbackData);
-
-        if (isMounted && resolved) {
-          setMetadata(resolved);
-          const {
-            nextShortDescription,
-            nextDetailedDescription,
-            nextDevelopers,
-            nextPublishers,
-            nextReleaseDate,
-            nextHeaderImage,
-            nextCapsuleImage,
-            nextReviewSummary,
-            topLevelChanged,
-          } = buildEnrichedTopLevelFields(canPersistMetadata ? resolved : null);
-          let updatedPlatforms = game.platforms;
-          let hasChanges =
-            canPersistMetadata &&
-            (!game.enrichedMetadata ||
-              Boolean(game.enrichedMetadata.__quotaSlimmed) ||
-              isOverrideUpdated ||
-              topLevelChanged);
-
-          if (liveAchs) {
-            const currentSteamPlat = game.platforms.find((p) => p.platformId === 'steam');
-            const curAch = currentSteamPlat?.achievements;
-            const achChanged =
-              !curAch ||
-              curAch.unlocked !== liveAchs.unlocked ||
-              curAch.total !== liveAchs.total ||
-              curAch.source !== liveAchs.source;
-            if (achChanged) {
-              hasChanges = true;
-              updatedPlatforms = game.platforms.map((p) =>
-                p.platformId === 'steam' ? { ...p, achievements: liveAchs } : p
-              );
-            }
-          }
-
-          if (hasChanges) {
-            const updatedGame: CanonicalGame = {
-              ...game,
-              platforms: updatedPlatforms,
-              shortDescription: nextShortDescription,
-              detailedDescription: nextDetailedDescription,
-              developers: nextDevelopers,
-              publishers: nextPublishers,
-              releaseDate: nextReleaseDate,
-              headerImage: nextHeaderImage,
-              capsuleImage: nextCapsuleImage,
-              ...(nextReviewSummary ? { reviewSummary: nextReviewSummary } : {}),
-              enrichedMetadata: canPersistMetadata
-                ? resolved
-                : existingRichMeta || game.enrichedMetadata,
-            };
-            if (canPersistMetadata) {
-              persistDetailToVault(resolved, game.steamAppId);
-            }
-            setCurrentGame(updatedGame);
-            onGameUpdated?.(updatedGame);
-          }
-        }
-      } else if (targetAppId) {
-        // Case B: Matched or routed to Steam
-        const needsBrowseArtworkUpgrade =
-          onlineLifecycleManager.isOnline() &&
-          typeof steamApi.fetchStoreBrowseAssets === 'function' &&
-          ((!hasUserCoverOverride &&
-            (!game.capsuleImage || isMicrosoftStoreAssetUrl(game.capsuleImage))) ||
-            (!hasUserHeaderOverride &&
-              (!game.headerImage || isMicrosoftStoreAssetUrl(game.headerImage))));
-
-        const browseAssetsPromise: Promise<SteamStoreBrowseAssets | null> | null =
-          needsBrowseArtworkUpgrade
-            ? Promise.resolve(
-                steamApi.fetchStoreBrowseAssets(targetAppId, RequestPriority.P0_INTERACTIVE)
-              ).catch(() => null)
-            : null;
-
-        const [liveData, liveAchs] = await Promise.all([
-          steamApi.fetchGameMetadata(targetAppId, RequestPriority.P0_INTERACTIVE, {
-            expectMacRequirements: activeStoreSupportsMac,
-          }),
-          steamAchievementsService.fetchPlayerGameAchievements(targetAppId),
-        ]);
-
-        const BROWSE_PENDING = Symbol('browse-pending');
-        const settledBrowseOrPending = browseAssetsPromise
-          ? await Promise.race([browseAssetsPromise, Promise.resolve(BROWSE_PENDING)])
-          : null;
-        const instantBrowse =
-          typeof steamApi.getStoreBrowseAssetsInstant === 'function'
-            ? steamApi.getStoreBrowseAssetsInstant(targetAppId)
-            : null;
-        const resolvedBrowseAssets: SteamStoreBrowseAssets | null =
-          settledBrowseOrPending !== BROWSE_PENDING && settledBrowseOrPending
-            ? settledBrowseOrPending
-            : instantBrowse;
-
-        if (isMounted) {
-          let candidateMetadata: SteamEnrichedMetadata | null = null;
-          if (liveData && !isSkeletonMetadata(liveData)) {
-            candidateMetadata = resolvedBrowseAssets
-              ? {
-                  ...liveData,
-                  headerImage: resolvedBrowseAssets.headerImage || liveData.headerImage,
-                  capsuleImage: resolvedBrowseAssets.capsuleImage || liveData.capsuleImage,
-                }
-              : liveData;
-            if (!candidateMetadata.movies || candidateMetadata.movies.length === 0) {
-              if (existingRichMeta?.movies && existingRichMeta.movies.length > 0) {
-                candidateMetadata = {
-                  ...candidateMetadata,
-                  movies: existingRichMeta.movies,
-                };
-              } else if (
-                game.platforms.some(
-                  (p) =>
-                    p.platformId === 'epic' || p.platformId === 'gog' || p.platformId === 'xbox'
-                )
-              ) {
-                try {
-                  const nonSteamFallback =
-                    await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(
-                      game,
-                      currentOverride
-                    );
-                  if (nonSteamFallback?.movies && nonSteamFallback.movies.length > 0) {
-                    candidateMetadata = {
-                      ...candidateMetadata,
-                      movies: nonSteamFallback.movies,
-                    };
-                  }
-                } catch {
-                  // Ignore fallback movie lookup error
-                }
-              }
-            }
-            if (currentOverride && route?.mode === 'routed' && route.source === 'steam') {
-              updateRoutedMetadataSnapshot(game.id, {
-                title: candidateMetadata.name,
-                shortDescription: candidateMetadata.shortDescription,
-                detailedDescription:
-                  candidateMetadata.detailedDescription || candidateMetadata.aboutTheGame,
-                headerImage: candidateMetadata.headerImage,
-                developers: candidateMetadata.developers,
-                publishers: candidateMetadata.publishers,
-                genres: candidateMetadata.genres,
-                tags: candidateMetadata.tags,
-                releaseDate: candidateMetadata.releaseDate,
-              });
-            }
-          } else if (
-            !existingRichMeta ||
-            isOverrideUpdated ||
-            !isAuthoritativeSteamMetadata(existingRichMeta, targetAppId)
-          ) {
-            // Query non-Steam fallback only when authoritative Steam metadata is unavailable
-            const fallbackData = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(
-              game,
-              currentOverride
-            );
-            if (isMounted) {
-              candidateMetadata = fallbackData;
-            }
-          }
-
-          const { resolved: resolvedMetadata, canPersistMetadata } = resolveSafeMetadata(
-            candidateMetadata,
-            targetAppId
-          );
-
-          if (isMounted && resolvedMetadata) {
-            setMetadata(resolvedMetadata);
-          }
-
-          const {
-            nextShortDescription,
-            nextDetailedDescription,
-            nextDevelopers,
-            nextPublishers,
-            nextReleaseDate,
-            nextHeaderImage,
-            nextCapsuleImage,
-            nextReviewSummary,
-            topLevelChanged,
-          } = buildEnrichedTopLevelFields(
-            canPersistMetadata ? resolvedMetadata : null,
-            resolvedBrowseAssets
-          );
-
-          let hasChanges = canPersistMetadata && topLevelChanged;
-          let updatedPlatforms = game.platforms;
-
-          if (liveAchs) {
-            const currentSteamPlat = game.platforms.find((p) => p.platformId === 'steam');
-            const curAch = currentSteamPlat?.achievements;
-            const achChanged =
-              !curAch ||
-              curAch.unlocked !== liveAchs.unlocked ||
-              curAch.total !== liveAchs.total ||
-              curAch.source !== liveAchs.source;
-
-            if (achChanged) {
-              hasChanges = true;
-              updatedPlatforms = game.platforms.map((p) => {
-                if (p.platformId === 'steam') {
-                  return {
-                    ...p,
-                    achievements: liveAchs,
-                  };
-                }
-                return p;
-              });
-            }
-          }
-
-          if (targetAppId !== game.steamAppId) {
-            hasChanges = true;
-          }
-
-          const gainedOsRequirements = Boolean(
-            resolvedMetadata &&
-              ((!game.enrichedMetadata?.macRequirements?.minimum &&
-                !game.enrichedMetadata?.macRequirements?.recommended &&
-                (resolvedMetadata.macRequirements?.minimum ||
-                  resolvedMetadata.macRequirements?.recommended)) ||
-                (!game.enrichedMetadata?.linuxRequirements?.minimum &&
-                  !game.enrichedMetadata?.linuxRequirements?.recommended &&
-                  (resolvedMetadata.linuxRequirements?.minimum ||
-                    resolvedMetadata.linuxRequirements?.recommended)))
-          );
-
-          if (
-            canPersistMetadata &&
-            resolvedMetadata &&
-            (!game.enrichedMetadata ||
-              Boolean(game.enrichedMetadata.__quotaSlimmed) ||
-              isOverrideUpdated ||
-              gainedOsRequirements ||
-              !isAuthoritativeSteamMetadata(game.enrichedMetadata, targetAppId))
-          ) {
-            hasChanges = true;
-          }
-
-          let latestGameSnapshot: CanonicalGame = game;
-
-          if (hasChanges && isMounted) {
-            const updatedGame: CanonicalGame = {
-              ...game,
-              platforms: updatedPlatforms,
-              steamAppId: targetAppId,
-              shortDescription: nextShortDescription,
-              detailedDescription: nextDetailedDescription,
-              developers: nextDevelopers,
-              publishers: nextPublishers,
-              releaseDate: nextReleaseDate,
-              headerImage: nextHeaderImage,
-              capsuleImage: nextCapsuleImage,
-              ...(nextReviewSummary ? { reviewSummary: nextReviewSummary } : {}),
-              enrichedMetadata: canPersistMetadata
-                ? resolvedMetadata || existingRichMeta || game.enrichedMetadata
-                : existingRichMeta || game.enrichedMetadata,
-            };
-            if (canPersistMetadata && resolvedMetadata) {
-              persistDetailToVault(resolvedMetadata, targetAppId);
-            }
-            latestGameSnapshot = updatedGame;
-            setCurrentGame(updatedGame);
-            onGameUpdated?.(updatedGame);
-          }
-
-          if (settledBrowseOrPending === BROWSE_PENDING && browseAssetsPromise) {
-            void browseAssetsPromise.then((lateBrowse) => {
-              if (!isMounted || !lateBrowse) return;
-              const upgradedHeader =
-                !hasUserHeaderOverride &&
-                lateBrowse.headerImage &&
-                (!latestGameSnapshot.headerImage ||
-                  isMicrosoftStoreAssetUrl(latestGameSnapshot.headerImage))
-                  ? lateBrowse.headerImage
-                  : undefined;
-              const upgradedCapsule =
-                !hasUserCoverOverride &&
-                lateBrowse.capsuleImage &&
-                (!latestGameSnapshot.capsuleImage ||
-                  isMicrosoftStoreAssetUrl(latestGameSnapshot.capsuleImage))
-                  ? lateBrowse.capsuleImage
-                  : undefined;
-              if (!upgradedHeader && !upgradedCapsule) return;
-
-              setMetadata((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      headerImage: upgradedHeader || prev.headerImage,
-                      capsuleImage: upgradedCapsule || prev.capsuleImage,
-                    }
-                  : prev
-              );
-
-              const nextGame: CanonicalGame = {
-                ...latestGameSnapshot,
-                headerImage: upgradedHeader || latestGameSnapshot.headerImage,
-                capsuleImage: upgradedCapsule || latestGameSnapshot.capsuleImage,
-                enrichedMetadata: latestGameSnapshot.enrichedMetadata
-                  ? {
-                      ...latestGameSnapshot.enrichedMetadata,
-                      headerImage:
-                        upgradedHeader || latestGameSnapshot.enrichedMetadata.headerImage,
-                      capsuleImage:
-                        upgradedCapsule || latestGameSnapshot.enrichedMetadata.capsuleImage,
-                    }
-                  : latestGameSnapshot.enrichedMetadata,
-              };
-              latestGameSnapshot = nextGame;
-              setCurrentGame(nextGame);
-              onGameUpdated?.(nextGame);
-            });
-          }
-        }
-      } else {
-        // Case C: Non-Steam game (e.g. GOG, Epic, Xbox, IGDB exclusive)
-        let fallbackData = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(
-          game,
-          currentOverride
-        );
-        if (
-          fallbackData &&
-          !isSkeletonMetadata(fallbackData) &&
-          (!fallbackData.movies || fallbackData.movies.length === 0) &&
-          existingRichMeta?.movies &&
-          existingRichMeta.movies.length > 0
-        ) {
-          fallbackData = {
-            ...fallbackData,
-            movies: existingRichMeta.movies,
-          };
-        }
-
-        const { resolved, canPersistMetadata } = resolveSafeMetadata(fallbackData);
-
-        if (isMounted && resolved) {
-          setMetadata(resolved);
-          if (canPersistMetadata) {
-            const {
-              nextShortDescription,
-              nextDetailedDescription,
-              nextDevelopers,
-              nextPublishers,
-              nextReleaseDate,
-              nextHeaderImage,
-              nextCapsuleImage,
-              nextReviewSummary,
-              topLevelChanged,
-            } = buildEnrichedTopLevelFields(resolved);
-            const hasChanges =
-              !game.enrichedMetadata ||
-              Boolean(game.enrichedMetadata.__quotaSlimmed) ||
-              isOverrideUpdated ||
-              topLevelChanged;
-            if (hasChanges) {
-              const updatedGame: CanonicalGame = {
-                ...game,
-                shortDescription: nextShortDescription,
-                detailedDescription: nextDetailedDescription,
-                developers: nextDevelopers,
-                publishers: nextPublishers,
-                releaseDate: nextReleaseDate,
-                headerImage: nextHeaderImage,
-                capsuleImage: nextCapsuleImage,
-                ...(nextReviewSummary ? { reviewSummary: nextReviewSummary } : {}),
-                enrichedMetadata: resolved,
-              };
-              persistDetailToVault(resolved, game.steamAppId);
-              setCurrentGame(updatedGame);
-              onGameUpdated?.(updatedGame);
-            }
-          }
-        }
-      }
-
-      if (isMounted) setIsLoading(false);
-    }
-
-    loadData();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [
-    game.id,
-    game.steamAppId,
-    userOverride?.updatedAt,
-    metadataRoute?.source,
-    metadataRoute?.matchedId,
-    metadataRoute?.steamAppId,
-    metadataRoute?.gogId,
-    reloadTrigger,
-    adoptVaultCriticScore,
-  ]);
 
   const isDynamicRouted =
     Boolean(userOverride) &&
@@ -1998,8 +285,9 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   const resolvedSteamAppId =
     currentSteamAppId || currentGame.steamAppId || effectiveSteamId || null;
 
-  const screenshots = metadata?.screenshots || [];
-  const movies = metadata?.movies || [];
+  // Hoisted module-level empty arrays preserve reference stability across re-renders (fixes live carousel reset!)
+  const screenshots = metadata?.screenshots ?? EMPTY_SCREENSHOTS;
+  const movies = metadata?.movies ?? EMPTY_MOVIES;
   const reviewSummary =
     metadata?.reviewSummary &&
     (metadata.reviewSummary.totalReviews > 0 || !game.reviewSummary?.totalReviews)
@@ -2082,24 +370,24 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
       ? metadata.developers
       : userOverride?.developers?.length
       ? userOverride.developers
-      : currentGame.developers || game.developers || []
+      : currentGame.developers || game.developers || EMPTY_STRINGS
     : userOverride?.developers?.length
     ? userOverride.developers
     : metadata?.developers?.length
     ? metadata.developers
-    : currentGame.developers || game.developers || [];
+    : currentGame.developers || game.developers || EMPTY_STRINGS;
 
   const publishers = isDynamicRouted
     ? metadata?.publishers?.length
       ? metadata.publishers
       : userOverride?.publishers?.length
       ? userOverride.publishers
-      : currentGame.publishers || game.publishers || []
+      : currentGame.publishers || game.publishers || EMPTY_STRINGS
     : userOverride?.publishers?.length
     ? userOverride.publishers
     : metadata?.publishers?.length
     ? metadata.publishers
-    : currentGame.publishers || game.publishers || [];
+    : currentGame.publishers || game.publishers || EMPTY_STRINGS;
 
   const cleanMetaReleaseDate =
     metadata?.releaseDate &&
@@ -2127,12 +415,12 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
       ? metadata.genres
       : userOverride?.genres?.length
       ? userOverride.genres
-      : currentGame.genres || game.genres || []
+      : currentGame.genres || game.genres || EMPTY_STRINGS
     : userOverride?.genres?.length
     ? userOverride.genres
     : metadata?.genres?.length
     ? metadata.genres
-    : currentGame.genres || game.genres || [];
+    : currentGame.genres || game.genres || EMPTY_STRINGS;
 
   const isOwnedOnSteam = isGameOwnedOnSteam(currentGame.platforms || game.platforms);
 
@@ -2168,25 +456,37 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     setTagOverridesTick((t) => t + 1);
   }, [currentGame]);
 
+  const handleSelectNativeOs = useCallback(
+    (os: 'mac' | 'windows' | 'linux') => {
+      onApplyFilter?.({
+        type: 'os',
+        label: 'Native OS',
+        value: os === 'mac' ? 'macOS' : os === 'linux' ? 'Linux' : 'Windows',
+      });
+    },
+    [onApplyFilter]
+  );
+
   const pickRichDetailed = (m?: SteamEnrichedMetadata | null): string | undefined => {
     if (!m || isSkeletonMetadata(m)) return undefined;
     if (RICH_HTML_DESC_RE.test(m.aboutTheGame || '')) return m.aboutTheGame;
     if (RICH_HTML_DESC_RE.test(m.detailedDescription || '')) return m.detailedDescription;
     return m.aboutTheGame || m.detailedDescription;
   };
-  const gameRichDetailed =
-    RICH_HTML_DESC_RE.test(currentGame.enrichedMetadata?.aboutTheGame || '')
-      ? currentGame.enrichedMetadata?.aboutTheGame
-      : RICH_HTML_DESC_RE.test(currentGame.enrichedMetadata?.detailedDescription || '')
-      ? currentGame.enrichedMetadata?.detailedDescription
-      : RICH_HTML_DESC_RE.test(currentGame.detailedDescription || '')
-      ? currentGame.detailedDescription
-      : currentGame.enrichedMetadata?.aboutTheGame ||
-        currentGame.enrichedMetadata?.detailedDescription ||
-        currentGame.detailedDescription ||
-        game.enrichedMetadata?.aboutTheGame ||
-        game.enrichedMetadata?.detailedDescription ||
-        game.detailedDescription;
+  const gameRichDetailed = RICH_HTML_DESC_RE.test(
+    currentGame.enrichedMetadata?.aboutTheGame || ''
+  )
+    ? currentGame.enrichedMetadata?.aboutTheGame
+    : RICH_HTML_DESC_RE.test(currentGame.enrichedMetadata?.detailedDescription || '')
+    ? currentGame.enrichedMetadata?.detailedDescription
+    : RICH_HTML_DESC_RE.test(currentGame.detailedDescription || '')
+    ? currentGame.detailedDescription
+    : currentGame.enrichedMetadata?.aboutTheGame ||
+      currentGame.enrichedMetadata?.detailedDescription ||
+      currentGame.detailedDescription ||
+      game.enrichedMetadata?.aboutTheGame ||
+      game.enrichedMetadata?.detailedDescription ||
+      game.detailedDescription;
 
   const detailedDescription = isDynamicRouted
     ? pickRichDetailed(metadata) || userOverride?.detailedDescription || gameRichDetailed
@@ -2194,236 +494,36 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
 
   const activeReviewGame = useMemo<CanonicalGame>(() => {
     const base = currentGame.id === game.id ? currentGame : game;
-    if (currentSteamAppId && currentSteamAppId !== base.steamAppId && currentGame.id === game.id) {
+    if (
+      currentSteamAppId &&
+      currentSteamAppId !== base.steamAppId &&
+      currentGame.id === game.id
+    ) {
       return { ...base, steamAppId: currentSteamAppId };
     }
     return base;
   }, [currentGame, game, currentSteamAppId]);
 
-  const [openCriticData, setOpenCriticData] = useState<CriticScoreData | null>(() =>
-    resolveGameReviewScore(activeReviewGame, {
-      liveMetadata: metadata,
-      liveReviewSummary: reviewSummary,
-      userOverride,
-      skipBackgroundTrigger: true,
-    })
-  );
-
-  useEffect(() => {
-    const refreshResolvedScore = (skipBackgroundTrigger = false): CriticScoreData | null => {
-      const liveOverride = getUserOverrideForGame(activeReviewGame);
-      const resolved = resolveGameReviewScore(activeReviewGame, {
-        liveMetadata: metadata,
-        liveReviewSummary: reviewSummary,
-        userOverride: liveOverride,
-        skipBackgroundTrigger,
-      });
-      const next = selectPreferredCriticScore(resolved, vaultCriticScore, liveOverride);
-      setOpenCriticData(next);
-      return next;
-    };
-
-    refreshResolvedScore(false);
-
-    const normalizedGameTitle = normalizeCriticTitleKey(game.title);
-    const lowerGameTitle = game.title.trim().toLowerCase();
-
-    const handleCriticUpdate = (e: Event) => {
-      const detail = (
-        e as CustomEvent<{
-          gameId?: string;
-          title?: string;
-          steamAppId?: number;
-          appId?: number;
-          data?: CriticScoreData | null;
-          refreshedAll?: boolean;
-          hydratedFromVault?: boolean;
-        }>
-      ).detail;
-
-      if (!detail || detail.refreshedAll || detail.hydratedFromVault) {
-        refreshResolvedScore(true);
-        return;
-      }
-
-      if (
-        !shouldAcceptCriticUpdateEvent(detail, {
-          gameId: game.id,
-          gameSteamAppId: game.steamAppId,
-          currentSteamAppId,
-          effectiveSteamId,
-          resolvedSteamAppId,
-          lowerGameTitle,
-          normalizedGameTitle,
-        })
-      ) {
-        return;
-      }
-
-      if (detail.data !== undefined) {
-        const liveOverride = getUserOverrideForGame(activeReviewGame);
-        const liveRoute = liveOverride ? inferReviewRouteFromOverride(liveOverride) : undefined;
-        if (liveRoute?.mode === 'unrated') {
-          setOpenCriticData(null);
-          return;
-        }
-        if (detail.data === null) {
-          refreshResolvedScore(true);
-          return;
-        }
-        const resolved = resolveGameReviewScore(activeReviewGame, {
-          liveMetadata: metadata,
-          liveReviewSummary: reviewSummary,
-          userOverride: liveOverride,
-          skipBackgroundTrigger: true,
-        });
-        const bestResolved = selectPreferredCriticScore(resolved, vaultCriticScore, liveOverride);
-        const incomingRank = getReviewSourceAuthorityRank(detail.data);
-        const bestRank = getReviewSourceAuthorityRank(bestResolved, {
-          isUserOverride: Boolean(liveRoute?.mode === 'static' || liveRoute?.mode === 'routed'),
-        });
-        setOpenCriticData(incomingRank >= bestRank ? detail.data : bestResolved);
-        return;
-      }
-
-      refreshResolvedScore(true);
-    };
-
-    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-      window.addEventListener('antigravity_critic_updated', handleCriticUpdate);
-      return () => window.removeEventListener('antigravity_critic_updated', handleCriticUpdate);
-    }
-    return undefined;
-  }, [
+  const openCriticData = useGameDetailCritic({
+    game,
     activeReviewGame,
-    game.id,
-    game.steamAppId,
-    game.title,
     currentSteamAppId,
     effectiveSteamId,
     resolvedSteamAppId,
     metadata,
     reviewSummary,
-    userOverride?.updatedAt,
+    userOverride,
     overrideTick,
-    vaultCriticScore,
-  ]);
+    vaultCritic,
+  });
 
-  useEffect(() => {
-    if (
-      typeof window === 'undefined' ||
-      typeof window.electronAPI?.offlineVault?.saveGameDetail !== 'function'
-    ) {
-      return;
-    }
-    const activeOverride = getUserOverrideForGame(activeReviewGame);
-    const activeRoute = activeOverride ? inferReviewRouteFromOverride(activeOverride) : undefined;
-    const isUnratedOverride =
-      activeRoute?.mode === 'unrated' || activeOverride?.reviewScoreOverride === null;
-
-    if (isUnratedOverride) {
-      const unratedSig = `${game.id}|__unrated__`;
-      if (lastPersistedVaultCriticSigRef.current === unratedSig) {
-        return;
-      }
-      lastPersistedVaultCriticSigRef.current = unratedSig;
-      try {
-        void window.electronAPI.offlineVault
-          .saveGameDetail({
-            gameId: game.id,
-            steamAppId: resolvedSteamAppId ?? null,
-            canonicalTitle: game.title,
-            clearCriticScore: true,
-          })
-          ?.catch?.(() => {});
-      } catch {
-        // Ignore vault persistence error
-      }
-      return;
-    }
-
-    if (
-      !openCriticData ||
-      typeof openCriticData.score !== 'number' ||
-      !Number.isFinite(openCriticData.score) ||
-      openCriticData.score <= 0
-    ) {
-      return;
-    }
-
-    const isExplicitOverride = Boolean(
-      activeRoute?.mode === 'static' ||
-        activeRoute?.mode === 'routed' ||
-        (activeOverride?.reviewScoreOverride &&
-          typeof activeOverride.reviewScoreOverride.score === 'number' &&
-          activeOverride.reviewScoreOverride.score > 0)
-    );
-    const anchorSlug = buildVerifiedSteamMetacriticAnchor(
-      activeReviewGame,
-      metadata
-    )?.metacriticSlug;
-    if (
-      !isExplicitOverride &&
-      !criticScoreService.isScoreSemanticallyCompatible(
-        game.title,
-        openCriticData,
-        resolvedSteamAppId ?? undefined,
-        anchorSlug
-      )
-    ) {
-      return;
-    }
-    const nextSig = buildVaultCriticSignature(game.id, openCriticData, isExplicitOverride);
-    if (!nextSig || nextSig === lastPersistedVaultCriticSigRef.current) {
-      return;
-    }
-    lastPersistedVaultCriticSigRef.current = nextSig;
-
-    const persistableEnrichedMetadata =
-      metadata &&
-      !isSkeletonMetadata(metadata) &&
-      !metadata.__quotaSlimmed &&
-      hasRealSteamReviewSummary(reviewSummary)
-        ? {
-            ...metadata,
-            reviewSummary,
-          }
-        : undefined;
-
-    try {
-      void window.electronAPI.offlineVault
-        .saveGameDetail({
-          gameId: game.id,
-          steamAppId: resolvedSteamAppId ?? null,
-          canonicalTitle: game.title,
-          criticScore: { ...openCriticData } as unknown as Record<string, unknown>,
-          ...(isExplicitOverride ? { forceCriticScore: true } : {}),
-          ...(persistableEnrichedMetadata
-            ? { enrichedMetadata: persistableEnrichedMetadata }
-            : {}),
-        })
-        ?.catch?.(() => {});
-    } catch {
-      // Ignore vault persistence error
-    }
-  }, [
-    activeReviewGame,
-    game.id,
-    game.title,
-    metadata,
-    openCriticData,
-    overrideTick,
-    resolvedSteamAppId,
-    reviewSummary,
-    userOverride?.updatedAt,
-  ]);
-
-  const syncInlineVideoPlayback = () => {
+  const syncInlineVideoPlayback = useCallback(() => {
     const root = containerRef.current;
     if (!root || typeof root.querySelectorAll !== 'function') return;
     const shouldHibernateMedia =
       !onlineLifecycleManager.isOnline() ||
       prefersReducedMotion() ||
+      isModalOverlayOpen() ||
       (typeof document !== 'undefined' && Boolean(document.hidden)) ||
       launcherService.isInGameHibernating() ||
       launcherService.getRunningGames().length > 0;
@@ -2446,18 +546,30 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         video.play().catch(() => {});
       }
     });
-  };
+  }, []);
+
+  const syncInlineVideoPlaybackRef = useRef(syncInlineVideoPlayback);
+  syncInlineVideoPlaybackRef.current = syncInlineVideoPlayback;
 
   useEffect(() => {
-    syncInlineVideoPlayback();
-    const unsubLauncher = launcherService.subscribe(syncInlineVideoPlayback);
+    const runSync = () => syncInlineVideoPlaybackRef.current();
+    runSync();
+    const unsubLauncher = launcherService.subscribe(runSync);
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('antigravity:modal-overlay-changed', runSync);
+      window.addEventListener('antigravity:hibernate-state-changed', runSync);
+    }
     if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
-      document.addEventListener('visibilitychange', syncInlineVideoPlayback);
+      document.addEventListener('visibilitychange', runSync);
     }
     return () => {
       unsubLauncher();
+      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+        window.removeEventListener('antigravity:modal-overlay-changed', runSync);
+        window.removeEventListener('antigravity:hibernate-state-changed', runSync);
+      }
       if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
-        document.removeEventListener('visibilitychange', syncInlineVideoPlayback);
+        document.removeEventListener('visibilitychange', runSync);
       }
     };
   }, [game.id, metadata, isOnline]);
@@ -2476,27 +588,15 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
 
       <div className="relative max-w-6xl mx-auto px-4 md:px-8 pt-6 space-y-6">
         {/* Navigation Breadcrumb */}
-        <div className="flex items-center justify-between border-b border-steam-border/40 pb-4">
-          <div className="flex items-center gap-2 text-xs text-steam-subtext">
-            <button
-              type="button"
-              onClick={onBackToLibrary}
-              className="inline-flex items-center gap-1.5 min-h-6 text-steam-accent hover:text-white hover:underline cursor-pointer uppercase tracking-wider text-[11px] font-bold transition-colors group"
-              title="Return to All Games library grid"
-            >
-              <ArrowLeft className="w-3.5 h-3.5 group-hover:-translate-x-0.5 transition-transform" />
-              <span>All Games</span>
-            </button>
-            <span>&gt;</span>
-            <span className="text-white font-semibold truncate max-w-md">{game.title}</span>
-          </div>
-        </div>
+        <StoreDetailBreadcrumb title={game.title} onBackToLibrary={onBackToLibrary} />
 
         {/* Akamai Edge Cooldown Notice */}
         {isCooldown && (
           <div className="bg-[#1b2838]/90 border border-[#2a475e] text-xs text-steam-subtext rounded px-3.5 py-2.5 flex items-center justify-between shadow-sm">
             <span>
-              <strong className="text-steam-accent">Local Library Mode:</strong> Live store web requests paused while Akamai CDN edge cooldown clears. Showing official local assets & artwork.
+              <strong className="text-steam-accent">Local Library Mode:</strong> Live store web
+              requests paused while Akamai CDN edge cooldown clears. Showing official local assets
+              &amp; artwork.
             </span>
             <span className="text-[11px] text-[#acb2b8] font-mono">Auto-resumes in ~15m</span>
           </div>
@@ -2506,7 +606,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         {disconnectedPlatforms.length > 0 && (
           <div className="bg-amber-950/40 border border-amber-500/50 text-xs text-amber-200 rounded px-3.5 py-2.5 flex items-center justify-between gap-3 shadow-sm">
             <div className="flex items-center gap-2 min-w-0">
-              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
               <span>
                 <strong className="text-amber-300">
                   {disconnectedPlatforms
@@ -2514,7 +614,8 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
                     .join(', ')}{' '}
                   (Not Connected):
                 </strong>{' '}
-                This title is cataloged in your baseline library. Live purchase sync & cloud trophies will resume when reconnected.
+                This title is cataloged in your baseline library. Live purchase sync &amp; cloud
+                trophies will resume when reconnected.
               </span>
             </div>
             {onOpenIntegrations && (
@@ -2540,12 +641,18 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
                 <div className="flex items-center gap-2 border-r border-[#2a475e]/70 pr-3 mr-1">
                   {isRunning ? (
                     <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-950/60 border border-emerald-500/40 text-xs font-semibold text-emerald-400">
-                      <Activity className="w-3.5 h-3.5 text-emerald-400 animate-pulse shrink-0" />
+                      <Activity
+                        className="w-3.5 h-3.5 text-emerald-400 animate-pulse shrink-0"
+                        aria-hidden="true"
+                      />
                       <span>Active Session</span>
                     </span>
                   ) : (
                     <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-950/40 border border-emerald-500/30 text-xs font-semibold text-emerald-400">
-                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      <CheckCircle2
+                        className="w-3.5 h-3.5 text-emerald-400 shrink-0"
+                        aria-hidden="true"
+                      />
                       <span>Ready to Play</span>
                     </span>
                   )}
@@ -2569,13 +676,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
                   <NativeOsBadges
                     platforms={activeStoreNativePlatforms}
                     variant="detail-pill"
-                    onSelectOs={(os) =>
-                      onApplyFilter?.({
-                        type: 'os',
-                        label: 'Native OS',
-                        value: os === 'mac' ? 'macOS' : 'Windows',
-                      })
-                    }
+                    onSelectOs={handleSelectNativeOs}
                   />
                 </div>
               )}
@@ -2583,7 +684,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           </div>
         </div>
 
-        {/* Steam Library Action & Stats Bar (Play Button, Library Status, Play Time, Last Played, Space Required, Achievements) */}
+        {/* Steam Library Action & Stats Bar */}
         <SteamLibraryActionBar
           game={currentGame}
           metadata={metadata}
@@ -2605,11 +706,11 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           <div className="flex-1 min-w-0 lg:max-w-[616px]">
             {isLoading ? (
               <div className="aspect-video w-full bg-black/60 rounded flex flex-col items-center justify-center gap-3 animate-pulse border border-steam-border">
-                <Sparkles className="w-8 h-8 text-steam-accent animate-spin" />
+                <Sparkles className="w-8 h-8 text-steam-accent animate-spin" aria-hidden="true" />
                 <span className="text-xs text-steam-accent">Loading Steam Media...</span>
               </div>
             ) : (
-              <MediaGallery
+              <MemoMediaGallery
                 screenshots={screenshots}
                 movies={movies}
                 headerImage={effectiveHeaderImage}
@@ -2669,10 +770,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         />
 
         {/* Critic Consensus Dashboard (OpenCritic / Metacritic) */}
-        <OpenCriticCard
-          gameTitle={game.title}
-          openCritic={openCriticData}
-        />
+        <OpenCriticCard gameTitle={game.title} openCritic={openCriticData} />
 
         {/* Content Section: Description & Technical Specs */}
         <div className="cv-section grid grid-cols-1 lg:grid-cols-12 gap-8 pt-4">
@@ -2749,8 +847,8 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
                 (metadata?.drmNotice?.includes('Javelin')
                   ? 'EA Javelin Anticheat'
                   : metadata?.drmNotice?.includes('Easy')
-                    ? 'Easy Anti-Cheat'
-                    : 'Anti-Cheat Software')
+                  ? 'Easy Anti-Cheat'
+                  : 'Anti-Cheat Software')
               }
               hasEula={Boolean(
                 metadata?.drmNotice?.toLowerCase().includes('eula') ||
@@ -2761,7 +859,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
 
             {/* Exact 1:1 Languages Matrix Table */}
             <div className="cv-store-section">
-              <SteamLanguagesTable
+              <MemoSteamLanguagesTable
                 rawSupportedLanguagesHtml={metadata?.supportedLanguages}
                 languageOptions={metadata?.languageOptions}
                 languageTableSchema={metadata?.languageTableSchema}

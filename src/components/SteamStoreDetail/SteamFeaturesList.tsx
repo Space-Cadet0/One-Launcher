@@ -21,8 +21,10 @@ const ACCESSIBILITY_IDS = new Set([
   64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
 ]);
 
-export const SteamFeaturesList: React.FC<SteamFeaturesListProps> = ({
-  categories = [],
+const EMPTY_CATEGORIES: SteamCategory[] = [];
+
+const SteamFeaturesListImpl: React.FC<SteamFeaturesListProps> = ({
+  categories = EMPTY_CATEGORIES,
   title = 'Game',
   hasAntiCheat = false,
   antiCheatName = 'Easy Anti-Cheat',
@@ -225,3 +227,7 @@ export const SteamFeaturesList: React.FC<SteamFeaturesListProps> = ({
     </div>
   );
 };
+
+export const SteamFeaturesList: React.FC<SteamFeaturesListProps> = React.memo(
+  SteamFeaturesListImpl
+);

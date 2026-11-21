@@ -82,7 +82,7 @@ export const TagManagerPopover: React.FC<TagManagerPopoverProps> = ({
 
   const filteredLibraryTags = useMemo<TagFacetCount[]>(() => {
     if (!lowerQuery) {
-      return [...mergedLibraryTags].sort(
+      return mergedLibraryTags.toSorted(
         (a, b) => b.count - a.count || a.label.localeCompare(b.label)
       );
     }
@@ -321,7 +321,7 @@ export const TagManagerPopover: React.FC<TagManagerPopoverProps> = ({
   const handleInputKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
       if (e.key === 'Enter') {
-        if (isImeComposing(e)) {
+        if (e.nativeEvent?.isComposing || isImeComposing(e)) {
           e.preventDefault();
           return;
         }
@@ -492,7 +492,7 @@ export const TagManagerPopover: React.FC<TagManagerPopoverProps> = ({
                     enterKeyHint="done"
                     maxLength={64}
                     placeholder="Search or add new tag..."
-                    className="w-full min-h-7 pl-8 pr-7 py-1 rounded bg-[#0c121a] border border-[#2a475e] text-xs text-white placeholder-[#7f93a8] focus:outline-none focus:border-[#66c0f4]"
+                    className="w-full min-h-7 pl-8 pr-7 py-1 rounded bg-[#0c121a] border border-[#2a475e] text-xs text-white placeholder-[#7f93a8] focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60"
                   />
                   {query.length > 0 && (
                     <button

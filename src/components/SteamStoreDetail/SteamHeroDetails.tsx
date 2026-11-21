@@ -20,6 +20,8 @@ import {
 import { TagManagerPopover } from './TagManagerPopover';
 import { HelpCircle, ExternalLink } from 'lucide-react';
 
+const EMPTY_STRINGS: string[] = [];
+
 function isSentinelReleaseDateValue(raw?: string | null): boolean {
   if (!raw) return false;
   const match = raw.match(/\b(\d{4})\b/);
@@ -59,7 +61,7 @@ interface SteamHeroDetailsProps {
   platforms?: Array<{ platformId: string; platformGameId: string }>;
 }
 
-export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
+const SteamHeroDetailsImpl: React.FC<SteamHeroDetailsProps> = ({
   headerImage,
   fallbackImage,
   title,
@@ -67,9 +69,9 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
   reviewSummary,
   openCritic,
   releaseDate = 'TBA',
-  developers = [],
-  publishers = [],
-  tags = [],
+  developers = EMPTY_STRINGS,
+  publishers = EMPTY_STRINGS,
+  tags = EMPTY_STRINGS,
   onApplyFilter,
   gameId,
   steamAppId,
@@ -335,7 +337,6 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
           <img
             src={activeHeaderSrc}
             alt={title}
-            fetchPriority="high"
             decoding="async"
             onError={() => {
               if (activeHeaderSrc === resolvedHeaderImage) {
@@ -582,3 +583,5 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
     </div>
   );
 };
+
+export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = React.memo(SteamHeroDetailsImpl);

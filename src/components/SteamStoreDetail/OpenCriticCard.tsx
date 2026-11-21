@@ -8,7 +8,7 @@ interface OpenCriticCardProps {
   gameTitle: string;
 }
 
-export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, gameTitle }) => {
+const OpenCriticCardImpl: React.FC<OpenCriticCardProps> = ({ openCritic, gameTitle }) => {
   const handleOpenExternal = (url: string, e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -358,3 +358,5 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
     </div>
   );
 };
+
+export const OpenCriticCard: React.FC<OpenCriticCardProps> = React.memo(OpenCriticCardImpl);

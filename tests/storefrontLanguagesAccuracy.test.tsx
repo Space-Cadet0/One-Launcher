@@ -289,7 +289,7 @@ describe('Storefront Language Parsing & SteamLanguagesTable Accuracy (Steam, GOG
 
       tree = harness.render();
 
-      const headerCells = findElements(tree, (el) => el.type === 'th');
+      const headerCells = findElements(tree, (el) => el.type === 'th' && el.props?.scope === 'col');
       expect(headerCells.map(getTextContent)).toEqual(['', 'Interface', 'Full Audio', 'Subtitles']);
 
       const bodyRows = findElements(
@@ -299,15 +299,24 @@ describe('Storefront Language Parsing & SteamLanguagesTable Accuracy (Steam, GOG
       expect(bodyRows).toHaveLength(6);
 
       for (let i = 0; i < bodyRows.length; i++) {
+        const rowHeaders = findElements(
+          bodyRows[i],
+          (el) => el.type === 'th' && el.props?.scope === 'row'
+        );
+        expect(rowHeaders).toHaveLength(1);
+        expect(getTextContent(rowHeaders[0])).toBe(PORTAL_2_LANG_NAMES[i]);
+
         const tds = findElements(bodyRows[i], (el) => el.type === 'td');
-        expect(tds).toHaveLength(4);
-        expect(getTextContent(tds[0])).toBe(PORTAL_2_LANG_NAMES[i]);
-        // Interface column has ✔
-        expect(getTextContent(tds[1])).toBe('✔');
+        expect(tds).toHaveLength(3);
+        // Interface column has ✔ + sr-only Supported
+        expect(findElements(tds[0], (el) => el.props?.className === 'check')).toHaveLength(1);
+        expect(getTextContent(tds[0])).toContain('✔');
         // Full Audio column has zero ticks
-        expect(getTextContent(tds[2])).toBe('');
+        expect(findElements(tds[1], (el) => el.props?.className === 'check')).toHaveLength(0);
+        expect(getTextContent(tds[1])).not.toContain('✔');
         // Subtitles column has zero ticks
-        expect(getTextContent(tds[3])).toBe('');
+        expect(findElements(tds[2], (el) => el.props?.className === 'check')).toHaveLength(0);
+        expect(getTextContent(tds[2])).not.toContain('✔');
       }
 
       harness.unmount();
@@ -419,7 +428,7 @@ describe('Storefront Language Parsing & SteamLanguagesTable Accuracy (Steam, GOG
       });
 
       const tree = harness.render();
-      const headerCells = findElements(tree, (el) => el.type === 'th');
+      const headerCells = findElements(tree, (el) => el.type === 'th' && el.props?.scope === 'col');
       expect(headerCells.map(getTextContent)).toEqual(['', 'Audio', 'Text']);
 
       const bodyRows = findElements(
@@ -429,11 +438,17 @@ describe('Storefront Language Parsing & SteamLanguagesTable Accuracy (Steam, GOG
       // Only English — no fake extra languages
       expect(bodyRows).toHaveLength(1);
 
+      const rowHeaders = findElements(
+        bodyRows[0],
+        (el) => el.type === 'th' && el.props?.scope === 'row'
+      );
+      expect(rowHeaders).toHaveLength(1);
+      expect(getTextContent(rowHeaders[0])).toBe('English');
+
       const tds = findElements(bodyRows[0], (el) => el.type === 'td');
-      expect(tds).toHaveLength(3);
-      expect(getTextContent(tds[0])).toBe('English');
-      expect(getTextContent(tds[1])).toBe('✔');
-      expect(getTextContent(tds[2])).toBe('✔');
+      expect(tds).toHaveLength(2);
+      expect(findElements(tds[0], (el) => el.props?.className === 'check')).toHaveLength(1);
+      expect(findElements(tds[1], (el) => el.props?.className === 'check')).toHaveLength(1);
 
       harness.unmount();
     });
@@ -571,7 +586,7 @@ describe('Storefront Language Parsing & SteamLanguagesTable Accuracy (Steam, GOG
       tree = harness.render();
 
       // Verify 2-column Audio | Text headers and no Subtitles column
-      const headerCells = findElements(tree, (el) => el.type === 'th');
+      const headerCells = findElements(tree, (el) => el.type === 'th' && el.props?.scope === 'col');
       expect(headerCells.map(getTextContent)).toEqual(['', 'Audio', 'Text']);
       expect(headerCells.map(getTextContent)).not.toContain('Subtitles');
 
@@ -582,13 +597,21 @@ describe('Storefront Language Parsing & SteamLanguagesTable Accuracy (Steam, GOG
       expect(bodyRows).toHaveLength(14);
 
       for (let i = 0; i < bodyRows.length; i++) {
-        const tds = findElements(bodyRows[i], (el) => el.type === 'td');
-        expect(tds).toHaveLength(3);
-        const langName = getTextContent(tds[0]);
+        const rowHeaders = findElements(
+          bodyRows[i],
+          (el) => el.type === 'th' && el.props?.scope === 'row'
+        );
+        expect(rowHeaders).toHaveLength(1);
+        const langName = getTextContent(rowHeaders[0]);
         expect(langName).toBe(EXPECTED_TEXT_LANGUAGES[i]);
-        const expectedAudioTick = EXPECTED_AUDIO_LANGUAGES.includes(langName) ? '✔' : '';
-        expect(getTextContent(tds[1])).toBe(expectedAudioTick);
-        expect(getTextContent(tds[2])).toBe('✔');
+
+        const tds = findElements(bodyRows[i], (el) => el.type === 'td');
+        expect(tds).toHaveLength(2);
+        const expectedAudioTickCount = EXPECTED_AUDIO_LANGUAGES.includes(langName) ? 1 : 0;
+        expect(findElements(tds[0], (el) => el.props?.className === 'check')).toHaveLength(
+          expectedAudioTickCount
+        );
+        expect(findElements(tds[1], (el) => el.props?.className === 'check')).toHaveLength(1);
       }
 
       harness.unmount();

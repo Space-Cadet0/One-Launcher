@@ -1470,12 +1470,17 @@ describe('Post-Xbox 9-Dimension, Dual-OS & WCAG 2.2 AA Regression Suite', () => 
         'Subtitles',
       ]);
 
+      const rowHeaders = steamDoc.querySelectorAll('th[scope="row"]');
+      expect(rowHeaders.length).toBe(5);
       const checkIcons = steamDoc.querySelectorAll('span.check[aria-hidden="true"]');
       expect(checkIcons.length).toBeGreaterThan(0);
-      const supportCells = steamDoc.querySelectorAll('td[aria-label="Supported"]');
-      const unsupportedCells = steamDoc.querySelectorAll('td[aria-label="Not supported"]');
-      expect(supportCells.length).toBeGreaterThan(0);
-      expect(unsupportedCells.length).toBeGreaterThan(0);
+      expect(steamDoc.querySelectorAll('td[aria-label]').length).toBe(0);
+      const srLabels = steamDoc
+        .querySelectorAll('td')
+        .flatMap((td) => td.querySelectorAll('span.sr-only'))
+        .map((n) => n.textContent.trim());
+      expect(srLabels.filter((t) => t === 'Supported').length).toBeGreaterThan(0);
+      expect(srLabels.filter((t) => t === 'Not supported').length).toBeGreaterThan(0);
 
       const audioTextHtml = renderToString(
         React.createElement(SteamLanguagesTable, {
