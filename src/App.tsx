@@ -258,6 +258,7 @@ export function App() {
     canGoForward,
     forwardTitle,
     pushEntry,
+    updateCurrentEntry,
     goBack,
     goForward,
     saveCurrentScroll,
@@ -270,6 +271,7 @@ export function App() {
       activeGroupId: null,
       title: 'All Games',
       scrollY: 0,
+      libraryFilterState: DEFAULT_LIBRARY_FILTER_STATE,
     },
     getCurrentScroll
   );
@@ -277,6 +279,8 @@ export function App() {
   const isGridView = currentEntry.view === 'grid';
   const activeGroupId = currentEntry.activeGroupId;
   const activeFilter = currentEntry.activeFilter;
+  const libraryFilterState = currentEntry.libraryFilterState ?? DEFAULT_LIBRARY_FILTER_STATE;
+  const deferredLibraryFilterState = useDeferredValue(libraryFilterState);
   const [gridSortBy, setGridSortBy] = useState<GridSortOption>(() => loadPersistedGridSort());
   const [isCatalogVaultHydrated, setIsCatalogVaultHydrated] = useState<boolean>(false);
 
@@ -331,31 +335,36 @@ export function App() {
         activeFilter: null,
         activeGroupId: null,
         title: resolved.title,
+        libraryFilterState: activeFilter ? DEFAULT_LIBRARY_FILTER_STATE : libraryFilterState,
       });
     },
-    [pushEntry]
+    [activeFilter, libraryFilterState, pushEntry]
   );
-
-  const [libraryFilterState, setLibraryFilterState] = useState<LibraryFilterState>(
-    DEFAULT_LIBRARY_FILTER_STATE
-  );
-  const deferredLibraryFilterState = useDeferredValue(libraryFilterState);
 
   const navigateApplyFilter = useCallback(
     (filter: ActiveGameFilter) => {
-      setLibraryFilterState((prev) => activeGameFilterToLibraryFilterState(filter, prev, false));
+      const nextFilterState = activeGameFilterToLibraryFilterState(
+        filter,
+        libraryFilterState,
+        false
+      );
       pushEntry({
         view: 'grid',
         selectedGameId: selectedGame?.id || null,
         activeFilter: filter,
         activeGroupId: null,
         title: `${filter.label}: ${filter.value}`,
+        libraryFilterState: nextFilterState,
       });
     },
-    [pushEntry, selectedGame?.id]
+    [libraryFilterState, pushEntry, selectedGame?.id]
   );
 
   const navigateHome = useCallback(() => {
+    if (isGridView && !activeFilter && !activeGroupId) {
+      updateCurrentEntry({ libraryFilterState: DEFAULT_LIBRARY_FILTER_STATE });
+      return;
+    }
     pushEntry({
       view: 'grid',
       selectedGameId: selectedGame?.id || null,
@@ -363,8 +372,18 @@ export function App() {
       activeGroupId: null,
       title: 'All Games',
       scrollY: getLastAllGamesScrollY(),
+      libraryFilterState: activeFilter ? DEFAULT_LIBRARY_FILTER_STATE : libraryFilterState,
     });
-  }, [getLastAllGamesScrollY, pushEntry, selectedGame?.id]);
+  }, [
+    activeFilter,
+    activeGroupId,
+    getLastAllGamesScrollY,
+    isGridView,
+    libraryFilterState,
+    pushEntry,
+    selectedGame?.id,
+    updateCurrentEntry,
+  ]);
 
   const {
     collections,
@@ -395,23 +414,35 @@ export function App() {
         activeFilter: null,
         activeGroupId: groupId,
         title: colName,
+        libraryFilterState: activeFilter ? DEFAULT_LIBRARY_FILTER_STATE : libraryFilterState,
       });
     },
-    [collections, navigateHome, pushEntry, selectedGame?.id]
+    [activeFilter, collections, libraryFilterState, navigateHome, pushEntry, selectedGame?.id]
   );
 
   const navigateClearFilter = useCallback(() => {
-    setLibraryFilterState(DEFAULT_LIBRARY_FILTER_STATE);
-    pushEntry({
-      view: 'grid',
-      selectedGameId: selectedGame?.id || null,
-      activeFilter: null,
-      activeGroupId: activeGroupId,
-      title: activeGroupId
-        ? collections.find((c) => c.id === activeGroupId)?.name || 'Collection'
-        : 'All Games',
-    });
-  }, [activeGroupId, collections, pushEntry, selectedGame?.id]);
+    if (activeFilter) {
+      pushEntry({
+        view: 'grid',
+        selectedGameId: selectedGame?.id || null,
+        activeFilter: null,
+        activeGroupId: activeGroupId,
+        title: activeGroupId
+          ? collections.find((c) => c.id === activeGroupId)?.name || 'Collection'
+          : 'All Games',
+        libraryFilterState: DEFAULT_LIBRARY_FILTER_STATE,
+      });
+      return;
+    }
+    updateCurrentEntry({ libraryFilterState: DEFAULT_LIBRARY_FILTER_STATE });
+  }, [
+    activeFilter,
+    activeGroupId,
+    collections,
+    pushEntry,
+    selectedGame?.id,
+    updateCurrentEntry,
+  ]);
 
   const [searchQuery, setSearchQuery] = useState('');
   const deferredSearchQuery = useDeferredValue(searchQuery);
@@ -1068,7 +1099,6 @@ export function App() {
 
   const handleUpdateLibraryFilterState = useCallback(
     (next: LibraryFilterState) => {
-      setLibraryFilterState(next);
       if (activeFilter) {
         const bounds = {
           minYear: libraryFilterIndex.minReleaseYear,
@@ -1083,9 +1113,12 @@ export function App() {
             title: activeGroupId
               ? collections.find((c) => c.id === activeGroupId)?.name || 'Collection'
               : 'All Games',
+            libraryFilterState: next,
           });
+          return;
         }
       }
+      updateCurrentEntry({ libraryFilterState: next });
     },
     [
       activeFilter,
@@ -1095,11 +1128,11 @@ export function App() {
       libraryFilterIndex.minReleaseYear,
       pushEntry,
       selectedGame?.id,
+      updateCurrentEntry,
     ]
   );
 
   const handleResetLibraryFilterState = useCallback(() => {
-    setLibraryFilterState(DEFAULT_LIBRARY_FILTER_STATE);
     navigateClearFilter();
   }, [navigateClearFilter]);
 

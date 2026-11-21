@@ -230,12 +230,54 @@ export class SteamIntegrationService {
   async fetchOwnedGames(
     credentials: StorefrontCredentials
   ): Promise<{ profile: SteamPlayerProfile; games: CanonicalGame[] }> {
-    const { steamId, apiKey } = credentials;
-    if (!steamId) {
+    const rawSteamId = credentials.steamId?.trim() || '';
+    const cleanApiKey =
+      credentials.apiKey && credentials.apiKey !== 'saved_in_electron'
+        ? credentials.apiKey.trim()
+        : '';
+
+    // Attempt 0 (Electron): if no raw renderer Web API key is provided (or steamId is stored in main vault),
+    // delegate directly to main-process IPC `syncStore('steam')` which uses encrypted tokens / SSR cookies / cache.
+    const canUseElectronIpc =
+      typeof window !== 'undefined' && typeof window.electronAPI?.syncStore === 'function';
+    if (!cleanApiKey && canUseElectronIpc) {
+      try {
+        const ipcPayload = rawSteamId ? { steamId: rawSteamId } : undefined;
+        const ipcRes = ipcPayload
+          ? await window.electronAPI!.syncStore('steam', ipcPayload)
+          : await window.electronAPI!.syncStore('steam');
+        if (ipcRes?.success && Array.isArray(ipcRes.games)) {
+          const resolvedId = rawSteamId || ipcRes.accountId || '';
+          const verifiedGames = ipcRes.games.map((g) => ({
+            ...g,
+            isVerifiedEntitlement: true,
+          }));
+          if (verifiedGames.length > 0 || ipcRes.authoritativeComplete === true) {
+            const profile: SteamPlayerProfile = {
+              steamId: resolvedId,
+              personaName: ipcRes.accountName || 'Steam User',
+              avatarUrl: ipcRes.avatarUrl || DEFAULT_STEAM_AVATAR_URL,
+              profileUrl: resolvedId
+                ? `https://steamcommunity.com/profiles/${encodeURIComponent(resolvedId)}`
+                : 'https://steamcommunity.com',
+              gamesCount: verifiedGames.length,
+            };
+            return { profile, games: verifiedGames };
+          }
+        }
+      } catch (err: unknown) {
+        console.warn('Steam native IPC sync warning:', formatSanitizedSteamError(err));
+      }
+    }
+
+    if (!rawSteamId) {
       throw new Error(
         'Steam ID is required to connect to Steam. Click "Sign In with Steam" or enter your SteamID64.'
       );
     }
+
+    const steamId = rawSteamId;
+    const apiKey = cleanApiKey || undefined;
 
     const profile = await this.fetchPlayerProfile(steamId, apiKey);
     const games: CanonicalGame[] = [];

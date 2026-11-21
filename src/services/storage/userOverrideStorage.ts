@@ -1909,32 +1909,41 @@ export function getUserOverrideForGame(
       return true;
     }
 
-    // If an override explicitly pins a non-Steam platform entitlement and `game.platforms` is populated,
-    // verify `game` either has that exact gameId or owns that platform entitlement so overrides never bleed across entitlements.
+    // If an override explicitly pins a platform entitlement and `game.platforms` is populated,
+    // verify `game` either owns that exact entitlement or does NOT carry a conflicting entitlement
+    // on the same storefront (preventing e.g. xbox:9NRRJLLXM68V from hijacking xbox:9P38D19T7LRV).
     if (hasPlatforms && ov.platformId && ov.platformGameId) {
+      const ovPlatIdLower = String(ov.platformId).toLowerCase();
+      const ovPlatGameIdLower = String(ov.platformGameId).toLowerCase();
+      const ownsMatchingPlat = game.platforms.some(
+        (p) =>
+          p &&
+          String(p.platformId).toLowerCase() === ovPlatIdLower &&
+          (String(p.platformGameId).toLowerCase() === ovPlatGameIdLower ||
+            (Boolean(p.xboxProductId) &&
+              String(p.xboxProductId).toLowerCase() === ovPlatGameIdLower))
+      );
+      if (ownsMatchingPlat) return true;
+
+      // Reject whenever the game owns one or more entries for `ov.platformId` and NONE match `ov.platformGameId`.
+      const hasSamePlatformWithoutMatch = game.platforms.some(
+        (p) => p && String(p.platformId).toLowerCase() === ovPlatIdLower
+      );
+      if (hasSamePlatformWithoutMatch) {
+        return false;
+      }
+
       if (game.id && ov.gameId && game.id === ov.gameId) {
-        const ownsMatchingPlat = game.platforms.some(
-          (p) =>
-            p &&
-            String(p.platformId).toLowerCase() === String(ov.platformId).toLowerCase() &&
-            String(p.platformGameId).toLowerCase() === String(ov.platformGameId).toLowerCase()
-        );
-        if (ownsMatchingPlat) return true;
         // Allow direct game.id match only when game does NOT exclusively belong to a conflicting storefront entitlement
         const onlySteamWithoutTargetStore = game.platforms.every(
-          (p) => String(p?.platformId).toLowerCase() !== String(ov.platformId).toLowerCase()
+          (p) => String(p?.platformId).toLowerCase() !== ovPlatIdLower
         );
         if (onlySteamWithoutTargetStore && game.platforms.some((p) => p?.platformId === 'steam')) {
           return false;
         }
         return true;
       }
-      return game.platforms.some(
-        (p) =>
-          p &&
-          String(p.platformId).toLowerCase() === String(ov.platformId).toLowerCase() &&
-          String(p.platformGameId).toLowerCase() === String(ov.platformGameId).toLowerCase()
-      );
+      return false;
     }
 
     return true;

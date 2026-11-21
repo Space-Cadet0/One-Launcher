@@ -304,6 +304,8 @@ export class EpicIntegrationService {
     if (!cleanAccountId) return {};
 
     try {
+      const cleanToken = accessToken ? normalizeEpicBearerToken(accessToken) : '';
+
       // 1. In Electron desktop runtime, delegate to native IPC if available
       if (hasElectronBridge() && window.electronAPI?.fetchEpicAchievements) {
         const nativeMap = await window.electronAPI.fetchEpicAchievements(
@@ -313,6 +315,11 @@ export class EpicIntegrationService {
         if (nativeMap && Object.keys(nativeMap).length > 0) {
           cacheUserEpicAchievements(nativeMap);
           return nativeMap;
+        }
+        // In Electron, OAuth tokens stay encrypted in main-process storage (renderer sees '' or
+        // 'saved_in_electron'). Do not issue an unauthenticated direct GraphQL POST from renderer.
+        if (!cleanToken || cleanToken === 'saved_in_electron') {
+          return nativeMap || {};
         }
       }
 
@@ -347,7 +354,6 @@ export class EpicIntegrationService {
         'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
       };
-      const cleanToken = accessToken ? normalizeEpicBearerToken(accessToken) : '';
       if (cleanToken && cleanToken !== 'saved_in_electron') {
         headers['Authorization'] = `bearer ${cleanToken}`;
       }

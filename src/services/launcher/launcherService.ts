@@ -408,6 +408,10 @@ export class LauncherService {
     this.sessionManager.applyHibernationState(hibernating, this.createSessionManagerContext());
   }
 
+  public resumeFromHibernation(): void {
+    this.setInGameHibernating(false);
+  }
+
   public subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => {
@@ -433,6 +437,7 @@ export class LauncherService {
   private syncInGameResourceThrottle(): void {
     const activeSessions = this.activeSessions;
     if (activeSessions.size > 0) {
+      this.sessionManager.markHibernationSessionObserved();
       if (typeof document !== 'undefined') {
         document.body?.classList?.add('is-in-game');
       }
@@ -498,7 +503,10 @@ export class LauncherService {
       if (typeof document !== 'undefined') {
         document.body?.classList?.remove('is-in-game');
       }
-      const wasHibernating = this.sessionManager.clearHibernatingFlag();
+      const preservePendingHibernation = this.sessionManager.shouldPreservePendingHibernation();
+      const wasHibernating = preservePendingHibernation
+        ? false
+        : this.sessionManager.clearHibernatingFlag();
       requestScheduler.setInGameThrottle(false);
       this.inGamePriorityScopeActive = false;
 

@@ -231,16 +231,30 @@ export class SyncJobManager {
     const activeCats = this.getActiveCategories();
     const activeLabels = activeCats.map((c) => CATEGORY_SHORT_LABELS[c]);
 
-    // P0-3: Prevent trophy sync from marking itself `isPreempted: true` if a caller wrapped
-    // `startTrophySync` inside a matching `beginPriorityScope('Syncing Storefront Trophies')`.
+    // P0-3 / BUG-C7: Prevent trophy sync and storefront library sync from marking themselves
+    // `isPreempted: true` when wrapped in their own matching priority scope.
     const isSelfTrophyJob =
       this.state.type === 'achievements' && this.state.id.startsWith('trophy-sync-');
+    const isSelfStorefrontJob =
+      !this.state.id.startsWith('priority-') &&
+      (this.state.type === 'storefront_libraries' ||
+        (this.state.id.startsWith('auto-sync-') &&
+          activeCats.includes('storefront_libraries')));
     const scopes = Array.from(this.priorityScopes.values());
-    const latestPriority = (
-      isSelfTrophyJob
-        ? scopes.filter((s) => s.headline !== this.state?.title)
-        : scopes
-    ).pop();
+    const latestPriority = scopes
+      .filter((s) => {
+        if (isSelfTrophyJob && s.headline === this.state?.title) {
+          return false;
+        }
+        if (
+          isSelfStorefrontJob &&
+          s.headline === CATEGORY_SINGLE_HEADLINES.storefront_libraries
+        ) {
+          return false;
+        }
+        return true;
+      })
+      .pop();
 
     this.state.activeCategories = activeLabels;
     this.state.activeCategoryKeys = activeCats;

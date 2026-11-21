@@ -77,9 +77,13 @@ export interface SessionLifecycleManagerContext {
   notifyStateChanged: () => void;
 }
 
+const HIBERNATION_IPC_RACE_GRACE_MS = 10_000;
+
 export class SessionLifecycleManager {
   private activeSessions: Map<string, ActiveGameSession> = new Map();
   private inGameHibernating = false;
+  private hibernationRequestedAtMs = 0;
+  private hibernationObservedActiveSession = false;
   private inFlightLaunchesByGameId: Map<string, Promise<LauncherActionResult>> = new Map();
 
   public getActiveSessionsMap(): Map<string, ActiveGameSession> {
@@ -113,12 +117,43 @@ export class SessionLifecycleManager {
   }
 
   public setInGameHibernatingRaw(val: boolean): void {
-    this.inGameHibernating = val;
+    const next = Boolean(val);
+    this.inGameHibernating = next;
+    if (next) {
+      this.hibernationRequestedAtMs = Date.now();
+      this.hibernationObservedActiveSession = this.activeSessions.size > 0;
+    } else {
+      this.hibernationRequestedAtMs = 0;
+      this.hibernationObservedActiveSession = false;
+    }
+  }
+
+  public markHibernationSessionObserved(): void {
+    if (this.inGameHibernating && this.activeSessions.size > 0) {
+      this.hibernationObservedActiveSession = true;
+    }
+  }
+
+  /**
+   * Returns true when `inGameHibernating` was explicitly asserted via IPC/API while awaiting
+   * `launcher:session-updated` (event: 'started') or during an in-flight launch, so an early
+   * `syncInGameResourceThrottle()` with `activeSessions.size === 0` does not wipe hibernation.
+   */
+  public shouldPreservePendingHibernation(nowMs: number = Date.now()): boolean {
+    if (!this.inGameHibernating) return false;
+    if (this.hibernationObservedActiveSession) return false;
+    if (this.inFlightLaunchesByGameId.size > 0) return true;
+    return (
+      this.hibernationRequestedAtMs > 0 &&
+      nowMs - this.hibernationRequestedAtMs < HIBERNATION_IPC_RACE_GRACE_MS
+    );
   }
 
   public clearHibernatingFlag(): boolean {
     const wasHibernating = this.inGameHibernating;
     this.inGameHibernating = false;
+    this.hibernationRequestedAtMs = 0;
+    this.hibernationObservedActiveSession = false;
     return wasHibernating;
   }
 
@@ -131,6 +166,13 @@ export class SessionLifecycleManager {
     const transitionedToTrue = !this.inGameHibernating && next;
     const transitionedToFalse = this.inGameHibernating && !next;
     this.inGameHibernating = next;
+    if (next) {
+      this.hibernationRequestedAtMs = Date.now();
+      this.hibernationObservedActiveSession = this.activeSessions.size > 0;
+    } else {
+      this.hibernationRequestedAtMs = 0;
+      this.hibernationObservedActiveSession = false;
+    }
 
     if (this.inGameHibernating) {
       ctx.stopDownloadPolling();
@@ -148,6 +190,9 @@ export class SessionLifecycleManager {
   public resetSessionState(): void {
     this.inFlightLaunchesByGameId.clear();
     this.activeSessions.clear();
+    this.inGameHibernating = false;
+    this.hibernationRequestedAtMs = 0;
+    this.hibernationObservedActiveSession = false;
   }
 
   public replaceActiveSessions(running: ActiveGameSession[]): void {
@@ -156,6 +201,9 @@ export class SessionLifecycleManager {
       if (s && s.gameId) {
         this.activeSessions.set(s.gameId, s);
       }
+    }
+    if (this.inGameHibernating && this.activeSessions.size > 0) {
+      this.hibernationObservedActiveSession = true;
     }
   }
 
@@ -294,6 +342,9 @@ export class SessionLifecycleManager {
         const fallbackGameId = typeof rawGameId === 'string' ? rawGameId.trim() : '';
         if (fallbackGameId) {
           this.activeSessions.delete(fallbackGameId);
+          if (this.inGameHibernating && this.activeSessions.size === 0) {
+            this.hibernationObservedActiveSession = true;
+          }
           ctx.syncInGameResourceThrottle();
           ctx.notifyStateChanged();
         }
@@ -324,6 +375,9 @@ export class SessionLifecycleManager {
 
     if (data.event === 'stopped') {
       this.activeSessions.delete(session.gameId);
+      if (this.inGameHibernating && this.activeSessions.size === 0) {
+        this.hibernationObservedActiveSession = true;
+      }
       if (data.cloudSync) {
         dispatchCloudSyncTelemetryEvent(data.cloudSync);
       }
@@ -352,6 +406,9 @@ export class SessionLifecycleManager {
       }
     } else {
       this.activeSessions.set(session.gameId, session);
+      if (this.inGameHibernating) {
+        this.hibernationObservedActiveSession = true;
+      }
     }
 
     ctx.syncInGameResourceThrottle();
@@ -530,6 +587,9 @@ export class SessionLifecycleManager {
 
         if (res.success && res.session) {
           this.activeSessions.set(game.id, res.session);
+          if (this.inGameHibernating) {
+            this.hibernationObservedActiveSession = true;
+          }
           ctx.syncInGameResourceThrottle();
           ctx.notifyStateChanged();
         }
@@ -584,6 +644,9 @@ export class SessionLifecycleManager {
           pid: session?.pid,
         });
         this.activeSessions.delete(gameId);
+        if (this.inGameHibernating && this.activeSessions.size === 0) {
+          this.hibernationObservedActiveSession = true;
+        }
         ctx.syncInGameResourceThrottle();
         ctx.notifyStateChanged();
         return res;

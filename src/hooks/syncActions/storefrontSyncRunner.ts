@@ -127,8 +127,20 @@ export async function runStorefrontLibrarySync({
       tasks.push(
         syncJobManager.trackTask('storefront_libraries', 'Steam', async () => {
           try {
+            const savedSteamId = steamInteg.credentials?.steamId || steamInteg.accountId;
+            const savedSteamApiKey =
+              steamInteg.credentials?.apiKey &&
+              steamInteg.credentials.apiKey !== 'saved_in_electron'
+                ? steamInteg.credentials.apiKey
+                : undefined;
+
             if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
-              const steamRes = await window.electronAPI.syncStore('steam');
+              const steamPayload = savedSteamId
+                ? { ...(steamInteg.credentials || {}), steamId: savedSteamId }
+                : steamInteg.credentials;
+              const steamRes = steamPayload
+                ? await window.electronAPI.syncStore('steam', steamPayload)
+                : await window.electronAPI.syncStore('steam');
               if (Array.isArray(steamRes?.suppressedItems)) {
                 registerSuppressedCatalogEntries(steamRes.suppressedItems, {
                   storefrontId: 'steam',
@@ -142,7 +154,11 @@ export async function runStorefrontLibrarySync({
                 };
                 cacheUserSteamAchievements(storeSteamAchs);
               }
-              if (steamRes?.success && steamRes.games && steamRes.games.length > 0) {
+              if (
+                steamRes?.success &&
+                Array.isArray(steamRes.games) &&
+                (steamRes.games.length > 0 || steamRes.authoritativeComplete === true)
+              ) {
                 const verifiedSteamGames = steamRes.games.map((g) => ({
                   ...g,
                   isVerifiedEntitlement: true,
@@ -150,27 +166,49 @@ export async function runStorefrontLibrarySync({
                 mergesByStore.set('steam', {
                   storefrontId: 'steam',
                   games: verifiedSteamGames,
+                  ...(steamRes.authoritativeComplete !== undefined
+                    ? {
+                        options: {
+                          authoritativeComplete: Boolean(steamRes.authoritativeComplete),
+                        },
+                      }
+                    : {}),
                 });
-                try {
-                  const liveAchs = await steamAchievementsService.syncUserLibraryAchievements(
-                    verifiedSteamGames,
-                    undefined,
-                    { priority: RequestPriority.P1_VIEWPORT }
-                  );
-                  if (liveAchs && Object.keys(liveAchs).length > 0) {
-                    liveSteamAchs = liveAchs;
-                    cacheUserSteamAchievements(liveSteamAchs);
-                  }
-                } catch {}
-              } else if (steamInteg.credentials?.steamId) {
-                const res = await steamIntegration.fetchOwnedGames(steamInteg.credentials);
+                if (verifiedSteamGames.length > 0) {
+                  try {
+                    const liveAchs = await steamAchievementsService.syncUserLibraryAchievements(
+                      verifiedSteamGames,
+                      undefined,
+                      { priority: RequestPriority.P1_VIEWPORT }
+                    );
+                    if (liveAchs && Object.keys(liveAchs).length > 0) {
+                      liveSteamAchs = liveAchs;
+                      cacheUserSteamAchievements(liveSteamAchs);
+                    }
+                  } catch {}
+                }
+              } else if (
+                !steamRes?.success &&
+                !steamRes?.transientOffline &&
+                savedSteamId &&
+                savedSteamApiKey
+              ) {
+                const res = await steamIntegration.fetchOwnedGames({
+                  ...steamInteg.credentials,
+                  steamId: savedSteamId,
+                  apiKey: savedSteamApiKey,
+                });
                 mergesByStore.set('steam', {
                   storefrontId: 'steam',
                   games: res.games,
                 });
               }
-            } else if (steamInteg.credentials?.steamId) {
-              const res = await steamIntegration.fetchOwnedGames(steamInteg.credentials);
+            } else if (savedSteamId) {
+              const res = await steamIntegration.fetchOwnedGames({
+                ...steamInteg.credentials,
+                steamId: savedSteamId,
+                ...(savedSteamApiKey ? { apiKey: savedSteamApiKey } : {}),
+              });
               mergesByStore.set('steam', {
                 storefrontId: 'steam',
                 games: res.games,
