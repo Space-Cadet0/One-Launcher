@@ -26,6 +26,8 @@ interface ManageCollectionsModalProps {
   onClose: () => void;
   collections: GameCollection[];
   game?: CanonicalGame | null;
+  games?: readonly CanonicalGame[];
+  validGameIds?: ReadonlySet<string>;
   onCreateCollection: (name: string, icon?: string) => void;
   onRenameCollection: (id: string, newName: string, icon?: string) => void;
   onDeleteCollection: (id: string) => void;
@@ -33,11 +35,21 @@ interface ManageCollectionsModalProps {
   onReorderCollections?: (fromIndex: number, toIndex: number) => void;
 }
 
+function isDomNode(value: EventTarget | null | undefined): value is Node {
+  if (!value || typeof value !== 'object') return false;
+  if (typeof Node !== 'undefined') {
+    return value instanceof Node;
+  }
+  return typeof (value as { nodeType?: unknown }).nodeType === 'number';
+}
+
 export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
   isOpen,
   onClose,
   collections,
   game,
+  games,
+  validGameIds,
   onCreateCollection,
   onRenameCollection,
   onDeleteCollection,
@@ -60,6 +72,19 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
   const [dropSlotIndex, setDropSlotIndex] = useState<number | null>(null);
 
   if (!isOpen) return null;
+
+  const effectiveValidGameIds: ReadonlySet<string> | null =
+    validGameIds ?? (games ? new Set(games.map((g) => g.id)) : null);
+
+  const countCollectionGames = (col: GameCollection): number => {
+    const uniqueIds = new Set(col.gameIds);
+    if (!effectiveValidGameIds) return uniqueIds.size;
+    let count = 0;
+    for (const id of uniqueIds) {
+      if (effectiveValidGameIds.has(id)) count += 1;
+    }
+    return count;
+  };
 
   const resolveSlotForRowDragOver = (
     rowIndex: number,
@@ -242,7 +267,7 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
           <div
             className="max-h-72 overflow-y-auto pr-1"
             onDragLeave={(e) => {
-              if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+              if (!isDomNode(e.relatedTarget) || !e.currentTarget.contains(e.relatedTarget)) {
                 setDropSlotIndex(null);
               }
             }}
@@ -250,6 +275,7 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
             {renderDropSlot(0)}
             {collections.map((col, index) => {
               const isIncluded = game ? col.gameIds.includes(game.id) : false;
+              const matchedGameCount = countCollectionGames(col);
               const isEditing = editingId === col.id;
               const isDragging = draggedIndex === index;
               const isReturningToOrigin =
@@ -447,16 +473,16 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                               </span>
                               <span className="text-xs font-semibold truncate">{col.name}</span>
                               <span className="text-[10px] text-slate-300 font-normal shrink-0">
-                                ({col.gameIds.length}{' '}
-                                {col.gameIds.length === 1 ? 'game' : 'games'})
+                                ({matchedGameCount}{' '}
+                                {matchedGameCount === 1 ? 'game' : 'games'})
                               </span>
                             </button>
                           ) : (
                             <div className="flex items-center gap-1.5 flex-1 min-w-0">
                               <span className="text-xs font-semibold truncate">{col.name}</span>
                               <span className="text-[10px] text-slate-300 font-normal shrink-0">
-                                ({col.gameIds.length}{' '}
-                                {col.gameIds.length === 1 ? 'game' : 'games'})
+                                ({matchedGameCount}{' '}
+                                {matchedGameCount === 1 ? 'game' : 'games'})
                               </span>
                             </div>
                           )}

@@ -13,16 +13,6 @@ export interface OfflineVaultSectionProps {
   onClearMediaCache: () => void;
 }
 
-const VAULT_TIER_OPTIONS: ReadonlyArray<{
-  id: OfflineVaultTier;
-  label: string;
-  capLabel: string;
-}> = [
-  { id: 'compact', label: 'Compact', capLabel: '250 MB' },
-  { id: 'balanced', label: 'Balanced', capLabel: '1 GB' },
-  { id: 'full_archive', label: 'Full Archive', capLabel: '2 GB' },
-];
-
 function formatVaultBytes(bytes?: number): string {
   const safeBytes = Math.max(0, Number(bytes || 0));
   if (safeBytes >= 1024 * 1024 * 1024) {
@@ -36,6 +26,43 @@ function formatVaultBytes(bytes?: number): string {
   }
   return `${safeBytes} B`;
 }
+
+function formatVaultTierCapLabel(bytes: number): string {
+  const safeBytes = Math.max(0, Number(bytes || 0));
+  if (safeBytes >= 1024 * 1024 * 1024) {
+    const gb = safeBytes / (1024 * 1024 * 1024);
+    const formatted = Number.isInteger(gb) ? String(gb) : gb.toFixed(2).replace(/\.?0+$/, '');
+    return `${formatted} GB`;
+  }
+  if (safeBytes >= 1024 * 1024) {
+    const mb = safeBytes / (1024 * 1024);
+    const formatted = Number.isInteger(mb) ? String(mb) : mb.toFixed(1).replace(/\.0$/, '');
+    return `${formatted} MB`;
+  }
+  return formatVaultBytes(safeBytes);
+}
+
+const VAULT_TIER_OPTIONS: ReadonlyArray<{
+  id: OfflineVaultTier;
+  label: string;
+  capLabel: string;
+}> = [
+  {
+    id: 'compact',
+    label: 'Compact',
+    capLabel: formatVaultTierCapLabel(OFFLINE_VAULT_TIER_CAPS.compact),
+  },
+  {
+    id: 'balanced',
+    label: 'Balanced',
+    capLabel: formatVaultTierCapLabel(OFFLINE_VAULT_TIER_CAPS.balanced),
+  },
+  {
+    id: 'full_archive',
+    label: 'Full Archive',
+    capLabel: formatVaultTierCapLabel(OFFLINE_VAULT_TIER_CAPS.full_archive),
+  },
+];
 
 export const OfflineVaultSection: React.FC<OfflineVaultSectionProps> = ({
   vaultStats,

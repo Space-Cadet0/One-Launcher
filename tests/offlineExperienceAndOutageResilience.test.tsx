@@ -2798,11 +2798,11 @@ describe('6. Offline MediaGallery, AboutThisGame DOM Fragment Replacement, Vault
     const text = modal.getTextContent();
     expect(text).toContain('Offline Library Vault');
     expect(text).toContain('Compact');
-    expect(text).toContain('250 MB');
+    expect(text).toContain('150 MB');
     expect(text).toContain('Balanced');
-    expect(text).toContain('1 GB');
+    expect(text).toContain('350 MB');
     expect(text).toContain('Full Archive');
-    expect(text).toContain('2 GB');
+    expect(text).toContain('1.5 GB');
     expect(text).toContain('Clear Offline Media Cache');
 
     // Strict zero-video UI invariant: no trailer/video caching option anywhere in Vault UI
