@@ -5,7 +5,7 @@
   "sources": {
     "electron/helpers/common_process_denylist.h": "ddd821b310fe49c191a48943c0b9d95f089c181fa08db17e0f9d7d7f919953e7",
     "electron/helpers/one_metal_preload.c": "2db37fbaa2da3d05eb766b619d09f22f05da9a609447872568043b2dfde2feee",
-    "electron/helpers/one_coop_activate.c": "3fe5da602bc925a5d978828483bd2bc0bd6a8a7a497ed71f46247974efab1ee0",
+    "electron/helpers/one_coop_activate.c": "7a32473a79da9d375b9e003791582abf302fd804253dd73d6d126dcb998a4b0e",
     "scripts/build-macos-helpers.cjs": "114403a1acc6a8c0f1a56a0b5035191f98c742ff2f809d654dc6300d97c05ab6"
   },
   "outputs": {
@@ -24,8 +24,8 @@
       ]
     },
     "libone_coop_activate.dylib": {
-      "sha256": "8a2c1e55565dd858b7e018e93b96b7113e8db99ba73d7d7f76391f401903cb36",
-      "sizeBytes": 138480,
+      "sha256": "6d82537560944eb8099ce195f90e2582f26dec796e7e04cb1d21d95a03751f3e",
+      "sizeBytes": 138592,
       "archs": [
         "arm64",
         "x86_64"

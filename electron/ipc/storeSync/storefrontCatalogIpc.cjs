@@ -556,8 +556,7 @@ function registerStorefrontCatalogIpcHandlers({
             if (
               !refreshedLive &&
               games.length === 0 &&
-              !hasSavedSteamId &&
-              !tokenData.steamId &&
+              !networkOfflineDetected &&
               !steamWebApiAuthQuery &&
               !isRealSecretToken(tokenData.access_token)
             ) {

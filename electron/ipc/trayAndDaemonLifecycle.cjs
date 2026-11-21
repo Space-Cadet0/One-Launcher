@@ -107,6 +107,8 @@ function createTrayAndDaemonLifecycle({
   let resumeReplayTimer = null;
   /** @type {(() => void) | null} */
   let powerResumeListener = null;
+  /** @type {(() => void) | null} */
+  let macAppFocusPresentationListener = null;
 
   /** @type {ReturnType<typeof setInterval> | null} */
   let macBottleFocusTimer = null;
@@ -128,6 +130,18 @@ function createTrayAndDaemonLifecycle({
     return null;
   };
 
+  function removeMacPresentationFocusListeners() {
+    if (macAppFocusPresentationListener && app && typeof app.removeListener === 'function') {
+      try {
+        app.removeListener('browser-window-focus', macAppFocusPresentationListener);
+      } catch {}
+      try {
+        app.removeListener('activate', macAppFocusPresentationListener);
+      } catch {}
+    }
+    macAppFocusPresentationListener = null;
+  }
+
   function clearAllLifecycleTimers() {
     zeroRendererTeardownTimer = clearTrackedTimer(zeroRendererTeardownTimer);
     postGameExitTimer = clearTrackedTimer(postGameExitTimer);
@@ -142,6 +156,7 @@ function createTrayAndDaemonLifecycle({
       } catch {}
       powerResumeListener = null;
     }
+    removeMacPresentationFocusListeners();
   }
 
   /**
@@ -517,6 +532,10 @@ function createTrayAndDaemonLifecycle({
           app.hide();
         } catch {}
       }
+      // Once One Launcher is hidden via app.hide(), NSApp is no longer frontmost, so
+      // restore One Launcher's presentation options immediately so switching back never
+      // leaves Menu Bar or Dock stuck auto-hidden.
+      restoreMacPresentationOptions();
     };
 
     let ticks = 0;
@@ -535,7 +554,7 @@ function createTrayAndDaemonLifecycle({
         if ((launcherEngine.getRunningGames() || []).length > 0) {
           hideLauncherAppOnce();
         }
-        stopMacBottleFocusHelper();
+        stopMacBottleFocusHelper({ restorePresentation: didHideAppForSession });
         return;
       }
       try {
@@ -561,7 +580,7 @@ function createTrayAndDaemonLifecycle({
         if (isActive && layer >= 25) {
           activeLayerTicks += 1;
           if (activeLayerTicks >= 3) {
-            stopMacBottleFocusHelper();
+            stopMacBottleFocusHelper({ restorePresentation: didHideAppForSession });
             return;
           }
         } else {
@@ -570,11 +589,11 @@ function createTrayAndDaemonLifecycle({
         if (isActive) {
           activeTicks += 1;
           if (activeTicks >= 3) {
-            stopMacBottleFocusHelper();
+            stopMacBottleFocusHelper({ restorePresentation: didHideAppForSession });
           }
         }
       } catch {
-        stopMacBottleFocusHelper();
+        stopMacBottleFocusHelper({ restorePresentation: didHideAppForSession });
       }
     }, pollIntervalMs);
 
@@ -584,7 +603,22 @@ function createTrayAndDaemonLifecycle({
     }
   }
 
+  function installMacPresentationFocusListeners() {
+    if (effectivePlatform !== 'darwin' || !app || typeof app.on !== 'function') {
+      return;
+    }
+    removeMacPresentationFocusListeners();
+    macAppFocusPresentationListener = () => {
+      restoreMacPresentationOptions();
+    };
+    try {
+      app.on('browser-window-focus', macAppFocusPresentationListener);
+      app.on('activate', macAppFocusPresentationListener);
+    } catch {}
+  }
+
   function installSessionLifecycleHook() {
+    installMacPresentationFocusListeners();
     launcherEngine.setSessionLifecycleHook(
       (/** @type {string} */ gameId, /** @type {any} */ eventPayload) => {
         try {
@@ -663,6 +697,7 @@ function createTrayAndDaemonLifecycle({
                 try {
                   app.hide();
                 } catch {}
+                restoreMacPresentationOptions();
               }
               launcherEngine.trimLauncherEngineMemory();
             } else if (mode === 'zero_renderer_daemon') {
@@ -688,6 +723,7 @@ function createTrayAndDaemonLifecycle({
                     try {
                       app.hide();
                     } catch {}
+                    restoreMacPresentationOptions();
                   }
                   launcherEngine.trimLauncherEngineMemory();
                 }, 1500);
@@ -866,6 +902,7 @@ function createTrayAndDaemonLifecycle({
     markMainWindowClosed,
     scheduleFallbackFlushAfterDidFinishLoad,
     registerRendererReadyListener,
+    restoreMacPresentationOptions,
     restoreOrCreateMainWindow,
     updateAppTrayMenu,
     ensureAppTray,

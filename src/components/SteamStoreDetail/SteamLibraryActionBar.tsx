@@ -79,9 +79,9 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const manageMenuRef = useRef<HTMLDivElement | null>(null);
   const manageTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const manageDropdownRef = useRef<HTMLDivElement | null>(null);
   const pendingManageFocusRef = useRef<'first' | 'last' | null>(null);
-  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const resetUiStateForNewGame = useCallback(() => {
     if (feedbackTimerRef.current) {

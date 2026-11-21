@@ -499,11 +499,16 @@ if (!gotTheLock) {
     lifecycle.scheduleBackgroundStartupJobs();
 
     app.on('activate', () => {
+      lifecycle.restoreMacPresentationOptions();
       if (BrowserWindow.getAllWindows().length === 0) {
         lifecycle.restoreOrCreateMainWindow();
       } else if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
         lifecycle.restoreOrCreateMainWindow();
       }
+    });
+
+    app.on('browser-window-focus', () => {
+      lifecycle.restoreMacPresentationOptions();
     });
   });
 }

@@ -111,6 +111,11 @@ extern napi_status napi_get_value_double(
     napi_value value,
     double *result
 );
+extern napi_status napi_get_value_bool(
+    napi_env env,
+    napi_value value,
+    bool *result
+);
 extern napi_status napi_is_array(
     napi_env env,
     napi_value value,
@@ -441,19 +446,76 @@ static bool is_borderless_fullscreen_rect(CGRect rect, CGRect disp_bounds, int32
 }
 
 /*
- * AppKit NSApplicationPresentationOptions ABI bitflags (macOS 10.6+):
+ * AppKit NSApplicationPresentationOptions ABI bitflags (macOS 10.6+ / 10.7+):
  *   NSApplicationPresentationDefault         = 0
  *   NSApplicationPresentationAutoHideDock    = 1 << 0
+ *   NSApplicationPresentationHideDock        = 1 << 1
  *   NSApplicationPresentationAutoHideMenuBar = 1 << 2
+ *   NSApplicationPresentationHideMenuBar     = 1 << 3
+ *   NSApplicationPresentationFullScreen      = 1 << 10
+ *   NSApplicationPresentationAutoHideToolbar = 1 << 11
  */
 #define ONE_NS_APP_PRESENTATION_DEFAULT            ((uintptr_t)0)
 #define ONE_NS_APP_PRESENTATION_AUTO_HIDE_DOCK     ((uintptr_t)(1u << 0))
+#define ONE_NS_APP_PRESENTATION_HIDE_DOCK          ((uintptr_t)(1u << 1))
 #define ONE_NS_APP_PRESENTATION_AUTO_HIDE_MENU_BAR ((uintptr_t)(1u << 2))
+#define ONE_NS_APP_PRESENTATION_HIDE_MENU_BAR      ((uintptr_t)(1u << 3))
+#define ONE_NS_APP_PRESENTATION_FULL_SCREEN        ((uintptr_t)(1u << 10))
+#define ONE_NS_APP_PRESENTATION_AUTO_HIDE_TOOLBAR  ((uintptr_t)(1u << 11))
+#define ONE_NS_APP_PRESENTATION_UNSETTABLE_MASK \
+    (ONE_NS_APP_PRESENTATION_FULL_SCREEN | ONE_NS_APP_PRESENTATION_AUTO_HIDE_TOOLBAR)
 #define ONE_NS_APP_PRESENTATION_BORDERLESS_MASK \
     (ONE_NS_APP_PRESENTATION_AUTO_HIDE_MENU_BAR | ONE_NS_APP_PRESENTATION_AUTO_HIDE_DOCK)
 
 static bool g_borderless_presentation_applied = false;
 static uintptr_t g_saved_presentation_options = ONE_NS_APP_PRESENTATION_DEFAULT;
+
+/*
+ * Compute AppKit-safe NSApplicationPresentationOptions without triggering
+ * NSInvalidArgumentException / SIGABRT:
+ *   - Skip setPresentationOptions: completely while NSApplicationPresentationFullScreen
+ *     (1 << 10) is active (Native macOS Fullscreen already manages auto-hide).
+ *   - Only add AutoHideDock when HideDock is absent, and only add AutoHideMenuBar
+ *     when HideMenuBar is absent (AppKit aborts on mutually-exclusive Hide/AutoHide
+ *     flags and requires HideDock whenever HideMenuBar is present).
+ *   - Strip FullScreen | AutoHideToolbar from saved/restored option masks.
+ */
+static bool compute_safe_borderless_presentation_options(
+    uintptr_t current_opts,
+    uintptr_t saved_opts,
+    bool enable,
+    uintptr_t *out_target_opts
+) {
+    if ((current_opts & ONE_NS_APP_PRESENTATION_FULL_SCREEN) != 0) {
+        return false;
+    }
+
+    uintptr_t base_opts = saved_opts & ~ONE_NS_APP_PRESENTATION_UNSETTABLE_MASK;
+    if (!enable) {
+        if (out_target_opts) {
+            *out_target_opts = base_opts;
+        }
+        return true;
+    }
+
+    uintptr_t target_opts = base_opts;
+    if ((target_opts & ONE_NS_APP_PRESENTATION_HIDE_DOCK) == 0) {
+        target_opts |= ONE_NS_APP_PRESENTATION_AUTO_HIDE_DOCK;
+    }
+    if ((target_opts & ONE_NS_APP_PRESENTATION_HIDE_MENU_BAR) == 0) {
+        target_opts |= ONE_NS_APP_PRESENTATION_AUTO_HIDE_MENU_BAR;
+    }
+    /* AppKit requires HideDock (not AutoHideDock) whenever HideMenuBar is present */
+    if ((target_opts & ONE_NS_APP_PRESENTATION_HIDE_MENU_BAR) != 0 &&
+        (target_opts & ONE_NS_APP_PRESENTATION_HIDE_DOCK) == 0) {
+        target_opts &= ~ONE_NS_APP_PRESENTATION_AUTO_HIDE_DOCK;
+        target_opts |= ONE_NS_APP_PRESENTATION_HIDE_DOCK;
+    }
+    if (out_target_opts) {
+        *out_target_opts = target_opts;
+    }
+    return true;
+}
 
 static bool set_borderless_presentation_options(bool enable) {
     if (!enable && !g_borderless_presentation_applied) {
@@ -485,17 +547,37 @@ static bool set_borderless_presentation_options(bool enable) {
     uintptr_t (*msg_get_opts)(id, SEL) = (uintptr_t (*)(id, SEL))objc_msgSend;
     void (*msg_set_opts)(id, SEL, uintptr_t) = (void (*)(id, SEL, uintptr_t))objc_msgSend;
 
+    uintptr_t current_opts = msg_get_opts(ns_app, sel_get_opts);
+
     if (enable) {
-        if (!g_borderless_presentation_applied) {
-            g_saved_presentation_options = msg_get_opts(ns_app, sel_get_opts);
+        if ((current_opts & ONE_NS_APP_PRESENTATION_FULL_SCREEN) != 0) {
+            return true;
         }
-        uintptr_t target_opts = g_saved_presentation_options | ONE_NS_APP_PRESENTATION_BORDERLESS_MASK;
+        if (!g_borderless_presentation_applied) {
+            g_saved_presentation_options =
+                current_opts & ~ONE_NS_APP_PRESENTATION_UNSETTABLE_MASK;
+        }
+        uintptr_t target_opts = ONE_NS_APP_PRESENTATION_DEFAULT;
+        if (!compute_safe_borderless_presentation_options(
+                current_opts,
+                g_saved_presentation_options,
+                true,
+                &target_opts)) {
+            return true;
+        }
         msg_set_opts(ns_app, sel_set_opts, target_opts);
         g_borderless_presentation_applied = true;
         return true;
     }
 
-    msg_set_opts(ns_app, sel_set_opts, g_saved_presentation_options);
+    uintptr_t restore_opts = ONE_NS_APP_PRESENTATION_DEFAULT;
+    if (compute_safe_borderless_presentation_options(
+            current_opts,
+            g_saved_presentation_options,
+            false,
+            &restore_opts)) {
+        msg_set_opts(ns_app, sel_set_opts, restore_opts);
+    }
     g_borderless_presentation_applied = false;
     g_saved_presentation_options = ONE_NS_APP_PRESENTATION_DEFAULT;
     return true;
@@ -912,8 +994,19 @@ static napi_value poll_and_activate_bottled_game(napi_env env, napi_callback_inf
             id (*msg_id)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
             id ns_app = cls_ns_app ? msg_id((id)cls_ns_app, sel_registerName("sharedApplication")) : NULL;
             id current_app = cls_run_app ? msg_id((id)cls_run_app, sel_registerName("currentApplication")) : NULL;
+            BOOL is_ns_app_hidden = NO;
+            if (ns_app) {
+                SEL sel_responds = sel_registerName("respondsToSelector:");
+                SEL sel_is_hidden = sel_registerName("isHidden");
+                BOOL (*msg_responds)(id, SEL, SEL) = (BOOL (*)(id, SEL, SEL))objc_msgSend;
+                BOOL (*msg_bool)(id, SEL) = (BOOL (*)(id, SEL))objc_msgSend;
+                if (msg_responds(ns_app, sel_responds, sel_is_hidden)) {
+                    is_ns_app_hidden = msg_bool(ns_app, sel_is_hidden);
+                }
+            }
             should_auto_hide_chrome =
-                active || can_cooperatively_transfer_from_frontmost(ns_app, current_app, pid);
+                !is_ns_app_hidden &&
+                (active || can_cooperatively_transfer_from_frontmost(ns_app, current_app, pid));
         }
         if (should_auto_hide_chrome) {
             (void)set_borderless_presentation_options(true);
@@ -941,6 +1034,30 @@ static napi_value restore_presentation_options(napi_env env, napi_callback_info 
 
     napi_value out = NULL;
     napi_get_boolean(env, ok, &out);
+    return out;
+}
+
+static napi_value compute_safe_presentation_options_js(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = { NULL, NULL, NULL };
+    int32_t result = -1;
+    if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) == napi_ok && argc >= 3) {
+        int32_t cur_i = 0;
+        int32_t saved_i = 0;
+        bool enable = false;
+        if (napi_get_value_int32(env, argv[0], &cur_i) == napi_ok &&
+            napi_get_value_int32(env, argv[1], &saved_i) == napi_ok &&
+            napi_get_value_bool(env, argv[2], &enable) == napi_ok) {
+            uintptr_t cur_u = cur_i >= 0 ? (uintptr_t)(uint32_t)cur_i : 0;
+            uintptr_t saved_u = saved_i >= 0 ? (uintptr_t)(uint32_t)saved_i : 0;
+            uintptr_t target_u = ONE_NS_APP_PRESENTATION_DEFAULT;
+            if (compute_safe_borderless_presentation_options(cur_u, saved_u, enable, &target_u)) {
+                result = (int32_t)(target_u & 0x7fffffffu);
+            }
+        }
+    }
+    napi_value out = NULL;
+    napi_create_int32(env, result, &out);
     return out;
 }
 
@@ -1023,6 +1140,12 @@ __attribute__((visibility("default")))
 napi_value napi_register_module_v1(napi_env env, napi_value exports) {
     export_napi_fn(env, exports, "pollAndActivateBottledGame", poll_and_activate_bottled_game);
     export_napi_fn(env, exports, "restorePresentationOptions", restore_presentation_options);
+    export_napi_fn(
+        env,
+        exports,
+        "computeSafePresentationOptions",
+        compute_safe_presentation_options_js
+    );
     export_napi_fn(env, exports, "isBorderlessFullscreenWindow", is_borderless_fullscreen_window_js);
     export_napi_fn(env, exports, "restoreHostDisplayConfiguration", restore_host_display_configuration);
     export_napi_fn(env, exports, "isSessionScreenLocked", is_session_screen_locked);

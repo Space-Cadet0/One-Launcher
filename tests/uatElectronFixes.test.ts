@@ -609,6 +609,100 @@ describe('Phase 3 UAT Electron Main Process Fixes', () => {
       expect(res.success).toBe(false);
       expect(res.error).toContain('No saved credentials found for steam');
     });
+
+    it('returns Steam session expired when saved steamId has expired cookies and empty disk cache while online, while preserving cached or offline syncs', async () => {
+      const userDataDir = createTempDir('ol-uat-c1-expired-');
+      const vaultOpts = { userDataDir };
+
+      storeSync.saveTokens(
+        'steam',
+        {
+          steamId: '76561198000000042',
+          accountName: 'ExpiredCookiePlayer',
+        },
+        vaultOpts
+      );
+
+      let isOnlineFlag = true;
+      const handlers = new Map<string, MockIpcHandler>();
+      const mockIpcMain = {
+        handle: vi.fn((ch: string, fn: MockIpcHandler) => {
+          handlers.set(ch, fn);
+        }),
+        on: vi.fn(),
+        removeListener: vi.fn(),
+      };
+
+      registerStoreSyncIpcHandlers({
+        ipcMain: mockIpcMain,
+        BrowserWindow: null,
+        session: {
+          fromPartition: () => ({
+            cookies: { get: async () => [] },
+            fetch: vi.fn(async () => ({
+              ok: true,
+              status: 200,
+              url: 'https://steamcommunity.com/login/home/?goto=%2Fmy%2Fgames%2F',
+              text: async () => '<html>login</html>',
+            })),
+          }),
+        },
+        getMainWindow: () => null,
+        storeSync: {
+          ...storeSync,
+          loadSavedTokens: () => storeSync.loadSavedTokens(vaultOpts),
+          saveTokens: (id: string, data: Record<string, unknown>) =>
+            storeSync.saveTokens(id, data, vaultOpts),
+          scanLocalSuppressedStorefrontItems: () => [],
+        },
+        launcherEngine: {},
+        options: { userDataDir, isOnline: () => isOnlineFlag },
+      });
+
+      const syncHandler = handlers.get('store:sync')!;
+
+      // 1. Online + saved steamId + expired cookies + empty disk cache -> MUST report expired session
+      const expiredRes = (await syncHandler({}, 'steam')) as {
+        success: boolean;
+        error?: string;
+        games?: unknown[];
+      };
+      expect(expiredRes.success).toBe(false);
+      expect(expiredRes.error).toBe(
+        'Steam session expired. Please sign in to Steam again in Settings.'
+      );
+
+      // 2. Offline + saved steamId + empty disk cache -> MUST NOT falsely declare expired session
+      isOnlineFlag = false;
+      const offlineRes = (await syncHandler({}, 'steam')) as {
+        success: boolean;
+        error?: string;
+        games?: unknown[];
+      };
+      expect(offlineRes.success).toBe(true);
+      expect(offlineRes.games).toEqual([]);
+
+      // 3. Online + saved steamId + expired cookies + non-empty disk cache -> preserves cached library
+      isOnlineFlag = true;
+      storeSync.saveSteamOwnedGamesCache(
+        [
+          {
+            id: 'steam-620',
+            steamAppId: 620,
+            title: 'Portal 2',
+            platforms: [{ platformId: 'steam', platformGameId: '620', playtimeMinutes: 60 }],
+          },
+        ],
+        { ...vaultOpts, steamId: '76561198000000042' }
+      );
+      const cachedRes = (await syncHandler({}, 'steam')) as {
+        success: boolean;
+        error?: string;
+        games?: Array<{ id: string }>;
+      };
+      expect(cachedRes.success).toBe(true);
+      expect(cachedRes.games?.map((g) => g.id)).toEqual(['steam-620']);
+    });
   });
 
   // ==========================================================================
@@ -1115,6 +1209,225 @@ describe('Phase 3 UAT Electron Main Process Fixes', () => {
         // Safe idempotent restore when not applied
         expect(mod.exports.restorePresentationOptions!()).toBe(true);
       }
+    });
+
+    it('guards AppKit mutually-exclusive Hide/AutoHide bits and Native FullScreen (1<<10) in one_coop_activate.c and compiled dylib', () => {
+      const coopSrc = fs.readFileSync(
+        path.join(REPO_ROOT, 'electron', 'helpers', 'one_coop_activate.c'),
+        'utf8'
+      );
+      expect(coopSrc).toContain('ONE_NS_APP_PRESENTATION_HIDE_DOCK');
+      expect(coopSrc).toContain('ONE_NS_APP_PRESENTATION_HIDE_MENU_BAR');
+      expect(coopSrc).toContain('ONE_NS_APP_PRESENTATION_FULL_SCREEN');
+      expect(coopSrc).toContain('ONE_NS_APP_PRESENTATION_AUTO_HIDE_TOOLBAR');
+      expect(coopSrc).toContain('compute_safe_borderless_presentation_options');
+
+      if (process.platform === 'darwin') {
+        const dylibPath = path.join(REPO_ROOT, 'electron', 'helpers', 'libone_coop_activate.dylib');
+        const mod: {
+          exports: {
+            computeSafePresentationOptions?: (
+              currentOpts: number,
+              savedOpts: number,
+              enable: boolean
+            ) => number;
+          };
+        } = { exports: {} };
+        process.dlopen(mod, dylibPath);
+
+        expect(typeof mod.exports.computeSafePresentationOptions).toBe('function');
+        const compute = mod.exports.computeSafePresentationOptions!;
+
+        const AUTO_HIDE_DOCK = 1 << 0;
+        const HIDE_DOCK = 1 << 1;
+        const AUTO_HIDE_MENU_BAR = 1 << 2;
+        const HIDE_MENU_BAR = 1 << 3;
+        const FULL_SCREEN = 1 << 10;
+        const AUTO_HIDE_TOOLBAR = 1 << 11;
+
+        // Default (0) -> AutoHideDock | AutoHideMenuBar (0x5)
+        expect(compute(0, 0, true)).toBe(AUTO_HIDE_DOCK | AUTO_HIDE_MENU_BAR);
+
+        // HideDock present -> NEVER OR AutoHideDock (prevents AppKit NSInvalidArgumentException 0x3!)
+        const hideDockTarget = compute(HIDE_DOCK, HIDE_DOCK, true);
+        expect(hideDockTarget).toBe(HIDE_DOCK | AUTO_HIDE_MENU_BAR);
+        expect(hideDockTarget & AUTO_HIDE_DOCK).toBe(0);
+
+        // HideDock | HideMenuBar present -> NEVER OR AutoHideDock or AutoHideMenuBar
+        const hideBoth = HIDE_DOCK | HIDE_MENU_BAR;
+        const hideBothTarget = compute(hideBoth, hideBoth, true);
+        expect(hideBothTarget).toBe(hideBoth);
+        expect(hideBothTarget & (AUTO_HIDE_DOCK | AUTO_HIDE_MENU_BAR)).toBe(0);
+
+        // Synthetic HideMenuBar alone -> upgrades dock bit to HideDock (never invalid 0x9)
+        const hideMenuOnlyTarget = compute(HIDE_MENU_BAR, HIDE_MENU_BAR, true);
+        expect(hideMenuOnlyTarget).toBe(HIDE_DOCK | HIDE_MENU_BAR);
+        expect(hideMenuOnlyTarget & (AUTO_HIDE_DOCK | AUTO_HIDE_MENU_BAR)).toBe(0);
+
+        // Native macOS Fullscreen (1<<10) -> MUST skip setPresentationOptions: (-1) on both enable & disable
+        expect(compute(FULL_SCREEN, FULL_SCREEN, true)).toBe(-1);
+        expect(compute(FULL_SCREEN | AUTO_HIDE_TOOLBAR, FULL_SCREEN | AUTO_HIDE_TOOLBAR, true)).toBe(
+          -1
+        );
+        expect(compute(FULL_SCREEN, 0, false)).toBe(-1);
+
+        // Restore outside FullScreen strips FullScreen | AutoHideToolbar from saved mask
+        expect(
+          compute(
+            AUTO_HIDE_DOCK | AUTO_HIDE_MENU_BAR,
+            FULL_SCREEN | AUTO_HIDE_TOOLBAR | HIDE_DOCK,
+            false
+          )
+        ).toBe(HIDE_DOCK);
+        expect(compute(AUTO_HIDE_DOCK | AUTO_HIDE_MENU_BAR, 0, false)).toBe(0);
+      }
+    });
+
+    it('restores macOS presentation options on hideLauncherAppOnce and on app browser-window-focus / activate even when mainWindow.isVisible() is true (keep_open mode)', async () => {
+      let hookFn: ((gameId: string, payload: Record<string, unknown>) => void) | null = null;
+      const appListeners = new Map<string, Set<() => void>>();
+      const emitAppEvent = (eventName: string) => {
+        for (const fn of Array.from(appListeners.get(eventName) || [])) {
+          fn();
+        }
+      };
+
+      const appHideSpy = vi.fn();
+      const restorePresentationSpy = vi.fn(() => true);
+      let behaviorMode: 'keep_open' | 'hide_tray_hibernate' = 'keep_open';
+      const pollAndActivateSpy = vi.fn(() => 1 | 2 | (0 << 2) | ((4321 & 0x7fff) << 16));
+
+      const mockMainWindow = {
+        isDestroyed: () => false,
+        isMinimized: () => false,
+        isVisible: () => true,
+        hide: vi.fn(),
+        show: vi.fn(),
+        restore: vi.fn(),
+        focus: vi.fn(),
+        webContents: {
+          isLoadingMainFrame: () => false,
+          setAudioMuted: vi.fn(),
+          setBackgroundThrottling: vi.fn(),
+          send: vi.fn(),
+        },
+      };
+
+      const lifecycle = createTrayAndDaemonLifecycle({
+        app: {
+          hide: appHideSpy,
+          show: vi.fn(),
+          focus: vi.fn(),
+          dock: { show: vi.fn() },
+          quit: vi.fn(),
+          on: (ev: string, fn: () => void) => {
+            if (!appListeners.has(ev)) appListeners.set(ev, new Set());
+            appListeners.get(ev)!.add(fn);
+          },
+          removeListener: (ev: string, fn: () => void) => {
+            appListeners.get(ev)?.delete(fn);
+          },
+        },
+        Menu: { buildFromTemplate: vi.fn(() => ({})) },
+        Tray: null,
+        nativeImage: null,
+        launcherEngine: {
+          setSessionLifecycleHook: (
+            fn: (gameId: string, payload: Record<string, unknown>) => void
+          ) => {
+            hookFn = fn;
+          },
+          getGameLaunchConfig: () => ({}),
+          resolvePlatformLaunchConfig: (cfg: Record<string, unknown>) => cfg,
+          resolveEffectivePerformancePolicy: () => ({
+            inGameLauncherBehavior: behaviorMode,
+            postGameLauncherBehavior: 'restore_window',
+          }),
+          trimLauncherEngineMemory: vi.fn(),
+          getRunningGames: () => [{ gameId: 'steam-1145350', title: 'Hades II' }],
+          getDownloadQueue: () => [],
+          shutdownLauncherEngine: vi.fn(),
+        },
+        mediaHydrationEngine: { shutdown: vi.fn() },
+        offlineVaultService: { shutdown: vi.fn() },
+        flushDiagnosticLogSync: vi.fn(),
+        electronDir: path.join(REPO_ROOT, 'electron'),
+        getMainWindow: () => mockMainWindow,
+        setMainWindow: vi.fn(),
+        createMainWindow: vi.fn(),
+        platform: 'darwin',
+        coopActivateHelper: {
+          pollAndActivateBottledGame: pollAndActivateSpy,
+          restorePresentationOptions: restorePresentationSpy,
+        },
+        macBottleFocusPollMs: 15,
+      });
+
+      lifecycle.installSessionLifecycleHook();
+      expect(hookFn).not.toBeNull();
+
+      // 1. keep_open mode: launch bottled borderless game while mainWindow.isVisible() remains true
+      hookFn!('steam-1145350', {
+        event: 'started',
+        title: 'Hades II',
+        session: {
+          gameId: 'steam-1145350',
+          pid: 4300,
+          launchMethod: 'compatibility_layer',
+          isBottledSession: true,
+          executablePath: '/Bottles/OneLauncher/drive_c/Hades2.exe',
+          winePrefix: '/Bottles/OneLauncher',
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(appHideSpy).not.toHaveBeenCalled();
+
+      // Switching back to One Launcher via browser-window-focus or Dock activate while
+      // mainWindow.isVisible() === true MUST restore presentation options immediately!
+      restorePresentationSpy.mockClear();
+      emitAppEvent('browser-window-focus');
+      expect(restorePresentationSpy).toHaveBeenCalledTimes(1);
+
+      emitAppEvent('activate');
+      expect(restorePresentationSpy).toHaveBeenCalledTimes(2);
+
+      // 2. hide_tray_hibernate mode: once hideLauncherAppOnce runs app.hide(), presentation
+      // options MUST be restored even before the game exits!
+      behaviorMode = 'hide_tray_hibernate';
+      restorePresentationSpy.mockClear();
+      appHideSpy.mockClear();
+      hookFn!('steam-1145350', {
+        event: 'started',
+        title: 'Hades II',
+        session: {
+          gameId: 'steam-1145350',
+          pid: 4301,
+          launchMethod: 'compatibility_layer',
+          isBottledSession: true,
+          executablePath: '/Bottles/OneLauncher/drive_c/Hades2.exe',
+          winePrefix: '/Bottles/OneLauncher',
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(appHideSpy).toHaveBeenCalledTimes(1);
+      expect(restorePresentationSpy).toHaveBeenCalled();
+
+      // 3. Verify electron/main.cjs also calls lifecycle.restoreMacPresentationOptions() on
+      // activate (even when mainWindow.isVisible() is true) and on browser-window-focus
+      const mainSrc = fs.readFileSync(path.join(REPO_ROOT, 'electron', 'main.cjs'), 'utf8');
+      expect(mainSrc).toMatch(
+        /app\.on\(['"]activate['"],[\s\S]*?lifecycle\.restoreMacPresentationOptions\(\)/
+      );
+      expect(mainSrc).toMatch(
+        /app\.on\(['"]browser-window-focus['"],[\s\S]*?lifecycle\.restoreMacPresentationOptions\(\)/
+      );
+
+      // 4. Shutdown detaches app focus listeners cleanly
+      lifecycle.runSubsystemShutdownOnce();
+      restorePresentationSpy.mockClear();
+      emitAppEvent('browser-window-focus');
+      emitAppEvent('activate');
+      expect(restorePresentationSpy).not.toHaveBeenCalled();
     });
   });
 });
