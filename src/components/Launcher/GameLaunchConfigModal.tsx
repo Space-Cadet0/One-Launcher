@@ -11,6 +11,7 @@ import {
   RotateCcw,
   CheckCircle2,
   AlertTriangle,
+  ChevronRight,
   Gauge,
 } from 'lucide-react';
 import { getBadgeToneClasses } from './LaunchConfig/launchConfigHelpers';
@@ -42,6 +43,7 @@ import {
 import {
   StorefrontLifecycleSection,
   StorefrontLifecycleSectionBase,
+  formatShortStorefrontPolicyLabel,
 } from './LaunchConfig/StorefrontLifecycleSection';
 import { useGameLaunchConfigForm } from './LaunchConfig/useGameLaunchConfigForm';
 import { useIsRealClientRenderer, useSafeId } from '../../utils/useSafeId';
@@ -227,7 +229,31 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     wineSyncMode: form.wineSyncMode,
     onSelectWineSyncMode: form.handleSelectWineSyncMode,
     displayOverrideCount: form.displayOverrideCount,
+    installedRecord: form.installedRecord,
+    platformId: form.preferredPlatformId,
+    isFastDirectActive: form.isFastDirectActive,
+    onAlignToInstallBottle: form.handleAlignToInstallBottle,
   };
+
+  const activeStorefrontPolicyPill = (() => {
+    if (form.preferredPlatformId === 'custom') return null;
+    const { policyKey, severity } = form.policyView.infoBox;
+    const label =
+      policyKey === 'protocol_delegated'
+        ? 'Storefront Protocol'
+        : policyKey === 'clientless_epic' && !form.policyView.showDropdown
+          ? 'Clientless EOS'
+          : policyKey === 'clientless_epic' || policyKey === 'clientless_bottle_gog'
+            ? 'Fast Direct Bypass'
+            : formatShortStorefrontPolicyLabel(policyKey);
+    const toneClasses =
+      severity === 'warning'
+        ? 'bg-amber-500/15 border-amber-400/40 text-amber-200'
+        : severity === 'optimal'
+          ? 'bg-emerald-500/15 border-emerald-400/35 text-emerald-200'
+          : 'bg-sky-500/15 border-sky-400/35 text-sky-200';
+    return { label, toneClasses };
+  })();
 
   const showExecutionDisclosure =
     form.preview.visibleSections.executableAndArgs ||
@@ -495,29 +521,63 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             )}
 
             {/* Disclosure 3: Launcher & Storefront Lifecycle Overrides */}
-            <LaunchDisclosure
-              summary="Launcher & Storefront Lifecycle Overrides"
-              subtitle="Per-game in-game behavior & storefront policy"
-              overrideCount={form.lifecycleOverrideCount}
-              testId="disclosure-lifecycle-overrides"
-              summaryTestId="disclosure-lifecycle-overrides-summary"
-              overrideBadgeTestId="disclosure-lifecycle-overrides-badge"
+            <details
+              data-testid="disclosure-lifecycle-overrides"
+              className="group rounded-lg bg-[#0e151f] border border-[#223447] overflow-hidden"
             >
-              {renderSection(StorefrontLifecycleSection, StorefrontLifecycleSectionBase, {
-                idPrefix,
-                isWindowsHost: form.isWindowsHost,
-                preview: form.preview,
-                activeDisplayMethod: form.activeDisplayMethod,
-                preferredPlatformId: form.preferredPlatformId,
-                inGameLauncherBehavior: form.inGameLauncherBehavior,
-                onChangeInGameLauncherBehavior: form.setInGameLauncherBehavior,
-                storefrontClientLifecycle: form.storefrontClientLifecycle,
-                onChangeStorefrontClientLifecycle: form.handleChangeStorefrontClientLifecycle,
-                policyView: form.policyView,
-                perfSettings: form.perfSettings,
-                onOpenGlobalSettings: handleOpenGlobalSettings,
-              })}
-            </LaunchDisclosure>
+              <summary
+                data-testid="disclosure-lifecycle-overrides-summary"
+                className={`list-none [&::-webkit-details-marker]:hidden min-h-[36px] px-3.5 py-2.5 flex items-center justify-between gap-2 cursor-pointer select-none hover:bg-[#141d2b]/70 transition-colors motion-reduce:transition-none ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+              >
+                <span className="flex items-center gap-2 min-w-0">
+                  <ChevronRight
+                    aria-hidden="true"
+                    className="w-4 h-4 text-sky-400 shrink-0 transition-transform duration-150 motion-reduce:transition-none group-open:rotate-90"
+                  />
+                  <span className="text-xs font-bold text-white truncate">
+                    Launcher &amp; Storefront Lifecycle Overrides
+                  </span>
+                  <span className="hidden sm:inline text-[10px] text-steam-subtext truncate">
+                    — Per-game in-game behavior &amp; storefront policy
+                  </span>
+                </span>
+                <span className="flex items-center gap-1.5 shrink-0">
+                  {activeStorefrontPolicyPill && (
+                    <span
+                      data-testid="disclosure-lifecycle-policy-pill"
+                      className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border shrink-0 ${activeStorefrontPolicyPill.toneClasses}`}
+                    >
+                      {activeStorefrontPolicyPill.label}
+                    </span>
+                  )}
+                  {form.lifecycleOverrideCount > 0 && (
+                    <span
+                      data-testid="disclosure-lifecycle-overrides-badge"
+                      className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-sky-500/20 border border-sky-400/40 text-sky-200 shrink-0"
+                    >
+                      {form.lifecycleOverrideCount}{' '}
+                      {form.lifecycleOverrideCount === 1 ? 'override' : 'overrides'}
+                    </span>
+                  )}
+                </span>
+              </summary>
+              <div className="px-3.5 pb-3.5 pt-2.5 border-t border-[#223447]/80 space-y-3.5">
+                {renderSection(StorefrontLifecycleSection, StorefrontLifecycleSectionBase, {
+                  idPrefix,
+                  isWindowsHost: form.isWindowsHost,
+                  preview: form.preview,
+                  activeDisplayMethod: form.activeDisplayMethod,
+                  preferredPlatformId: form.preferredPlatformId,
+                  inGameLauncherBehavior: form.inGameLauncherBehavior,
+                  onChangeInGameLauncherBehavior: form.setInGameLauncherBehavior,
+                  storefrontClientLifecycle: form.storefrontClientLifecycle,
+                  onChangeStorefrontClientLifecycle: form.handleChangeStorefrontClientLifecycle,
+                  policyView: form.policyView,
+                  perfSettings: form.perfSettings,
+                  onOpenGlobalSettings: handleOpenGlobalSettings,
+                })}
+              </div>
+            </details>
           </div>
         </div>
 

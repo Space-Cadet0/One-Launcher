@@ -18,6 +18,7 @@ import {
   Sparkles,
   Settings,
   Activity,
+  AlertTriangle,
   Loader2,
   Maximize2,
   Minimize2,
@@ -77,6 +78,10 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   const [isStopPending, setIsStopPending] = useState(false);
   const [isFullscreenTogglePending, setIsFullscreenTogglePending] = useState(false);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
+  const [bottleSteamLaunchError, setBottleSteamLaunchError] = useState<{
+    errorCode: 'BOTTLE_STEAM_NOT_INSTALLED' | 'BOTTLE_STEAM_APP_NOT_IN_TARGET_BOTTLE';
+    message: string;
+  } | null>(null);
   const manageMenuRef = useRef<HTMLDivElement | null>(null);
   const manageTriggerRef = useRef<HTMLButtonElement | null>(null);
   const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -95,6 +100,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
     setIsStopPending(false);
     setIsFullscreenTogglePending(false);
     setActionFeedback(null);
+    setBottleSteamLaunchError(null);
   }, []);
 
   useEffect(() => {
@@ -330,11 +336,24 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
   const handlePlayClick = async () => {
     if (isLaunchPending || isRunning) return;
+    setBottleSteamLaunchError(null);
     setIsLaunchPending(true);
     try {
       const res = await launcherService.launchGame(game, selectedPlatformId);
       if (res && !res.success) {
-        showTempFeedback(res.error || 'Failed to launch game');
+        if (
+          res.errorCode === 'BOTTLE_STEAM_NOT_INSTALLED' ||
+          res.errorCode === 'BOTTLE_STEAM_APP_NOT_IN_TARGET_BOTTLE'
+        ) {
+          setBottleSteamLaunchError({
+            errorCode: res.errorCode,
+            message:
+              res.error ||
+              'Cannot launch via Bottle Steam because Windows Steam or this game is not available in the selected target bottle.',
+          });
+        } else {
+          showTempFeedback(res.error || 'Failed to launch game');
+        }
       }
     } finally {
       setIsLaunchPending(false);
@@ -686,6 +705,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                   onChange={(e) => {
                     const nextPlat = e.target.value as StorefrontId;
                     userManuallySelectedPlatformRef.current = true;
+                    setBottleSteamLaunchError(null);
                     setSelectedPlatformId(nextPlat);
                     launcherService.setSelectedStorefrontForGame(game.id, nextPlat);
                   }}
@@ -1138,6 +1158,47 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
           selectedPlatformId,
         })}
 
+      {/* Persistent Bottle Steam Launch Recovery Banner */}
+      {bottleSteamLaunchError && (
+        <div
+          data-testid="bottle-steam-launch-error-banner"
+          data-error-code={bottleSteamLaunchError.errorCode}
+          role="alert"
+          className="mt-3 px-3 py-2.5 rounded-lg bg-rose-950/65 border border-rose-500/55 text-xs text-rose-100 flex flex-wrap items-start justify-between gap-2.5"
+        >
+          <div className="flex items-start gap-2 min-w-0 flex-1">
+            <AlertTriangle
+              className="w-4 h-4 text-rose-400 shrink-0 mt-0.5"
+              aria-hidden="true"
+            />
+            <span className="leading-relaxed break-words">{bottleSteamLaunchError.message}</span>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              data-testid="bottle-steam-open-launch-config-btn"
+              onPointerEnter={prefetchGameLaunchConfigModal}
+              onFocus={prefetchGameLaunchConfigModal}
+              onClick={() => setIsLaunchConfigOpen(true)}
+              className="min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-[11px] font-semibold text-sky-100 hover:text-white transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+            >
+              <Settings className="w-3 h-3 shrink-0" aria-hidden="true" />
+              <span>Open Launch Config</span>
+            </button>
+            <button
+              type="button"
+              data-testid="bottle-steam-dismiss-error-btn"
+              aria-label="Dismiss launch error"
+              onClick={() => setBottleSteamLaunchError(null)}
+              className="min-h-6 inline-flex items-center gap-1 px-2 py-1 rounded bg-white/5 hover:bg-white/15 border border-rose-400/35 text-[11px] font-semibold text-rose-200 hover:text-white transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
+            >
+              <X className="w-3 h-3 shrink-0" aria-hidden="true" />
+              <span>Dismiss</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Action Feedback / Launch Error Banner */}
       {actionFeedback && (
         <div
@@ -1195,6 +1256,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
               initialPlatformId={selectedPlatformId}
               onClose={() => setIsLaunchConfigOpen(false)}
               onSaved={(cfg) => {
+                setBottleSteamLaunchError(null);
                 if (cfg.preferredPlatformId) {
                   userManuallySelectedPlatformRef.current = true;
                   setSelectedPlatformId(cfg.preferredPlatformId);

@@ -109,6 +109,10 @@ export interface CompatibilityLayerInfo {
       wineArch?: 'win64' | 'arm64';
       previewEnabled?: boolean;
       timestamp?: string;
+      hasSteam?: boolean;
+      steamSignedIn?: boolean;
+      hasGogGalaxy?: boolean;
+      hasEpicLauncher?: boolean;
     }
   >;
   buildTimestamp?: string;
@@ -572,6 +576,7 @@ export interface ActiveGameSession {
   launchMethod: string;
   executablePath?: string;
   status: ActiveGameSessionStatus;
+  winePrefix?: string;
   isBottledSession?: boolean;
   fullscreenActive?: boolean;
   displayScalingMode?: GlobalBottleDisplayScalingMode;
@@ -756,6 +761,12 @@ export interface LauncherActionResult {
   success: boolean;
   message?: string;
   error?: string;
+  errorCode?: string;
+  targetBottleName?: string;
+  targetBottlePath?: string;
+  installBottleName?: string;
+  installBottleHasSteam?: boolean;
+  recommendedRunnerType?: CompatibilityLayerType;
   session?: ActiveGameSession;
   sessionMinutesPlayed?: number;
   task?: DownloadTaskState;
