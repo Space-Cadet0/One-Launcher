@@ -1,11 +1,19 @@
+import { ENVIRONMENT_COMPONENT_CATALOG } from '../../contracts/environmentCatalog';
 import type { CanonicalGame, GamePlatformOwnership } from '../../contracts/game';
 import {
   DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
-  isBottleCompatibleWithLayer,
-  resolveDefaultBottleForLayer,
-  resolveEffectiveLaunchPolicy,
+  sanitizeCrossOverGraphicsBackend,
   sanitizeLaunchMethod,
+  sanitizeLegacyCompatLayer,
   sanitizeStorefrontLifecyclePolicy,
+} from '../../contracts/launchConfigSanitizers';
+import {
+  inferDetectedBuildType,
+  isRunnerSupportedOnHost,
+  resolveEffectiveLaunchPolicy,
+} from '../../contracts/launchPolicyResolver';
+import {
+  resolveDefaultBottleForLayer,
   type CompatibilityLayerInfo,
   type CompatibilityLayerType,
   type CompatibilityRunnerDescriptor,
@@ -13,6 +21,8 @@ import {
   type FastMinimalLaunchAdvisory,
   type GameInstallInfo,
   type GameLaunchConfig,
+  type GlobalBottleDisplayScalingMode,
+  type GlobalDisplayAspectRatioMode,
   type InstalledGameRecord,
   type LaunchMethod,
   type ResolvedLaunchModePreview,
@@ -31,10 +41,8 @@ import {
   resolveCanonicalKernelAntiCheatDisplayName,
   type NormalizedChainedHandoffId,
 } from '../integrations/catalogSanitizer';
-import {
-  sanitizeLegacyCompatLayer,
-  sanitizeStorefrontLifecycleOverride,
-} from './launchConfigStore';
+import { isBottleNameCompatibleWithRunner } from './bottleArchitectureUtils';
+import { sanitizeStorefrontLifecycleOverride } from './launchConfigStore';
 
 function resolveChainedPublisherDisplayName(
   handoffId?: NormalizedChainedHandoffId,
@@ -51,36 +59,49 @@ export const COMPATIBILITY_RUNNER_DESCRIPTORS: CompatibilityRunnerDescriptor[] =
   {
     type: 'crossover',
     label: 'CrossOver (Recommended)',
-    shortLabel: 'CrossOver',
+    shortLabel: ENVIRONMENT_COMPONENT_CATALOG.runner_crossover.shortLabel,
     vendor: 'CodeWeavers',
     description:
       'Commercial Windows compatibility layer for macOS with built-in Bottle management, automatic 64-bit/32-bit graphics routing (D3DMetal, DXMT, DXVK, Vulkan WineD3D), and MetalFX DLSS upscaling.',
     bestFor:
       'Best overall compatibility for 64-bit and 32-bit DirectX 9/10/11/12 Windows games and Windows Steam/GOG/Epic bottles on Apple Silicon.',
-    downloadUrl: 'https://www.codeweavers.com/crossover/download',
+    downloadUrl:
+      ENVIRONMENT_COMPONENT_CATALOG.runner_crossover.externalDownloadUrl ||
+      'https://www.codeweavers.com/crossover/download',
     downloadLabel: 'Open CrossOver Download Page',
     brewCask: 'crossover',
     canAutoInstallViaBrew: true,
-    canAutoInstallDirect: true,
-    estimatedDownloadMB: 480,
+    canAutoInstallDirect: ENVIRONMENT_COMPONENT_CATALOG.runner_crossover.canAutoInstallOnMac,
+    estimatedDownloadMB: ENVIRONMENT_COMPONENT_CATALOG.runner_crossover.estimatedDownloadMB,
+    defaultBottleName: ENVIRONMENT_COMPONENT_CATALOG.runner_crossover.defaultBottleName,
+    supportedBottleArches: ENVIRONMENT_COMPONENT_CATALOG.runner_crossover.supportedBottleArches
+      ? [...ENVIRONMENT_COMPONENT_CATALOG.runner_crossover.supportedBottleArches]
+      : undefined,
   },
   {
     type: 'crossover_preview',
     label: 'CrossOver Preview',
-    shortLabel: 'CrossOver Preview',
+    shortLabel: ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview.shortLabel,
     vendor: 'CodeWeavers',
     description:
       'Early-access preview build of CrossOver featuring the latest experimental Wine, D3DMetal (64-bit DX11/DX12), and DXMT (32-bit & 64-bit Metal DX10/DX11) updates.',
     bestFor:
       'Testing newly released 64-bit and 32-bit Windows titles that need bleeding-edge graphics translation fixes.',
-    downloadUrl: 'https://www.codeweavers.com/preview/download',
+    downloadUrl:
+      ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview.externalDownloadUrl ||
+      'https://www.codeweavers.com/preview/download',
     downloadLabel: 'Open Preview Portal',
     canAutoInstallViaBrew: false,
-    canAutoInstallDirect: true,
-    estimatedDownloadMB: 480,
+    canAutoInstallDirect:
+      ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview.canAutoInstallOnMac,
+    estimatedDownloadMB:
+      ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview.estimatedDownloadMB,
     previewBranch: 'standard',
-    defaultBottleName: 'OneLauncher',
-    supportedBottleArches: ['win64'],
+    defaultBottleName: ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview.defaultBottleName,
+    supportedBottleArches: ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview
+      .supportedBottleArches
+      ? [...ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview.supportedBottleArches]
+      : undefined,
   },
   {
     type: 'crossover_preview_arm64',
@@ -91,31 +112,43 @@ export const COMPATIBILITY_RUNNER_DESCRIPTORS: CompatibilityRunnerDescriptor[] =
       'Experimental arm64 Wine + FEX translation branch of CrossOver Preview for Apple Silicon Macs with dedicated arm64 bottles, D3DMetal, DXMT, and DXVK.',
     bestFor:
       'Testing Apple Silicon native arm64 Wine with FEX x86/x64 emulation in isolated arm64 bottles.',
-    downloadUrl: 'https://www.codeweavers.com/preview/download',
+    downloadUrl:
+      ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview_arm64.externalDownloadUrl ||
+      'https://www.codeweavers.com/preview/download',
     downloadLabel: 'Open Preview Portal',
     canAutoInstallViaBrew: false,
-    canAutoInstallDirect: true,
-    estimatedDownloadMB: 480,
+    canAutoInstallDirect:
+      ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview_arm64.canAutoInstallOnMac,
+    estimatedDownloadMB:
+      ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview_arm64.estimatedDownloadMB,
     previewBranch: 'arm64',
-    defaultBottleName: 'OneLauncher-arm64',
-    requiresAppleSilicon: true,
-    supportedBottleArches: ['arm64'],
+    defaultBottleName:
+      ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview_arm64.defaultBottleName,
+    requiresAppleSilicon:
+      ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview_arm64.requiresAppleSilicon,
+    supportedBottleArches: ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview_arm64
+      .supportedBottleArches
+      ? [...ENVIRONMENT_COMPONENT_CATALOG.runner_crossover_preview_arm64.supportedBottleArches]
+      : undefined,
   },
   {
     type: 'gptk',
     label: 'Apple Game Porting Toolkit (GPTK / D3DMetal)',
-    shortLabel: 'Apple GPTK',
+    shortLabel: ENVIRONMENT_COMPONENT_CATALOG.runner_gptk.shortLabel,
     vendor: 'Apple',
     description:
       'Apple’s 64-bit DirectX 11/12-to-Metal 3 runtime (D3DMetal), detected from /Applications/Game Porting Toolkit.app or Heroic GPTK tools.',
     bestFor:
       'Running 64-bit DirectX 11/12 Windows executables on Apple Silicon using Apple’s standalone D3DMetal runtime.',
-    downloadUrl: 'https://github.com/Gcenx/game-porting-toolkit/releases/latest',
+    downloadUrl:
+      ENVIRONMENT_COMPONENT_CATALOG.runner_gptk.externalDownloadUrl ||
+      'https://github.com/Gcenx/game-porting-toolkit/releases/latest',
     downloadLabel: 'Open GPTK Releases',
     brewCask: 'game-porting-toolkit',
     canAutoInstallViaBrew: false,
-    canAutoInstallDirect: true,
-    estimatedDownloadMB: 228,
+    canAutoInstallDirect: ENVIRONMENT_COMPONENT_CATALOG.runner_gptk.canAutoInstallOnMac,
+    estimatedDownloadMB: ENVIRONMENT_COMPONENT_CATALOG.runner_gptk.estimatedDownloadMB,
+    requiresAppleSilicon: ENVIRONMENT_COMPONENT_CATALOG.runner_gptk.requiresAppleSilicon,
   },
   {
     type: 'wine',
@@ -126,12 +159,14 @@ export const COMPATIBILITY_RUNNER_DESCRIPTORS: CompatibilityRunnerDescriptor[] =
       'Free, open-source Windows API translation layer (wine64) installed directly into /Applications or Heroic Wine-CrossOver builds.',
     bestFor:
       'Running DRM-free or standalone DirectX 9/10/11 Windows .exe games without a paid CrossOver license.',
-    downloadUrl: 'https://github.com/Gcenx/macOS_Wine_builds/releases/latest',
+    downloadUrl:
+      ENVIRONMENT_COMPONENT_CATALOG.runner_wine.externalDownloadUrl ||
+      'https://github.com/Gcenx/macOS_Wine_builds/releases/latest',
     downloadLabel: 'Open Wine macOS Releases',
     brewCask: 'wine-stable',
     canAutoInstallViaBrew: true,
-    canAutoInstallDirect: true,
-    estimatedDownloadMB: 240,
+    canAutoInstallDirect: ENVIRONMENT_COMPONENT_CATALOG.runner_wine.canAutoInstallOnMac,
+    estimatedDownloadMB: ENVIRONMENT_COMPONENT_CATALOG.runner_wine.estimatedDownloadMB,
   },
 ];
 
@@ -186,26 +221,81 @@ export const CROSSOVER_GRAPHICS_BACKEND_POLICIES: Record<
 export function getCrossOverGraphicsBackendPolicy(
   backend?: CrossOverGraphicsBackend | string
 ): CrossOverGraphicsBackendPolicyDescriptor {
-  if (
-    backend === 'd3dmetal' ||
-    backend === 'dxmt' ||
-    backend === 'dxvk' ||
-    backend === 'wined3d'
-  ) {
-    return CROSSOVER_GRAPHICS_BACKEND_POLICIES[backend];
+  const sanitized = sanitizeCrossOverGraphicsBackend(backend);
+  return CROSSOVER_GRAPHICS_BACKEND_POLICIES[sanitized ?? 'auto'];
+}
+
+export interface RunnerMetalFxEligibility {
+  supportsDlss: boolean;
+  supportsSpatial: boolean;
+  reason: string | null;
+}
+
+/**
+ * Pure MetalFX DLSS & DXMT spatial upscaling eligibility aligned 1:1 with Electron
+ * (`macNativeInstallerAndCodesign.cjs:10019-10058` & `launchPolicyCore.cjs`),
+ * covering CrossOver runners as well as Apple GPTK and Open-Source Wine on Apple Silicon.
+ */
+export function resolveRunnerMetalFxEligibility(params: {
+  runnerType?: CompatibilityLayerType | string | null;
+  hostPlatform?: 'darwin' | 'win32' | 'linux' | string;
+  hostArch?: 'arm64' | 'x64' | string;
+  graphicsBackend?: CrossOverGraphicsBackend | string;
+  is32BitExecutable?: boolean;
+  darwinKernelMajor?: number;
+}): RunnerMetalFxEligibility {
+  const cleanRunner = sanitizeLegacyCompatLayer(params.runnerType);
+  const hostPlatform = params.hostPlatform || 'darwin';
+  const hostSupport = isRunnerSupportedOnHost(cleanRunner, hostPlatform, params.hostArch);
+  if (!hostSupport.supported) {
+    return { supportsDlss: false, supportsSpatial: false, reason: hostSupport.reason };
   }
-  return CROSSOVER_GRAPHICS_BACKEND_POLICIES.auto;
+  if (!cleanRunner || cleanRunner === 'native' || hostPlatform !== 'darwin') {
+    return {
+      supportsDlss: false,
+      supportsSpatial: false,
+      reason: 'MetalFX upscaling applies only to Windows compatibility runners on Apple Silicon macOS.',
+    };
+  }
+  const isIntel = /^(x64|ia32|x86_64|x86|intel|amd64)$/i.test(String(params.hostArch || '').trim());
+  if (isIntel) {
+    return {
+      supportsDlss: false,
+      supportsSpatial: false,
+      reason: 'MetalFX upscaling requires an Apple Silicon Mac.',
+    };
+  }
+  const backend = sanitizeCrossOverGraphicsBackend(params.graphicsBackend) ?? 'auto';
+  const isDxvkOrWineD3d = backend === 'dxvk' || backend === 'wined3d';
+  const darwinMajor = params.darwinKernelMajor ?? 25;
+  const supportsSpatial =
+    !isDxvkOrWineD3d && (backend === 'dxmt' || backend === 'auto') && darwinMajor >= 23;
+  const supportsDlss =
+    !isDxvkOrWineD3d && !params.is32BitExecutable && darwinMajor >= 23;
+  return {
+    supportsDlss,
+    supportsSpatial,
+    reason:
+      supportsDlss || supportsSpatial
+        ? null
+        : isDxvkOrWineD3d
+          ? `MetalFX is unavailable on the ${backend.toUpperCase()} backend.`
+          : 'MetalFX DLSS requires a 64-bit game on Apple Silicon macOS 14+.',
+  };
 }
 
 export interface FastMinimalLaunchAdvisoryParams {
   platformId: StorefrontId;
   detectedBuildType: ResolvedLaunchModePreview['detectedBuildType'];
   hostPlatform: 'darwin' | 'win32' | 'linux';
+  hostArch?: 'arm64' | 'x64' | string;
   launchMethod: LaunchMethod;
   storefrontClientLifecycle: 'default' | StorefrontClientLifecyclePolicy;
   globalStorefrontLifecycle?: StorefrontClientLifecyclePolicy;
   isInstalled?: boolean;
   executablePath?: string;
+  usesGalaxySdk?: boolean;
+  isClientlessXboxInstall?: boolean;
   chainedLauncherHandoff?: string | null;
   externalStorefrontHandoff?: string | null;
   externalLauncher?: string | null;
@@ -222,12 +312,15 @@ export function computeFastMinimalLaunchAdvisory(
   const policy = resolveEffectiveLaunchPolicy({
     platformId: params.platformId,
     hostPlatform: params.hostPlatform,
+    hostArch: params.hostArch,
     detectedBuildType: params.detectedBuildType,
     isInstalled: params.isInstalled,
     executablePath: params.executablePath,
     configuredLaunchMethod: params.launchMethod,
     storefrontClientLifecycle: params.storefrontClientLifecycle,
     globalStorefrontLifecycle: params.globalStorefrontLifecycle || fallbackGlobalLifecycle,
+    usesGalaxySdk: params.usesGalaxySdk,
+    isClientlessXboxInstall: params.isClientlessXboxInstall,
   });
 
   const isBottle =
@@ -1457,6 +1550,11 @@ export interface BuildEffectiveLaunchModePreviewParams {
   layers: CompatibilityLayerInfo[];
   cachedInstallInfo?: GameInstallInfo;
   globalStorefrontLifecycle: StorefrontClientLifecyclePolicy;
+  globalDisplayScalingMode?: GlobalBottleDisplayScalingMode;
+  globalDisplayAspectRatio?: GlobalDisplayAspectRatioMode;
+  globalDefaultPerformanceHud?: boolean;
+  usesGalaxySdk?: boolean;
+  isClientlessXboxInstall?: boolean;
   installedStorefrontClients?: Partial<Record<StorefrontId, boolean>>;
 }
 
@@ -1641,24 +1739,36 @@ export function buildEffectiveLaunchModePreview(
       : undefined;
 
   const isIntelX64Host = /^(x64|ia32|x86_64|x86|intel|amd64)$/i.test(String(hostArch || '').trim());
-  const hostSupportedLayers = isIntelX64Host
-    ? layers.filter((l) => l.type !== 'crossover_preview_arm64' && l.available !== false)
-    : layers.filter((l) => l.available !== false);
+  const hostSupportedLayers = layers.filter(
+    (l) => l.available !== false && isRunnerSupportedOnHost(l.type, hostPlatform, hostArch).supported
+  );
   const rawSelectedLayerType = sanitizeLegacyCompatLayer(mergedDraft.compatibilityLayer);
+  const requestedRunnerSupport = isRunnerSupportedOnHost(
+    rawSelectedLayerType,
+    hostPlatform,
+    hostArch
+  );
+  const isRequestedRunnerUnsupportedOnHost = Boolean(
+    rawSelectedLayerType && rawSelectedLayerType !== 'native' && !requestedRunnerSupport.supported
+  );
   const coercedFromArm64OnX64 =
     isIntelX64Host && rawSelectedLayerType === 'crossover_preview_arm64';
-  const selectedLayerType: CompatibilityLayerType | undefined = coercedFromArm64OnX64
-    ? hostSupportedLayers.find((l) => l.type === 'crossover_preview')?.type ||
-      hostSupportedLayers.find((l) => l.type === 'crossover')?.type ||
-      hostSupportedLayers.find((l) => l.type !== 'native')?.type ||
-      'crossover'
-    : rawSelectedLayerType;
+  const selectedLayerType: CompatibilityLayerType | undefined = rawSelectedLayerType;
+  const fallbackSupportedLayerType: CompatibilityLayerType | undefined =
+    isRequestedRunnerUnsupportedOnHost
+      ? hostSupportedLayers.find((l) => l.type === 'crossover_preview')?.type ||
+        hostSupportedLayers.find((l) => l.type === 'crossover')?.type ||
+        hostSupportedLayers.find((l) => l.type !== 'native')?.type ||
+        'crossover'
+      : selectedLayerType;
   const hasExplicitNonNativeLayer = Boolean(selectedLayerType && selectedLayerType !== 'native');
   const selectedDescriptor = hasExplicitNonNativeLayer
     ? COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === selectedLayerType)
     : undefined;
   const activeLayer = hasExplicitNonNativeLayer
-    ? (isIntelX64Host ? hostSupportedLayers : layers).find((l) => l.type === selectedLayerType)
+    ? (isRequestedRunnerUnsupportedOnHost ? hostSupportedLayers : layers).find(
+        (l) => l.type === (isRequestedRunnerUnsupportedOnHost ? fallbackSupportedLayerType : selectedLayerType)
+      )
     : hostSupportedLayers.find(
         (l) =>
           l.type === 'crossover' ||
@@ -1668,20 +1778,25 @@ export function buildEffectiveLaunchModePreview(
       hostSupportedLayers[0] ||
       layers[0];
   const layerName =
-    activeLayer?.name ||
-    selectedDescriptor?.shortLabel ||
-    selectedDescriptor?.label ||
-    (hasExplicitNonNativeLayer ? selectedLayerType! : 'CrossOver / Wine');
+    (isRequestedRunnerUnsupportedOnHost
+      ? selectedDescriptor?.shortLabel || selectedDescriptor?.label || selectedLayerType
+      : activeLayer?.name ||
+        selectedDescriptor?.shortLabel ||
+        selectedDescriptor?.label ||
+        (hasExplicitNonNativeLayer ? selectedLayerType! : 'CrossOver / Wine')) || 'CrossOver / Wine';
   const rawDraftBottle = mergedDraft.wineBottleName?.trim() || '';
   const draftBottleCompatible =
     !rawDraftBottle ||
     !coercedFromArm64OnX64 ||
-    isBottleCompatibleWithLayer(rawDraftBottle, activeLayer, selectedLayerType);
+    isBottleNameCompatibleWithRunner(rawDraftBottle, fallbackSupportedLayerType || 'crossover', {
+      layer: activeLayer,
+      allLayers: layers,
+    });
   const bottleName =
     (draftBottleCompatible ? rawDraftBottle : '') ||
     resolveDefaultBottleForLayer(
       activeLayer,
-      selectedLayerType || activeLayer?.type,
+      fallbackSupportedLayerType || activeLayer?.type,
       selectedDescriptor?.defaultBottleName
     );
 
@@ -1741,35 +1856,32 @@ export function buildEffectiveLaunchModePreview(
     detectedBuildDetail =
       executablePath || installPath || 'Installed on Windows';
   } else {
-    const isExplicitAppBundle = Boolean(
-      (executablePath && /\.app(\/|$)/i.test(executablePath)) ||
-        (!executablePath && installPath && /\.app(\/|$)/i.test(installPath))
-    );
-    const isBottlePath = /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(
-      String(executablePath || installPath || '')
-    );
     const hasExplicitWinFlag =
       installedRecord?.isWindowsBinaryOnMac !== undefined
         ? installedRecord.isWindowsBinaryOnMac
-        : effPlatform?.isWindowsBinaryOnMac;
-    const isExeOnMac =
-      Boolean(executablePath && /\.(exe|bat|msi)$/i.test(executablePath)) ||
-      (!isExplicitAppBundle &&
-        (Boolean(hasExplicitWinFlag) ||
-          isBottlePath ||
-          (!executablePath && hasExplicitWinFlag !== false && isKnownWinOnlyOnMac)));
+        : resolvedEffPlatform?.isWindowsBinaryOnMac;
+    const inferredWinFlag =
+      hasExplicitWinFlag !== undefined
+        ? Boolean(hasExplicitWinFlag)
+        : !executablePath && isKnownWinOnlyOnMac;
+    detectedBuildType = inferDetectedBuildType(
+      {
+        executablePath,
+        installPath,
+        isWindowsBinaryOnMac: inferredWinFlag,
+      },
+      hostPlatform,
+      true
+    );
 
-    if (isExeOnMac) {
-      detectedBuildType = 'windows_exe_on_mac';
+    if (detectedBuildType === 'windows_exe_on_mac') {
       detectedBuildLabel = 'Windows Build (.exe) on macOS';
       detectedBuildDetail = `Requires CrossOver / Wine translation layer on ${resolveMacArchitectureLabel(hostArch)}`;
-    } else if (isExplicitAppBundle) {
-      detectedBuildType = 'mac_native_app';
+    } else if (detectedBuildType === 'mac_native_app') {
       detectedBuildLabel = 'macOS Native App Bundle (.app)';
       detectedBuildDetail =
         'Runs natively on macOS without translation layers';
     } else {
-      detectedBuildType = 'mac_native_bin';
       detectedBuildLabel = 'macOS Native Binary';
       detectedBuildDetail = 'Runs natively on macOS';
     }
@@ -1846,34 +1958,62 @@ export function buildEffectiveLaunchModePreview(
     ? activeMode
     : rawConfiguredLaunchMethod;
 
-  const resolvedPolicy = resolveEffectiveLaunchPolicy({
-    platformId,
-    hostPlatform,
-    detectedBuildType,
-    isInstalled,
-    hasExecutable: Boolean(executablePath),
-    hasCustomExecutable: Boolean(customExecPath),
-    executablePath,
-    installPath,
-    configuredLaunchMethod: policyConfiguredLaunchMethod,
-    storefrontClientLifecycle: rawLifecycleOverride,
-    globalStorefrontLifecycle,
-  });
-
-  const isLifecycleFastBypass = resolvedPolicy.effectiveLifecycle === 'fast_direct_bypass';
-  const isFastDirectActive = resolvedPolicy.isFastDirectBypass;
-  const rawEffectiveCompatLayer: CompatibilityLayerType =
+  const effectiveCompatLayer: CompatibilityLayerType =
     sanitizeLegacyCompatLayer(draftConfig?.compatibilityLayer) ||
     sanitizeLegacyCompatLayer(savedConfig?.compatibilityLayer) ||
     hostSupportedLayers[0]?.type ||
     layers[0]?.type ||
     'crossover';
-  const effectiveCompatLayer: CompatibilityLayerType =
-    isIntelX64Host && rawEffectiveCompatLayer === 'crossover_preview_arm64'
-      ? selectedLayerType || 'crossover'
-      : rawEffectiveCompatLayer;
 
+  const resolvedIsClientlessXboxInstall =
+    typeof params.isClientlessXboxInstall === 'boolean'
+      ? params.isClientlessXboxInstall
+      : platformId === 'xbox' &&
+        (installedRecord?.runner === 'xbox_xgr' ||
+          installedRecord?.runner === 'one_launcher' ||
+          Boolean(
+            executablePath &&
+              !installedRecord?.appUserModelId &&
+              !resolvedEffPlatform?.appUserModelId
+          ));
+
+  const resolvedPolicy = resolveEffectiveLaunchPolicy({
+    platformId,
+    hostPlatform,
+    hostArch,
+    detectedBuildType,
+    isInstalled,
+    isWindowsBinaryOnMac:
+      installedRecord?.isWindowsBinaryOnMac ?? resolvedEffPlatform?.isWindowsBinaryOnMac,
+    hasExecutable: Boolean(executablePath),
+    hasCustomExecutable: Boolean(customExecPath),
+    executablePath,
+    installPath,
+    configuredLaunchMethod: policyConfiguredLaunchMethod,
+    compatibilityLayer: rawSelectedLayerType ?? effectiveCompatLayer,
+    crossoverGraphicsBackend: mergedDraft.crossoverGraphicsBackend,
+    displayScalingMode: mergedDraft.displayScalingMode,
+    globalDisplayScalingMode: params.globalDisplayScalingMode,
+    displayAspectRatio: mergedDraft.displayAspectRatio,
+    globalDisplayAspectRatio: params.globalDisplayAspectRatio,
+    virtualDesktop: mergedDraft.virtualDesktop,
+    performanceHud: mergedDraft.performanceHud,
+    metalHud: mergedDraft.metalHud,
+    dxvkHud: mergedDraft.dxvkHud,
+    globalDefaultPerformanceHud: params.globalDefaultPerformanceHud,
+    storefrontClientLifecycle: rawLifecycleOverride,
+    globalStorefrontLifecycle,
+    usesGalaxySdk: params.usesGalaxySdk,
+    isClientlessXboxInstall: resolvedIsClientlessXboxInstall,
+  });
+
+  const isLifecycleFastBypass = resolvedPolicy.effectiveLifecycle === 'fast_direct_bypass';
+  const isFastDirectActive = resolvedPolicy.isFastDirectBypass;
   const isStorefrontUriMode = activeMode === 'storefront_uri';
+  const isCrossOverRunner =
+    effectiveCompatLayer === 'crossover' ||
+    effectiveCompatLayer === 'crossover_preview' ||
+    effectiveCompatLayer === 'crossover_preview_arm64';
 
   let visibleSections: ResolvedLaunchModePreview['visibleSections'];
   if (hostPlatform === 'win32') {
@@ -1898,10 +2038,7 @@ export function buildEffectiveLaunchModePreview(
   } else if (detectedBuildType === 'windows_exe_on_mac') {
     visibleSections = {
       compatibilityLayer: true,
-      crossoverRendering:
-        effectiveCompatLayer === 'crossover' ||
-        effectiveCompatLayer === 'crossover_preview' ||
-        effectiveCompatLayer === 'crossover_preview_arm64',
+      crossoverRendering: isCrossOverRunner,
       nativeMacMetalHud: false,
       executableAndArgs: true,
       environmentAndHooks: true,
@@ -1914,11 +2051,7 @@ export function buildEffectiveLaunchModePreview(
       activeMode === 'auto';
     visibleSections = {
       compatibilityLayer: showCompatForUninstalled,
-      crossoverRendering:
-        showCompatForUninstalled &&
-        (effectiveCompatLayer === 'crossover' ||
-          effectiveCompatLayer === 'crossover_preview' ||
-          effectiveCompatLayer === 'crossover_preview_arm64'),
+      crossoverRendering: showCompatForUninstalled && isCrossOverRunner,
       nativeMacMetalHud: showNativeMacForUninstalled,
       executableAndArgs: true,
       environmentAndHooks: showCompatForUninstalled,
@@ -2271,21 +2404,30 @@ export function buildEffectiveLaunchModePreview(
         auto: {
           badge: hasMacRing0HardBlock
             ? 'Unsupported on macOS'
-            : hasMacBattlEyeWarning
-              ? 'Multiplayer Blocked'
-              : 'Recommended',
-          badgeTone: hasMacRing0HardBlock || hasMacBattlEyeWarning ? 'amber' : 'emerald',
-          dynamicDesc: bottleAutoDesc,
+            : isRequestedRunnerUnsupportedOnHost
+              ? 'Unsupported on Intel Mac'
+              : hasMacBattlEyeWarning
+                ? 'Multiplayer Blocked'
+                : 'Recommended',
+          badgeTone:
+            hasMacRing0HardBlock || isRequestedRunnerUnsupportedOnHost || hasMacBattlEyeWarning
+              ? 'amber'
+              : 'emerald',
+          dynamicDesc: isRequestedRunnerUnsupportedOnHost && requestedRunnerSupport.reason
+            ? requestedRunnerSupport.reason
+            : bottleAutoDesc,
           ...(hasMacRing0HardBlock
             ? {
                 warning: `${antiCheatLabel} requires a Windows ring-0 kernel driver that cannot load inside macOS Wine/CrossOver bottles.`,
               }
-            : hasMacBattlEyeWarning
-              ? {
-                  warning:
-                    'Online multiplayer requiring BattlEye (BEDaisy.sys) is blocked inside macOS Wine/CrossOver bottles; offline Story Mode (-nobattleye) remains playable where supported.',
-                }
-              : {}),
+            : isRequestedRunnerUnsupportedOnHost && requestedRunnerSupport.reason
+              ? { warning: requestedRunnerSupport.reason }
+              : hasMacBattlEyeWarning
+                ? {
+                    warning:
+                      'Online multiplayer requiring BattlEye (BEDaisy.sys) is blocked inside macOS Wine/CrossOver bottles; offline Story Mode (-nobattleye) remains playable where supported.',
+                  }
+                : {}),
         },
         custom: {
           badge: 'Legacy',
@@ -2293,9 +2435,18 @@ export function buildEffectiveLaunchModePreview(
           dynamicDesc: bottleAutoDesc,
         },
         compatibility_layer: {
-          badge: hasMacRing0HardBlock ? 'Unsupported on macOS' : 'Custom Runner & Bottle',
-          badgeTone: hasMacRing0HardBlock ? 'amber' : 'sky',
-          dynamicDesc: bottleCompatDesc,
+          badge: hasMacRing0HardBlock
+            ? 'Unsupported on macOS'
+            : isRequestedRunnerUnsupportedOnHost
+              ? 'Unsupported on Intel Mac'
+              : 'Custom Runner & Bottle',
+          badgeTone: hasMacRing0HardBlock || isRequestedRunnerUnsupportedOnHost ? 'amber' : 'sky',
+          dynamicDesc: isRequestedRunnerUnsupportedOnHost && requestedRunnerSupport.reason
+            ? requestedRunnerSupport.reason
+            : bottleCompatDesc,
+          ...(isRequestedRunnerUnsupportedOnHost && requestedRunnerSupport.reason
+            ? { warning: requestedRunnerSupport.reason }
+            : {}),
         },
         direct: {
           badge: 'Requires Translation',
@@ -2702,19 +2853,26 @@ export function buildEffectiveLaunchModePreview(
         warning:
           'No local installation detected yet. Link a custom executable path below to use Direct Executable mode.',
       },
-      compatibility_layer: isDualBuildMacPreview
+      compatibility_layer: isRequestedRunnerUnsupportedOnHost && requestedRunnerSupport.reason
         ? {
-            badge: 'Windows Translation',
-            badgeTone: 'sky',
-            dynamicDesc: `Use the Windows (.exe) build via ${layerName} with ${preInstallCloudDesc} instead of the native macOS build — pre-configure runner, bottle, and 64-bit/32-bit graphics settings.`,
+            badge: 'Unsupported on Intel Mac',
+            badgeTone: 'amber',
+            dynamicDesc: requestedRunnerSupport.reason,
+            warning: requestedRunnerSupport.reason,
           }
-        : {
-            badge: hasMacRing0HardBlock ? 'Unsupported on macOS' : 'Pre-Configure',
-            badgeTone: hasMacRing0HardBlock ? 'amber' : 'sky',
-            dynamicDesc: hasMacRing0HardBlock
-              ? notInstalledAutoSummary
-              : `Pre-configure ${layerName} bottle, CrossOver 64-bit/32-bit graphics backend, and ${preInstallCloudDesc} before installing or linking a Windows .exe.`,
-          },
+        : isDualBuildMacPreview
+          ? {
+              badge: 'Windows Translation',
+              badgeTone: 'sky',
+              dynamicDesc: `Use the Windows (.exe) build via ${layerName} with ${preInstallCloudDesc} instead of the native macOS build — pre-configure runner, bottle, and 64-bit/32-bit graphics settings.`,
+            }
+          : {
+              badge: hasMacRing0HardBlock ? 'Unsupported on macOS' : 'Pre-Configure',
+              badgeTone: hasMacRing0HardBlock ? 'amber' : 'sky',
+              dynamicDesc: hasMacRing0HardBlock
+                ? notInstalledAutoSummary
+                : `Pre-configure ${layerName} bottle, CrossOver 64-bit/32-bit graphics backend, and ${preInstallCloudDesc} before installing or linking a Windows .exe.`,
+            },
       storefront_uri: {
         badge: isClientInstalled === false ? 'Client Not Installed' : 'Store Fallback',
         badgeTone: isClientInstalled === false ? 'slate' : 'sky',
