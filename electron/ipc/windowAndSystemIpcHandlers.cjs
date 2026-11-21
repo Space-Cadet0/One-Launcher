@@ -98,11 +98,12 @@ function selectPlatformReleaseAsset(assets, platform = process.platform, arch = 
  * Window Chrome, Fullscreen & Menu Action IPC Handlers
  * Extracted from electron/main.cjs for clean modular boundary separation.
  *
- * @param {{ ipcMain: any, app: any, getMainWindow: () => any, options?: Record<string, any> }} deps
+ * @param {{ ipcMain: any, app: any, BrowserWindow?: any, getMainWindow: () => any, options?: Record<string, any> }} deps
  */
 function registerWindowAndSystemIpcHandlers({
   ipcMain: rawIpcMain,
   app,
+  BrowserWindow: injectedBrowserWindow,
   getMainWindow,
   options: handlerOptions = {},
 }) {
@@ -113,6 +114,16 @@ function registerWindowAndSystemIpcHandlers({
     allowedDevOrigin: handlerOptions.allowedDevOrigin || null,
     expectedFileHref: handlerOptions.expectedFileHref || null,
   });
+
+  const resolveBrowserWindowClass = () => {
+    if (injectedBrowserWindow) return injectedBrowserWindow;
+    try {
+      const electronMod = require('electron');
+      return electronMod?.BrowserWindow || null;
+    } catch {
+      return null;
+    }
+  };
 
   ipcMain.handle('window:toggle-fullscreen', () => {
     const mainWindow = getMainWindow?.();
@@ -160,9 +171,29 @@ function registerWindowAndSystemIpcHandlers({
   });
 
   ipcMain.handle('window:perform-menu-action', (/** @type {any} */ _event, /** @type {unknown} */ action) => {
+    const act = String(action || '').toLowerCase().trim();
+    if (act === 'quit') {
+      app?.quit?.();
+      return true;
+    }
+    if (act === 'close') {
+      const bwClass = resolveBrowserWindowClass();
+      const focusedWin =
+        typeof bwClass?.getFocusedWindow === 'function' ? bwClass.getFocusedWindow() : null;
+      const mainWindow = getMainWindow?.();
+      const targetWin =
+        focusedWin && (typeof focusedWin.isDestroyed !== 'function' || !focusedWin.isDestroyed())
+          ? focusedWin
+          : mainWindow && (typeof mainWindow.isDestroyed !== 'function' || !mainWindow.isDestroyed())
+            ? mainWindow
+            : null;
+      if (!targetWin || typeof targetWin.close !== 'function') return false;
+      targetWin.close();
+      return true;
+    }
+
     const mainWindow = getMainWindow?.();
     if (!mainWindow || mainWindow.isDestroyed()) return false;
-    const act = String(action || '').toLowerCase().trim();
     switch (act) {
       case 'reload':
         mainWindow.webContents.reload();
@@ -215,10 +246,6 @@ function registerWindowAndSystemIpcHandlers({
         } else {
           mainWindow.maximize();
         }
-        return true;
-      case 'close':
-      case 'quit':
-        app?.quit?.();
         return true;
       default:
         return false;

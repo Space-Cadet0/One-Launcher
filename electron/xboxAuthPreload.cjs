@@ -87,31 +87,61 @@ function installPasskeyCancellationHelper() {
     panel.style.cssText =
       'all:initial;display:block;position:fixed;left:16px;right:16px;bottom:16px;z-index:2147483647;max-width:560px;margin:0 auto;color-scheme:dark';
     const shadow = panel.attachShadow({ mode: 'open' });
-    shadow.innerHTML = `<style>
-      :host{font-family:system-ui,-apple-system,sans-serif;font-size:13px;color:#f4f5f6}
-      .panel{box-sizing:border-box;display:flex;align-items:center;gap:16px;padding:14px 16px;font:13px system-ui,-apple-system,sans-serif;color:#f4f5f6;background:#1e2228;border:1px solid #3d4450;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,0.45)}
-      .copy{flex:1;min-width:0}
-      .brand{font-size:10px;font-weight:700;letter-spacing:.8px;color:#52b043;margin-bottom:4px}
-      h2{font-size:13.5px;line-height:1.35;margin:0 0 4px;font-weight:600}
-      p{font-size:12px;line-height:1.45;color:#bdc3cb;margin:0}
-      button{flex:none;font:600 12.5px system-ui,-apple-system,sans-serif;color:#f4f5f6;background:#2f3640;border:1px solid #596270;border-radius:6px;padding:9px 12px;cursor:pointer}
-      button:hover{background:#3d4652}
-      @media(max-width:460px){.panel{align-items:stretch;flex-direction:column;gap:10px}button{width:100%}}
-    </style><section class="panel" role="region" aria-label="One Launcher sign-in helper">
-      <div class="copy">
-        <div class="brand">ONE LAUNCHER</div>
-        <h2>Passkey prompt taking too long?</h2>
-        <p>Cancel the passkey request to choose <strong>Other ways to sign in</strong> (password, email code, or Microsoft Authenticator).</p>
-      </div>
-      <button type="button" data-cancel>Cancel passkey</button>
-    </section>`;
-    const btn = shadow.querySelector('[data-cancel]');
-    if (btn) {
-      btn.addEventListener('click', () => {
-        for (const ctrl of activeControllers) ctrl.abort();
-        hide();
-      });
-    }
+    const styleEl = doc.createElement('style');
+    styleEl.textContent = [
+      ':host{font-family:system-ui,-apple-system,sans-serif;font-size:13px;color:#f4f5f6}',
+      '.panel{box-sizing:border-box;display:flex;align-items:center;gap:16px;padding:14px 16px;font:13px system-ui,-apple-system,sans-serif;color:#f4f5f6;background:#1e2228;border:1px solid #3d4450;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,0.45)}',
+      '.copy{flex:1;min-width:0}',
+      '.brand{font-size:10px;font-weight:700;letter-spacing:.8px;color:#52b043;margin-bottom:4px}',
+      'h2{font-size:13.5px;line-height:1.35;margin:0 0 4px;font-weight:600}',
+      'p{font-size:12px;line-height:1.45;color:#bdc3cb;margin:0}',
+      'button{flex:none;font:600 12.5px system-ui,-apple-system,sans-serif;color:#f4f5f6;background:#2f3640;border:1px solid #596270;border-radius:6px;padding:9px 12px;cursor:pointer}',
+      'button:hover{background:#3d4652}',
+      '@media(max-width:460px){.panel{align-items:stretch;flex-direction:column;gap:10px}button{width:100%}}',
+    ].join('');
+
+    const section = doc.createElement('section');
+    section.className = 'panel';
+    section.setAttribute('role', 'region');
+    section.setAttribute('aria-label', 'One Launcher sign-in helper');
+
+    const copyDiv = doc.createElement('div');
+    copyDiv.className = 'copy';
+
+    const brandDiv = doc.createElement('div');
+    brandDiv.className = 'brand';
+    brandDiv.textContent = 'ONE LAUNCHER';
+
+    const heading = doc.createElement('h2');
+    heading.textContent = 'Passkey prompt taking too long?';
+
+    const desc = doc.createElement('p');
+    desc.appendChild(doc.createTextNode('Cancel the passkey request to choose '));
+    const strongEl = doc.createElement('strong');
+    strongEl.textContent = 'Other ways to sign in';
+    desc.appendChild(strongEl);
+    desc.appendChild(
+      doc.createTextNode(' (password, email code, or Microsoft Authenticator).')
+    );
+
+    copyDiv.appendChild(brandDiv);
+    copyDiv.appendChild(heading);
+    copyDiv.appendChild(desc);
+
+    const btn = doc.createElement('button');
+    btn.type = 'button';
+    btn.setAttribute('data-cancel', '');
+    btn.textContent = 'Cancel passkey';
+    btn.addEventListener('click', () => {
+      for (const ctrl of activeControllers) ctrl.abort();
+      hide();
+    });
+
+    section.appendChild(copyDiv);
+    section.appendChild(btn);
+
+    shadow.appendChild(styleEl);
+    shadow.appendChild(section);
     doc.body.appendChild(panel);
   };
 
