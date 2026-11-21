@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { SteamReviewSummary } from '../../contracts/steam';
 import { toOlMediaUrl } from '../../contracts/network';
 import { OpenCriticData, getTierColor } from '../../services/opencritic/openCritic';
+import { getReviewSourceDisplayMeta } from '../../services/critic/criticUtils';
 import { ActiveGameFilter } from '../../contracts/filter';
 import type { ResolvedGameTag, TagFacetCount } from '../../contracts/tags';
 import { stripHtmlToPlainSynopsis } from '../../services/steam/fallbackMetadataProvider';
@@ -316,6 +317,9 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
           !/no user reviews/i.test(reviewSummary.reviewScoreDesc)))
   );
 
+  const ocMeta = openCritic ? getReviewSourceDisplayMeta(openCritic) : null;
+  const ocColors = openCritic ? getTierColor(openCritic.tier) : null;
+
   const activeHeaderSrc =
     resolvedHeaderImage && !primaryFailed
       ? resolvedHeaderImage
@@ -395,20 +399,10 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
         )}
 
         {/* Critic Consensus Rating Row */}
-        {openCritic && (
-          <div className="flex items-center">
+        {openCritic && ocMeta && ocColors && (
+          <div className="flex items-center" data-critic-source={ocMeta.shortTag}>
             <span className="w-[94px] flex-shrink-0 text-[10px] uppercase text-[#94a3b8] font-normal tracking-wider">
-              {openCritic.source === 'metacritic'
-                ? 'Metacritic:'
-                : openCritic.source === 'metacritic_user'
-                ? 'MC User Score:'
-                : openCritic.source === 'steam'
-                ? 'Steam Rating:'
-                : openCritic.source === 'gog'
-                ? 'GOG Rating:'
-                : openCritic.source === 'epic'
-                ? 'Epic Rating:'
-                : 'OpenCritic:'}
+              {`${ocMeta.shortLabel}:`}
             </span>
             <div className="flex items-center gap-1.5">
               <button
@@ -420,17 +414,13 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
                     value: openCritic.tier,
                   })
                 }
-                className={`min-h-6 inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-bold border hover:brightness-125 cursor-pointer ${
-                  getTierColor(openCritic.tier).badgeBg
-                } ${getTierColor(openCritic.tier).badgeBorder} ${
-                  getTierColor(openCritic.tier).badgeText
-                }`}
+                aria-label={`${ocMeta.ariaLabel}. Filter library for ${openCritic.tier} games`}
+                className={`min-h-6 inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-bold border hover:brightness-125 cursor-pointer ${ocColors.badgeBg} ${ocColors.badgeBorder} ${ocColors.badgeText}`}
                 title={`Filter library for ${openCritic.tier} games`}
               >
-                {openCritic.source === 'metacritic_user' && openCritic.userScoreRaw !== undefined
+                {ocMeta.shortTag === 'MCU' && openCritic.userScoreRaw !== undefined
                   ? `${openCritic.userScoreRaw}/10`
-                  : (openCritic.source === 'gog' || openCritic.source === 'epic') &&
-                    openCritic.starRatingRaw !== undefined
+                  : ocMeta.isStoreRating && openCritic.starRatingRaw !== undefined
                   ? `${openCritic.starRatingRaw}★`
                   : openCritic.score}
               </button>
@@ -443,50 +433,40 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
                     value: openCritic.tier,
                   })
                 }
-                className={`min-h-6 inline-flex items-center font-bold hover:underline cursor-pointer ${
-                  getTierColor(openCritic.tier).accentText
-                }`}
+                aria-label={`Filter library for ${openCritic.tier} games`}
+                className={`min-h-6 inline-flex items-center font-bold hover:underline cursor-pointer ${ocColors.accentText}`}
                 title={`Filter library for ${openCritic.tier} games`}
               >
                 {openCritic.tier}
               </button>
-              <a
-                href={openCritic.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
-                    window.electronAPI.openExternal(openCritic.url);
-                  } else {
-                    window.open(openCritic.url, '_blank', 'noreferrer,noopener');
-                  }
-                }}
-                className="inline-flex items-center justify-center min-w-6 min-h-6 text-[#94a3b8] hover:text-[#c6d4df] transition-colors ml-0.5 cursor-pointer"
-                title={
-                  openCritic.source === 'metacritic'
-                    ? `View ${title} on Metacritic.com`
-                    : openCritic.source === 'metacritic_user'
-                    ? `View ${title} User Reviews on Metacritic.com`
-                    : openCritic.source === 'steam'
-                    ? `View ${title} on Steam Store`
-                    : openCritic.source === 'gog'
-                    ? `View ${title} on GOG.com`
-                    : openCritic.source === 'epic'
-                    ? `View ${title} on Epic Games Store`
-                    : `View ${title} on OpenCritic.com`
-                }
-              >
-                <ExternalLink className="w-2.5 h-2.5" />
-              </a>
+              {openCritic.url && (
+                <a
+                  href={openCritic.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+                      window.electronAPI.openExternal(openCritic.url);
+                    } else {
+                      window.open(openCritic.url, '_blank', 'noreferrer,noopener');
+                    }
+                  }}
+                  className="inline-flex items-center justify-center min-w-6 min-h-6 text-[#94a3b8] hover:text-[#c6d4df] transition-colors ml-0.5 cursor-pointer"
+                  aria-label={`${ocMeta.externalLinkPrefix} ${title}`}
+                  title={`${ocMeta.externalLinkPrefix} ${title}`}
+                >
+                  <ExternalLink className="w-2.5 h-2.5" aria-hidden="true" />
+                </a>
+              )}
               {openCritic.percentRecommended !== undefined ? (
                 <span className="text-[#94a3b8] font-normal text-[11px]">
                   ({openCritic.percentRecommended}%{' '}
-                  {openCritic.source === 'steam' ? 'positive' : 'rec'})
+                  {ocMeta.shortTag === 'STM' ? 'positive' : 'rec'})
                 </span>
               ) : (
-                (openCritic.source === 'gog' || openCritic.source === 'epic') && (
+                ocMeta.isStoreRating && (
                   <span className="text-[#94a3b8] font-normal text-[11px]">
                     ({openCritic.score}/100)
                   </span>
