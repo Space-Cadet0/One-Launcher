@@ -24,6 +24,7 @@ import {
   type ArtworkRecoveryContext,
 } from '../services/storage/metadataReconciliation';
 import { launcherService } from '../services/launcher/launcherService';
+import { getAlphabeticalTitleSortKey } from '../services/common/titleSortUtils';
 
 export type PartialAchievementRecord = Partial<StoreAchievementSummary> & {
   unlocked: number;
@@ -31,8 +32,32 @@ export type PartialAchievementRecord = Partial<StoreAchievementSummary> & {
   percentage: number;
 };
 
+function areAchievementSummariesSame(
+  a?: StoreAchievementSummary,
+  b?: StoreAchievementSummary
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.unlocked === b.unlocked &&
+    a.total === b.total &&
+    a.percentage === b.percentage &&
+    Boolean(a.isMastered) === Boolean(b.isMastered) &&
+    a.lastUnlockedAt === b.lastUnlockedAt &&
+    a.source === b.source &&
+    a.syncedAt === b.syncedAt &&
+    Boolean(a.hasConflict) === Boolean(b.hasConflict) &&
+    a.conflictDetails === b.conflictDetails &&
+    a.gamerscore?.earned === b.gamerscore?.earned &&
+    a.gamerscore?.total === b.gamerscore?.total &&
+    a.xp?.earned === b.xp?.earned &&
+    a.xp?.total === b.xp?.total
+  );
+}
+
 /**
  * Reconciles achievements and local installation state across the game catalog.
+ * Preserves exact object references on zero-change entries to avoid unnecessary re-renders.
  */
 export function reconcileCatalogTrophiesRecords(
   catalog: CanonicalGame[],
@@ -42,7 +67,9 @@ export function reconcileCatalogTrophiesRecords(
   installedSteamAppIds?: Set<number> | null,
   xboxAchs: Record<string, PartialAchievementRecord> = {}
 ): CanonicalGame[] {
-  return catalog.map((game) => {
+  let anyCatalogChanged = false;
+
+  const updatedCatalog = catalog.map((game) => {
     const targetAppId = game.steamAppId;
     const ach = targetAppId
       ? steamAchs[targetAppId] || getKnownSteamAchievements(targetAppId, game.title)
@@ -50,57 +77,105 @@ export function reconcileCatalogTrophiesRecords(
     const titleLower = (game.title || '').toLowerCase().trim();
     const normTitle = titleLower.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
 
+    let gamePlatformsChanged = false;
     const updatedPlatforms = game.platforms.map((p) => {
-      const newP = sanitizePlatformOwnershipOsFlags({ ...p });
+      const sanitizedBase = sanitizePlatformOwnershipOsFlags(p);
+      let working: GamePlatformOwnership = sanitizedBase;
+      const cloneIfNeeded = (): GamePlatformOwnership => {
+        if (working === p) {
+          working = { ...p };
+        }
+        return working;
+      };
+
       const rec = launcherService.getInstalledRecordForGame(game, p.platformId);
       if (rec && rec.platformId === p.platformId) {
-        newP.installed = true;
-        newP.installPath = rec.installPath || newP.installPath;
-        newP.executablePath = rec.executablePath || newP.executablePath;
-        newP.launchArguments = rec.launchArguments || newP.launchArguments;
-        newP.installSize = rec.installSize ?? newP.installSize;
-        newP.version = rec.version || newP.version;
-        newP.isWindowsBinaryOnMac = rec.isWindowsBinaryOnMac ?? newP.isWindowsBinaryOnMac;
-        if (rec.isCrossPlatformLauncherRuntime !== undefined) {
-          newP.isCrossPlatformLauncherRuntime = rec.isCrossPlatformLauncherRuntime;
-        }
-        if (rec.externalStorefrontHandoff) {
-          newP.externalStorefrontHandoff =
-            (rec.externalStorefrontHandoff as GamePlatformOwnership['externalStorefrontHandoff']) ||
-            newP.externalStorefrontHandoff;
-        }
-        if (rec.chainedLauncherHandoff) {
-          newP.chainedLauncherHandoff = rec.chainedLauncherHandoff || newP.chainedLauncherHandoff;
-        }
-        if (rec.chainedExternalInstallId) {
-          newP.chainedExternalInstallId =
-            rec.chainedExternalInstallId || newP.chainedExternalInstallId;
-        }
+        const nextInstalled = true;
+        const nextInstallPath = rec.installPath || working.installPath;
+        const nextExePath = rec.executablePath || working.executablePath;
+        const nextLaunchArgs = rec.launchArguments || working.launchArguments;
+        const nextInstallSize = rec.installSize ?? working.installSize;
+        const nextVersion = rec.version || working.version;
+        const nextWinOnMac = rec.isWindowsBinaryOnMac ?? working.isWindowsBinaryOnMac;
+        const nextCrossPlat =
+          rec.isCrossPlatformLauncherRuntime !== undefined
+            ? rec.isCrossPlatformLauncherRuntime
+            : working.isCrossPlatformLauncherRuntime;
+        const nextExtHandoff = rec.externalStorefrontHandoff
+          ? ((rec.externalStorefrontHandoff as GamePlatformOwnership['externalStorefrontHandoff']) ||
+            working.externalStorefrontHandoff)
+          : working.externalStorefrontHandoff;
+        const nextChainedHandoff = rec.chainedLauncherHandoff || working.chainedLauncherHandoff;
+        const nextChainedInstallId =
+          rec.chainedExternalInstallId || working.chainedExternalInstallId;
         const recXboxProductId = (rec as typeof rec & { xboxProductId?: string }).xboxProductId;
-        if (recXboxProductId) newP.xboxProductId = recXboxProductId || newP.xboxProductId;
-        if (rec.packageFamilyName) {
-          newP.packageFamilyName = rec.packageFamilyName || newP.packageFamilyName;
+        const nextXboxProductId = recXboxProductId || working.xboxProductId;
+        const nextPfn = rec.packageFamilyName || working.packageFamilyName;
+        const nextAumid = rec.appUserModelId || working.appUserModelId;
+        const nextXboxTitleId = rec.xboxTitleId || working.xboxTitleId;
+        const nextScid = rec.scid || working.scid;
+        const nextMsaAppId = rec.msaAppId || working.msaAppId;
+
+        if (
+          working.installed !== nextInstalled ||
+          working.installPath !== nextInstallPath ||
+          working.executablePath !== nextExePath ||
+          working.launchArguments !== nextLaunchArgs ||
+          working.installSize !== nextInstallSize ||
+          working.version !== nextVersion ||
+          working.isWindowsBinaryOnMac !== nextWinOnMac ||
+          working.isCrossPlatformLauncherRuntime !== nextCrossPlat ||
+          working.externalStorefrontHandoff !== nextExtHandoff ||
+          working.chainedLauncherHandoff !== nextChainedHandoff ||
+          working.chainedExternalInstallId !== nextChainedInstallId ||
+          working.xboxProductId !== nextXboxProductId ||
+          working.packageFamilyName !== nextPfn ||
+          working.appUserModelId !== nextAumid ||
+          working.xboxTitleId !== nextXboxTitleId ||
+          working.scid !== nextScid ||
+          working.msaAppId !== nextMsaAppId
+        ) {
+          const target = cloneIfNeeded();
+          target.installed = nextInstalled;
+          target.installPath = nextInstallPath;
+          target.executablePath = nextExePath;
+          target.launchArguments = nextLaunchArgs;
+          target.installSize = nextInstallSize;
+          target.version = nextVersion;
+          target.isWindowsBinaryOnMac = nextWinOnMac;
+          if (nextCrossPlat !== undefined) {
+            target.isCrossPlatformLauncherRuntime = nextCrossPlat;
+          }
+          if (nextExtHandoff) target.externalStorefrontHandoff = nextExtHandoff;
+          if (nextChainedHandoff) target.chainedLauncherHandoff = nextChainedHandoff;
+          if (nextChainedInstallId) target.chainedExternalInstallId = nextChainedInstallId;
+          if (nextXboxProductId) target.xboxProductId = nextXboxProductId;
+          if (nextPfn) target.packageFamilyName = nextPfn;
+          if (nextAumid) target.appUserModelId = nextAumid;
+          if (nextXboxTitleId) target.xboxTitleId = nextXboxTitleId;
+          if (nextScid) target.scid = nextScid;
+          if (nextMsaAppId) target.msaAppId = nextMsaAppId;
         }
-        if (rec.appUserModelId) newP.appUserModelId = rec.appUserModelId || newP.appUserModelId;
-        if (rec.xboxTitleId) newP.xboxTitleId = rec.xboxTitleId || newP.xboxTitleId;
-        if (rec.scid) newP.scid = rec.scid || newP.scid;
-        if (rec.msaAppId) newP.msaAppId = rec.msaAppId || newP.msaAppId;
       }
 
       if (p.platformId === 'steam') {
         if (installedSteamAppIds) {
-          newP.installed =
+          const nextSteamInstalled =
             (targetAppId ? installedSteamAppIds.has(targetAppId) : false) ||
             launcherService.isGameInstalled(game, 'steam');
+          if (working.installed !== nextSteamInstalled) {
+            cloneIfNeeded().installed = nextSteamInstalled;
+          }
         }
         if (ach && ach.total > 0) {
           const reconciled = reconcileAchievementSummaries(
-            p.achievements,
+            working.achievements,
             {
               unlocked: ach.unlocked,
               total: ach.total,
               percentage: ach.percentage,
               isMastered: ach.percentage >= 100 || (ach.total > 0 && ach.unlocked >= ach.total),
+              lastUnlockedAt: ach.lastUnlockedAt,
               source: ach.source || 'local_client_cache',
               syncedAt: ach.syncedAt,
               hasConflict: ach.hasConflict,
@@ -108,7 +183,9 @@ export function reconcileCatalogTrophiesRecords(
             },
             { title: game.title, appId: targetAppId, store: 'steam' }
           );
-          if (reconciled) newP.achievements = reconciled;
+          if (reconciled && !areAchievementSummariesSame(working.achievements, reconciled)) {
+            cloneIfNeeded().achievements = reconciled;
+          }
         }
       } else if (p.platformId === 'gog') {
         const gogId = String(p.platformGameId || game.id).replace(/^gog-/, '');
@@ -119,16 +196,18 @@ export function reconcileCatalogTrophiesRecords(
           gogAchs[normTitle] ||
           getKnownGogAchievements(p.platformGameId || game.id, game.title);
         if (gogAch && gogAch.total > 0) {
-          const reconciled = reconcileAchievementSummaries(p.achievements, gogAch, {
+          const reconciled = reconcileAchievementSummaries(working.achievements, gogAch, {
             title: game.title,
             store: 'gog',
           });
-          if (reconciled) newP.achievements = reconciled;
+          if (reconciled && !areAchievementSummariesSame(working.achievements, reconciled)) {
+            cloneIfNeeded().achievements = reconciled;
+          }
         }
       } else if (p.platformId === 'epic') {
         const epicId = String(p.platformGameId || game.id);
         const epicIdLower = epicId.toLowerCase();
-        const epicNamespace = (p as GamePlatformOwnership & { namespace?: string }).namespace;
+        const epicNamespace = p.namespace;
         const epicAch =
           epicAchs[epicId] ||
           epicAchs[epicIdLower] ||
@@ -138,11 +217,13 @@ export function reconcileCatalogTrophiesRecords(
           epicAchs[normTitle] ||
           getKnownEpicAchievements(p.platformGameId || game.id, game.title);
         if (epicAch && epicAch.total > 0) {
-          const reconciled = reconcileAchievementSummaries(p.achievements, epicAch, {
+          const reconciled = reconcileAchievementSummaries(working.achievements, epicAch, {
             title: game.title,
             store: 'epic',
           });
-          if (reconciled) newP.achievements = reconciled;
+          if (reconciled && !areAchievementSummariesSame(working.achievements, reconciled)) {
+            cloneIfNeeded().achievements = reconciled;
+          }
         }
       } else if (p.platformId === 'xbox') {
         const rawXboxId = String(p.xboxProductId || p.platformGameId || game.id).replace(
@@ -167,47 +248,66 @@ export function reconcileCatalogTrophiesRecords(
             game.title
           );
         if (xboxAch && (xboxAch.total > 0 || (xboxAch.gamerscore?.total ?? 0) > 0)) {
-          const reconciled = reconcileAchievementSummaries(p.achievements, xboxAch, {
+          const reconciled = reconcileAchievementSummaries(working.achievements, xboxAch, {
             title: game.title,
             store: 'xbox',
           });
-          if (reconciled) newP.achievements = reconciled;
+          if (reconciled && !areAchievementSummariesSame(working.achievements, reconciled)) {
+            cloneIfNeeded().achievements = reconciled;
+          }
         }
       }
-      return sanitizePlatformOwnershipOsFlags(newP);
+
+      const finalP = working === sanitizedBase ? sanitizedBase : sanitizePlatformOwnershipOsFlags(working);
+      if (finalP !== p) {
+        gamePlatformsChanged = true;
+      }
+      return finalP;
     });
 
+    if (!gamePlatformsChanged) {
+      return game;
+    }
+    anyCatalogChanged = true;
     return { ...game, platforms: updatedPlatforms };
   });
+
+  return anyCatalogChanged ? updatedCatalog : catalog;
 }
 
 /**
  * Intelligent non-Steam Steam App ID matching pass that avoids same-storefront or conflicting-title collisions.
  */
 export function runIntelligentNonSteamMatchPass(currentCatalog: CanonicalGame[]): CanonicalGame[] {
-  const assignedSteamIds = new Map<number, CanonicalGame>();
+  const assignedSteamIds = new Map<number, CanonicalGame[]>();
+  const registerAssigned = (appId: number, game: CanonicalGame) => {
+    let bucket = assignedSteamIds.get(appId);
+    if (!bucket) {
+      bucket = [];
+      assignedSteamIds.set(appId, bucket);
+    }
+    bucket.push(game);
+  };
   for (const existingGame of currentCatalog) {
     if (existingGame.steamAppId) {
-      assignedSteamIds.set(existingGame.steamAppId, existingGame);
+      registerAssigned(existingGame.steamAppId, existingGame);
     }
   }
-  return currentCatalog.map((g) => {
+  let anyChanged = false;
+  const nextCatalog = currentCatalog.map((g) => {
     if (g.steamAppId || g.isExplicitNonSteam) return g;
     const matched = steamMatcher.getEffectiveSteamAppId(g);
     if (matched) {
-      const existingOwner = assignedSteamIds.get(matched);
-      const conflictingOwner =
-        (existingOwner &&
-          existingOwner !== g &&
-          (hasSameStorefrontConflict(existingOwner, g) ||
-            normalizeCanonicalTitle(existingOwner.title) !== normalizeCanonicalTitle(g.title))) ||
-        currentCatalog.some(
-          (other) =>
-            other !== g &&
-            other.steamAppId === matched &&
-            (hasSameStorefrontConflict(other, g) ||
-              normalizeCanonicalTitle(other.title) !== normalizeCanonicalTitle(g.title))
-        );
+      const existingOwners = assignedSteamIds.get(matched);
+      const normTitle = normalizeCanonicalTitle(g.title);
+      const conflictingOwner = Boolean(
+        existingOwners?.some(
+          (owner) =>
+            owner !== g &&
+            (hasSameStorefrontConflict(owner, g) ||
+              normalizeCanonicalTitle(owner.title) !== normTitle)
+        )
+      );
       if (conflictingOwner) {
         return g;
       }
@@ -219,7 +319,7 @@ export function runIntelligentNonSteamMatchPass(currentCatalog: CanonicalGame[])
       const candidateCapsule =
         browseAssets?.capsuleImage ||
         (!isKnownDeadSteamCover(matched)
-          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matched}/library_600x900.jpg`
+          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matched}/library_600x900_2x.jpg`
           : undefined);
 
       const artworkCtx: ArtworkRecoveryContext = {
@@ -244,11 +344,13 @@ export function runIntelligentNonSteamMatchPass(currentCatalog: CanonicalGame[])
         headerImage: nextHeader,
         capsuleImage: nextCapsule,
       };
-      assignedSteamIds.set(matched, enriched);
+      registerAssigned(matched, enriched);
+      anyChanged = true;
       return enriched;
     }
     return g;
   });
+  return anyChanged ? nextCatalog : currentCatalog;
 }
 
 /**
@@ -571,7 +673,7 @@ export function revertRemovedOverrideInCatalog(
           ...g,
           id: restoredId,
           title: restoredTitle,
-          sortTitle: restoredTitle.replace(/^(The|A|An)\s+/i, '').trim(),
+          sortTitle: getAlphabeticalTitleSortKey(restoredTitle, true),
           steamAppId: restoredSteamAppId,
           isExplicitNonSteam: false,
           matchConfidence: undefined,
@@ -616,7 +718,7 @@ export function revertRemovedOverrideInCatalog(
         ...osFieldsFromPlats,
         id: restoredId,
         title: restoredTitle,
-        sortTitle: restoredTitle.replace(/^(The|A|An)\s+/i, '').trim(),
+        sortTitle: getAlphabeticalTitleSortKey(restoredTitle, true),
         steamAppId: undefined,
         isExplicitNonSteam: false,
         matchConfidence: undefined,
@@ -649,14 +751,16 @@ export function revertRemovedOverrideInCatalog(
       ...osFieldsFromPlats,
       id: `steam-${steamIdStr}`,
       title: restoredTitle,
-      sortTitle: restoredTitle.replace(/^(The|A|An)\s+/i, '').trim(),
+      sortTitle: getAlphabeticalTitleSortKey(restoredTitle, true),
       steamAppId: restoredAppId,
       isExplicitNonSteam: false,
       matchConfidence: undefined,
       needsMatchReview: undefined,
       reviewScoreOverride: undefined,
       enrichedMetadata: undefined,
-      capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamIdStr}/library_600x900_2x.jpg`,
+      capsuleImage: !isKnownDeadSteamCover(restoredAppId)
+        ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamIdStr}/library_600x900_2x.jpg`
+        : undefined,
       headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamIdStr}/header.jpg`,
       iconUrl: undefined,
       shortDescription: '',

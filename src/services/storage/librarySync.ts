@@ -1,8 +1,5 @@
 import { CanonicalGame } from '../../contracts/game';
 import { SteamSystemRequirements } from '../../contracts/steam';
-import { FULL_USER_STEAM_GAMES } from './fullUserSteamGames';
-import { USER_SCANNED_STEAM_GAMES } from './userScannedLibrary';
-import { reconcileAchievementSummaries } from './achievementReconciliation';
 import { isUnsuitableHeaderUrl } from '../igdb/igdbCoverService';
 import {
   reconcileCapsuleImage,
@@ -10,6 +7,7 @@ import {
   type ArtworkRecoveryContext,
 } from './metadataReconciliation';
 import { sanitizeStoreReleaseDate } from '../common/titleUtils';
+import { LIBRARY_TITLE_COLLATOR } from '../common/titleSortUtils';
 
 const RICH_MEDIA_HTML_RE = /<(?:video|img)\b/i;
 
@@ -56,9 +54,9 @@ export function getEnrichedMetadataQualityRank(
 ): number {
   if (!meta || typeof meta !== 'object') return -1;
 
-  // Universal C8 Lattice Invariant: __quotaSlimmed projections are ALWAYS Rank 0 (skeleton_fallback)
-  // so they can never outrank or overwrite any non-slimmed durable record.
-  if (meta.__quotaSlimmed === true) {
+  // Universal C8 Lattice Invariant: __quotaSlimmed and __digestOnly projections are ALWAYS Rank 0
+  // so they can never outrank or overwrite any full non-slimmed durable record.
+  if (meta.__quotaSlimmed === true || meta.__digestOnly === true) {
     return 0;
   }
 
@@ -256,6 +254,29 @@ export function pickBestEnrichedMetadata(
       nextAchievements = other.achievements;
     }
 
+    const nextName =
+      typeof winner.name === 'string' && winner.name.trim().length > 0
+        ? winner.name
+        : typeof other.name === 'string' && other.name.trim().length > 0
+        ? other.name
+        : winner.name;
+    const validWinnerReleaseDate = sanitizeStoreReleaseDate(winner.releaseDate);
+    const validOtherReleaseDate = sanitizeStoreReleaseDate(other.releaseDate);
+    const nextReleaseDate = validWinnerReleaseDate
+      ? winner.releaseDate
+      : validOtherReleaseDate
+      ? validOtherReleaseDate
+      : winner.releaseDate || other.releaseDate;
+    const nextHeaderImage =
+      winner.headerImage && !isUnsuitableHeaderUrl(winner.headerImage)
+        ? winner.headerImage
+        : other.headerImage && !isUnsuitableHeaderUrl(other.headerImage)
+        ? other.headerImage
+        : winner.headerImage || other.headerImage;
+    const nextCapsuleImage = winner.capsuleImage || other.capsuleImage;
+    const nextIconUrl = winner.iconUrl || other.iconUrl;
+    const nextHdrSupport = winner.hdrSupport ?? other.hdrSupport;
+
     const nextLegalNotice = winner.legalNotice || other.legalNotice;
     const nextDrmNotice = winner.drmNotice || other.drmNotice;
     const nextExtUserAccountNotice = winner.extUserAccountNotice || other.extUserAccountNotice;
@@ -272,6 +293,7 @@ export function pickBestEnrichedMetadata(
       typeof other.fetchedAt === 'number' &&
       other.fetchedAt > 0 &&
       !other.__quotaSlimmed &&
+      !other.__digestOnly &&
       (samePositiveAppId || sameEnrichedSource)
         ? other.fetchedAt
         : undefined;
@@ -298,10 +320,11 @@ export function pickBestEnrichedMetadata(
         ? other.mediaSyncFailureCount ?? winner.mediaSyncFailureCount
         : winner.mediaSyncFailureCount ?? other.mediaSyncFailureCount;
 
-    // Never clear __quotaSlimmed on a slimmed winner unless `other` provides non-slimmed
-    // authoritative specs/descriptions (prevents Frankenstein Rank-4 stubs lacking specs).
+    // Never clear __quotaSlimmed / __digestOnly on a slimmed/digest winner unless `other` provides
+    // non-slimmed authoritative specs/descriptions (prevents Frankenstein Rank-4 stubs lacking specs).
     const otherProvidesAuthoritativeRestore = Boolean(
       !other.__quotaSlimmed &&
+        !other.__digestOnly &&
         other.metadataQuality !== 'skeleton_fallback' &&
         (hasRequirementContent(other.systemRequirements) ||
           hasRequirementContent(other.macRequirements) ||
@@ -318,6 +341,11 @@ export function pickBestEnrichedMetadata(
       : otherProvidesAuthoritativeRestore
       ? undefined
       : true;
+    const nextDigestOnly = !winner.__digestOnly
+      ? undefined
+      : otherProvidesAuthoritativeRestore
+      ? undefined
+      : true;
     const nextHasScreenshotsCount = nextQuotaSlimmed
       ? Math.max(winner.hasScreenshotsCount || 0, other.hasScreenshotsCount || 0) || undefined
       : undefined;
@@ -326,6 +354,12 @@ export function pickBestEnrichedMetadata(
       : undefined;
 
     if (
+      nextName === winner.name &&
+      nextReleaseDate === winner.releaseDate &&
+      nextHeaderImage === winner.headerImage &&
+      nextCapsuleImage === winner.capsuleImage &&
+      nextIconUrl === winner.iconUrl &&
+      nextHdrSupport === winner.hdrSupport &&
       nextXboxHints === winner.xboxDeliveryHints &&
       nextMovies === winner.movies &&
       nextCategories === winner.categories &&
@@ -360,6 +394,7 @@ export function pickBestEnrichedMetadata(
       nextMediaSyncOutcome === winner.mediaSyncOutcome &&
       nextMediaSyncFailureCount === winner.mediaSyncFailureCount &&
       nextQuotaSlimmed === winner.__quotaSlimmed &&
+      nextDigestOnly === winner.__digestOnly &&
       nextHasScreenshotsCount === winner.hasScreenshotsCount &&
       nextHasMoviesCount === winner.hasMoviesCount
     ) {
@@ -368,6 +403,12 @@ export function pickBestEnrichedMetadata(
 
     const merged: NonNullable<CanonicalGame['enrichedMetadata']> = {
       ...winner,
+      ...(nextName !== undefined ? { name: nextName } : {}),
+      ...(nextReleaseDate !== undefined ? { releaseDate: nextReleaseDate } : {}),
+      ...(nextHeaderImage !== undefined ? { headerImage: nextHeaderImage } : {}),
+      ...(nextCapsuleImage !== undefined ? { capsuleImage: nextCapsuleImage } : {}),
+      ...(nextIconUrl !== undefined ? { iconUrl: nextIconUrl } : {}),
+      ...(nextHdrSupport !== undefined ? { hdrSupport: nextHdrSupport } : {}),
       ...(nextXboxHints ? { xboxDeliveryHints: nextXboxHints } : {}),
       ...(nextMovies ? { movies: nextMovies } : {}),
       ...(nextCategories ? { categories: nextCategories } : {}),
@@ -429,6 +470,11 @@ export function pickBestEnrichedMetadata(
       delete merged.hasScreenshotsCount;
       delete merged.hasMoviesCount;
     }
+    if (nextDigestOnly) {
+      merged.__digestOnly = true;
+    } else {
+      delete merged.__digestOnly;
+    }
     return merged;
   };
 
@@ -458,6 +504,12 @@ export function pickBestEnrichedMetadata(
     return mergeWinnerWithFallbackFields(existing, incoming);
   }
   if (existing.__quotaSlimmed && !incoming.__quotaSlimmed) {
+    return mergeWinnerWithFallbackFields(incoming, existing);
+  }
+  if (incoming.__digestOnly && !existing.__digestOnly) {
+    return mergeWinnerWithFallbackFields(existing, incoming);
+  }
+  if (existing.__digestOnly && !incoming.__digestOnly) {
     return mergeWinnerWithFallbackFields(incoming, existing);
   }
 
@@ -493,6 +545,17 @@ export function pickPreferredHeaderImage(
   return reconcileHeaderImage(existingUrl, incomingUrl, ctx);
 }
 
+const STUB_DESCRIPTION_RE = /^(?:tba|tbd|coming\s+soon|n\/a|none|placeholder)\.?$/i;
+
+function isStubDetailedDescription(html: string): boolean {
+  const plain = html
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return plain.length < 40 || STUB_DESCRIPTION_RE.test(plain);
+}
+
 export function pickPreferredDetailedDescription(
   existingHtml?: string,
   incomingHtml?: string
@@ -510,6 +573,10 @@ export function pickPreferredDetailedDescription(
   if (existingHasTags && !incomingHasTags) return existingHtml;
   if (incomingHasTags && !existingHasTags) return incomingHtml;
 
+  if (isStubDetailedDescription(existingHtml) && !isStubDetailedDescription(incomingHtml)) {
+    return incomingHtml;
+  }
+
   return existingHtml;
 }
 
@@ -525,90 +592,11 @@ export function pickPreferredReleaseDate(
   return existingDate || incomingDate;
 }
 
+/**
+ * Legacy compatibility export retained after static stub library removal.
+ * Returns a deterministically title-sorted shallow copy of `existingGames`.
+ */
 export function mergeScannedSteamGames(existingGames: CanonicalGame[]): CanonicalGame[] {
-  const merged = [...existingGames];
-
-  // Merge full local Steam library of 251 games
-  const allSteamGames = [...USER_SCANNED_STEAM_GAMES, ...FULL_USER_STEAM_GAMES];
-
-  for (const scanned of allSteamGames) {
-    const existingIndex = merged.findIndex(
-      (g) =>
-        (g.steamAppId && scanned.steamAppId && g.steamAppId === scanned.steamAppId) ||
-        g.title.toLowerCase().trim() === scanned.title.toLowerCase().trim()
-    );
-
-    const scannedSteam = scanned.platforms.find((p) => p.platformId === 'steam');
-
-    if (existingIndex >= 0) {
-      const existing = merged[existingIndex];
-      let hasSteam = false;
-
-      const updatedPlatforms = existing.platforms.map((p) => {
-        if (p.platformId === 'steam') {
-          hasSteam = true;
-          if (scannedSteam) {
-            return {
-              ...p,
-              playtimeMinutes: Math.max(p.playtimeMinutes || 0, scannedSteam.playtimeMinutes || 0),
-              lastPlayed: scannedSteam.lastPlayed || p.lastPlayed,
-              installed: p.installed || scannedSteam.installed,
-              achievements: reconcileAchievementSummaries(
-                p.achievements,
-                scannedSteam.achievements,
-                { title: scanned.title, appId: scanned.steamAppId, store: 'steam' }
-              ),
-            };
-          }
-        }
-        return p;
-      });
-
-      if (!hasSteam && scannedSteam) {
-        updatedPlatforms.push(scannedSteam);
-      }
-
-      const gogPlat = updatedPlatforms.find((p) => p.platformId === 'gog');
-      const artworkCtx: ArtworkRecoveryContext = {
-        gameId: existing.id,
-        title: existing.title,
-        steamAppId: existing.steamAppId || scanned.steamAppId,
-        gogId: gogPlat?.platformGameId,
-      };
-      const mergedHeader =
-        pickPreferredHeaderImage(existing.headerImage, scanned.headerImage, artworkCtx) ||
-        existing.headerImage ||
-        scanned.headerImage;
-      const mergedCapsule = pickPreferredCapsuleImage(existing.capsuleImage, scanned.capsuleImage, {
-        ...artworkCtx,
-        headerUrl: mergedHeader,
-      });
-
-      merged[existingIndex] = {
-        ...existing,
-        steamAppId: existing.steamAppId || scanned.steamAppId,
-        platforms: updatedPlatforms,
-        headerImage: mergedHeader,
-        capsuleImage: mergedCapsule,
-        iconUrl: !isUnsuitableHeaderUrl(existing.iconUrl) ? existing.iconUrl : (scanned.iconUrl || scanned.capsuleImage || scanned.headerImage),
-        shortDescription: existing.shortDescription || scanned.shortDescription,
-        detailedDescription: pickPreferredDetailedDescription(
-          existing.detailedDescription,
-          scanned.detailedDescription
-        ),
-        releaseDate: pickPreferredReleaseDate(existing.releaseDate, scanned.releaseDate) || existing.releaseDate,
-        reviewSummary: existing.reviewSummary || scanned.reviewSummary,
-        tags: existing.tags && existing.tags.length > 0 ? existing.tags : scanned.tags,
-        enrichedMetadata: pickBestEnrichedMetadata(
-          existing.enrichedMetadata,
-          scanned.enrichedMetadata
-        ),
-      };
-    } else {
-      merged.push(scanned);
-    }
-  }
-
-  // Sort alphabetically by canonical title
-  return merged.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }));
+  if (!Array.isArray(existingGames) || existingGames.length === 0) return [];
+  return existingGames.toSorted((a, b) => LIBRARY_TITLE_COLLATOR.compare(a.title, b.title));
 }

@@ -15,7 +15,6 @@ import {
   sanitizeStorefrontLifecyclePolicy,
   type ActiveGameSession,
   type AppInfoResult,
-  type CloudSaveSyncTelemetry,
   type CompatibilityLayerInfo,
   type CompatibilityLayerType,
   type CompatibilityLayerUpdateInfo,
@@ -28,30 +27,20 @@ import {
   type GameLaunchConfigResetRequest,
   type GlobalDisplayAspectRatioMode,
   type HibernateStatePayload,
-  type InstallCompatibilityLayerRequest,
   type InstallCompatibilityLayerResult,
   type InstalledGameRecord,
   type InstallGameRequest,
   type LauncherActionResult,
   type LauncherPerformanceSettings,
-  type LaunchMethod,
   type ResolvedLaunchModePreview,
-  type SessionUpdatedEventType,
   type SessionUpdatedPayload,
   type StorefrontLaunchPolicyView,
   type StorefrontLaunchProfile,
   type ToggleSessionFullscreenResult,
-  type UpdateCompatibilityLayerPayload,
   type UpdateCompatibilityLayerResult,
 } from '../../contracts/launcher';
 import type { StorefrontId } from '../../contracts/platform';
-import { normalizeTitleKey } from '../common/titleUtils';
 import { requestScheduler } from '../network/requestScheduler';
-import {
-  getStorefrontNativeOsFlags,
-  saveCachedGogOsSupport,
-} from '../platform/nativeOsService';
-import { steamApi } from '../steam/steamApi';
 import {
   LAUNCH_CONFIGS_STORAGE_KEY,
   PERF_SETTINGS_STORAGE_KEY,
@@ -86,32 +75,35 @@ import {
   buildStorefrontLaunchPolicyView,
   computeFastMinimalLaunchAdvisory,
   getCrossOverGraphicsBackendPolicy,
+  resolveRunnerMetalFxEligibility,
   type BuildEffectiveLaunchModePreviewParams,
   type BuildLaunchModePreviewParams,
   type BuildStorefrontLaunchPolicyViewParams,
   type CrossOverGraphicsBackendPolicyDescriptor,
   type FastMinimalLaunchAdvisoryParams,
+  type RunnerMetalFxEligibility,
 } from './launchPolicyPreview';
-import { sanitizeGameInstallSizeBytes } from '../../utils/formatBytes';
-
-function sanitizeGameInstallInfo(info: GameInstallInfo): GameInstallInfo {
-  return {
-    ...info,
-    estimatedSizeBytes: sanitizeGameInstallSizeBytes(info.estimatedSizeBytes),
-    downloadSizeBytes: sanitizeGameInstallSizeBytes(info.downloadSizeBytes),
-    dlcSizeBytes: sanitizeGameInstallSizeBytes(info.dlcSizeBytes),
-    ...(Array.isArray(info.availableInstallers)
-      ? {
-          availableInstallers: info.availableInstallers.map((ins) => ({
-            ...ins,
-            totalSizeBytes: sanitizeGameInstallSizeBytes(ins.totalSizeBytes),
-            downloadSizeBytes: sanitizeGameInstallSizeBytes(ins.downloadSizeBytes),
-            dlcSizeBytes: sanitizeGameInstallSizeBytes(ins.dlcSizeBytes),
-          })),
-        }
-      : {}),
-  };
-}
+import {
+  CompatibilityRunnerClient,
+  type CompatibilityRunnerClientContext,
+} from './core/compatibilityRunnerClient';
+import {
+  DownloadQueueManager,
+  MAX_INSTALL_INFO_CACHE_SIZE,
+  type DownloadQueueManagerContext,
+} from './core/downloadQueueManager';
+import {
+  InstalledGamesRegistry,
+  type InstalledGamesRegistryContext,
+} from './core/installedGamesRegistry';
+import {
+  dispatchLauncherStateChangedEvent,
+  dispatchOpenDownloadDrawerEvent,
+} from './core/launcherEventHelpers';
+import {
+  SessionLifecycleManager,
+  type SessionLifecycleManagerContext,
+} from './core/sessionLifecycleManager';
 
 export type {
   FastMinimalLaunchAdvisory,
@@ -133,6 +125,7 @@ export {
   getCrossOverGraphicsBackendPolicy,
   resolveEffectiveLaunchPolicy,
   resolveEffectiveLifecyclePolicy,
+  resolveRunnerMetalFxEligibility,
   sanitizeBottleDisplayScalingMode,
   sanitizeDisplayAspectRatio,
   sanitizeGameLaunchConfig,
@@ -149,53 +142,26 @@ export {
   type CrossOverGraphicsBackendPolicyDescriptor,
   type BuildStorefrontLaunchPolicyViewParams,
   type FastMinimalLaunchAdvisoryParams,
+  type RunnerMetalFxEligibility,
 };
 
-function normalizeTitleForMatch(title?: string): string {
-  if (!title) return '';
-  return normalizeTitleKey(title);
-}
-
-interface InstalledLookupIndex {
-  byPlatGameKey: Map<string, InstalledGameRecord>;
-  bySteamAppId: Map<number, InstalledGameRecord>;
-  byPlatInstallPath: Map<string, InstalledGameRecord>;
-  byPlatExePath: Map<string, InstalledGameRecord>;
-  byPlatNormTitle: Map<string, InstalledGameRecord>;
-}
-
 const FOCUS_RESCAN_COOLDOWN_MS = 5 * 60 * 1000;
-const INIT_CONFIG_FRESH_WINDOW_MS = 10_000;
 
 export class LauncherService {
-  public static readonly MAX_INSTALL_INFO_CACHE_SIZE = 150;
-  private installedRecords: InstalledGameRecord[] = [];
-  private installedIndexMutationSeq = 0;
-  private installedIndexBuiltSeq = -1;
-  private installedIndexRecordsRef: InstalledGameRecord[] | null = null;
-  private installedIndexRecordsLen = -1;
-  private installedLookupIndex: InstalledLookupIndex = {
-    byPlatGameKey: new Map(),
-    bySteamAppId: new Map(),
-    byPlatInstallPath: new Map(),
-    byPlatExePath: new Map(),
-    byPlatNormTitle: new Map(),
-  };
-  private epicPlatformSupportMap: Record<string, { windows: boolean; mac: boolean }> = {};
-  private activeSessions: Map<string, ActiveGameSession> = new Map();
-  private downloadQueue: DownloadTaskState[] = [];
+  public static readonly MAX_INSTALL_INFO_CACHE_SIZE = MAX_INSTALL_INFO_CACHE_SIZE;
+
+  private readonly installedRegistry = new InstalledGamesRegistry();
+  private readonly downloadManager = new DownloadQueueManager();
+  private readonly sessionManager = new SessionLifecycleManager();
+  private readonly runnerClient = new CompatibilityRunnerClient();
+
   private launchConfigs: Record<string, GameLaunchConfig> = {};
   private performanceSettings: LauncherPerformanceSettings = {
     ...DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
   };
-  private inGameHibernating = false;
   private inGamePriorityScopeActive = false;
   private inGamePriorityScopeRelease: (() => void) | null = null;
   private downloadsPausedByInGame: Set<string> = new Set();
-  private compatibilityLayers: CompatibilityLayerInfo[] = [];
-  private installedStorefrontClients: Partial<Record<StorefrontId, boolean>> = {};
-  private runnerUpdates: Record<string, CompatibilityLayerUpdateInfo> = {};
-  private installInfoCache: Map<string, GameInstallInfo> = new Map();
   private listeners: Set<() => void> = new Set();
   private initialized = false;
   private initPromise: Promise<void> | null = null;
@@ -204,55 +170,158 @@ export class LauncherService {
   private cachedAppInfoPromise: Promise<AppInfoResult | null> | null = null;
   private cachedAppInfoApiRef: unknown = undefined;
   private lastConfigsFetchedAt = 0;
-  private inFlightLaunchesByGameId: Map<string, Promise<LauncherActionResult>> = new Map();
   private unsubscribeDownload?: () => void;
   private unsubscribeSession?: () => void;
   private unsubscribeHibernate?: () => void;
-  private unsubscribeRunnerProgress?: () => void;
-  private boundRunnerProgressApi?: unknown;
-  private activeRunnerOperations: Map<
-    Exclude<CompatibilityLayerType, 'native'>,
-    CompatibilityRunnerProgressEvent
-  > = new Map();
-  private runnerProgressListeners: Set<(event: CompatibilityRunnerProgressEvent) => void> =
-    new Set();
-  private postRunnerMutationSyncHooks: Set<() => Promise<void>> = new Set();
   private focusListener?: () => void;
-  private activeDownloadPollTimer?: ReturnType<typeof setInterval> | null;
-  private inFlightScanPromise: Promise<InstalledGameRecord[]> | null = null;
-  private lastScanTimestamp = 0;
-  private lastScanSucceeded = false;
   private detectedHostArch?: string;
 
   constructor() {
     this.loadLocalConfigs();
   }
 
-  private getErrorMessage(err: unknown, fallback: string): string {
-    if (err instanceof Error && err.message) return err.message;
-    if (err && typeof err === 'object' && typeof (err as { message?: unknown }).message === 'string') {
-      const msg = (err as { message: string }).message;
-      if (msg) return msg;
-    }
-    return fallback;
+  // Compatibility accessors preserving direct property access from unit test harnesses
+  private get installedRecords(): InstalledGameRecord[] {
+    return this.installedRegistry.getRecords();
   }
 
-  private attachEpicPlatformSupportMetadata(
-    records: InstalledGameRecord[]
-  ): InstalledGameRecord[] {
-    if (Object.keys(this.epicPlatformSupportMap).length > 0) {
-      Object.defineProperty(records, 'epicPlatformSupport', {
-        value: this.epicPlatformSupportMap,
-        enumerable: false,
-        configurable: true,
-        writable: true,
-      });
+  private set installedRecords(records: InstalledGameRecord[]) {
+    this.installedRegistry.setRecords(records);
+  }
+
+  private get activeSessions(): Map<string, ActiveGameSession> {
+    return this.sessionManager.getActiveSessionsMap();
+  }
+
+  private get downloadQueue(): DownloadTaskState[] {
+    return this.downloadManager.getQueue();
+  }
+
+  private set downloadQueue(queue: DownloadTaskState[]) {
+    this.downloadManager.setQueue(queue);
+  }
+
+  private get installedStorefrontClients(): Partial<Record<StorefrontId, boolean>> {
+    return this.runnerClient.getRawInstalledStorefrontClients();
+  }
+
+  private set installedStorefrontClients(clients: Partial<Record<StorefrontId, boolean>>) {
+    this.runnerClient.setInstalledStorefrontClients(clients);
+  }
+
+  private get runnerUpdates(): Record<string, CompatibilityLayerUpdateInfo> {
+    return this.runnerClient.getRunnerUpdates();
+  }
+
+  private set runnerUpdates(updates: Record<string, CompatibilityLayerUpdateInfo>) {
+    this.runnerClient.setRunnerUpdates(updates);
+  }
+
+  private createInstalledRegistryContext(): InstalledGamesRegistryContext {
+    return {
+      isWindowsHost: () => this.isWindowsHost(),
+      isInitialized: () => this.initialized,
+      getLaunchConfigsMap: () => this.launchConfigs,
+      setLaunchConfigsMap: (next) => {
+        this.launchConfigs = next;
+      },
+      persistLocalConfigs: () => this.persistLocalConfigs(),
+      getLastConfigsFetchedAt: () => this.lastConfigsFetchedAt,
+      setLastConfigsFetchedAt: (ts) => {
+        this.lastConfigsFetchedAt = ts;
+      },
+      getLaunchConfig: (gameId, platformId) => this.getLaunchConfig(gameId, platformId),
+      saveLaunchConfig: (cfg, platformId) => this.saveLaunchConfig(cfg, platformId),
+      getInstalledRecordForGame: (game, platformId) =>
+        this.getInstalledRecordForGame(game, platformId),
+      getEffectivePlatformForGame: (game, platformId) =>
+        this.getEffectivePlatformForGame(game, platformId),
+      getDownloadQueue: () => this.downloadManager.getQueue(),
+      setDownloadQueue: (queue) => {
+        this.downloadManager.setQueue(queue);
+      },
+      getActiveDownload: (gameId, platformId) => this.getActiveDownload(gameId, platformId),
+      reconcileActiveDownloads: (records) =>
+        this.downloadManager.reconcileActiveDownloadsWithInstalledRecords(records),
+      deleteCachedInstallInfoEntry: (key) => this.downloadManager.deleteCachedInstallInfoEntry(key),
+      ensureActiveDownloadPolling: () => this.ensureActiveDownloadPolling(),
+      notifyStateChanged: () => this.notifyStateChanged(),
+    };
+  }
+
+  private createDownloadManagerContext(): DownloadQueueManagerContext {
+    return {
+      getHostPlatform: () => this.getHostPlatform(),
+      isWindowsHost: () => this.isWindowsHost(),
+      isInGameHibernating: () => this.sessionManager.isInGameHibernating(),
+      getEffectivePlatformForGame: (game, platformId) =>
+        this.getEffectivePlatformForGame(game, platformId),
+      getDiskSpace: (targetPath) => this.getDiskSpace(targetPath),
+      upsertInstalledRecord: (record, matchHint) =>
+        this.installedRegistry.upsertInstalledRecord(record, matchHint),
+      scanAllInstalledGames: (forceRefresh) => this.scanAllInstalledGames(forceRefresh),
+      openDownloadDrawer: () => this.openDownloadDrawer(),
+      notifyStateChanged: () => this.notifyStateChanged(),
+    };
+  }
+
+  private createSessionManagerContext(): SessionLifecycleManagerContext {
+    return {
+      isWindowsHost: () => this.isWindowsHost(),
+      getPerformanceSettings: () => this.getPerformanceSettings(),
+      getLaunchConfig: (gameId, platformId) => this.getLaunchConfig(gameId, platformId),
+      saveLaunchConfig: (cfg, platformId) => this.saveLaunchConfig(cfg, platformId),
+      getEffectivePlatformForGame: (game, platformId) =>
+        this.getEffectivePlatformForGame(game, platformId),
+      getInstalledRecordForGame: (game, platformId) =>
+        this.getInstalledRecordForGame(game, platformId),
+      getInstalledStorefrontClients: () => this.runnerClient.getRawInstalledStorefrontClients(),
+      resolveEffectiveLaunchModePreview: (game, preferredPlatformId, draftConfig) =>
+        this.resolveEffectiveLaunchModePreview(game, preferredPlatformId, draftConfig),
+      deleteCachedInstallInfoEntry: (key) => this.downloadManager.deleteCachedInstallInfoEntry(key),
+      removeInstalledRecords: (predicate) =>
+        this.installedRegistry.removeInstalledRecords(predicate),
+      selectExecutable: (defaultPath) => this.selectExecutable(defaultPath),
+      stopDownloadPolling: () => this.downloadManager.stopDownloadPolling(),
+      ensureActiveDownloadPolling: () => this.ensureActiveDownloadPolling(),
+      syncInGameResourceThrottle: () => this.syncInGameResourceThrottle(),
+      notifyStateChanged: () => this.notifyStateChanged(),
+    };
+  }
+
+  private createRunnerClientContext(): CompatibilityRunnerClientContext {
+    return {
+      getHostCapabilities: () => this.getHostCapabilities(),
+      detectCompatibilityLayers: () => this.detectCompatibilityLayers(),
+      checkCompatibilityLayerUpdates: () => this.checkCompatibilityLayerUpdates(),
+      notifyStateChanged: () => this.notifyStateChanged(),
+    };
+  }
+
+  private teardownElectronApiListeners(): void {
+    if (this.unsubscribeDownload) {
+      try {
+        this.unsubscribeDownload();
+      } catch {}
+      this.unsubscribeDownload = undefined;
     }
-    return records;
+    if (this.unsubscribeSession) {
+      try {
+        this.unsubscribeSession();
+      } catch {}
+      this.unsubscribeSession = undefined;
+    }
+    if (this.unsubscribeHibernate) {
+      try {
+        this.unsubscribeHibernate();
+      } catch {}
+      this.unsubscribeHibernate = undefined;
+    }
+    this.runnerClient.teardownRunnerProgressSubscription();
   }
 
   public getEpicPlatformSupport(): Record<string, { windows: boolean; mac: boolean }> {
-    return { ...this.epicPlatformSupportMap };
+    return this.installedRegistry.getEpicPlatformSupport();
   }
 
   private sanitizePerformanceSettings(
@@ -316,39 +385,11 @@ export class LauncherService {
   }
 
   public isInGameHibernating(): boolean {
-    return this.inGameHibernating;
+    return this.sessionManager.isInGameHibernating();
   }
 
   public setInGameHibernating(hibernating: boolean): void {
-    const next = Boolean(hibernating);
-    const transitionedToTrue = !this.inGameHibernating && next;
-    const transitionedToFalse = this.inGameHibernating && !next;
-    this.inGameHibernating = next;
-
-    if (this.inGameHibernating) {
-      if (this.activeDownloadPollTimer) {
-        clearInterval(this.activeDownloadPollTimer);
-        this.activeDownloadPollTimer = null;
-      }
-      if (transitionedToTrue) {
-        window.electronAPI?.clearRendererImageCache?.()?.catch?.(() => {});
-      }
-    } else if (transitionedToFalse) {
-      this.ensureActiveDownloadPolling();
-    }
-
-    this.emitStateChanged();
-    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-      window.dispatchEvent(
-        new CustomEvent('antigravity:hibernate-state-changed', {
-          detail: {
-            hibernating: this.inGameHibernating,
-            hibernated: this.inGameHibernating,
-            isHibernated: this.inGameHibernating,
-          },
-        })
-      );
-    }
+    this.sessionManager.applyHibernationState(hibernating, this.createSessionManagerContext());
   }
 
   public subscribe(listener: () => void): () => void {
@@ -358,47 +399,29 @@ export class LauncherService {
     };
   }
 
-  private emitStateChanged(): void {
-    this.notifyStateChanged();
-  }
-
   private notifyStateChanged(): void {
     for (const listener of this.listeners) {
       try {
         listener();
       } catch {}
     }
-    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-      window.dispatchEvent(
-        new CustomEvent('antigravity:launcher-state-changed', {
-          detail: {
-            runningGames: this.getRunningGames(),
-            downloadQueue: this.getDownloadQueue(),
-            installedRecords: this.installedRecords,
-            inGameHibernating: this.inGameHibernating,
-            performanceSettings: this.getPerformanceSettings(),
-          },
-        })
-      );
-    }
+    dispatchLauncherStateChangedEvent({
+      runningGames: this.getRunningGames(),
+      downloadQueue: this.downloadQueue,
+      installedRecords: this.installedRecords,
+      inGameHibernating: this.sessionManager.isInGameHibernating(),
+      performanceSettings: this.getPerformanceSettings(),
+    });
   }
 
   private syncInGameResourceThrottle(): void {
-    if (this.activeSessions.size > 0) {
+    const activeSessions = this.activeSessions;
+    if (activeSessions.size > 0) {
       if (typeof document !== 'undefined') {
         document.body?.classList?.add('is-in-game');
       }
 
-      const activeSession = Array.from(this.activeSessions.values())[0];
-      const activeConfig = activeSession
-        ? this.getLaunchConfig(activeSession.gameId, activeSession.platformId)
-        : undefined;
-      const effectiveBehavior =
-        activeConfig?.inGameLauncherBehavior && activeConfig.inGameLauncherBehavior !== 'default'
-          ? activeConfig.inGameLauncherBehavior
-          : this.performanceSettings.inGameLauncherBehavior;
-
-      void effectiveBehavior;
+      const activeSession = Array.from(activeSessions.values())[0];
 
       if (this.performanceSettings.pauseBackgroundSyncInGame !== false) {
         requestScheduler.setInGameThrottle(true);
@@ -418,7 +441,7 @@ export class LauncherService {
                   syncJobManager.endPriorityScope(scopeHandle);
                 }
               };
-              if (!this.inGamePriorityScopeActive || this.activeSessions.size === 0) {
+              if (!this.inGamePriorityScopeActive || activeSessions.size === 0) {
                 try {
                   release();
                 } catch {}
@@ -442,7 +465,7 @@ export class LauncherService {
       }
 
       if (this.performanceSettings.pauseDownloadsInGame !== false) {
-        for (const task of this.downloadQueue) {
+        for (const task of this.downloadManager.getQueue()) {
           if (task && task.status === 'downloading') {
             this.downloadsPausedByInGame.add(task.taskId);
             void this.pauseDownload(task.taskId);
@@ -459,8 +482,7 @@ export class LauncherService {
       if (typeof document !== 'undefined') {
         document.body?.classList?.remove('is-in-game');
       }
-      const wasHibernating = this.inGameHibernating;
-      this.inGameHibernating = false;
+      const wasHibernating = this.sessionManager.clearHibernatingFlag();
       requestScheduler.setInGameThrottle(false);
       this.inGamePriorityScopeActive = false;
 
@@ -489,52 +511,8 @@ export class LauncherService {
     return this.initialized;
   }
 
-  private hasActiveDownloads(): boolean {
-    return this.downloadQueue.some(
-      (t) =>
-        t.status === 'downloading' ||
-        t.status === 'queued' ||
-        t.status === 'extracting' ||
-        t.status === 'verifying'
-    );
-  }
-
   private ensureActiveDownloadPolling(): void {
-    if (this.inGameHibernating || !this.hasActiveDownloads()) {
-      if (this.activeDownloadPollTimer) {
-        clearInterval(this.activeDownloadPollTimer);
-        this.activeDownloadPollTimer = null;
-      }
-      return;
-    }
-
-    if (this.activeDownloadPollTimer || typeof window === 'undefined' || !window.electronAPI) {
-      return;
-    }
-
-    const timer = setInterval(async () => {
-      if (this.inGameHibernating || !this.hasActiveDownloads()) {
-        if (this.activeDownloadPollTimer) {
-          clearInterval(this.activeDownloadPollTimer);
-          this.activeDownloadPollTimer = null;
-        }
-        return;
-      }
-
-      try {
-        if (window.electronAPI?.getDownloadQueue) {
-          const latestQueue = await window.electronAPI.getDownloadQueue();
-          if (Array.isArray(latestQueue) && latestQueue.length > 0) {
-            this.handleDownloadUpdated({ queue: latestQueue });
-          }
-        }
-      } catch {}
-    }, 3500);
-
-    if (timer && typeof timer === 'object' && 'unref' in timer && typeof timer.unref === 'function') {
-      timer.unref();
-    }
-    this.activeDownloadPollTimer = timer;
+    this.downloadManager.ensureActiveDownloadPolling(this.createDownloadManagerContext());
   }
 
   public async getAppInfo(): Promise<AppInfoResult | null> {
@@ -579,6 +557,8 @@ export class LauncherService {
   }
 
   public resetForTests(): void {
+    this.teardownElectronApiListeners();
+    this.downloadManager.stopDownloadPolling();
     this.initialized = false;
     this.initPromise = null;
     this.initializedElectronApiRef = undefined;
@@ -586,11 +566,8 @@ export class LauncherService {
     this.cachedAppInfoPromise = null;
     this.cachedAppInfoApiRef = undefined;
     this.lastConfigsFetchedAt = 0;
-    this.inFlightLaunchesByGameId.clear();
-    this.inFlightScanPromise = null;
-    this.lastScanTimestamp = 0;
-    this.lastScanSucceeded = false;
-    this.activeSessions.clear();
+    this.installedRegistry.resetScanState();
+    this.sessionManager.resetSessionState();
     this.inGamePriorityScopeActive = false;
     if (this.inGamePriorityScopeRelease) {
       try {
@@ -609,6 +586,7 @@ export class LauncherService {
       return Promise.resolve();
     }
     if (this.initializedElectronApiRef !== currentApi) {
+      this.teardownElectronApiListeners();
       this.initialized = false;
       this.initPromise = null;
       this.cachedAppInfo = null;
@@ -630,10 +608,17 @@ export class LauncherService {
   private async runInitializeInternal(): Promise<void> {
     this.loadLocalConfigs();
 
-    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function' && !this.focusListener) {
+    if (
+      typeof window !== 'undefined' &&
+      typeof window.addEventListener === 'function' &&
+      !this.focusListener
+    ) {
       this.focusListener = () => {
-        if (this.activeSessions.size > 0) return;
-        if (!this.inFlightScanPromise && Date.now() - this.lastScanTimestamp > FOCUS_RESCAN_COOLDOWN_MS) {
+        if (this.sessionManager.getActiveSessionsMap().size > 0) return;
+        if (
+          !this.installedRegistry.getInFlightScanPromise() &&
+          Date.now() - this.installedRegistry.getLastScanTimestamp() > FOCUS_RESCAN_COOLDOWN_MS
+        ) {
           this.scanAllInstalledGames().catch(() => {});
         }
       };
@@ -653,7 +638,7 @@ export class LauncherService {
         });
       }
 
-      this.ensureRunnerProgressSubscription();
+      this.runnerClient.ensureRunnerProgressSubscription(this.createRunnerClientContext());
 
       if (!this.unsubscribeHibernate && window.electronAPI.onHibernateStateChanged) {
         this.unsubscribeHibernate = window.electronAPI.onHibernateStateChanged(
@@ -661,32 +646,11 @@ export class LauncherService {
             const nextHibernating = Boolean(
               data?.hibernating ?? data?.hibernated ?? data?.isHibernated
             );
-            const transitionedToTrue = !this.inGameHibernating && nextHibernating;
-            const transitionedToFalse = this.inGameHibernating && !nextHibernating;
-            this.inGameHibernating = nextHibernating;
-            if (this.inGameHibernating) {
-              if (this.activeDownloadPollTimer) {
-                clearInterval(this.activeDownloadPollTimer);
-                this.activeDownloadPollTimer = null;
-              }
-              if (transitionedToTrue) {
-                window.electronAPI?.clearRendererImageCache?.()?.catch?.(() => {});
-              }
-            } else if (transitionedToFalse) {
-              this.ensureActiveDownloadPolling();
-            }
-            this.emitStateChanged();
-            if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-              window.dispatchEvent(
-                new CustomEvent('antigravity:hibernate-state-changed', {
-                  detail: {
-                    ...data,
-                    hibernating: this.inGameHibernating,
-                    hibernated: this.inGameHibernating,
-                  },
-                })
-              );
-            }
+            this.sessionManager.applyHibernationState(
+              nextHibernating,
+              this.createSessionManagerContext(),
+              data
+            );
           }
         );
       }
@@ -768,107 +732,32 @@ export class LauncherService {
         }
 
         if (Array.isArray(running)) {
-          this.activeSessions.clear();
-          for (const s of running) {
-            if (s && s.gameId) {
-              this.activeSessions.set(s.gameId, s);
-            }
-          }
+          this.sessionManager.replaceActiveSessions(running);
         }
 
         if (Array.isArray(queue)) {
-          this.downloadQueue = queue;
+          this.downloadManager.setQueue(queue);
         }
 
         if (Array.isArray(layers)) {
-          this.compatibilityLayers = layers;
+          this.runnerClient.setCompatibilityLayers(layers);
         }
 
         if (detectedClients && typeof detectedClients === 'object') {
-          const nextClients: Partial<Record<StorefrontId, boolean>> = {};
-          const clientsMap = detectedClients as Record<string, unknown>;
-          for (const key of ['steam', 'gog', 'epic', 'xbox'] as const) {
-            if (typeof clientsMap[key] === 'boolean') {
-              nextClients[key] = clientsMap[key] as boolean;
-            }
-          }
-          this.installedStorefrontClients = nextClients;
+          this.runnerClient.applyDetectedStorefrontClients(detectedClients);
         }
 
-        type DrainedSessionItem = {
-          session?: ActiveGameSession;
-          sessionId?: string;
-          gameId?: string;
-          title?: string;
-          platformId?: StorefrontId;
-          platformGameId?: string;
-          startedAt?: string;
-          endedAt?: string;
-          lastPlayed?: string;
-          launchMethod?: string;
-          event?: SessionUpdatedEventType;
-          sessionMinutesPlayed?: number;
-          durationSeconds?: number;
-          storefrontTotalPlaytimeMinutes?: number | null;
-          cloudSync?: CloudSaveSyncTelemetry;
-          statusMessage?: string;
-          error?: string;
-        };
-
-        const pendingContainer =
-          pendingSessions && !Array.isArray(pendingSessions) && typeof pendingSessions === 'object'
-            ? (pendingSessions as {
-                pendingSessions?: DrainedSessionItem[];
-                sessions?: DrainedSessionItem[];
-              })
-            : null;
-        const drainedList: DrainedSessionItem[] = Array.isArray(pendingSessions)
-          ? (pendingSessions as DrainedSessionItem[])
-          : Array.isArray(pendingContainer?.pendingSessions)
-            ? pendingContainer.pendingSessions
-            : Array.isArray(pendingContainer?.sessions)
-              ? pendingContainer.sessions
-              : [];
-
-        for (const item of drainedList) {
-          if (!item) continue;
-          const sessionObj: ActiveGameSession | undefined =
-            item.session ||
-            (item.gameId
-              ? {
-                  sessionId: item.sessionId || `drained-${item.gameId}-${Date.now()}`,
-                  gameId: item.gameId,
-                  title: item.title || item.gameId,
-                  platformId: (item.platformId || 'steam') as StorefrontId,
-                  platformGameId: String(item.platformGameId || item.gameId),
-                  startedAt: item.startedAt || new Date().toISOString(),
-                  launchMethod: item.launchMethod || 'direct',
-                  status: 'stopping',
-                  ...(item.cloudSync ? { cloudSync: item.cloudSync } : {}),
-                  ...(item.statusMessage ? { statusMessage: item.statusMessage } : {}),
-                }
-              : undefined);
-          if (sessionObj || item.cloudSync) {
-            this.handleSessionUpdated({
-              session: sessionObj,
-              event: item.event || 'stopped',
-              sessionMinutesPlayed: item.sessionMinutesPlayed ?? 1,
-              durationSeconds: item.durationSeconds ?? 60,
-              lastPlayed: item.lastPlayed || item.endedAt || new Date().toISOString(),
-              storefrontTotalPlaytimeMinutes: item.storefrontTotalPlaytimeMinutes,
-              cloudSync: item.cloudSync,
-              statusMessage: item.statusMessage,
-              error: item.error,
-            });
-          }
-        }
+        this.sessionManager.processDrainedPendingSessions(
+          pendingSessions,
+          this.createSessionManagerContext()
+        );
       } catch (err) {
         console.warn('[LauncherService] Initialization sync warning:', err);
       }
 
       this.syncInGameResourceThrottle();
-      this.lastScanTimestamp = 0;
-      if (this.activeSessions.size === 0) {
+      this.installedRegistry.setLastScanTimestamp(0);
+      if (this.sessionManager.getActiveSessionsMap().size === 0) {
         await this.scanAllInstalledGames(true, { silentInitialBoot: true });
       }
       this.ensureActiveDownloadPolling();
@@ -878,362 +767,15 @@ export class LauncherService {
     this.notifyStateChanged();
   }
 
-  private mergeTaskMonotonically(
-    existing: DownloadTaskState | undefined,
-    incoming: DownloadTaskState
-  ): DownloadTaskState {
-    if (
-      !existing ||
-      existing.status === 'queued' ||
-      !['downloading', 'extracting', 'verifying'].includes(incoming.status)
-    ) {
-      return incoming;
-    }
-    const progressPercent = Math.max(existing.progressPercent || 0, incoming.progressPercent || 0);
-    const bytesDownloaded = Math.max(existing.bytesDownloaded || 0, incoming.bytesDownloaded || 0);
-    const totalBytes =
-      incoming.totalBytes && incoming.totalBytes > 0
-        ? Math.max(incoming.totalBytes, bytesDownloaded)
-        : incoming.totalBytes;
-    return {
-      ...incoming,
-      progressPercent,
-      bytesDownloaded,
-      totalBytes,
-    };
-  }
-
-  private handleDownloadUpdated(data: { task?: DownloadTaskState; queue?: DownloadTaskState[] }): void {
-    const existingById = new Map<string, DownloadTaskState>();
-    for (const t of this.downloadQueue) {
-      if (t && t.taskId) {
-        existingById.set(t.taskId, t);
-      }
-    }
-
-    if (Array.isArray(data?.queue)) {
-      this.downloadQueue = data.queue.map((incoming) =>
-        this.mergeTaskMonotonically(existingById.get(incoming.taskId), incoming)
-      );
-    } else if (data?.task) {
-      const mergedTask = this.mergeTaskMonotonically(
-        existingById.get(data.task.taskId),
-        data.task
-      );
-      const idx = this.downloadQueue.findIndex((t) => t.taskId === mergedTask.taskId);
-      if (idx >= 0) {
-        this.downloadQueue[idx] = mergedTask;
-      } else {
-        this.downloadQueue = [...this.downloadQueue, mergedTask];
-      }
-    }
-
-    const completedById = new Map<string, DownloadTaskState>();
-    if (data?.task && data.task.status === 'completed') {
-      completedById.set(data.task.taskId, data.task);
-    }
-    for (const queuedTask of this.downloadQueue) {
-      if (
-        queuedTask &&
-        queuedTask.status === 'completed' &&
-        existingById.get(queuedTask.taskId)?.status !== 'completed'
-      ) {
-        completedById.set(queuedTask.taskId, queuedTask);
-      }
-    }
-
-    let shouldRescanInstalled = false;
-    for (const task of completedById.values()) {
-      const installPath = task.finalInstallPath || task.installDir;
-      const isWindowsBinaryOnMac =
-        !this.isWindowsHost() &&
-        (Boolean(task.isWindowsBinaryOnMac) ||
-          Boolean(task.executablePath && /\.exe$/i.test(task.executablePath)) ||
-          /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(
-            String(task.executablePath || installPath || '')
-          ));
-      const normalizedSteamAppId =
-        task.platformId === 'steam'
-          ? Number(task.steamAppId || String(task.platformGameId || '').replace(/^steam-/i, '')) ||
-            undefined
-          : undefined;
-      const normalizedPlatformGameId =
-        task.platformId === 'steam' && normalizedSteamAppId
-          ? String(normalizedSteamAppId)
-          : task.platformGameId;
-
-      const taskExt = task as DownloadTaskState & {
-        xboxProductId?: string;
-        packageFamilyName?: string;
-        appUserModelId?: string;
-        xboxTitleId?: string;
-        scid?: string;
-        msaAppId?: string;
-        version?: string;
-        installRequest?: InstallGameRequest & {
-          xboxProductId?: string;
-          packageFamilyName?: string;
-          appUserModelId?: string;
-          xboxTitleId?: string;
-          scid?: string;
-          msaAppId?: string;
-        };
-      };
-      const taskXboxProductId = taskExt.xboxProductId || taskExt.installRequest?.xboxProductId;
-      const taskPackageFamilyName =
-        taskExt.packageFamilyName || taskExt.installRequest?.packageFamilyName;
-      const taskAppUserModelId = taskExt.appUserModelId || taskExt.installRequest?.appUserModelId;
-      const taskXboxTitleId = taskExt.xboxTitleId || taskExt.installRequest?.xboxTitleId;
-      const taskScid = taskExt.scid || taskExt.installRequest?.scid;
-      const taskMsaAppId = taskExt.msaAppId || taskExt.installRequest?.msaAppId;
-      const taskVersion = taskExt.version;
-
-      const sanitizedTaskSize = sanitizeGameInstallSizeBytes(task.totalBytes);
-      const newRecord: InstalledGameRecord & { xboxProductId?: string } = {
-        platformId: task.platformId,
-        platformGameId: normalizedPlatformGameId,
-        appId: normalizedSteamAppId,
-        title: task.title,
-        installPath,
-        executablePath: task.executablePath,
-        ...(task.launchArguments ? { launchArguments: task.launchArguments } : {}),
-        ...(sanitizedTaskSize !== undefined ? { installSize: sanitizedTaskSize } : {}),
-        ...(taskVersion ? { version: taskVersion } : {}),
-        ...(taskXboxProductId ? { xboxProductId: taskXboxProductId } : {}),
-        ...(taskPackageFamilyName ? { packageFamilyName: taskPackageFamilyName } : {}),
-        ...(taskAppUserModelId ? { appUserModelId: taskAppUserModelId } : {}),
-        ...(taskXboxTitleId ? { xboxTitleId: taskXboxTitleId } : {}),
-        ...(taskScid ? { scid: taskScid } : {}),
-        ...(taskMsaAppId ? { msaAppId: taskMsaAppId } : {}),
-        runner: task.runner || (task.platformId === 'steam' ? 'steam' : 'one_launcher'),
-        isWindowsBinaryOnMac,
-      };
-
-      const existingIdx = this.installedRecords.findIndex(
-        (r) =>
-          r.platformId === newRecord.platformId &&
-          (String(r.platformGameId).toLowerCase() ===
-            String(newRecord.platformGameId).toLowerCase() ||
-            String(r.platformGameId).toLowerCase() === String(task.platformGameId).toLowerCase() ||
-            Boolean(
-              taskPackageFamilyName &&
-                r.packageFamilyName &&
-                r.packageFamilyName.toLowerCase() === taskPackageFamilyName.toLowerCase()
-            ) ||
-            (normalizedSteamAppId !== undefined && Number(r.appId) === normalizedSteamAppId))
-      );
-      if (existingIdx >= 0) {
-        this.installedRecords[existingIdx] = { ...this.installedRecords[existingIdx], ...newRecord };
-      } else {
-        this.installedRecords.push(newRecord);
-      }
-      this.installedIndexMutationSeq++;
-
-      if (task.platformId === 'steam' || task.platformId === 'xbox') {
-        shouldRescanInstalled = true;
-      }
-
-      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-        window.dispatchEvent(
-          new CustomEvent('antigravity:game-installed', {
-            detail: {
-              gameId: task.gameId,
-              platformId: task.platformId,
-              platformGameId: task.platformGameId,
-              ...(normalizedSteamAppId ? { steamAppId: normalizedSteamAppId } : {}),
-              installPath,
-              executablePath: task.executablePath,
-              ...(task.launchArguments ? { launchArguments: task.launchArguments } : {}),
-              ...(taskVersion ? { version: taskVersion } : {}),
-              ...(taskXboxProductId ? { xboxProductId: taskXboxProductId } : {}),
-              ...(taskPackageFamilyName ? { packageFamilyName: taskPackageFamilyName } : {}),
-              ...(taskAppUserModelId ? { appUserModelId: taskAppUserModelId } : {}),
-              ...(taskXboxTitleId ? { xboxTitleId: taskXboxTitleId } : {}),
-              ...(taskScid ? { scid: taskScid } : {}),
-              ...(taskMsaAppId ? { msaAppId: taskMsaAppId } : {}),
-              isWindowsBinaryOnMac,
-              installed: true,
-            },
-          })
-        );
-      }
-    }
-
-    if (
-      shouldRescanInstalled &&
-      typeof window !== 'undefined' &&
-      window.electronAPI?.scanAllInstalledGames
-    ) {
-      void this.scanAllInstalledGames(true).catch(() => {});
-    }
-
-    this.ensureActiveDownloadPolling();
-    this.notifyStateChanged();
+  private handleDownloadUpdated(data: {
+    task?: DownloadTaskState;
+    queue?: DownloadTaskState[];
+  }): void {
+    this.downloadManager.handleDownloadUpdated(data, this.createDownloadManagerContext());
   }
 
   private handleSessionUpdated(data: SessionUpdatedPayload): void {
-    const session = data?.session;
-    const isLifecycleEvent =
-      data?.event === 'started' ||
-      data?.event === 'stopping' ||
-      data?.event === 'stopped' ||
-      data?.event === 'fullscreen_updated' ||
-      data?.event === 'playtime_synced';
-
-    if (data?.event === 'fullscreen_updated') {
-      const rawGameId: unknown = Reflect.get(data, 'gameId');
-      const rawFullscreenActive: unknown = Reflect.get(data, 'fullscreenActive');
-      const rawDisplayAspectRatio: unknown = Reflect.get(data, 'displayAspectRatio');
-      const rawDisplayScalingMode: unknown = Reflect.get(data, 'displayScalingMode');
-      const targetGameId =
-        session?.gameId || (typeof rawGameId === 'string' ? rawGameId : undefined);
-      if (targetGameId) {
-        const existingSession = this.activeSessions.get(targetGameId);
-        if (existingSession || session) {
-          const mergedSession: ActiveGameSession = {
-            ...(existingSession || session!),
-            ...(session || {}),
-            ...(typeof rawFullscreenActive === 'boolean'
-              ? { fullscreenActive: rawFullscreenActive }
-              : {}),
-            ...(typeof rawDisplayAspectRatio === 'string'
-              ? {
-                  displayAspectRatio: sanitizeGlobalDisplayAspectRatio(rawDisplayAspectRatio),
-                }
-              : {}),
-            ...(typeof rawDisplayScalingMode === 'string'
-              ? {
-                  displayScalingMode: sanitizeGlobalBottleDisplayScalingMode(rawDisplayScalingMode),
-                }
-              : {}),
-          };
-          this.activeSessions.set(targetGameId, mergedSession);
-        }
-      }
-      this.notifyStateChanged();
-      return;
-    }
-
-    const isCloudSyncEvent =
-      data?.event === 'cloud_sync_warning' ||
-      data?.event === 'cloud_sync_complete' ||
-      (!isLifecycleEvent &&
-        (session?.status === 'cloud_sync_warning' ||
-          session?.status === 'cloud_sync_complete' ||
-          Boolean(data?.cloudSync || session?.cloudSync)));
-
-    if (isCloudSyncEvent) {
-      const targetGameId = session?.gameId || data?.cloudSync?.gameId;
-      const cloudSyncDetail = data?.cloudSync || session?.cloudSync;
-      if (targetGameId && this.activeSessions.has(targetGameId)) {
-        const existingSession = this.activeSessions.get(targetGameId)!;
-        this.activeSessions.set(targetGameId, {
-          ...existingSession,
-          ...(cloudSyncDetail ? { cloudSync: cloudSyncDetail } : {}),
-          ...(data?.statusMessage || session?.statusMessage
-            ? { statusMessage: data?.statusMessage || session?.statusMessage }
-            : {}),
-        });
-      }
-      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-        window.dispatchEvent(
-          new CustomEvent('antigravity:cloud-sync-telemetry', {
-            detail: cloudSyncDetail || session || data,
-          })
-        );
-      }
-      this.notifyStateChanged();
-      return;
-    }
-
-    if (!session || !session.gameId) {
-      if (data?.event === 'stopped') {
-        const rawGameId: unknown = Reflect.get(data, 'gameId');
-        const fallbackGameId = typeof rawGameId === 'string' ? rawGameId.trim() : '';
-        if (fallbackGameId) {
-          this.activeSessions.delete(fallbackGameId);
-          this.syncInGameResourceThrottle();
-          this.notifyStateChanged();
-        }
-      }
-      return;
-    }
-
-    if (data.event === 'playtime_synced') {
-      if (
-        typeof data.storefrontTotalPlaytimeMinutes === 'number' &&
-        data.storefrontTotalPlaytimeMinutes > 0 &&
-        typeof window !== 'undefined' &&
-        typeof window.dispatchEvent === 'function'
-      ) {
-        window.dispatchEvent(
-          new CustomEvent('antigravity:game-session-ended', {
-            detail: {
-              ...(session.sessionId ? { sessionId: session.sessionId } : {}),
-              sessionEvent: 'playtime_synced',
-              gameId: session.gameId,
-              platformId: session.platformId,
-              platformGameId: session.platformGameId,
-              sessionMinutesPlayed: 0,
-              durationSeconds: data.durationSeconds ?? 0,
-              lastPlayed: data.lastPlayed || new Date().toISOString(),
-              storefrontTotalPlaytimeMinutes: data.storefrontTotalPlaytimeMinutes,
-            },
-          })
-        );
-      }
-      this.notifyStateChanged();
-      return;
-    }
-
-    if (data.event === 'stopped') {
-      this.activeSessions.delete(session.gameId);
-      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-        if (data.cloudSync) {
-          window.dispatchEvent(
-            new CustomEvent('antigravity:cloud-sync-telemetry', {
-              detail: data.cloudSync,
-            })
-          );
-        }
-        if (data.error) {
-          window.dispatchEvent(
-            new CustomEvent('antigravity:game-launch-error', {
-              detail: {
-                gameId: session.gameId,
-                platformId: session.platformId,
-                error: data.error,
-              },
-            })
-          );
-        }
-        if ((data.sessionMinutesPlayed ?? 0) > 0 && !data.error) {
-          window.dispatchEvent(
-            new CustomEvent('antigravity:game-session-ended', {
-              detail: {
-                ...(session.sessionId ? { sessionId: session.sessionId } : {}),
-                sessionEvent: 'stopped',
-                gameId: session.gameId,
-                platformId: session.platformId,
-                platformGameId: session.platformGameId,
-                sessionMinutesPlayed: data.sessionMinutesPlayed ?? 1,
-                durationSeconds: data.durationSeconds ?? 60,
-                lastPlayed: data.lastPlayed || new Date().toISOString(),
-                ...(typeof data.storefrontTotalPlaytimeMinutes === 'number' &&
-                data.storefrontTotalPlaytimeMinutes > 0
-                  ? { storefrontTotalPlaytimeMinutes: data.storefrontTotalPlaytimeMinutes }
-                  : {}),
-              },
-            })
-          );
-        }
-      }
-    } else {
-      this.activeSessions.set(session.gameId, session);
-    }
-
-    this.syncInGameResourceThrottle();
-    this.notifyStateChanged();
+    this.sessionManager.handleSessionUpdated(data, this.createSessionManagerContext());
   }
 
   public getHostPlatform(): HostPlatform {
@@ -1259,284 +801,26 @@ export class LauncherService {
   }
 
   public hasAuthoritativeInstallScan(): boolean {
-    return this.lastScanSucceeded;
+    return this.installedRegistry.hasAuthoritativeInstallScan();
   }
 
   public async scanAllInstalledGames(
     forceRefresh = false,
     options?: { silentInitialBoot?: boolean }
   ): Promise<InstalledGameRecord[]> {
-    if (this.inFlightScanPromise) {
-      return this.inFlightScanPromise;
-    }
-
-    if (
-      !forceRefresh &&
-      this.lastScanTimestamp > 0 &&
-      Date.now() - this.lastScanTimestamp < 1500 &&
-      this.installedRecords.length > 0
-    ) {
-      return this.installedRecords;
-    }
-
-    if (typeof window !== 'undefined' && window.electronAPI?.scanAllInstalledGames) {
-      this.inFlightScanPromise = (async () => {
-        try {
-          const prevRecords = [...this.installedRecords];
-          const res = await window.electronAPI!.scanAllInstalledGames();
-          if (res && res.success !== false && Array.isArray(res.installedGames)) {
-            this.lastScanSucceeded = true;
-            const isWin = this.isWindowsHost();
-            if (res.epicPlatformSupport && typeof res.epicPlatformSupport === 'object') {
-              this.epicPlatformSupportMap = { ...res.epicPlatformSupport };
-            }
-            this.installedRecords = this.attachEpicPlatformSupportMetadata(
-              res.installedGames.map((r) => {
-                const sanitizedInstallSize = sanitizeGameInstallSizeBytes(r.installSize);
-                const nextRec: InstalledGameRecord = {
-                  ...r,
-                  ...(isWin ? { isWindowsBinaryOnMac: false } : {}),
-                };
-                if (sanitizedInstallSize !== undefined) {
-                  nextRec.installSize = sanitizedInstallSize;
-                } else {
-                  delete nextRec.installSize;
-                }
-                return nextRec;
-              })
-            );
-            this.lastScanTimestamp = Date.now();
-
-            const hasAnyCustomExe = Object.values(this.launchConfigs).some(
-              (c) =>
-                Boolean(c?.customExecutablePath) ||
-                (c?.platformConfigs &&
-                  Object.values(c.platformConfigs).some((p) => Boolean(p?.customExecutablePath)))
-            );
-            const configsFreshFromInit =
-              Boolean(options?.silentInitialBoot) ||
-              (this.lastConfigsFetchedAt > 0 &&
-                Date.now() - this.lastConfigsFetchedAt < INIT_CONFIG_FRESH_WINDOW_MS);
-            if (
-              !configsFreshFromInit &&
-              typeof window !== 'undefined' &&
-              typeof window.electronAPI?.getGameLaunchConfigs === 'function' &&
-              hasAnyCustomExe
-            ) {
-              try {
-                const freshConfigs = (await window.electronAPI.getGameLaunchConfigs()) as Record<
-                  string,
-                  GameLaunchConfig
-                >;
-                this.lastConfigsFetchedAt = Date.now();
-                if (freshConfigs && typeof freshConfigs === 'object') {
-                  const reconciled = reconcileLaunchConfigsWithDisk(
-                    this.launchConfigs,
-                    freshConfigs,
-                    false
-                  );
-                  if (reconciled.changed) {
-                    this.launchConfigs = reconciled.configs;
-                    this.persistLocalConfigs();
-                  }
-                }
-              } catch {}
-            }
-
-            // 1. Reconcile any active downloads whose game is now detected as installed on disk
-            for (let i = 0; i < this.downloadQueue.length; i++) {
-              const task = this.downloadQueue[i];
-              if (
-                task.status !== 'downloading' &&
-                task.status !== 'queued' &&
-                task.status !== 'extracting' &&
-                task.status !== 'verifying'
-              ) {
-                continue;
-              }
-
-              const matchedRecord = this.installedRecords.find(
-                (r) =>
-                  r.platformId === task.platformId &&
-                  (String(r.platformGameId) === String(task.platformGameId) ||
-                    (task.steamAppId &&
-                      Number(r.appId || r.platformGameId) === Number(task.steamAppId)))
-              );
-
-              if (matchedRecord) {
-                const resolvedBytes =
-                  sanitizeGameInstallSizeBytes(matchedRecord.installSize) ??
-                  sanitizeGameInstallSizeBytes(task.totalBytes) ??
-                  0;
-                this.downloadQueue[i] = {
-                  ...task,
-                  status: 'completed',
-                  progressPercent: 100,
-                  bytesDownloaded: resolvedBytes,
-                  totalBytes: resolvedBytes,
-                  speedBytesPerSec: 0,
-                  etaSeconds: 0,
-                  finalInstallPath: matchedRecord.installPath,
-                  executablePath: matchedRecord.executablePath,
-                  isWindowsBinaryOnMac: matchedRecord.isWindowsBinaryOnMac,
-                  completedAt: new Date().toISOString(),
-                  statusMessage: 'Installation complete',
-                };
-
-                if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-                  const matchedExt = matchedRecord as InstalledGameRecord & {
-                    xboxProductId?: string;
-                  };
-                  window.dispatchEvent(
-                    new CustomEvent('antigravity:game-installed', {
-                      detail: {
-                        gameId: task.gameId,
-                        platformId: task.platformId,
-                        platformGameId: task.platformGameId,
-                        installPath: matchedRecord.installPath,
-                        executablePath: matchedRecord.executablePath,
-                        ...(matchedRecord.launchArguments
-                          ? { launchArguments: matchedRecord.launchArguments }
-                          : {}),
-                        ...(matchedRecord.version ? { version: matchedRecord.version } : {}),
-                        ...(matchedExt.xboxProductId
-                          ? { xboxProductId: matchedExt.xboxProductId }
-                          : {}),
-                        ...(matchedRecord.packageFamilyName
-                          ? { packageFamilyName: matchedRecord.packageFamilyName }
-                          : {}),
-                        ...(matchedRecord.appUserModelId
-                          ? { appUserModelId: matchedRecord.appUserModelId }
-                          : {}),
-                        ...(matchedRecord.xboxTitleId
-                          ? { xboxTitleId: matchedRecord.xboxTitleId }
-                          : {}),
-                        ...(matchedRecord.scid ? { scid: matchedRecord.scid } : {}),
-                        ...(matchedRecord.msaAppId ? { msaAppId: matchedRecord.msaAppId } : {}),
-                        isWindowsBinaryOnMac: matchedRecord.isWindowsBinaryOnMac,
-                        installed: true,
-                      },
-                    })
-                  );
-                }
-              }
-            }
-
-            // 2. Dispatch antigravity:game-installed for any newly discovered installation
-            // (Skip individual cold-boot event storm when App.tsx batch-reconciles initial scan)
-            if (
-              !options?.silentInitialBoot &&
-              typeof window !== 'undefined' &&
-              typeof window.dispatchEvent === 'function'
-            ) {
-              for (const rec of this.installedRecords) {
-                const prevRec = prevRecords.find(
-                  (p) =>
-                    p.platformId === rec.platformId &&
-                    String(p.platformGameId).toLowerCase() ===
-                      String(rec.platformGameId).toLowerCase()
-                );
-                const recExt = rec as InstalledGameRecord & { xboxProductId?: string };
-                const prevRecExt = prevRec as
-                  | (InstalledGameRecord & { xboxProductId?: string })
-                  | undefined;
-                const gainedXboxIdentityOrExe =
-                  rec.platformId === 'xbox' &&
-                  Boolean(
-                    prevRec &&
-                      ((rec.executablePath && rec.executablePath !== prevRec.executablePath) ||
-                        (rec.packageFamilyName &&
-                          rec.packageFamilyName !== prevRec.packageFamilyName) ||
-                        (rec.appUserModelId && rec.appUserModelId !== prevRec.appUserModelId) ||
-                        (rec.xboxTitleId && rec.xboxTitleId !== prevRec.xboxTitleId) ||
-                        (rec.scid && rec.scid !== prevRec.scid) ||
-                        (rec.msaAppId && rec.msaAppId !== prevRec.msaAppId) ||
-                        (recExt.xboxProductId && recExt.xboxProductId !== prevRecExt?.xboxProductId))
-                  );
-                if (!prevRec || gainedXboxIdentityOrExe) {
-                  const matchingTask = this.downloadQueue.find(
-                    (t) =>
-                      t.platformId === rec.platformId &&
-                      (String(t.platformGameId).toLowerCase() ===
-                        String(rec.platformGameId).toLowerCase() ||
-                        Boolean(
-                          recExt.xboxProductId &&
-                            String(t.platformGameId).toLowerCase() ===
-                              String(recExt.xboxProductId).toLowerCase()
-                        ))
-                  );
-                  window.dispatchEvent(
-                    new CustomEvent('antigravity:game-installed', {
-                      detail: {
-                        gameId: matchingTask?.gameId || `${rec.platformId}-${rec.platformGameId}`,
-                        platformId: rec.platformId,
-                        platformGameId: rec.platformGameId,
-                        installPath: rec.installPath,
-                        executablePath: rec.executablePath,
-                        ...(rec.launchArguments ? { launchArguments: rec.launchArguments } : {}),
-                        ...(rec.version ? { version: rec.version } : {}),
-                        ...(recExt.xboxProductId ? { xboxProductId: recExt.xboxProductId } : {}),
-                        ...(rec.packageFamilyName
-                          ? { packageFamilyName: rec.packageFamilyName }
-                          : {}),
-                        ...(rec.appUserModelId ? { appUserModelId: rec.appUserModelId } : {}),
-                        ...(rec.xboxTitleId ? { xboxTitleId: rec.xboxTitleId } : {}),
-                        ...(rec.scid ? { scid: rec.scid } : {}),
-                        ...(rec.msaAppId ? { msaAppId: rec.msaAppId } : {}),
-                        isWindowsBinaryOnMac: rec.isWindowsBinaryOnMac,
-                        installed: true,
-                      },
-                    })
-                  );
-                }
-              }
-            }
-
-            this.ensureActiveDownloadPolling();
-            this.notifyStateChanged();
-            return this.installedRecords;
-          }
-        } catch (err) {
-          console.warn('[LauncherService] scanAllInstalledGames failed:', err);
-        } finally {
-          this.inFlightScanPromise = null;
-        }
-        return this.installedRecords;
-      })();
-      return this.inFlightScanPromise;
-    }
-    return this.installedRecords;
+    return this.installedRegistry.scanAllInstalledGames(
+      forceRefresh,
+      options,
+      this.createInstalledRegistryContext()
+    );
   }
 
   public async detectCompatibilityLayers(): Promise<CompatibilityLayerInfo[]> {
-    if (!this.getHostCapabilities().supportsWindowsTranslation) {
-      if (this.compatibilityLayers.length > 0) {
-        this.compatibilityLayers = [];
-        this.notifyStateChanged();
-      }
-      return [];
-    }
-    if (typeof window !== 'undefined' && window.electronAPI?.detectCompatibilityLayers) {
-      try {
-        const layers = await window.electronAPI.detectCompatibilityLayers();
-        if (Array.isArray(layers)) {
-          const prevSerialized = JSON.stringify(this.compatibilityLayers);
-          const nextSerialized = JSON.stringify(layers);
-          this.compatibilityLayers = layers;
-          if (prevSerialized !== nextSerialized) {
-            this.notifyStateChanged();
-          }
-          return layers;
-        }
-      } catch (err) {
-        console.warn('[LauncherService] detectCompatibilityLayers failed:', err);
-      }
-    }
-    return this.compatibilityLayers;
+    return this.runnerClient.detectCompatibilityLayers(this.createRunnerClientContext());
   }
 
   public getCompatibilityLayers(): CompatibilityLayerInfo[] {
-    return this.compatibilityLayers;
+    return this.runnerClient.getCompatibilityLayers();
   }
 
   public getInstalledStorefrontClients(): Partial<Record<StorefrontId, boolean>> {
@@ -1546,211 +830,41 @@ export class LauncherService {
   public async detectInstalledStorefrontClients(): Promise<
     Partial<Record<StorefrontId, boolean>>
   > {
-    if (
-      typeof window !== 'undefined' &&
-      typeof window.electronAPI?.detectInstalledStorefrontClients === 'function'
-    ) {
-      try {
-        const detected = await window.electronAPI.detectInstalledStorefrontClients();
-        if (detected && typeof detected === 'object') {
-          const next: Partial<Record<StorefrontId, boolean>> = {};
-          for (const key of ['steam', 'gog', 'epic', 'xbox'] as const) {
-            if (typeof detected[key] === 'boolean') {
-              next[key] = detected[key];
-            }
-          }
-          const prevSerialized = JSON.stringify(this.installedStorefrontClients);
-          const nextSerialized = JSON.stringify(next);
-          this.installedStorefrontClients = next;
-          if (prevSerialized !== nextSerialized) {
-            this.notifyStateChanged();
-          }
-          return { ...this.installedStorefrontClients };
-        }
-      } catch (err) {
-        console.warn('[LauncherService] detectInstalledStorefrontClients failed:', err);
-      }
-    }
-    return { ...this.installedStorefrontClients };
-  }
-
-  private ensureRunnerProgressSubscription(): void {
-    if (typeof window === 'undefined' || !window.electronAPI) return;
-    const api = window.electronAPI;
-    if (this.boundRunnerProgressApi === api && this.unsubscribeRunnerProgress) {
-      return;
-    }
-    if (this.unsubscribeRunnerProgress) {
-      try {
-        this.unsubscribeRunnerProgress();
-      } catch {}
-      this.unsubscribeRunnerProgress = undefined;
-    }
-    this.boundRunnerProgressApi = api;
-    if (typeof api.onCompatibilityRunnerProgress === 'function') {
-      this.unsubscribeRunnerProgress = api.onCompatibilityRunnerProgress(
-        (event: CompatibilityRunnerProgressEvent) => {
-          this.handleRunnerProgressEvent(event);
-        }
-      );
-    }
-  }
-
-  private handleRunnerProgressEvent(event: CompatibilityRunnerProgressEvent): void {
-    if (!event || !event.runnerType) return;
-    const runnerType = event.runnerType;
-    const isTerminal =
-      event.phase === 'completed' || event.phase === 'failed' || event.phase === 'cancelled';
-
-    let nextEvent: CompatibilityRunnerProgressEvent = event;
-    if (!isTerminal) {
-      const prev = this.activeRunnerOperations.get(runnerType);
-      if (
-        prev &&
-        prev.operation === event.operation &&
-        prev.phase === 'downloading' &&
-        event.phase === 'downloading'
-      ) {
-        const progressPercent =
-          typeof event.progressPercent === 'number'
-            ? typeof prev.progressPercent === 'number'
-              ? Math.max(prev.progressPercent, Math.min(100, event.progressPercent))
-              : Math.min(100, Math.max(0, event.progressPercent))
-            : prev.progressPercent;
-        const bytesDownloaded =
-          typeof event.bytesDownloaded === 'number' && typeof prev.bytesDownloaded === 'number'
-            ? Math.max(prev.bytesDownloaded, event.bytesDownloaded)
-            : event.bytesDownloaded ?? prev.bytesDownloaded;
-        const totalBytes = event.totalBytes ?? prev.totalBytes;
-        nextEvent = {
-          ...event,
-          progressPercent,
-          ...(bytesDownloaded !== undefined ? { bytesDownloaded } : {}),
-          ...(totalBytes !== undefined ? { totalBytes } : {}),
-        };
-      }
-      this.activeRunnerOperations.set(runnerType, nextEvent);
-    } else {
-      this.activeRunnerOperations.delete(runnerType);
-    }
-
-    for (const listener of this.runnerProgressListeners) {
-      try {
-        listener(nextEvent);
-      } catch {}
-    }
-    this.notifyStateChanged();
+    return this.runnerClient.detectInstalledStorefrontClients(this.createRunnerClientContext());
   }
 
   public getActiveRunnerOperations(): Partial<
     Record<Exclude<CompatibilityLayerType, 'native'>, CompatibilityRunnerProgressEvent>
   > {
-    this.ensureRunnerProgressSubscription();
-    const snapshot: Partial<
-      Record<Exclude<CompatibilityLayerType, 'native'>, CompatibilityRunnerProgressEvent>
-    > = {};
-    for (const [runnerType, ev] of this.activeRunnerOperations.entries()) {
-      snapshot[runnerType] = ev;
-    }
-    return snapshot;
+    return this.runnerClient.getActiveRunnerOperations(this.createRunnerClientContext());
   }
 
   public getActiveRunnerOperation(
     runnerType: Exclude<CompatibilityLayerType, 'native'>
   ): CompatibilityRunnerProgressEvent | undefined {
-    this.ensureRunnerProgressSubscription();
-    return this.activeRunnerOperations.get(runnerType);
+    return this.runnerClient.getActiveRunnerOperation(
+      runnerType,
+      this.createRunnerClientContext()
+    );
   }
 
   public onRunnerProgress(
     listener: (event: CompatibilityRunnerProgressEvent) => void
   ): () => void {
-    this.ensureRunnerProgressSubscription();
-    this.runnerProgressListeners.add(listener);
-    return () => {
-      this.runnerProgressListeners.delete(listener);
-    };
+    return this.runnerClient.onRunnerProgress(listener, this.createRunnerClientContext());
   }
 
   public registerPostRunnerMutationSyncHook(hook: () => Promise<void>): () => void {
-    this.postRunnerMutationSyncHooks.add(hook);
-    return () => {
-      this.postRunnerMutationSyncHooks.delete(hook);
-    };
-  }
-
-  private async runPostRunnerMutationSyncHooks(): Promise<void> {
-    if (this.postRunnerMutationSyncHooks.size === 0) return;
-    await Promise.allSettled(
-      Array.from(this.postRunnerMutationSyncHooks).map((hook) =>
-        Promise.resolve().then(() => hook())
-      )
-    );
-  }
-
-  private emitTerminalProgressIfActive(
-    runnerType: Exclude<CompatibilityLayerType, 'native'>,
-    operation: 'install' | 'update',
-    outcome: {
-      success: boolean;
-      cancelled?: boolean;
-      message?: string;
-      error?: string;
-    }
-  ): void {
-    if (!this.activeRunnerOperations.has(runnerType)) {
-      return;
-    }
-    const phase = outcome.cancelled
-      ? 'cancelled'
-      : outcome.success
-        ? 'completed'
-        : 'failed';
-    this.handleRunnerProgressEvent({
-      runnerType,
-      operation,
-      phase,
-      progressPercent: phase === 'completed' ? 100 : null,
-      message:
-        outcome.message ||
-        outcome.error ||
-        (phase === 'completed'
-          ? 'Operation completed.'
-          : phase === 'cancelled'
-            ? 'Operation cancelled.'
-            : 'Operation failed.'),
-      ...(phase === 'failed' && outcome.error ? { error: outcome.error } : {}),
-      updatedAt: new Date().toISOString(),
-    });
+    return this.runnerClient.registerPostRunnerMutationSyncHook(hook);
   }
 
   public async cancelCompatibilityLayerOperation(
     runnerType: Exclude<CompatibilityLayerType, 'native'>
   ): Promise<{ success: boolean; cancelled: boolean }> {
-    this.ensureRunnerProgressSubscription();
-    const existing = this.activeRunnerOperations.get(runnerType);
-    let res = { success: true, cancelled: Boolean(existing) };
-    if (
-      typeof window !== 'undefined' &&
-      typeof window.electronAPI?.cancelCompatibilityLayerOperation === 'function'
-    ) {
-      try {
-        res = await window.electronAPI.cancelCompatibilityLayerOperation(runnerType);
-      } catch (err) {
-        console.warn('[LauncherService] cancelCompatibilityLayerOperation failed:', err);
-      }
-    }
-    if (this.activeRunnerOperations.has(runnerType)) {
-      this.handleRunnerProgressEvent({
-        runnerType,
-        operation: existing?.operation || 'install',
-        phase: 'cancelled',
-        progressPercent: null,
-        message: 'Operation cancelled.',
-        updatedAt: new Date().toISOString(),
-      });
-    }
-    return res;
+    return this.runnerClient.cancelCompatibilityLayerOperation(
+      runnerType,
+      this.createRunnerClientContext()
+    );
   }
 
   public async installCompatibilityLayer(
@@ -1758,83 +872,12 @@ export class LauncherService {
     mode: 'auto' | 'direct' | 'download' = 'auto',
     options?: { dmgPath?: string; archivePath?: string; authenticateOnly?: boolean }
   ): Promise<InstallCompatibilityLayerResult> {
-    this.ensureRunnerProgressSubscription();
-    const descriptor = COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === runnerType);
-    if (
-      mode === 'download' ||
-      typeof window === 'undefined' ||
-      !window.electronAPI?.installCompatibilityLayer
-    ) {
-      if (descriptor?.downloadUrl && typeof window !== 'undefined') {
-        if (window.electronAPI?.openExternal) {
-          await window.electronAPI.openExternal(descriptor.downloadUrl);
-        } else if (typeof window.open === 'function') {
-          window.open(descriptor.downloadUrl, '_blank', 'noopener,noreferrer');
-        }
-      }
-      return {
-        success: true,
-        openedExternalInstaller: true,
-        runnerType,
-        message: 'Opened official installer download page.',
-      };
-    }
-
-    const requestPayload: InstallCompatibilityLayerRequest = {
+    return this.runnerClient.installCompatibilityLayer(
       runnerType,
       mode,
-      ...(options?.dmgPath ? { dmgPath: options.dmgPath } : {}),
-      ...(options?.archivePath ? { archivePath: options.archivePath } : {}),
-      ...(options?.authenticateOnly !== undefined
-        ? { authenticateOnly: options.authenticateOnly }
-        : {}),
-    };
-
-    if (!this.activeRunnerOperations.has(runnerType)) {
-      this.handleRunnerProgressEvent({
-        runnerType,
-        operation: 'install',
-        phase: options?.archivePath || options?.dmgPath ? 'extracting' : 'probing',
-        progressPercent: null,
-        message:
-          options?.archivePath || options?.dmgPath
-            ? `Installing ${descriptor?.shortLabel || runnerType} from local archive...`
-            : `Preparing ${descriptor?.shortLabel || runnerType} download...`,
-        updatedAt: new Date().toISOString(),
-      });
-    }
-
-    let result: InstallCompatibilityLayerResult;
-    try {
-      const res = await window.electronAPI.installCompatibilityLayer(requestPayload);
-      this.compatibilityLayers = res.layers || (await this.detectCompatibilityLayers());
-      await this.checkCompatibilityLayerUpdates();
-      this.emitTerminalProgressIfActive(runnerType, 'install', {
-        success: res.success,
-        cancelled: res.cancelled,
-        message: res.message,
-        error: res.error,
-      });
-      await this.runPostRunnerMutationSyncHooks();
-      result = res;
-    } catch (err: unknown) {
-      const errMsg = this.getErrorMessage(err, 'Failed to install compatibility layer.');
-      this.emitTerminalProgressIfActive(runnerType, 'install', {
-        success: false,
-        message: errMsg,
-        error: errMsg,
-      });
-      await this.runPostRunnerMutationSyncHooks();
-      result = {
-        success: false,
-        runnerType,
-        error: errMsg,
-      };
-    } finally {
-      this.activeRunnerOperations.delete(runnerType);
-      this.notifyStateChanged();
-    }
-    return result;
+      options,
+      this.createRunnerClientContext()
+    );
   }
 
   public getRunnerUpdates(): Record<string, CompatibilityLayerUpdateInfo> {
@@ -1844,32 +887,7 @@ export class LauncherService {
   public async checkCompatibilityLayerUpdates(): Promise<
     Record<string, CompatibilityLayerUpdateInfo>
   > {
-    if (!this.getHostCapabilities().supportsWindowsTranslation) {
-      if (Object.keys(this.runnerUpdates).length > 0) {
-        this.runnerUpdates = {};
-        this.notifyStateChanged();
-      }
-      return {};
-    }
-    if (
-      typeof window !== 'undefined' &&
-      window.electronAPI?.checkCompatibilityLayerUpdates
-    ) {
-      try {
-        const res = await window.electronAPI.checkCompatibilityLayerUpdates();
-        if (res && typeof res === 'object') {
-          const prevSerialized = JSON.stringify(this.runnerUpdates);
-          const nextSerialized = JSON.stringify(res);
-          this.runnerUpdates = res;
-          if (prevSerialized !== nextSerialized) {
-            this.notifyStateChanged();
-          }
-        }
-      } catch (err) {
-        console.warn('[LauncherService] checkCompatibilityLayerUpdates failed:', err);
-      }
-    }
-    return this.runnerUpdates;
+    return this.runnerClient.checkCompatibilityLayerUpdates(this.createRunnerClientContext());
   }
 
   public async updateCompatibilityLayer(
@@ -1881,414 +899,26 @@ export class LauncherService {
       authenticateOnly?: boolean;
     }
   ): Promise<UpdateCompatibilityLayerResult> {
-    this.ensureRunnerProgressSubscription();
-    const descriptor = COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === runnerType);
-    if (
-      typeof window === 'undefined' ||
-      !window.electronAPI?.updateCompatibilityLayer
-    ) {
-      if (descriptor?.downloadUrl && typeof window !== 'undefined') {
-        if (window.electronAPI?.openExternal) {
-          await window.electronAPI.openExternal(descriptor.downloadUrl);
-        } else if (typeof window.open === 'function') {
-          window.open(descriptor.downloadUrl, '_blank', 'noopener,noreferrer');
-        }
-      }
-      return {
-        success: true,
-        runnerType,
-        updated: false,
-        openedExternalUrl: descriptor?.downloadUrl,
-        message: 'Opened official runner update portal.',
-      };
-    }
-
-    const payload: UpdateCompatibilityLayerPayload = {
+    return this.runnerClient.updateCompatibilityLayer(
       runnerType,
-      ...(options?.dmgPath ? { dmgPath: options.dmgPath } : {}),
-      ...(options?.archivePath ? { archivePath: options.archivePath } : {}),
-      ...(options?.switchToStableCrossOver ? { switchToStableCrossOver: true } : {}),
-      ...(options?.authenticateOnly !== undefined
-        ? { authenticateOnly: options.authenticateOnly }
-        : {}),
-    };
-
-    if (!this.activeRunnerOperations.has(runnerType)) {
-      this.handleRunnerProgressEvent({
-        runnerType,
-        operation: 'update',
-        phase: options?.archivePath || options?.dmgPath ? 'extracting' : 'probing',
-        progressPercent: null,
-        message: options?.switchToStableCrossOver
-          ? 'Downloading newer CrossOver Stable release...'
-          : options?.archivePath || options?.dmgPath
-            ? `Updating ${descriptor?.shortLabel || runnerType} from local archive...`
-            : `Preparing ${descriptor?.shortLabel || runnerType} update...`,
-        updatedAt: new Date().toISOString(),
-      });
-    }
-
-    let result: UpdateCompatibilityLayerResult;
-    try {
-      const res = await window.electronAPI.updateCompatibilityLayer(payload);
-      if (Array.isArray(res.detectedLayers)) {
-        this.compatibilityLayers = res.detectedLayers;
-      } else {
-        await this.detectCompatibilityLayers();
-      }
-      if (res.updateInfo) {
-        const resultRunnerKey = res.updateInfo.runnerType || res.runnerType || runnerType;
-        this.runnerUpdates = {
-          ...this.runnerUpdates,
-          [resultRunnerKey]: res.updateInfo,
-        };
-      } else {
-        await this.checkCompatibilityLayerUpdates();
-      }
-      this.emitTerminalProgressIfActive(runnerType, 'update', {
-        success: res.success,
-        cancelled: res.cancelled,
-        message: res.message,
-        error: res.error,
-      });
-      await this.runPostRunnerMutationSyncHooks();
-      result = res;
-    } catch (err: unknown) {
-      const errMsg = this.getErrorMessage(err, 'Failed to update compatibility layer.');
-      this.emitTerminalProgressIfActive(runnerType, 'update', {
-        success: false,
-        message: errMsg,
-        error: errMsg,
-      });
-      await this.runPostRunnerMutationSyncHooks();
-      result = {
-        success: false,
-        runnerType,
-        updated: false,
-        message: errMsg,
-        error: errMsg,
-      };
-    } finally {
-      this.activeRunnerOperations.delete(runnerType);
-      if (options?.switchToStableCrossOver) {
-        this.activeRunnerOperations.delete('crossover');
-      }
-      this.notifyStateChanged();
-    }
-    return result;
+      options,
+      this.createRunnerClientContext()
+    );
   }
 
   public getInstalledRecords(): InstalledGameRecord[] {
-    return this.installedRecords;
-  }
-
-  private ensureInstalledLookupIndex(): InstalledLookupIndex {
-    if (
-      this.installedIndexRecordsRef === this.installedRecords &&
-      this.installedIndexRecordsLen === this.installedRecords.length &&
-      this.installedIndexBuiltSeq === this.installedIndexMutationSeq
-    ) {
-      return this.installedLookupIndex;
-    }
-
-    const byPlatGameKey = new Map<string, InstalledGameRecord>();
-    const bySteamAppId = new Map<number, InstalledGameRecord>();
-    const byPlatInstallPath = new Map<string, InstalledGameRecord>();
-    const byPlatExePath = new Map<string, InstalledGameRecord>();
-    const byPlatNormTitle = new Map<string, InstalledGameRecord>();
-
-    const normalizeLookupPlatGameId = (raw: unknown): string =>
-      String(raw ?? '')
-        .trim()
-        .replace(/^(?:gog[_-]|epic[_-]|steam[_-]|xbox[_-]|custom[_-])/i, '')
-        .toLowerCase();
-    const normalizeLookupPath = (raw: string): string => raw.trim().replace(/[\\/]+$/, '');
-
-    for (const r of this.installedRecords) {
-      if (!r) continue;
-      if (r.platformGameId !== undefined && r.platformGameId !== null && r.platformGameId !== '') {
-        const key = `${r.platformId}:${String(r.platformGameId)}`;
-        if (!byPlatGameKey.has(key)) byPlatGameKey.set(key, r);
-        const normId = normalizeLookupPlatGameId(r.platformGameId);
-        if (normId) {
-          const normKey = `${r.platformId}:${normId}`;
-          if (!byPlatGameKey.has(normKey)) byPlatGameKey.set(normKey, r);
-        }
-      }
-      if (r.packageFamilyName) {
-        const pfnKey = `${r.platformId}:${String(r.packageFamilyName)}`;
-        if (!byPlatGameKey.has(pfnKey)) byPlatGameKey.set(pfnKey, r);
-        const normPfn = String(r.packageFamilyName).trim().toLowerCase();
-        if (normPfn && !byPlatGameKey.has(`${r.platformId}:${normPfn}`)) {
-          byPlatGameKey.set(`${r.platformId}:${normPfn}`, r);
-        }
-      }
-      const rXboxProductId = (r as InstalledGameRecord & { xboxProductId?: string }).xboxProductId;
-      if (rXboxProductId) {
-        const prodKey = `${r.platformId}:${String(rXboxProductId)}`;
-        if (!byPlatGameKey.has(prodKey)) byPlatGameKey.set(prodKey, r);
-        const normProd = normalizeLookupPlatGameId(rXboxProductId);
-        if (normProd && !byPlatGameKey.has(`${r.platformId}:${normProd}`)) {
-          byPlatGameKey.set(`${r.platformId}:${normProd}`, r);
-        }
-      }
-      if (r.xboxTitleId) {
-        const titleIdKey = `${r.platformId}:${String(r.xboxTitleId).trim().toLowerCase()}`;
-        if (!byPlatGameKey.has(titleIdKey)) byPlatGameKey.set(titleIdKey, r);
-      }
-      if (r.platformId === 'steam') {
-        const appIdNum = Number(r.appId || normalizeLookupPlatGameId(r.platformGameId));
-        if (Number.isFinite(appIdNum) && appIdNum > 0 && !bySteamAppId.has(appIdNum)) {
-          bySteamAppId.set(appIdNum, r);
-        }
-      }
-      if (r.installPath) {
-        const key = `${r.platformId}:${r.installPath}`;
-        if (!byPlatInstallPath.has(key)) byPlatInstallPath.set(key, r);
-        const trimmedKey = `${r.platformId}:${normalizeLookupPath(r.installPath)}`;
-        if (!byPlatInstallPath.has(trimmedKey)) byPlatInstallPath.set(trimmedKey, r);
-      }
-      if (r.executablePath) {
-        const key = `${r.platformId}:${r.executablePath}`;
-        if (!byPlatExePath.has(key)) byPlatExePath.set(key, r);
-      }
-      if (r.title) {
-        const norm = normalizeTitleForMatch(r.title);
-        if (norm) {
-          const key = `${r.platformId}:${norm}`;
-          if (!byPlatNormTitle.has(key)) byPlatNormTitle.set(key, r);
-        }
-      }
-    }
-
-    this.installedLookupIndex = {
-      byPlatGameKey,
-      bySteamAppId,
-      byPlatInstallPath,
-      byPlatExePath,
-      byPlatNormTitle,
-    };
-    this.installedIndexRecordsRef = this.installedRecords;
-    this.installedIndexRecordsLen = this.installedRecords.length;
-    this.installedIndexBuiltSeq = this.installedIndexMutationSeq;
-    return this.installedLookupIndex;
+    return this.installedRegistry.getRecords();
   }
 
   public getInstalledRecordForGame(
     game: CanonicalGame,
     preferredPlatformId?: StorefrontId
   ): InstalledGameRecord | undefined {
-    if (!game) return undefined;
-    const platforms = Array.isArray(game.platforms)
-      ? game.platforms.filter((p): p is GamePlatformOwnership => Boolean(p && typeof p === 'object' && p.platformId))
-      : [];
-
-    const idx = this.ensureInstalledLookupIndex();
-    const cfg = this.getLaunchConfig(game.id);
-    const normGameTitle = game.title ? normalizeTitleForMatch(game.title) : '';
-
-    const normalizeLookupPlatGameId = (raw: unknown): string =>
-      String(raw ?? '')
-        .trim()
-        .replace(/^(?:gog[_-]|epic[_-]|steam[_-]|xbox[_-]|custom[_-])/i, '')
-        .toLowerCase();
-
-    // 1. O(1) indexed helper to check matching platform records in installedRecords
-    const matchPlatformRecord = (p: GamePlatformOwnership): InstalledGameRecord | undefined => {
-      const pGameId = String(p.platformGameId || p.storefrontAppId || '');
-      if (pGameId) {
-        const byPlatKey =
-          idx.byPlatGameKey.get(`${p.platformId}:${pGameId}`) ||
-          idx.byPlatGameKey.get(`${p.platformId}:${normalizeLookupPlatGameId(pGameId)}`);
-        if (byPlatKey) return byPlatKey;
-      }
-      if (p.xboxProductId) {
-        const byProdKey =
-          idx.byPlatGameKey.get(`${p.platformId}:${p.xboxProductId}`) ||
-          idx.byPlatGameKey.get(`${p.platformId}:${normalizeLookupPlatGameId(p.xboxProductId)}`);
-        if (byProdKey) return byProdKey;
-      }
-      if (p.packageFamilyName) {
-        const byPfnKey =
-          idx.byPlatGameKey.get(`${p.platformId}:${p.packageFamilyName}`) ||
-          idx.byPlatGameKey.get(`${p.platformId}:${p.packageFamilyName.trim().toLowerCase()}`);
-        if (byPfnKey) return byPfnKey;
-      }
-      if (p.storefrontAppId) {
-        const normStoreId = normalizeLookupPlatGameId(p.storefrontAppId);
-        if (normStoreId) {
-          const byStoreKey = idx.byPlatGameKey.get(`${p.platformId}:${normStoreId}`);
-          if (byStoreKey) return byStoreKey;
-        }
-      }
-      if (p.platformId === 'steam' && game.steamAppId) {
-        const bySteamApp = idx.bySteamAppId.get(Number(game.steamAppId));
-        if (bySteamApp) return bySteamApp;
-      }
-
-      if (p.installPath) {
-        const trimmedPath = p.installPath.trim().replace(/[\\/]+$/, '');
-        const byInstall =
-          idx.byPlatInstallPath.get(`${p.platformId}:${p.installPath}`) ||
-          idx.byPlatInstallPath.get(`${p.platformId}:${trimmedPath}`);
-        if (byInstall) return byInstall;
-      }
-      if (p.executablePath) {
-        const byExe = idx.byPlatExePath.get(`${p.platformId}:${p.executablePath}`);
-        if (byExe) return byExe;
-      }
-      if (normGameTitle) {
-        const byTitle = idx.byPlatNormTitle.get(`${p.platformId}:${normGameTitle}`);
-        if (byTitle) return byTitle;
-      }
-
-      if (
-        !this.initialized &&
-        !this.lastScanSucceeded &&
-        p.installed &&
-        (p.installPath || p.executablePath)
-      ) {
-        const isWinPath = Boolean(
-          (p.executablePath && /\.exe$/i.test(p.executablePath)) ||
-            /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(
-              String(p.executablePath || p.installPath || '')
-            )
-        );
-        const isMacPath = Boolean(
-          (p.executablePath && !/\.exe$/i.test(p.executablePath)) ||
-            (p.installPath && /\.app(\/|$)/i.test(p.installPath))
-        );
-        const inferredWinOnMac = this.isWindowsHost()
-          ? false
-          : p.isWindowsBinaryOnMac !== undefined
-            ? p.isWindowsBinaryOnMac
-            : isWinPath
-              ? true
-              : isMacPath
-                ? false
-                : undefined;
-        return {
-          platformId: p.platformId,
-          platformGameId: p.platformGameId,
-          appId: p.platformId === 'steam' ? game.steamAppId || Number(p.platformGameId) : undefined,
-          packageFamilyName: p.packageFamilyName,
-          appUserModelId: p.appUserModelId,
-          xboxTitleId: p.xboxTitleId,
-          title: game.title,
-          installPath: p.installPath || '',
-          executablePath: p.executablePath,
-          launchArguments: p.launchArguments,
-          installSize: sanitizeGameInstallSizeBytes(p.installSize),
-          version: p.version,
-          isWindowsBinaryOnMac: inferredWinOnMac,
-        };
-      }
-      return undefined;
-    };
-
-    // When preferredPlatformId is explicitly provided, strictly scope to that storefront
-    if (preferredPlatformId) {
-      const targetPlat = platforms.find((p) => p.platformId === preferredPlatformId);
-      if (targetPlat) {
-        const matched = matchPlatformRecord(targetPlat);
-        if (matched) return matched;
-      }
-
-      if (preferredPlatformId === 'steam' && game.steamAppId) {
-        const bySteamId = idx.bySteamAppId.get(Number(game.steamAppId));
-        if (bySteamId) return bySteamId;
-      }
-
-      const platCfg = this.getLaunchConfig(game.id, preferredPlatformId);
-      if (platCfg?.customExecutablePath) {
-        return {
-          platformId: preferredPlatformId,
-          platformGameId: String(
-            targetPlat?.platformGameId ||
-              targetPlat?.storefrontAppId ||
-              platforms[0]?.platformGameId ||
-              game.id
-          ),
-          packageFamilyName: targetPlat?.packageFamilyName,
-          appUserModelId: targetPlat?.appUserModelId,
-          xboxTitleId: targetPlat?.xboxTitleId,
-          title: game.title,
-          installPath: platCfg.workingDirectory || platCfg.customExecutablePath,
-          executablePath: platCfg.customExecutablePath,
-          launchArguments: platCfg.launchArguments || targetPlat?.launchArguments,
-          runner: 'custom',
-          isWindowsBinaryOnMac:
-            !this.isWindowsHost() && /\.exe$/i.test(platCfg.customExecutablePath),
-        };
-      }
-
-      return undefined;
-    }
-
-    const targetPlatformId = cfg?.preferredPlatformId;
-    if (targetPlatformId) {
-      const targetPlat = platforms.find((p) => p.platformId === targetPlatformId);
-      if (targetPlat) {
-        const matched = matchPlatformRecord(targetPlat);
-        if (matched) return matched;
-      }
-    }
-
-    for (const p of platforms) {
-      const matched = matchPlatformRecord(p);
-      if (matched) return matched;
-    }
-
-    // 2. Fallback check by steamAppId
-    if (game.steamAppId) {
-      const bySteamId = idx.bySteamAppId.get(Number(game.steamAppId));
-      if (bySteamId) return bySteamId;
-    }
-
-    // 3. Fallback check by customExecutablePath in LaunchConfig or platformConfigs
-    if (cfg?.customExecutablePath) {
-      const resolvedPlatId = targetPlatformId || platforms[0]?.platformId || 'custom';
-      const targetPlat = platforms.find((p) => p.platformId === resolvedPlatId);
-      return {
-        platformId: resolvedPlatId,
-        platformGameId: targetPlat?.platformGameId || platforms[0]?.platformGameId || game.id,
-        packageFamilyName: targetPlat?.packageFamilyName,
-        appUserModelId: targetPlat?.appUserModelId,
-        xboxTitleId: targetPlat?.xboxTitleId,
-        title: game.title,
-        installPath: cfg.workingDirectory || cfg.customExecutablePath,
-        executablePath: cfg.customExecutablePath,
-        launchArguments: cfg.launchArguments || targetPlat?.launchArguments,
-        runner: 'custom',
-        isWindowsBinaryOnMac:
-          !this.isWindowsHost() && /\.exe$/i.test(cfg.customExecutablePath),
-      };
-    }
-
-    if (cfg?.platformConfigs) {
-      for (const [platId, platProfile] of Object.entries(cfg.platformConfigs)) {
-        if (platProfile?.customExecutablePath) {
-          const resolvedPlatId = platId as StorefrontId;
-          const targetPlat = platforms.find((p) => p.platformId === resolvedPlatId);
-          return {
-            platformId: resolvedPlatId,
-            platformGameId: targetPlat?.platformGameId || platforms[0]?.platformGameId || game.id,
-            packageFamilyName: targetPlat?.packageFamilyName,
-            appUserModelId: targetPlat?.appUserModelId,
-            xboxTitleId: targetPlat?.xboxTitleId,
-            title: game.title,
-            installPath: platProfile.workingDirectory || platProfile.customExecutablePath,
-            executablePath: platProfile.customExecutablePath,
-            launchArguments: platProfile.launchArguments || targetPlat?.launchArguments,
-            runner: 'custom',
-            isWindowsBinaryOnMac:
-              !this.isWindowsHost() && /\.exe$/i.test(platProfile.customExecutablePath),
-          };
-        }
-      }
-    }
-
-    return undefined;
+    return this.installedRegistry.getInstalledRecordForGame(
+      game,
+      preferredPlatformId,
+      this.createInstalledRegistryContext()
+    );
   }
 
   public getSelectedStorefrontForGame(gameOrId: CanonicalGame | string): StorefrontId | undefined {
@@ -2319,214 +949,43 @@ export class LauncherService {
     game: CanonicalGame,
     preferredPlatformId?: StorefrontId
   ): GamePlatformOwnership | undefined {
-    if (!game || !Array.isArray(game.platforms) || game.platforms.length === 0) {
-      return undefined;
-    }
-
-    const cfg = this.getLaunchConfig(game.id);
-    const rememberedId = !preferredPlatformId
-      ? loadSelectedStorefrontsFromStorage()[game.id]
-      : undefined;
-    const validRememberedId =
-      rememberedId && game.platforms.some((p) => p.platformId === rememberedId)
-        ? rememberedId
-        : undefined;
-    const explicitOrRememberedId = preferredPlatformId || validRememberedId;
-    const targetId = explicitOrRememberedId || cfg?.preferredPlatformId;
-    let fallbackPreferredUninstalled: GamePlatformOwnership | undefined;
-
-    if (targetId) {
-      const found = game.platforms.find((p) => p.platformId === targetId);
-      if (found) {
-        const rec = this.getInstalledRecordForGame(game, targetId);
-        if (rec) {
-          return {
-            ...found,
-            installed: true,
-            installPath: rec.installPath || found.installPath,
-            executablePath: rec.executablePath || found.executablePath,
-            launchArguments: rec.launchArguments || found.launchArguments,
-            xboxProductId: found.xboxProductId,
-            packageFamilyName: rec.packageFamilyName || found.packageFamilyName,
-            appUserModelId: rec.appUserModelId || found.appUserModelId,
-            xboxTitleId: rec.xboxTitleId || found.xboxTitleId,
-            scid: rec.scid || found.scid,
-            msaAppId: rec.msaAppId || found.msaAppId,
-            ...(rec.isCrossPlatformLauncherRuntime !== undefined ||
-            found.isCrossPlatformLauncherRuntime !== undefined
-              ? {
-                  isCrossPlatformLauncherRuntime:
-                    rec.isCrossPlatformLauncherRuntime ?? found.isCrossPlatformLauncherRuntime,
-                }
-              : {}),
-            ...(rec.externalStorefrontHandoff || found.externalStorefrontHandoff
-              ? {
-                  externalStorefrontHandoff: (rec.externalStorefrontHandoff ||
-                    found.externalStorefrontHandoff) as GamePlatformOwnership['externalStorefrontHandoff'],
-                }
-              : {}),
-            ...(rec.chainedLauncherHandoff || found.chainedLauncherHandoff
-              ? {
-                  chainedLauncherHandoff:
-                    rec.chainedLauncherHandoff || found.chainedLauncherHandoff,
-                }
-              : {}),
-            ...(rec.chainedExternalInstallId || found.chainedExternalInstallId
-              ? {
-                  chainedExternalInstallId:
-                    rec.chainedExternalInstallId || found.chainedExternalInstallId,
-                }
-              : {}),
-            isWindowsBinaryOnMac: this.isWindowsHost()
-              ? false
-              : (rec.isWindowsBinaryOnMac ?? found.isWindowsBinaryOnMac),
-          };
-        }
-        const targetPlatCfg = this.getLaunchConfig(game.id, targetId);
-        const isTargetInstalled = Boolean(found.installed || targetPlatCfg?.customExecutablePath);
-        if (explicitOrRememberedId || isTargetInstalled) {
-          return found;
-        }
-        fallbackPreferredUninstalled = found;
-      }
-    }
-
-    // Prefer an installed platform
-    const installedRecord = this.getInstalledRecordForGame(game);
-    if (installedRecord) {
-      const matchingPlat = game.platforms.find(
-        (p) => p.platformId === installedRecord.platformId
-      );
-      if (matchingPlat) {
-        return {
-          ...matchingPlat,
-          installed: true,
-          installPath: installedRecord.installPath || matchingPlat.installPath,
-          executablePath: installedRecord.executablePath || matchingPlat.executablePath,
-          launchArguments: installedRecord.launchArguments || matchingPlat.launchArguments,
-          xboxProductId: matchingPlat.xboxProductId,
-          packageFamilyName: installedRecord.packageFamilyName || matchingPlat.packageFamilyName,
-          appUserModelId: installedRecord.appUserModelId || matchingPlat.appUserModelId,
-          xboxTitleId: installedRecord.xboxTitleId || matchingPlat.xboxTitleId,
-          scid: installedRecord.scid || matchingPlat.scid,
-          msaAppId: installedRecord.msaAppId || matchingPlat.msaAppId,
-          ...(installedRecord.isCrossPlatformLauncherRuntime !== undefined ||
-          matchingPlat.isCrossPlatformLauncherRuntime !== undefined
-            ? {
-                isCrossPlatformLauncherRuntime:
-                  installedRecord.isCrossPlatformLauncherRuntime ??
-                  matchingPlat.isCrossPlatformLauncherRuntime,
-              }
-            : {}),
-          ...(installedRecord.externalStorefrontHandoff || matchingPlat.externalStorefrontHandoff
-            ? {
-                externalStorefrontHandoff: (installedRecord.externalStorefrontHandoff ||
-                  matchingPlat.externalStorefrontHandoff) as GamePlatformOwnership['externalStorefrontHandoff'],
-              }
-            : {}),
-          ...(installedRecord.chainedLauncherHandoff || matchingPlat.chainedLauncherHandoff
-            ? {
-                chainedLauncherHandoff:
-                  installedRecord.chainedLauncherHandoff || matchingPlat.chainedLauncherHandoff,
-              }
-            : {}),
-          ...(installedRecord.chainedExternalInstallId || matchingPlat.chainedExternalInstallId
-            ? {
-                chainedExternalInstallId:
-                  installedRecord.chainedExternalInstallId || matchingPlat.chainedExternalInstallId,
-              }
-            : {}),
-          isWindowsBinaryOnMac: this.isWindowsHost()
-            ? false
-            : (installedRecord.isWindowsBinaryOnMac ?? matchingPlat.isWindowsBinaryOnMac),
-        };
-      }
-    }
-
-    const installedPlat = game.platforms.find((p) => p.installed);
-    if (installedPlat) return installedPlat;
-
-    if (fallbackPreferredUninstalled) return fallbackPreferredUninstalled;
-
-    return game.platforms[0];
-  }
-
-  public isGameInstalled(game: CanonicalGame, platformId?: StorefrontId): boolean {
-    if (!game) return false;
-    const platforms = Array.isArray(game.platforms)
-      ? game.platforms.filter((p): p is GamePlatformOwnership => Boolean(p && typeof p === 'object' && p.platformId))
-      : [];
-
-    if (platformId) {
-      const platCfg = this.getLaunchConfig(game.id, platformId);
-      if (platCfg?.customExecutablePath) {
-        return true;
-      }
-      if (this.getInstalledRecordForGame(game, platformId)) return true;
-      const plat = platforms.find((p) => p.platformId === platformId);
-      return Boolean(plat?.installed);
-    }
-
-    const cfg = this.getLaunchConfig(game.id);
-    if (cfg?.customExecutablePath) return true;
-    if (
-      cfg?.platformConfigs &&
-      Object.values(cfg.platformConfigs).some((p) => Boolean(p?.customExecutablePath))
-    ) {
-      return true;
-    }
-    if (platforms.some((p) => p.installed)) return true;
-    return Boolean(this.getInstalledRecordForGame(game));
-  }
-
-  public isGameRunning(gameId: string, platformId?: StorefrontId): boolean {
-    const session = this.activeSessions.get(gameId);
-    if (!session) return false;
-    return !platformId || !session.platformId || session.platformId === platformId;
-  }
-
-  public getActiveSession(gameId: string, platformId?: StorefrontId): ActiveGameSession | undefined {
-    const session = this.activeSessions.get(gameId);
-    if (!session) return undefined;
-    if (platformId && session.platformId && session.platformId !== platformId) {
-      return undefined;
-    }
-    return session;
-  }
-
-  public getRunningGames(): ActiveGameSession[] {
-    return Array.from(this.activeSessions.values());
-  }
-
-  public getActiveDownload(gameId: string, platformId?: StorefrontId): DownloadTaskState | undefined {
-    return this.downloadQueue.find(
-      (t) =>
-        t.gameId === gameId &&
-        (!platformId || !t.platformId || t.platformId === platformId) &&
-        (t.status === 'queued' ||
-          t.status === 'downloading' ||
-          t.status === 'extracting' ||
-          t.status === 'verifying' ||
-          t.status === 'paused')
+    return this.installedRegistry.getEffectivePlatformForGame(
+      game,
+      preferredPlatformId,
+      this.createInstalledRegistryContext()
     );
   }
 
+  public isGameInstalled(game: CanonicalGame, platformId?: StorefrontId): boolean {
+    return this.installedRegistry.isGameInstalled(
+      game,
+      platformId,
+      this.createInstalledRegistryContext()
+    );
+  }
+
+  public isGameRunning(gameId: string, platformId?: StorefrontId): boolean {
+    return this.sessionManager.isGameRunning(gameId, platformId);
+  }
+
+  public getActiveSession(gameId: string, platformId?: StorefrontId): ActiveGameSession | undefined {
+    return this.sessionManager.getActiveSession(gameId, platformId);
+  }
+
+  public getRunningGames(): ActiveGameSession[] {
+    return this.sessionManager.getRunningGames();
+  }
+
+  public getActiveDownload(gameId: string, platformId?: StorefrontId): DownloadTaskState | undefined {
+    return this.downloadManager.getActiveDownload(gameId, platformId);
+  }
+
   public getDownloadQueue(): DownloadTaskState[] {
-    return this.downloadQueue;
+    return this.downloadManager.getQueue();
   }
 
   public async getDiskSpace(targetPath?: string): Promise<DiskSpaceInfo | null> {
-    if (typeof window !== 'undefined' && window.electronAPI?.getDiskSpace) {
-      try {
-        return await window.electronAPI.getDiskSpace(targetPath);
-      } catch {}
-    }
-    return {
-      targetPath: targetPath || (this.isWindowsHost() ? 'C:\\Games\\OneLauncher' : '~/Games/OneLauncher'),
-      freeBytes: 120 * 1024 * 1024 * 1024,
-      totalBytes: 500 * 1024 * 1024 * 1024,
-      usedBytes: 380 * 1024 * 1024 * 1024,
-    };
+    return this.downloadManager.getDiskSpace(targetPath, this.isWindowsHost());
   }
 
   public async getGameInstallInfo(
@@ -2534,595 +993,45 @@ export class LauncherService {
     platformId?: StorefrontId,
     targetInstallDir?: string
   ): Promise<GameInstallInfo> {
-    const hostPlatform = this.getHostPlatform();
-    const isWin = hostPlatform === 'win32';
-    const effPlatform = this.getEffectivePlatformForGame(game, platformId);
-    const resolvedPlatformId: StorefrontId =
-      platformId || effPlatform?.platformId || (game.steamAppId ? 'steam' : 'custom');
-    const resolvedPlatformGameId =
-      effPlatform?.platformGameId || (game.steamAppId ? String(game.steamAppId) : game.id);
-    const storeFlags = getStorefrontNativeOsFlags(game, resolvedPlatformId);
-
-    if (typeof window !== 'undefined' && window.electronAPI?.getGameInstallInfo) {
-      try {
-        const cachedSteamMeta =
-          resolvedPlatformId === 'steam' && game.steamAppId
-            ? steamApi.getCachedMetadata(Number(game.steamAppId))
-            : undefined;
-        const steamPlatforms =
-          resolvedPlatformId === 'steam'
-            ? cachedSteamMeta?.platforms || game.enrichedMetadata?.platforms
-            : undefined;
-        const res = await window.electronAPI.getGameInstallInfo({
-          gameId: game.id,
-          title: game.title,
-          platformId: resolvedPlatformId,
-          platformGameId: resolvedPlatformGameId,
-          steamAppId: game.steamAppId,
-          xboxProductId: effPlatform?.xboxProductId,
-          packageFamilyName: effPlatform?.packageFamilyName,
-          appUserModelId: effPlatform?.appUserModelId,
-          xboxTitleId: effPlatform?.xboxTitleId,
-          externalStorefrontHandoff: effPlatform?.externalStorefrontHandoff,
-          xboxBottleCompatibilityTier: effPlatform?.xboxBottleCompatibilityTier,
-          isCrossPlatformLauncherRuntime: effPlatform?.isCrossPlatformLauncherRuntime,
-          chainedLauncherHandoff: effPlatform?.chainedLauncherHandoff,
-          chainedExternalInstallId: effPlatform?.chainedExternalInstallId,
-          targetInstallDir,
-          steamPlatforms,
-          storePlatforms: {
-            windows: storeFlags.windows,
-            mac: storeFlags.mac,
-          },
-        });
-        const resHostPlatform = res.hostPlatform || hostPlatform;
-        const canUpdateStoreOsFromInstallers =
-          resolvedPlatformId !== 'xbox' &&
-          resolvedPlatformId !== 'ubisoft' &&
-          resolvedPlatformId !== 'ea' &&
-          resolvedPlatformId !== 'rockstar' &&
-          (resolvedPlatformId as string) !== 'riot' &&
-          (resolvedPlatformId === 'steam'
-            ? res.authoritativeOsSupport === true
-            : res.authoritativeOsSupport !== false);
-
-        if (
-          canUpdateStoreOsFromInstallers &&
-          Array.isArray(res.availableInstallers) &&
-          res.availableInstallers.length > 0 &&
-          !res.availableInstallers.every((i) => i.authoritativeOsSupport === false)
-        ) {
-          const hasMac = res.availableInstallers.some((i) => i.os === 'mac');
-          const hasWin = res.availableInstallers.some((i) => i.os === 'windows');
-          if (hasWin || hasMac) {
-            const targetPlat = (game.platforms || []).find(
-              (p) => p.platformId === resolvedPlatformId
-            );
-            if (resHostPlatform === 'win32') {
-              if (targetPlat) {
-                targetPlat.platforms = {
-                  ...targetPlat.platforms,
-                  windows: hasWin,
-                  mac: targetPlat.platforms?.mac ?? false,
-                };
-              }
-            } else {
-              if (targetPlat) {
-                targetPlat.platforms = {
-                  ...targetPlat.platforms,
-                  windows: hasWin,
-                  mac: hasMac,
-                };
-              }
-              if (resolvedPlatformId === 'gog') {
-                saveCachedGogOsSupport(resolvedPlatformGameId, game.title, {
-                  windows: hasWin,
-                  mac: hasMac,
-                });
-              }
-            }
-          }
-        }
-        const info: GameInstallInfo = sanitizeGameInstallInfo({
-          ...res,
-          hostPlatform: resHostPlatform,
-        });
-        this.setCachedInstallInfoEntry(`${game.id}:${resolvedPlatformId}`, info);
-        return info;
-      } catch (err) {
-        console.warn('[LauncherService] getGameInstallInfo fallback:', err);
-      }
-    }
-
-    const storeFolder =
-      resolvedPlatformId === 'gog'
-        ? 'GOG'
-        : resolvedPlatformId === 'epic'
-          ? 'Epic'
-          : resolvedPlatformId === 'xbox'
-            ? 'Xbox'
-            : resolvedPlatformId === 'steam'
-              ? 'Steam'
-              : 'Games';
-    const defaultInstallDir = isWin
-      ? `C:\\Games\\OneLauncher\\${storeFolder}`
-      : `~/Games/OneLauncher/${storeFolder}`;
-    const availableInstallDirs = isWin
-      ? [defaultInstallDir, 'C:\\Games', 'D:\\Games']
-      : [defaultInstallDir, '/Applications'];
-    const diskSpace = (await this.getDiskSpace(targetInstallDir || defaultInstallDir)) || undefined;
-
-    const macFallbackInstallers: NonNullable<GameInstallInfo['availableInstallers']> = [];
-    if (!isWin) {
-      if (storeFlags.mac) {
-        macFallbackInstallers.push({
-          id: `${resolvedPlatformId}-mac-native`,
-          name: `${game.title || 'Game'} — Native macOS Build`,
-          os: 'mac',
-        });
-      }
-      if (storeFlags.windows || macFallbackInstallers.length === 0) {
-        macFallbackInstallers.push({
-          id: `${resolvedPlatformId}-win-compat`,
-          name: `${game.title || 'Game'} — Windows Build (CrossOver / Wine)`,
-          os: 'windows',
-        });
-      }
-    }
-
-    const fallbackInfo: GameInstallInfo = sanitizeGameInstallInfo({
-      platformId: resolvedPlatformId,
-      platformGameId: resolvedPlatformGameId,
-      hostPlatform,
-      defaultInstallDir,
-      availableInstallDirs,
-      availableInstallers: isWin
-        ? [
-            {
-              id: `${resolvedPlatformId}-win-native`,
-              name: `${game.title || 'Game'} — Windows Native Build`,
-              os: 'windows',
-            },
-          ]
-        : macFallbackInstallers,
-      canDirectDownload: resolvedPlatformId === 'gog',
-      requiresStoreClientFallback: resolvedPlatformId !== 'gog',
-      diskSpace,
-    });
-    this.setCachedInstallInfoEntry(`${game.id}:${resolvedPlatformId}`, fallbackInfo);
-    return fallbackInfo;
-  }
-
-  private setCachedInstallInfoEntry(key: string, info: GameInstallInfo): void {
-    if (!key) return;
-    const sanitized = sanitizeGameInstallInfo(info);
-    if (this.installInfoCache.has(key)) {
-      this.installInfoCache.delete(key);
-    }
-    while (this.installInfoCache.size >= LauncherService.MAX_INSTALL_INFO_CACHE_SIZE) {
-      const oldestKey = this.installInfoCache.keys().next().value;
-      if (oldestKey === undefined) break;
-      this.installInfoCache.delete(oldestKey);
-    }
-    this.installInfoCache.set(key, sanitized);
+    return this.downloadManager.getGameInstallInfo(
+      game,
+      platformId,
+      targetInstallDir,
+      this.createDownloadManagerContext()
+    );
   }
 
   public getCachedInstallInfo(
     gameId?: string,
     platformId?: StorefrontId
   ): GameInstallInfo | undefined {
-    if (!gameId) return undefined;
-    if (platformId) {
-      return this.installInfoCache.get(`${gameId}:${platformId}`);
-    }
-    for (const [key, value] of this.installInfoCache.entries()) {
-      if (key.startsWith(`${gameId}:`)) {
-        return value;
-      }
-    }
-    return undefined;
+    return this.downloadManager.getCachedInstallInfo(gameId, platformId);
   }
 
   public launchGame(
     game: CanonicalGame,
     platformId?: StorefrontId
   ): Promise<LauncherActionResult> {
-    if (!game) {
-      return Promise.resolve({ success: false, error: 'No game specified to launch.' });
-    }
-
-    if (this.activeSessions.has(game.id)) {
-      return Promise.resolve({
-        success: true,
-        message: `${game.title} is already running.`,
-        session: this.activeSessions.get(game.id),
-      });
-    }
-
-    const existingFlight = this.inFlightLaunchesByGameId.get(game.id);
-    if (existingFlight) {
-      return existingFlight;
-    }
-
-    const launchFlight = this.executeLaunchGameInternal(game, platformId).finally(() => {
-      if (this.inFlightLaunchesByGameId.get(game.id) === launchFlight) {
-        this.inFlightLaunchesByGameId.delete(game.id);
-      }
-    });
-    this.inFlightLaunchesByGameId.set(game.id, launchFlight);
-    return launchFlight;
-  }
-
-  private async executeLaunchGameInternal(
-    game: CanonicalGame,
-    platformId?: StorefrontId
-  ): Promise<LauncherActionResult> {
-
-    const effPlatform = this.getEffectivePlatformForGame(game, platformId);
-    const resolvedPlatformId: StorefrontId =
-      platformId ||
-      effPlatform?.platformId ||
-      this.getLaunchConfig(game.id)?.preferredPlatformId ||
-      (game.steamAppId ? 'steam' : 'custom');
-
-    const savedLaunchConfig = this.getLaunchConfig(game.id, resolvedPlatformId);
-    const installedRecord = this.getInstalledRecordForGame(game, resolvedPlatformId);
-    const targetPlatformObj =
-      game.platforms.find((p) => p.platformId === resolvedPlatformId) || effPlatform;
-
-    const resolvedPlatformGameId =
-      installedRecord?.platformGameId ||
-      targetPlatformObj?.platformGameId ||
-      (game.steamAppId ? String(game.steamAppId) : game.id);
-
-    const installPath = installedRecord?.installPath || targetPlatformObj?.installPath;
-    const executablePath =
-      savedLaunchConfig?.customExecutablePath ||
-      installedRecord?.executablePath ||
-      targetPlatformObj?.executablePath;
-    const launchArguments =
-      savedLaunchConfig?.launchArguments ||
-      installedRecord?.launchArguments ||
-      targetPlatformObj?.launchArguments;
-    const isWindowsBinaryOnMac =
-      installedRecord?.isWindowsBinaryOnMac ?? targetPlatformObj?.isWindowsBinaryOnMac;
-
-    const xboxProductId = targetPlatformObj?.xboxProductId;
-    const packageFamilyName =
-      installedRecord?.packageFamilyName || targetPlatformObj?.packageFamilyName;
-    const appUserModelId =
-      installedRecord?.appUserModelId || targetPlatformObj?.appUserModelId;
-    const xboxTitleId =
-      installedRecord?.xboxTitleId || targetPlatformObj?.xboxTitleId;
-    const scid = installedRecord?.scid || targetPlatformObj?.scid;
-    const msaAppId = installedRecord?.msaAppId || targetPlatformObj?.msaAppId;
-
-    const preview = this.resolveEffectiveLaunchModePreview(
-      game,
-      resolvedPlatformId,
-      savedLaunchConfig
-    );
-    const isNativeInstalledBuild =
-      preview.detectedBuildType === 'mac_native_app' ||
-      preview.detectedBuildType === 'mac_native_bin' ||
-      preview.detectedBuildType === 'windows_native';
-
-    let launchConfig: GameLaunchConfig | undefined = savedLaunchConfig;
-    if (isNativeInstalledBuild) {
-      if (!savedLaunchConfig) {
-        launchConfig = {
-          gameId: game.id,
-          preferredPlatformId: resolvedPlatformId,
-          launchMethod: preview.defaultLaunchMethod,
-        };
-      } else if (
-        !savedLaunchConfig.launchMethod ||
-        savedLaunchConfig.launchMethod === 'auto' ||
-        savedLaunchConfig.launchMethod === 'custom'
-      ) {
-        launchConfig = {
-          ...savedLaunchConfig,
-          launchMethod: preview.defaultLaunchMethod,
-        };
-      } else if (
-        savedLaunchConfig.launchMethod === 'storefront_uri' &&
-        (resolvedPlatformId === 'gog' ||
-          resolvedPlatformId === 'epic' ||
-          resolvedPlatformId === 'xbox') &&
-        this.installedStorefrontClients[resolvedPlatformId] === false
-      ) {
-        launchConfig = {
-          ...savedLaunchConfig,
-          launchMethod: 'direct',
-        };
-      }
-    }
-
-    if (typeof window !== 'undefined' && window.electronAPI?.launchGame) {
-      try {
-        const res = await window.electronAPI.launchGame({
-          gameId: game.id,
-          title: game.title,
-          platformId: resolvedPlatformId,
-          platformGameId: resolvedPlatformGameId,
-          steamAppId: game.steamAppId,
-          ...(xboxProductId ? { xboxProductId } : {}),
-          packageFamilyName,
-          appUserModelId,
-          xboxTitleId,
-          scid,
-          msaAppId,
-          installPath,
-          executablePath,
-          launchArguments,
-          isWindowsBinaryOnMac,
-          ...(installedRecord?.isCrossPlatformLauncherRuntime !== undefined ||
-          targetPlatformObj?.isCrossPlatformLauncherRuntime !== undefined
-            ? {
-                isCrossPlatformLauncherRuntime:
-                  installedRecord?.isCrossPlatformLauncherRuntime ??
-                  targetPlatformObj?.isCrossPlatformLauncherRuntime,
-              }
-            : {}),
-          ...(installedRecord?.externalStorefrontHandoff ||
-          targetPlatformObj?.externalStorefrontHandoff
-            ? {
-                externalStorefrontHandoff:
-                  installedRecord?.externalStorefrontHandoff ||
-                  targetPlatformObj?.externalStorefrontHandoff,
-              }
-            : {}),
-          ...(installedRecord?.chainedLauncherHandoff || targetPlatformObj?.chainedLauncherHandoff
-            ? {
-                chainedLauncherHandoff:
-                  installedRecord?.chainedLauncherHandoff ||
-                  targetPlatformObj?.chainedLauncherHandoff,
-              }
-            : {}),
-          ...(installedRecord?.chainedExternalInstallId ||
-          targetPlatformObj?.chainedExternalInstallId
-            ? {
-                chainedExternalInstallId:
-                  installedRecord?.chainedExternalInstallId ||
-                  targetPlatformObj?.chainedExternalInstallId,
-              }
-            : {}),
-          launchConfig,
-          performanceSettings: this.getPerformanceSettings(),
-        });
-
-        if (res.success && res.session) {
-          this.activeSessions.set(game.id, res.session);
-          this.syncInGameResourceThrottle();
-          this.notifyStateChanged();
-        }
-        return res;
-      } catch (err: unknown) {
-        return {
-          success: false,
-          error: this.getErrorMessage(err, 'Failed to launch game.'),
-        };
-      }
-    }
-
-    // Browser / Non-Electron fallback
-    const fallbackLaunchMethod =
-      launchConfig?.launchMethod ||
-      preview.resolvedPolicy?.effectiveLaunchMethod ||
-      preview.defaultLaunchMethod ||
-      'storefront_uri';
-    const session: ActiveGameSession = {
-      sessionId: `web-session-${Date.now()}`,
-      gameId: game.id,
-      title: game.title,
-      platformId: resolvedPlatformId,
-      platformGameId: resolvedPlatformGameId,
-      startedAt: new Date().toISOString(),
-      launchMethod: fallbackLaunchMethod,
-      executablePath,
-      status: 'running',
-    };
-
-    this.activeSessions.set(game.id, session);
-    this.syncInGameResourceThrottle();
-    this.notifyStateChanged();
-
-    return {
-      success: true,
-      message: `Launched ${game.title}`,
-      session,
-    };
+    return this.sessionManager.launchGame(game, platformId, this.createSessionManagerContext());
   }
 
   public async stopGame(gameId: string): Promise<LauncherActionResult> {
-    if (typeof window !== 'undefined' && window.electronAPI?.stopGame) {
-      try {
-        const session = this.activeSessions.get(gameId);
-        const res = await window.electronAPI.stopGame({
-          gameId,
-          sessionId: session?.sessionId,
-          pid: session?.pid,
-        });
-        this.activeSessions.delete(gameId);
-        this.syncInGameResourceThrottle();
-        this.notifyStateChanged();
-        return res;
-      } catch (err: unknown) {
-        return {
-          success: false,
-          error: this.getErrorMessage(err, 'Failed to stop game.'),
-        };
-      }
-    }
-
-    const existing = this.activeSessions.get(gameId);
-    if (!existing) {
-      return { success: false, error: 'Game is not currently running.' };
-    }
-
-    this.handleSessionUpdated({
-      session: existing,
-      event: 'stopped',
-      sessionMinutesPlayed: 1,
-      durationSeconds: 60,
-      lastPlayed: new Date().toISOString(),
-    });
-
-    return {
-      success: true,
-      message: `Stopped ${existing.title}`,
-      sessionMinutesPlayed: 1,
-    };
+    return this.sessionManager.stopGame(gameId, this.createSessionManagerContext());
   }
 
   public async toggleSessionFullscreen(
     gameId: string,
     options?: { fullscreen?: boolean; aspectRatio?: GlobalDisplayAspectRatioMode }
   ): Promise<ToggleSessionFullscreenResult> {
-    const active = this.activeSessions.get(gameId);
-
-    if (
-      typeof window !== 'undefined' &&
-      typeof window.electronAPI?.toggleSessionFullscreen === 'function'
-    ) {
-      try {
-        const res = await window.electronAPI.toggleSessionFullscreen({
-          gameId,
-          sessionId: active?.sessionId,
-          ...options,
-        });
-        const latestSession = this.activeSessions.get(gameId);
-        if (latestSession && res && res.success !== false) {
-          const nextFullscreen =
-            typeof res.fullscreenActive === 'boolean'
-              ? res.fullscreenActive
-              : typeof options?.fullscreen === 'boolean'
-                ? options.fullscreen
-                : !latestSession.fullscreenActive;
-          const nextAspect: GlobalDisplayAspectRatioMode | undefined = res.displayAspectRatio
-            ? sanitizeGlobalDisplayAspectRatio(res.displayAspectRatio)
-            : options?.aspectRatio
-              ? sanitizeGlobalDisplayAspectRatio(options.aspectRatio)
-              : latestSession.displayAspectRatio;
-          this.activeSessions.set(gameId, {
-            ...latestSession,
-            fullscreenActive: nextFullscreen,
-            ...(nextAspect ? { displayAspectRatio: nextAspect } : {}),
-          });
-          this.notifyStateChanged();
-        }
-        return res;
-      } catch (err: unknown) {
-        return {
-          success: false,
-          gameId,
-          sessionId: active?.sessionId,
-          error: this.getErrorMessage(err, 'Failed to toggle session fullscreen.'),
-        };
-      }
-    }
-
-    if (!active) {
-      return {
-        success: false,
-        gameId,
-        error: 'Game is not currently running.',
-      };
-    }
-
-    const nextFullscreen =
-      typeof options?.fullscreen === 'boolean' ? options.fullscreen : !active.fullscreenActive;
-    const nextAspect: GlobalDisplayAspectRatioMode = options?.aspectRatio
-      ? sanitizeGlobalDisplayAspectRatio(options.aspectRatio)
-      : active.displayAspectRatio ??
-        sanitizeGlobalDisplayAspectRatio(
-          this.performanceSettings.defaultDisplayAspectRatio
-        );
-
-    this.activeSessions.set(gameId, {
-      ...active,
-      fullscreenActive: nextFullscreen,
-      displayAspectRatio: nextAspect,
-    });
-    this.notifyStateChanged();
-
-    return {
-      success: true,
+    return this.sessionManager.toggleSessionFullscreen(
       gameId,
-      sessionId: active.sessionId,
-      fullscreenActive: nextFullscreen,
-      displayAspectRatio: nextAspect,
-      message: nextFullscreen
-        ? 'Switched bottled game to fullscreen.'
-        : 'Switched bottled game to windowed mode.',
-    };
+      options,
+      this.createSessionManagerContext()
+    );
   }
 
   public async startInstall(request: InstallGameRequest): Promise<LauncherActionResult> {
-    const resolvedTotalBytes = request.totalBytes || request.estimatedSizeBytes;
-    const payload: InstallGameRequest = {
-      ...request,
-      estimatedSizeBytes: request.estimatedSizeBytes,
-      totalBytes: resolvedTotalBytes,
-      ...(request.compatibilityLayer ? { compatibilityLayer: request.compatibilityLayer } : {}),
-      ...(request.wineBottleName ? { wineBottleName: request.wineBottleName } : {}),
-      ...(typeof request.includeDlcs === 'boolean' ? { includeDlcs: request.includeDlcs } : {}),
-      ...(typeof request.preferClientlessExtraction === 'boolean'
-        ? { preferClientlessExtraction: request.preferClientlessExtraction }
-        : {}),
-    };
-
-    if (typeof window !== 'undefined' && window.electronAPI?.installGame) {
-      try {
-        const res = await window.electronAPI.installGame(payload);
-        if (res.success && res.task) {
-          const exists = this.downloadQueue.some((t) => t.taskId === res.task!.taskId);
-          if (!exists) {
-            this.downloadQueue = [...this.downloadQueue, res.task];
-          }
-          this.ensureActiveDownloadPolling();
-          this.notifyStateChanged();
-          this.openDownloadDrawer();
-        }
-        return res;
-      } catch (err: unknown) {
-        return {
-          success: false,
-          error: this.getErrorMessage(err, 'Failed to start installation.'),
-        };
-      }
-    }
-
-    // Web mode fallback task
-    const task: DownloadTaskState = {
-      taskId: `web-dl-${Date.now()}`,
-      gameId: request.gameId,
-      title: request.title,
-      platformId: request.platformId,
-      platformGameId: request.platformGameId,
-      steamAppId: request.steamAppId,
-      headerImage: request.headerImage,
-      installDir: request.installDir,
-      status: 'downloading',
-      progressPercent: 0,
-      bytesDownloaded: 0,
-      totalBytes: resolvedTotalBytes || 250 * 1024 * 1024,
-      speedBytesPerSec: 15 * 1024 * 1024,
-      etaSeconds: 16,
-      statusMessage: `Downloading ${request.title}...`,
-      startedAt: new Date().toISOString(),
-    };
-
-    this.downloadQueue = [...this.downloadQueue, task];
-    this.ensureActiveDownloadPolling();
-    this.notifyStateChanged();
-    this.openDownloadDrawer();
-
-    return {
-      success: true,
-      message: `Started installation for ${request.title}`,
-      task,
-    };
+    return this.downloadManager.startInstall(request, this.createDownloadManagerContext());
   }
 
   public async installGame(request: InstallGameRequest): Promise<LauncherActionResult> {
@@ -3130,80 +1039,19 @@ export class LauncherService {
   }
 
   public async pauseDownload(taskId: string): Promise<LauncherActionResult> {
-    if (typeof window !== 'undefined' && window.electronAPI?.pauseDownload) {
-      const res = await window.electronAPI.pauseDownload(taskId);
-      if (res.task) {
-        this.handleDownloadUpdated({ task: res.task });
-      }
-      return res;
-    }
-
-    const idx = this.downloadQueue.findIndex((t) => t.taskId === taskId);
-    if (idx < 0) return { success: false, error: 'Download task not found.' };
-    const updated: DownloadTaskState = {
-      ...this.downloadQueue[idx],
-      status: 'paused',
-      speedBytesPerSec: 0,
-      statusMessage: 'Download paused',
-    };
-    this.downloadQueue[idx] = updated;
-    this.ensureActiveDownloadPolling();
-    this.notifyStateChanged();
-    return { success: true, task: updated };
+    return this.downloadManager.pauseDownload(taskId, this.createDownloadManagerContext());
   }
 
   public async resumeDownload(taskId: string): Promise<LauncherActionResult> {
-    if (typeof window !== 'undefined' && window.electronAPI?.resumeDownload) {
-      const res = await window.electronAPI.resumeDownload(taskId);
-      if (res.task) {
-        this.handleDownloadUpdated({ task: res.task });
-      }
-      return res;
-    }
-
-    const idx = this.downloadQueue.findIndex((t) => t.taskId === taskId);
-    if (idx < 0) return { success: false, error: 'Download task not found.' };
-    const updated: DownloadTaskState = {
-      ...this.downloadQueue[idx],
-      status: 'downloading',
-      speedBytesPerSec: 15 * 1024 * 1024,
-      statusMessage: 'Resuming download...',
-    };
-    this.downloadQueue[idx] = updated;
-    this.ensureActiveDownloadPolling();
-    this.notifyStateChanged();
-    return { success: true, task: updated };
+    return this.downloadManager.resumeDownload(taskId, this.createDownloadManagerContext());
   }
 
   public async cancelDownload(taskId: string): Promise<LauncherActionResult> {
-    if (typeof window !== 'undefined' && window.electronAPI?.cancelDownload) {
-      const res = await window.electronAPI.cancelDownload(taskId);
-      if (res.task) {
-        this.handleDownloadUpdated({ task: res.task });
-      }
-      return res;
-    }
-
-    const idx = this.downloadQueue.findIndex((t) => t.taskId === taskId);
-    if (idx < 0) return { success: false, error: 'Download task not found.' };
-    const updated: DownloadTaskState = {
-      ...this.downloadQueue[idx],
-      status: 'cancelled',
-      speedBytesPerSec: 0,
-      statusMessage: 'Download cancelled',
-    };
-    this.downloadQueue[idx] = updated;
-    this.ensureActiveDownloadPolling();
-    this.notifyStateChanged();
-    return { success: true, task: updated };
+    return this.downloadManager.cancelDownload(taskId, this.createDownloadManagerContext());
   }
 
   public clearCompletedDownloads(): void {
-    this.downloadQueue = this.downloadQueue.filter(
-      (t) => t.status !== 'completed' && t.status !== 'cancelled' && t.status !== 'failed'
-    );
-    this.ensureActiveDownloadPolling();
-    this.notifyStateChanged();
+    this.downloadManager.clearCompletedDownloads(this.createDownloadManagerContext());
   }
 
   public setManualInstallStatus(
@@ -3211,330 +1059,56 @@ export class LauncherService {
     installed: boolean,
     platformId?: StorefrontId
   ): void {
-    if (!game) return;
-
-    const effPlatform = this.getEffectivePlatformForGame(game, platformId);
-    const resolvedPlatformId: StorefrontId =
-      platformId || effPlatform?.platformId || (game.steamAppId ? 'steam' : 'custom');
-    const resolvedPlatformGameId =
-      effPlatform?.platformGameId || (game.steamAppId ? String(game.steamAppId) : game.id);
-
-    if (installed) {
-      const activeTask = this.getActiveDownload(game.id, resolvedPlatformId);
-      if (activeTask) {
-        if (typeof window !== 'undefined' && window.electronAPI?.cancelDownload) {
-          window.electronAPI.cancelDownload(activeTask.taskId).catch(() => {});
-        }
-        this.downloadQueue = this.downloadQueue.map((t) =>
-          t.gameId === game.id &&
-          (!t.platformId || t.platformId === resolvedPlatformId) &&
-          (t.status === 'queued' ||
-            t.status === 'downloading' ||
-            t.status === 'extracting' ||
-            t.status === 'verifying' ||
-            t.status === 'paused')
-            ? {
-                ...t,
-                status: 'completed',
-                progressPercent: 100,
-                bytesDownloaded: t.totalBytes,
-                speedBytesPerSec: 0,
-                etaSeconds: 0,
-                completedAt: new Date().toISOString(),
-                statusMessage: 'Marked as installed',
-              }
-            : t
-        );
-      }
-
-      const existingIdx = this.installedRecords.findIndex(
-        (r) =>
-          r.platformId === resolvedPlatformId &&
-          String(r.platformGameId) === String(resolvedPlatformGameId)
-      );
-      const sanitizedManualSize = sanitizeGameInstallSizeBytes(
-        effPlatform?.installSize ??
-          (existingIdx >= 0 ? this.installedRecords[existingIdx]?.installSize : undefined)
-      );
-      const record: InstalledGameRecord = {
-        platformId: resolvedPlatformId,
-        platformGameId: String(resolvedPlatformGameId),
-        appId:
-          resolvedPlatformId === 'steam'
-            ? game.steamAppId || Number(resolvedPlatformGameId) || undefined
-            : undefined,
-        packageFamilyName: effPlatform?.packageFamilyName,
-        appUserModelId: effPlatform?.appUserModelId,
-        xboxTitleId: effPlatform?.xboxTitleId,
-        scid: effPlatform?.scid,
-        msaAppId: effPlatform?.msaAppId,
-        title: game.title,
-        installPath: effPlatform?.installPath || '',
-        executablePath: effPlatform?.executablePath,
-        ...(sanitizedManualSize !== undefined ? { installSize: sanitizedManualSize } : {}),
-        runner: 'custom',
-      };
-      if (existingIdx >= 0) {
-        const mergedRecord: InstalledGameRecord = {
-          ...this.installedRecords[existingIdx],
-          ...record,
-        };
-        if (sanitizedManualSize === undefined) {
-          delete mergedRecord.installSize;
-        }
-        this.installedRecords[existingIdx] = mergedRecord;
-      } else {
-        this.installedRecords.push(record);
-      }
-      this.installedIndexMutationSeq++;
-    } else {
-      this.installInfoCache.delete(`${game.id}:${resolvedPlatformId}`);
-      const cfg = this.getLaunchConfig(game.id, resolvedPlatformId);
-      if (cfg?.customExecutablePath) {
-        const { customExecutablePath: _ce, workingDirectory: _wd, ...rest } = cfg;
-        void this.saveLaunchConfig(
-          {
-            ...rest,
-            gameId: game.id,
-            preferredPlatformId: resolvedPlatformId,
-            launchMethod: rest.launchMethod || 'auto',
-          },
-          resolvedPlatformId
-        );
-      }
-      this.installedRecords = this.attachEpicPlatformSupportMetadata(
-        this.installedRecords.filter(
-          (r) =>
-            !(
-              (r.platformId === resolvedPlatformId &&
-                (String(r.platformGameId) === String(resolvedPlatformGameId) ||
-                  (effPlatform?.xboxProductId &&
-                    String(r.platformGameId) === String(effPlatform.xboxProductId)) ||
-                  (effPlatform?.packageFamilyName &&
-                    r.packageFamilyName === effPlatform.packageFamilyName))) ||
-              (resolvedPlatformId === 'steam' &&
-                game.steamAppId &&
-                Number(r.appId || r.platformGameId) === Number(game.steamAppId))
-            )
-        )
-      );
-    }
-
-    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-      window.dispatchEvent(
-        new CustomEvent('antigravity:game-installed', {
-          detail: {
-            gameId: game.id,
-            platformId: resolvedPlatformId,
-            platformGameId: resolvedPlatformGameId,
-            installed,
-          },
-        })
-      );
-    }
-
-    this.ensureActiveDownloadPolling();
-    this.notifyStateChanged();
+    this.installedRegistry.setManualInstallStatus(
+      game,
+      installed,
+      platformId,
+      this.createInstalledRegistryContext()
+    );
   }
 
   public async uninstallGame(
     game: CanonicalGame,
     platformId?: StorefrontId
   ): Promise<LauncherActionResult> {
-    const effPlatform = this.getEffectivePlatformForGame(game, platformId);
-    const rec = this.getInstalledRecordForGame(game, platformId || effPlatform?.platformId);
-    const resolvedPlatformId: StorefrontId =
-      platformId || rec?.platformId || effPlatform?.platformId || 'custom';
-    const resolvedPlatformGameId =
-      rec?.platformGameId || effPlatform?.platformGameId || game.id;
-    const installPath = rec?.installPath || effPlatform?.installPath;
-    const xboxProductId = effPlatform?.xboxProductId;
-    const packageFamilyName = rec?.packageFamilyName || effPlatform?.packageFamilyName;
-    const appUserModelId = rec?.appUserModelId || effPlatform?.appUserModelId;
-
-    let res: LauncherActionResult = {
-      success: true,
-      message: `Uninstalled ${game.title}`,
-    };
-
-    if (typeof window !== 'undefined' && window.electronAPI?.uninstallGame) {
-      res = await window.electronAPI.uninstallGame({
-        gameId: game.id,
-        title: game.title,
-        platformId: resolvedPlatformId,
-        platformGameId: resolvedPlatformGameId,
-        steamAppId: game.steamAppId,
-        ...(xboxProductId ? { xboxProductId } : {}),
-        packageFamilyName,
-        appUserModelId,
-        installPath,
-      });
-    }
-
-    if (res.success) {
-      this.installInfoCache.delete(`${game.id}:${resolvedPlatformId}`);
-      this.installedRecords = this.attachEpicPlatformSupportMetadata(
-        this.installedRecords.filter(
-          (r) =>
-            !(
-              r.platformId === resolvedPlatformId &&
-              (String(r.platformGameId) === String(resolvedPlatformGameId) ||
-                (xboxProductId && String(r.platformGameId) === String(xboxProductId)) ||
-                (packageFamilyName && r.packageFamilyName === packageFamilyName))
-            )
-        )
-      );
-
-      const existingPlatCfg = this.getLaunchConfig(game.id, resolvedPlatformId);
-      if (existingPlatCfg?.customExecutablePath) {
-        const { customExecutablePath: _ce, workingDirectory: _wd, ...restCfg } = existingPlatCfg;
-        await this.saveLaunchConfig(
-          {
-            ...restCfg,
-            gameId: game.id,
-            preferredPlatformId: resolvedPlatformId,
-            launchMethod: restCfg.launchMethod || 'auto',
-          },
-          resolvedPlatformId
-        );
-      }
-
-      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-        window.dispatchEvent(
-          new CustomEvent('antigravity:game-installed', {
-            detail: {
-              gameId: game.id,
-              platformId: resolvedPlatformId,
-              platformGameId: resolvedPlatformGameId,
-              installed: false,
-            },
-          })
-        );
-      }
-
-      this.notifyStateChanged();
-    }
-
-    return res;
+    return this.sessionManager.uninstallGame(
+      game,
+      platformId,
+      this.createSessionManagerContext()
+    );
   }
 
   public async verifyGameFiles(
     game: CanonicalGame,
     platformId?: StorefrontId
   ): Promise<LauncherActionResult> {
-    const effPlatform = this.getEffectivePlatformForGame(game, platformId);
-    const rec = this.getInstalledRecordForGame(game, effPlatform?.platformId);
-    const resolvedPlatformId: StorefrontId =
-      platformId || rec?.platformId || effPlatform?.platformId || 'steam';
-    const resolvedPlatformGameId =
-      rec?.platformGameId || effPlatform?.platformGameId || String(game.steamAppId || game.id);
-    const installPath = rec?.installPath || effPlatform?.installPath;
-
-    if (typeof window !== 'undefined' && window.electronAPI?.verifyGameFiles) {
-      return await window.electronAPI.verifyGameFiles({
-        gameId: game.id,
-        title: game.title,
-        platformId: resolvedPlatformId,
-        platformGameId: resolvedPlatformGameId,
-        steamAppId: game.steamAppId,
-        installPath,
-      });
-    }
-
-    return {
-      success: true,
-      message: `Verified game files for ${game.title}`,
-    };
+    return this.sessionManager.verifyGameFiles(
+      game,
+      platformId,
+      this.createSessionManagerContext()
+    );
   }
 
   public async browseLocalFiles(
     game: CanonicalGame,
     platformId?: StorefrontId
   ): Promise<boolean> {
-    const effPlatform = this.getEffectivePlatformForGame(game, platformId);
-    const resolvedPlatformId = platformId || effPlatform?.platformId;
-    const cfg = this.getLaunchConfig(game.id, resolvedPlatformId);
-    const rec = this.getInstalledRecordForGame(game, resolvedPlatformId);
-    const targetPath =
-      rec?.installPath ||
-      effPlatform?.installPath ||
-      cfg?.workingDirectory ||
-      cfg?.customExecutablePath ||
-      rec?.executablePath;
-
-    if (!targetPath) return false;
-
-    if (typeof window !== 'undefined' && window.electronAPI?.browseLocalFiles) {
-      const res = await window.electronAPI.browseLocalFiles(targetPath);
-      return typeof res === 'boolean' ? res : Boolean(res?.success);
-    }
-
-    return false;
+    return this.sessionManager.browseLocalFiles(
+      game,
+      platformId,
+      this.createSessionManagerContext()
+    );
   }
 
   public async locateInstalledGame(
     game: CanonicalGame,
     platformId?: StorefrontId
   ): Promise<string | null> {
-    const selectedExe = await this.selectExecutable();
-    if (!selectedExe) return null;
-
-    const resolvedPlatformId: StorefrontId =
-      platformId ||
-      this.getLaunchConfig(game.id)?.preferredPlatformId ||
-      game.platforms[0]?.platformId ||
-      'custom';
-
-    const existingCfg = this.getLaunchConfig(game.id, resolvedPlatformId) || {
-      gameId: game.id,
-      launchMethod: 'direct' as LaunchMethod,
-    };
-
-    const normalizedExe = selectedExe.replace(/[\\/]+$/, '');
-    const lastSepIdx = Math.max(normalizedExe.lastIndexOf('/'), normalizedExe.lastIndexOf('\\'));
-    const exeDir = lastSepIdx > 0 ? normalizedExe.slice(0, lastSepIdx) : undefined;
-    const isWinExeOnMac = !this.isWindowsHost() && /\.exe$/i.test(selectedExe);
-
-    let resolvedLaunchMethod: LaunchMethod;
-    if (isWinExeOnMac) {
-      resolvedLaunchMethod =
-        existingCfg.launchMethod === 'compatibility_layer' ? 'compatibility_layer' : 'auto';
-    } else {
-      resolvedLaunchMethod = 'direct';
-    }
-
-    const updatedCfg: GameLaunchConfig = {
-      ...existingCfg,
-      gameId: game.id,
-      preferredPlatformId: resolvedPlatformId,
-      launchMethod: resolvedLaunchMethod,
-      customExecutablePath: selectedExe,
-      ...(exeDir ? { workingDirectory: exeDir } : {}),
-    };
-
-    await this.saveLaunchConfig(updatedCfg, resolvedPlatformId);
-
-    const resolvedPlatformGameId =
-      game.platforms.find((p) => p.platformId === resolvedPlatformId)?.platformGameId || game.id;
-
-    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-      window.dispatchEvent(
-        new CustomEvent('antigravity:game-installed', {
-          detail: {
-            gameId: game.id,
-            platformId: resolvedPlatformId,
-            platformGameId: resolvedPlatformGameId,
-            installPath: exeDir || selectedExe,
-            executablePath: selectedExe,
-            isWindowsBinaryOnMac: isWinExeOnMac,
-            installed: true,
-          },
-        })
-      );
-    }
-
-    this.notifyStateChanged();
-    return selectedExe;
+    return this.sessionManager.locateInstalledGame(
+      game,
+      platformId,
+      this.createSessionManagerContext()
+    );
   }
 
   public async selectExecutable(defaultPath?: string): Promise<string | null> {
@@ -3564,9 +1138,10 @@ export class LauncherService {
   }
 
   public extractStorefrontProfile(
-    config: Partial<GameLaunchConfig | StorefrontLaunchProfile>
+    config: Partial<GameLaunchConfig | StorefrontLaunchProfile>,
+    platformId?: StorefrontId
   ): StorefrontLaunchProfile {
-    return extractStorefrontProfileFromConfig(config);
+    return extractStorefrontProfileFromConfig(config, platformId);
   }
 
   public async saveLaunchConfig(
@@ -3574,10 +1149,8 @@ export class LauncherService {
     platformId?: StorefrontId
   ): Promise<void> {
     if (!config || !config.gameId) return;
-    const nextConfig = buildMergedSaveLaunchConfig(
-      this.launchConfigs[config.gameId],
-      config,
-      platformId
+    const nextConfig = sanitizeGameLaunchConfig(
+      buildMergedSaveLaunchConfig(this.launchConfigs[config.gameId], config, platformId)
     );
 
     this.launchConfigs[config.gameId] = nextConfig;
@@ -3594,10 +1167,7 @@ export class LauncherService {
     this.notifyStateChanged();
   }
 
-  public async resetLaunchConfig(
-    gameId: string,
-    platformId?: StorefrontId
-  ): Promise<void> {
+  public async resetLaunchConfig(gameId: string, platformId?: StorefrontId): Promise<void> {
     if (!gameId) return;
 
     if (platformId && this.launchConfigs[gameId]?.platformConfigs) {
@@ -3608,13 +1178,13 @@ export class LauncherService {
       if (remainingIds.length > 0) {
         const fallbackPlatId = remainingIds[0];
         const fallbackProfile = nextPlatformConfigs[fallbackPlatId] || { launchMethod: 'auto' };
-        const updatedConfig: GameLaunchConfig = {
+        const updatedConfig: GameLaunchConfig = sanitizeGameLaunchConfig({
           gameId,
           preferredPlatformId: fallbackPlatId,
           launchMethod: fallbackProfile.launchMethod || 'auto',
           ...fallbackProfile,
           platformConfigs: nextPlatformConfigs,
-        };
+        });
         this.launchConfigs[gameId] = updatedConfig;
         this.persistLocalConfigs();
 
@@ -3690,9 +1260,7 @@ export class LauncherService {
       preferredPlatformId ||
       draftConfig?.preferredPlatformId ||
       baseConfig?.preferredPlatformId;
-    const savedConfig = game
-      ? this.getLaunchConfig(game.id, targetPlatformId)
-      : undefined;
+    const savedConfig = game ? this.getLaunchConfig(game.id, targetPlatformId) : undefined;
     const installedRecord = game
       ? this.getInstalledRecordForGame(game, targetPlatformId)
       : undefined;
@@ -3704,6 +1272,7 @@ export class LauncherService {
       installedRecord?.platformId ||
       effPlatform?.platformId ||
       (game?.steamAppId ? 'steam' : 'custom');
+    const perfSettings = this.getPerformanceSettings();
 
     return buildEffectiveLaunchModePreview({
       game,
@@ -3717,15 +1286,16 @@ export class LauncherService {
       effPlatform,
       layers: this.getCompatibilityLayers(),
       cachedInstallInfo: this.getCachedInstallInfo(game?.id, platformIdForCache),
-      globalStorefrontLifecycle: this.getPerformanceSettings().storefrontClientLifecycle,
-      installedStorefrontClients: this.installedStorefrontClients,
+      globalStorefrontLifecycle: perfSettings.storefrontClientLifecycle,
+      globalDisplayScalingMode: perfSettings.defaultBottleDisplayScalingMode,
+      globalDisplayAspectRatio: perfSettings.defaultDisplayAspectRatio,
+      globalDefaultPerformanceHud: perfSettings.defaultPerformanceHud,
+      installedStorefrontClients: this.runnerClient.getRawInstalledStorefrontClients(),
     });
   }
 
   public openDownloadDrawer(): void {
-    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-      window.dispatchEvent(new CustomEvent('antigravity:open-download-drawer'));
-    }
+    dispatchOpenDownloadDrawerEvent();
   }
 }
 

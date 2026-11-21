@@ -7,6 +7,19 @@ import {
   SteamCategory,
   SteamLanguageOption,
 } from '../../contracts/steam';
+import { LruMap } from '../common/lruMap';
+import { getSafeLocalStorage, isTestEnv } from '../common/runtimeEnv';
+import { stripHtmlToPlainSynopsis } from '../common/synopsisTextUtils';
+import { getDevProxyBaseForRoute } from '../network/browserDevProxy';
+import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
+import { requestScheduler, RequestPriority } from '../network/requestScheduler';
+import { isIndexedDbAvailable, vaultDelete, vaultGet, vaultSet } from '../storage/indexedDbVault';
+import {
+  evictStagedCache,
+  loadStagedCache,
+  saveStagedCache,
+  STAGED_CACHE_PREFIX,
+} from '../storage/stagedCacheService';
 
 export function getSteamCategoryIconUrl(id: number): string {
   const map: Record<number, string> = {
@@ -38,7 +51,7 @@ export function getSteamCategoryIconUrl(id: number): string {
     47: 'https://store.akamai.steamstatic.com/public/images/v6/ico/ico_multiPlayer.png',
     48: 'https://store.akamai.steamstatic.com/public/images/v6/ico/ico_coop.png',
     49: 'https://store.akamai.steamstatic.com/public/images/v6/ico/ico_multiPlayer.png',
-    51: 'https://store.akamai.steamstatic.com/public/images/v6/ico/ico_cards.png',
+    51: 'https://store.akamai.steamstatic.com/public/images/v6/ico/ico_workshop.png',
     52: 'https://store.akamai.steamstatic.com/public/images/v6/ico/ico_vr_input_motion.png',
     53: 'https://store.akamai.steamstatic.com/public/images/v6/ico/ico_vr_support.png',
     54: 'https://store.akamai.steamstatic.com/public/images/v6/ico/ico_vr_headset.png',
@@ -52,20 +65,9 @@ export function getSteamCategoryIconUrl(id: number): string {
   return map[id] || 'https://store.akamai.steamstatic.com/public/images/v6/ico/ico_singlePlayer.png';
 }
 
-import steamEnrichedCache from '../storage/steamEnrichedCache.json';
-import { requestScheduler, RequestPriority } from '../network/requestScheduler';
-import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
-import { isIndexedDbAvailable, vaultDelete, vaultGet, vaultSet } from '../storage/indexedDbVault';
-import {
-  evictStagedCache,
-  loadStagedCache,
-  saveStagedCache,
-  STAGED_CACHE_PREFIX,
-} from '../storage/stagedCacheService';
-import { stripHtmlToPlainSynopsis } from '../common/synopsisTextUtils';
-
 const STEAM_APPDETAILS_404_KEY_PREFIX = `${STAGED_CACHE_PREFIX}steam_appdetails_404_v1_`;
 const STEAM_APPDETAILS_404_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const BROWSE_ASSETS_SAVE_DEBOUNCE_MS = 200;
 
 /**
  * Truncates rich store HTML at a safe tag/entity/container boundary so `<img ...>`,
@@ -93,7 +95,7 @@ export function truncateHtmlSafely(rawHtml: string, maxChars: number = 35000): s
       const idx = lowerCut.lastIndexOf(openNeedle, searchFrom - 1);
       if (idx === -1) break;
       const nextCh = lowerCut[idx + openNeedle.length];
-      if (!nextCh || /[\s>\/]/.test(nextCh)) {
+      if (!nextCh || /[\s>/]/.test(nextCh)) {
         const closeIdx = lowerCut.indexOf(`</${tag}>`, idx);
         if (closeIdx === -1) {
           earliestUnclosedIdx =
@@ -139,7 +141,7 @@ export function isNonEnglishRegionalMovieName(name?: string): boolean {
 
   // 2a. Explicit hyphenated regional locale pairs (unambiguous across case)
   if (
-    /(?:^|[\s_\-[(\/])(?:PT-BR|ES-MX|ES-AR|ES-419|FR-CA|ZH-CN|ZH-TW|ZH-HANS|ZH-HANT)(?:$|[\s_\-\])\/.])/i.test(
+    /(?:^|[\s_\-[(/])(?:PT-BR|ES-MX|ES-AR|ES-419|FR-CA|ZH-CN|ZH-TW|ZH-HANS|ZH-HANT)(?:$|[\s_\-\])/.])/i.test(
       trimmed
     )
   ) {
@@ -148,17 +150,16 @@ export function isNonEnglishRegionalMovieName(name?: string): boolean {
 
   // 2b. Bracketed or parenthesized regional ISO tags, e.g. "[ES]", "(ITA)", "(FR)", "[DE]"
   if (
-    /[\[(]\s*(?:IT|ITA|FR|FRA|FRE|DE|DEU|GER|ES|ESP|SPA|PT|POR|BR|PTBR|RU|RUS|PL|POL|JP|JPN|KR|KOR|CN|CHN|ZH|ZHS|ZHT|TW|CHT|CHS|TR|TUR|ARA|LATAM)\s*[\])]/i.test(
+    /[[(]\s*(?:IT|ITA|FR|FRA|FRE|DE|DEU|GER|ES|ESP|SPA|PT|POR|BR|PTBR|RU|RUS|PL|POL|JP|JPN|KR|KOR|CN|CHN|ZH|ZHS|ZHT|TW|CHT|CHS|TR|TUR|ARA|LATAM)\s*[\])]/i.test(
       trimmed
     )
   ) {
     return true;
   }
 
-  // 2c. Case-sensitive uppercase ISO tags delimited by underscores, slashes, or hyphen separators in production trailer filenames
-  // e.g. "Wolfenstein II_Launch Trailer_IT_PEGI", "12_RE9_LaunchPV_Multi_IT_FullHD_PEGI.mp4", "Launch_Trailer_FR_1080p", "Trailer - DE"
+  // 2c. Case-sensitive uppercase ISO tags delimited by underscores, slashes, or hyphen separators
   if (
-    /(?:_|\/|\s-\s)(?:IT|ITA|FR|FRA|FRE|DE|DEU|GER|ES|ESP|SPA|PT|POR|BR|PTBR|RU|RUS|PL|POL|JP|JPN|KR|KOR|CN|CHN|ZH|ZHS|ZHT|TW|CHT|CHS|TR|TUR|ARA|LATAM)(?=$|[_\-\/\])\s.])/.test(
+    /(?:_|\/|\s-\s)(?:IT|ITA|FR|FRA|FRE|DE|DEU|GER|ES|ESP|SPA|PT|POR|BR|PTBR|RU|RUS|PL|POL|JP|JPN|KR|KOR|CN|CHN|ZH|ZHS|ZHT|TW|CHT|CHS|TR|TUR|ARA|LATAM)(?=$|[_\-/\]\s.)])/.test(
       trimmed
     )
   ) {
@@ -193,7 +194,9 @@ export function filterEnglishMovies<T extends { name?: string }>(movies?: T[] | 
  */
 export function parseSteamLanguageTableHtml(html?: string): SteamLanguageOption[] {
   if (!html || typeof html !== 'string') return [];
-  const tableMatch = html.match(/<table[^>]*class=["'][^"']*game_language_options[^"']*["'][^>]*>[\s\S]*?<\/table>/i);
+  const tableMatch = html.match(
+    /<table[^>]*class=["'][^"']*game_language_options[^"']*["'][^>]*>[\s\S]*?<\/table>/i
+  );
   if (!tableMatch) return [];
 
   const rows = tableMatch[0].match(/<tr[\s\S]*?<\/tr>/gi) || [];
@@ -289,6 +292,12 @@ const STORAGE_KEY_BROWSE_ASSETS = 'antigravity_steam_browse_assets_v1';
 const BROWSE_ASSETS_BATCH_CHUNK_SIZE = 80;
 const MAX_BROWSE_ASSETS_CACHE_ENTRIES = 5000;
 
+/**
+ * Projects a full `SteamEnrichedMetadata` entry into a lightweight synopsis/filter digest
+ * when evicted from the 60-entry hot detail LRU. Explicitly stamps `__digestOnly: true`,
+ * demotes `metadataQuality` to `'skeleton_fallback'`, and strips `fetchedAt` so callers and
+ * `needsOnlineUpgrade` NEVER mistake a hollow digest for full Rank-4 authoritative metadata.
+ */
 function toLightweightSteamDigest(meta: SteamEnrichedMetadata): SteamEnrichedMetadata {
   return {
     appId: meta.appId,
@@ -315,71 +324,132 @@ function toLightweightSteamDigest(meta: SteamEnrichedMetadata): SteamEnrichedMet
     metacritic: meta.metacritic,
     platforms: meta.platforms,
     xboxDeliveryHints: meta.xboxDeliveryHints,
-    metadataQuality: meta.metadataQuality,
+    metadataQuality: 'skeleton_fallback',
     enrichedSource: meta.enrichedSource,
-    fetchedAt: meta.fetchedAt,
+    __digestOnly: true,
   };
+}
+
+const activeSteamApiInstances = new Set<SteamApiService>();
+let steamApiBeforeUnloadAttached = false;
+
+function registerSteamApiUnloadFlush(instance: SteamApiService): void {
+  activeSteamApiInstances.add(instance);
+  if (steamApiBeforeUnloadAttached) return;
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    steamApiBeforeUnloadAttached = true;
+    try {
+      window.addEventListener('beforeunload', () => {
+        for (const svc of activeSteamApiInstances) {
+          svc.flushBrowseAssetsSave();
+        }
+      });
+    } catch {
+      // Ignore partial window mocks in unit tests
+    }
+  }
 }
 
 export class SteamApiService {
   public static readonly MAX_METADATA_CACHE_ENTRIES = 60;
   public static readonly MAX_METADATA_CACHE_SIZE = 60;
   private static readonly MAX_DIGEST_CACHE_SIZE = 4096;
-  private static readonly staticEnrichedMemo = new Map<number, SteamEnrichedMetadata | null>();
-  private cache = new Map<number, SteamEnrichedMetadata>();
-  private digestCache = new Map<number, SteamEnrichedMetadata>();
-  private rateLimitedUntil = 0;
-  private browseAssetsCache = new Map<number, SteamStoreBrowseAssets>();
-  private inFlightBrowseAssets = new Map<number, Promise<SteamStoreBrowseAssets | null>>();
-  private browseCacheLoaded = false;
 
-  private setBrowseAssetsEntry(appId: number, entry: SteamStoreBrowseAssets): void {
-    if (this.browseAssetsCache.has(appId)) {
-      this.browseAssetsCache.delete(appId);
-    }
-    this.browseAssetsCache.set(appId, entry);
-    while (this.browseAssetsCache.size > MAX_BROWSE_ASSETS_CACHE_ENTRIES) {
-      const oldestKey = this.browseAssetsCache.keys().next().value;
-      if (oldestKey === undefined) break;
-      this.browseAssetsCache.delete(oldestKey);
-    }
+  private cache = new LruMap<number, SteamEnrichedMetadata>(SteamApiService.MAX_METADATA_CACHE_SIZE);
+  private digestCache = new LruMap<number, SteamEnrichedMetadata>(
+    SteamApiService.MAX_DIGEST_CACHE_SIZE
+  );
+  private rateLimitedUntil = 0;
+
+  private browseAssetsCache = new LruMap<number, SteamStoreBrowseAssets>(
+    MAX_BROWSE_ASSETS_CACHE_ENTRIES
+  );
+  private inFlightBrowseAssets = new Map<number, Promise<SteamStoreBrowseAssets | null>>();
+  private inFlightMetadata = new Map<string, Promise<SteamEnrichedMetadata | null>>();
+  private browseCacheLoaded = false;
+  private browseVaultHydrationState: 'idle' | 'pending' | 'done' = 'idle';
+  private browseVaultHydrationPromise: Promise<number> | null = null;
+  private pendingBrowseAssetsSaveAfterHydration = false;
+  private pendingBrowseAssetsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private evictedBrowseAssetIds = new Set<number>();
+
+  constructor() {
+    registerSteamApiUnloadFlush(this);
   }
 
+  private setBrowseAssetsEntry(appId: number, entry: SteamStoreBrowseAssets): void {
+    this.evictedBrowseAssetIds.delete(appId);
+    this.browseAssetsCache.set(appId, entry);
+  }
+
+  /**
+   * Hydrates browse assets from IndexedDB vault and merges with any newer in-memory entries.
+   * Implements the P0-9 hydration-before-write barrier so early writes never clobber IDB.
+   */
   public async hydrateBrowseAssetsFromVault(): Promise<number> {
     if (typeof window === 'undefined') return 0;
-    try {
-      const vaultData = await vaultGet<Record<string, SteamStoreBrowseAssets>>(
-        STORAGE_KEY_BROWSE_ASSETS
-      );
-      if (!vaultData || typeof vaultData !== 'object' || Array.isArray(vaultData)) return 0;
+    if (this.browseVaultHydrationState === 'done') return 0;
+    if (this.browseVaultHydrationPromise) {
+      return this.browseVaultHydrationPromise;
+    }
+
+    this.browseVaultHydrationState = 'pending';
+    let flight: Promise<number> | null = null;
+    flight = (async (): Promise<number> => {
       let loaded = 0;
-      for (const [k, v] of Object.entries(vaultData)) {
-        const id = Number(k);
-        if (
-          Number.isFinite(id) &&
-          id > 0 &&
-          v &&
-          typeof v === 'object' &&
-          !this.browseAssetsCache.has(id)
-        ) {
-          if (v.capsuleImage || v.headerImage || v.iconUrl) {
-            this.setBrowseAssetsEntry(id, v);
-            loaded++;
+      try {
+        const vaultData = await vaultGet<Record<string, SteamStoreBrowseAssets>>(
+          STORAGE_KEY_BROWSE_ASSETS
+        );
+        if (vaultData && typeof vaultData === 'object' && !Array.isArray(vaultData)) {
+          for (const [k, v] of Object.entries(vaultData)) {
+            const id = Number(k);
+            if (
+              Number.isFinite(id) &&
+              id > 0 &&
+              !this.evictedBrowseAssetIds.has(id) &&
+              v &&
+              typeof v === 'object' &&
+              !this.browseAssetsCache.has(id)
+            ) {
+              if (v.capsuleImage || v.headerImage || v.iconUrl) {
+                this.browseAssetsCache.set(id, v);
+                loaded++;
+              }
+            }
           }
         }
+        this.browseVaultHydrationState = 'done';
+        if (this.pendingBrowseAssetsSaveAfterHydration) {
+          this.pendingBrowseAssetsSaveAfterHydration = false;
+          this.writeBrowseAssetsSnapshot(true);
+        }
+        return loaded;
+      } catch {
+        this.browseVaultHydrationState = 'done';
+        if (this.pendingBrowseAssetsSaveAfterHydration) {
+          this.pendingBrowseAssetsSaveAfterHydration = false;
+          this.writeBrowseAssetsSnapshot(true);
+        }
+        return loaded;
+      } finally {
+        if (this.browseVaultHydrationPromise === flight) {
+          this.browseVaultHydrationPromise = null;
+        }
       }
-      return loaded;
-    } catch {
-      return 0;
-    }
+    })();
+
+    this.browseVaultHydrationPromise = flight;
+    return flight;
   }
 
   private loadBrowseAssetsCache(): void {
     if (this.browseCacheLoaded) return;
     this.browseCacheLoaded = true;
     try {
-      if (typeof localStorage !== 'undefined') {
-        const raw = localStorage.getItem(STORAGE_KEY_BROWSE_ASSETS);
+      const storage = getSafeLocalStorage();
+      if (storage) {
+        const raw = storage.getItem(STORAGE_KEY_BROWSE_ASSETS);
         if (raw) {
           const parsed: unknown = JSON.parse(raw);
           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -403,7 +473,7 @@ export class SteamApiService {
     }
   }
 
-  private saveBrowseAssetsCache(): void {
+  private buildBrowseAssetsSnapshot(): Record<string, SteamStoreBrowseAssets> {
     const obj: Record<string, SteamStoreBrowseAssets> = {};
     const entries = Array.from(this.browseAssetsCache.entries()).slice(
       -MAX_BROWSE_ASSETS_CACHE_ENTRIES
@@ -413,25 +483,63 @@ export class SteamApiService {
         obj[String(k)] = v;
       }
     }
-    let mirroredToVault = false;
-    try {
-      if (typeof localStorage !== 'undefined') {
-        localStorage.setItem(STORAGE_KEY_BROWSE_ASSETS, JSON.stringify(obj));
+    return obj;
+  }
+
+  private writeBrowseAssetsSnapshot(allowDirectIdbWrite: boolean): void {
+    const obj = this.buildBrowseAssetsSnapshot();
+    const storage = getSafeLocalStorage();
+    let localWriteFailed = false;
+    if (storage) {
+      try {
+        storage.setItem(STORAGE_KEY_BROWSE_ASSETS, JSON.stringify(obj));
+      } catch {
+        localWriteFailed = true;
       }
-    } catch {
-      // Quota fallback: mirror the full 5,000-entry browse asset cache into IndexedDB vault
-      mirroredToVault = true;
-      void vaultSet(STORAGE_KEY_BROWSE_ASSETS, obj);
     }
-    if (!mirroredToVault && isIndexedDbAvailable()) {
-      void vaultSet(STORAGE_KEY_BROWSE_ASSETS, obj);
+
+    if (
+      allowDirectIdbWrite &&
+      (this.browseVaultHydrationState === 'done' || !isIndexedDbAvailable())
+    ) {
+      if (localWriteFailed || isIndexedDbAvailable()) {
+        void vaultSet(STORAGE_KEY_BROWSE_ASSETS, obj);
+      }
+    } else if (isIndexedDbAvailable()) {
+      // Hydration-before-write barrier: defer IDB write until existing IDB entries are merged
+      this.pendingBrowseAssetsSaveAfterHydration = true;
+      void this.hydrateBrowseAssetsFromVault();
+    }
+  }
+
+  private scheduleBrowseAssetsSave(immediate = false): void {
+    if (immediate || isTestEnv()) {
+      if (this.pendingBrowseAssetsSaveTimer !== null) {
+        clearTimeout(this.pendingBrowseAssetsSaveTimer);
+        this.pendingBrowseAssetsSaveTimer = null;
+      }
+      this.writeBrowseAssetsSnapshot(true);
+      return;
+    }
+    if (this.pendingBrowseAssetsSaveTimer !== null) return;
+    this.pendingBrowseAssetsSaveTimer = setTimeout(() => {
+      this.pendingBrowseAssetsSaveTimer = null;
+      this.writeBrowseAssetsSnapshot(true);
+    }, BROWSE_ASSETS_SAVE_DEBOUNCE_MS);
+  }
+
+  public flushBrowseAssetsSave(): void {
+    if (this.pendingBrowseAssetsSaveTimer !== null) {
+      clearTimeout(this.pendingBrowseAssetsSaveTimer);
+      this.pendingBrowseAssetsSaveTimer = null;
+      this.writeBrowseAssetsSnapshot(true);
     }
   }
 
   public getStoreBrowseAssetsInstant(appId?: number | null): SteamStoreBrowseAssets | null {
     if (!appId || appId <= 0) return null;
     this.loadBrowseAssetsCache();
-    return this.browseAssetsCache.get(appId) || null;
+    return this.browseAssetsCache.peek(appId) || null;
   }
 
   public peekCachedBrowseAssets(appId?: number | null): SteamStoreBrowseAssets | null {
@@ -444,16 +552,14 @@ export class SteamApiService {
     this.digestCache.delete(appId);
     void vaultDelete(`enriched_metadata:${appId}`);
     this.loadBrowseAssetsCache();
+    this.evictedBrowseAssetIds.add(appId);
     if (this.browseAssetsCache.delete(appId)) {
-      this.saveBrowseAssetsCache();
+      this.scheduleBrowseAssetsSave();
     }
   }
 
   private getSteamWebApiBaseUrl(): string {
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      return '/api/steam-api';
-    }
-    return 'https://api.steampowered.com';
+    return getDevProxyBaseForRoute('steamApi');
   }
 
   private parseStoreBrowseItemAssets(
@@ -548,7 +654,7 @@ export class SteamApiService {
           return cached || null;
         }
         this.setBrowseAssetsEntry(appId, resolved);
-        this.saveBrowseAssetsCache();
+        this.scheduleBrowseAssetsSave();
 
         if (typeof window !== 'undefined') {
           window.dispatchEvent(
@@ -571,7 +677,8 @@ export class SteamApiService {
 
   /**
    * Batch-resolves 2x SHA1-hashed Steam library covers, headers, and community icons
-   * for up to 80 AppIDs per IStoreBrowseService/GetItems/v1 GET request.
+   * for up to 80 AppIDs per IStoreBrowseService/GetItems/v1 GET request, coalescing
+   * concurrent requests across overlapping AppIDs via `inFlightBrowseAssets`.
    */
   public async fetchStoreBrowseAssetsBatch(
     appIds: number[],
@@ -582,7 +689,10 @@ export class SteamApiService {
 
     this.loadBrowseAssetsCache();
     const missing: number[] = [];
+    const awaitingInFlight: Array<{ id: number; promise: Promise<SteamStoreBrowseAssets | null> }> =
+      [];
     const seen = new Set<number>();
+
     for (const rawId of appIds) {
       const id = Number(rawId);
       if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
@@ -591,98 +701,128 @@ export class SteamApiService {
       if (cached && cached.capsuleImage) {
         result.set(id, cached);
       } else {
-        missing.push(id);
+        const existingFlight = this.inFlightBrowseAssets.get(id);
+        if (existingFlight) {
+          awaitingInFlight.push({ id, promise: existingFlight });
+        } else {
+          missing.push(id);
+        }
       }
     }
 
-    if (missing.length === 0 || !onlineLifecycleManager.isOnline()) {
-      return result;
-    }
-
-    let updatedAny = false;
-    for (let offset = 0; offset < missing.length; offset += BROWSE_ASSETS_BATCH_CHUNK_SIZE) {
-      if (!onlineLifecycleManager.isOnline()) break;
-      const chunk = missing.slice(offset, offset + BROWSE_ASSETS_BATCH_CHUNK_SIZE);
-      try {
-        const inputJson = JSON.stringify({
-          ids: chunk.map((appid) => ({ appid })),
-          context: { language: 'english', country_code: 'US' },
-          data_request: { include_assets: true },
+    if (missing.length > 0 && onlineLifecycleManager.isOnline()) {
+      // Register per-AppID deferred promises so concurrent batch/single calls coalesce cleanly
+      const resolvers = new Map<number, (val: SteamStoreBrowseAssets | null) => void>();
+      for (const id of missing) {
+        const deferred = new Promise<SteamStoreBrowseAssets | null>((resolve) => {
+          resolvers.set(id, resolve);
         });
-        const url = `${this.getSteamWebApiBaseUrl()}/IStoreBrowseService/GetItems/v1/?input_json=${encodeURIComponent(
-          inputJson
-        )}`;
-        const res = await requestScheduler.schedule(
-          url,
-          () => axios.get(url, { timeout: 8000 }),
-          priority,
-          'api.steampowered.com'
-        );
-        const storeItems = res?.data?.response?.store_items;
-        if (Array.isArray(storeItems)) {
-          for (const item of storeItems) {
-            const itemAppId = Number(item?.appid ?? item?.id);
-            if (!Number.isFinite(itemAppId) || itemAppId <= 0) continue;
-            const prevCached = this.browseAssetsCache.get(itemAppId);
-            const resolved = this.parseStoreBrowseItemAssets(itemAppId, item?.assets, prevCached);
-            if (resolved && resolved !== prevCached) {
-              this.setBrowseAssetsEntry(itemAppId, resolved);
-              result.set(itemAppId, resolved);
-              updatedAny = true;
-              if (typeof window !== 'undefined') {
-                try {
-                  window.dispatchEvent(
-                    new CustomEvent('antigravity:steam-assets-resolved', {
-                      detail: { appId: itemAppId, ...resolved },
-                    })
-                  );
-                } catch {}
+        this.inFlightBrowseAssets.set(id, deferred);
+      }
+
+      let updatedAny = false;
+      try {
+        for (let offset = 0; offset < missing.length; offset += BROWSE_ASSETS_BATCH_CHUNK_SIZE) {
+          if (!onlineLifecycleManager.isOnline()) break;
+          const chunk = missing.slice(offset, offset + BROWSE_ASSETS_BATCH_CHUNK_SIZE);
+          try {
+            const inputJson = JSON.stringify({
+              ids: chunk.map((appid) => ({ appid })),
+              context: { language: 'english', country_code: 'US' },
+              data_request: { include_assets: true },
+            });
+            const url = `${this.getSteamWebApiBaseUrl()}/IStoreBrowseService/GetItems/v1/?input_json=${encodeURIComponent(
+              inputJson
+            )}`;
+            const res = await requestScheduler.schedule(
+              url,
+              () => axios.get(url, { timeout: 8000 }),
+              priority,
+              'api.steampowered.com'
+            );
+            const storeItems = res?.data?.response?.store_items;
+            if (Array.isArray(storeItems)) {
+              for (const item of storeItems) {
+                const itemAppId = Number(item?.appid ?? item?.id);
+                if (!Number.isFinite(itemAppId) || itemAppId <= 0) continue;
+                const prevCached = this.browseAssetsCache.peek(itemAppId);
+                const resolved = this.parseStoreBrowseItemAssets(
+                  itemAppId,
+                  item?.assets,
+                  prevCached
+                );
+                if (resolved && resolved !== prevCached) {
+                  this.setBrowseAssetsEntry(itemAppId, resolved);
+                  result.set(itemAppId, resolved);
+                  updatedAny = true;
+                  if (typeof window !== 'undefined') {
+                    try {
+                      window.dispatchEvent(
+                        new CustomEvent('antigravity:steam-assets-resolved', {
+                          detail: { appId: itemAppId, ...resolved },
+                        })
+                      );
+                    } catch {
+                      // Ignore event dispatch errors in non-DOM runtimes
+                    }
+                  }
+                }
               }
             }
+          } catch {
+            // Best-effort batch enrichment; preserve already-cached items
           }
         }
-      } catch {
-        // Best-effort batch enrichment; preserve already-cached items
+
+        if (updatedAny) {
+          this.scheduleBrowseAssetsSave(true);
+        }
+      } finally {
+        for (const id of missing) {
+          const resolve = resolvers.get(id);
+          this.inFlightBrowseAssets.delete(id);
+          resolve?.(result.get(id) || this.browseAssetsCache.peek(id) || null);
+        }
       }
     }
 
-    if (updatedAny) {
-      this.saveBrowseAssetsCache();
+    if (awaitingInFlight.length > 0) {
+      const settled = await Promise.all(awaitingInFlight.map((entry) => entry.promise));
+      for (let i = 0; i < awaitingInFlight.length; i++) {
+        const asset = settled[i];
+        if (asset) {
+          result.set(awaitingInFlight[i].id, asset);
+        }
+      }
     }
+
     return result;
   }
 
-  private get metadataCache(): Map<number, SteamEnrichedMetadata> {
+  private get metadataCache(): LruMap<number, SteamEnrichedMetadata> {
     return this.cache;
   }
 
   private setDigestCacheEntry(appId: number, value: SteamEnrichedMetadata): void {
-    if (this.digestCache.has(appId)) {
-      this.digestCache.delete(appId);
-    }
     this.digestCache.set(appId, toLightweightSteamDigest(value));
-    while (this.digestCache.size > SteamApiService.MAX_DIGEST_CACHE_SIZE) {
-      const oldestKey = this.digestCache.keys().next().value;
-      if (oldestKey === undefined) break;
-      this.digestCache.delete(oldestKey);
-    }
   }
 
   private setCacheEntry(appId: number, value: SteamEnrichedMetadata): void {
-    if (this.metadataCache.has(appId)) {
-      this.metadataCache.delete(appId);
-    }
     this.digestCache.delete(appId);
-    this.metadataCache.set(appId, value);
-    while (this.metadataCache.size > SteamApiService.MAX_METADATA_CACHE_SIZE) {
+    if (
+      !this.metadataCache.has(appId) &&
+      this.metadataCache.size >= SteamApiService.MAX_METADATA_CACHE_SIZE
+    ) {
       const oldestKey = this.metadataCache.keys().next().value;
-      if (oldestKey === undefined) break;
-      const evicted = this.metadataCache.get(oldestKey);
-      this.metadataCache.delete(oldestKey);
-      if (evicted) {
-        this.setDigestCacheEntry(oldestKey, evicted);
+      if (oldestKey !== undefined) {
+        const evicted = this.metadataCache.peek(oldestKey);
+        this.metadataCache.delete(oldestKey);
+        if (evicted) {
+          this.setDigestCacheEntry(oldestKey, evicted);
+        }
       }
     }
+    this.metadataCache.set(appId, value);
   }
 
   public trimMemoryCache(maxEntries: number = 30): void {
@@ -690,17 +830,40 @@ export class SteamApiService {
     while (this.metadataCache.size > limit) {
       const oldestKey = this.metadataCache.keys().next().value;
       if (oldestKey === undefined) break;
-      const evicted = this.metadataCache.get(oldestKey);
+      const evicted = this.metadataCache.peek(oldestKey);
       this.metadataCache.delete(oldestKey);
       if (evicted) {
-        // Retain lightweight synopsis/developer/year digest so diagnostics & filters never thrash
+        // Retain lightweight __digestOnly synopsis/developer/year digest so diagnostics & filters never thrash
         this.setDigestCacheEntry(oldestKey, evicted);
       }
     }
   }
 
+  private recordStoreRateLimitIfNeeded(err: unknown): boolean {
+    const errObj =
+      err && typeof err === 'object'
+        ? (err as { response?: { status?: number }; isRateLimited?: boolean })
+        : undefined;
+    const status = errObj?.response?.status;
+    if (
+      onlineLifecycleManager.isOnline() &&
+      (status === 403 || status === 429 || errObj?.isRateLimited)
+    ) {
+      // Akamai CDN edge rate limit: pause storefront web requests for 15 minutes
+      this.rateLimitedUntil = Date.now() + 15 * 60 * 1000;
+      requestScheduler.setCooldown('store.steampowered.com', 900);
+      console.warn(
+        `[Steam API] Akamai edge cooldown encountered (${status || 429}). Pausing web requests to store.steampowered.com for 15 minutes to allow IP cooldown to clear.`
+      );
+      return true;
+    }
+    return false;
+  }
+
   isStoreRateLimited(): boolean {
-    return Date.now() < this.rateLimitedUntil || requestScheduler.isRateLimited('store.steampowered.com');
+    return (
+      Date.now() < this.rateLimitedUntil || requestScheduler.isRateLimited('store.steampowered.com')
+    );
   }
 
   getCooldownRemainingSeconds(): number {
@@ -710,50 +873,24 @@ export class SteamApiService {
   }
 
   private getBaseUrl(): string {
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      return '/api/steam-store';
-    }
-    return 'https://store.steampowered.com';
+    return getDevProxyBaseForRoute('steamStore');
   }
 
-  getCachedMetadata(appId: number): SteamEnrichedMetadata | null {
+  getCachedMetadata(
+    appId: number,
+    options?: { includeDigest?: boolean }
+  ): SteamEnrichedMetadata | null {
     if (!appId || appId <= 0) return null;
-    if (this.metadataCache.has(appId)) {
-      const hit = this.metadataCache.get(appId)!;
-      this.setCacheEntry(appId, hit);
+    const hit = this.metadataCache.get(appId);
+    if (hit) {
       return hit;
     }
-    if (this.digestCache.has(appId)) {
-      return this.digestCache.get(appId)!;
+    if (options?.includeDigest !== false) {
+      const digest = this.digestCache.get(appId);
+      if (digest) {
+        return digest;
+      }
     }
-    if (SteamApiService.staticEnrichedMemo.has(appId)) {
-      return SteamApiService.staticEnrichedMemo.get(appId) ?? null;
-    }
-    const preCached = (
-      steamEnrichedCache as Record<string, (Partial<SteamEnrichedMetadata> & { library_capsule?: string }) | undefined>
-    )[String(appId)];
-    if (preCached && preCached.shortDescription) {
-      const languageOptions =
-        Array.isArray(preCached.languageOptions) && preCached.languageOptions.length > 0
-          ? preCached.languageOptions
-          : preCached.supportedLanguages
-          ? parseSteamSupportedLanguagesString(preCached.supportedLanguages)
-          : undefined;
-      const built: SteamEnrichedMetadata = {
-        ...(preCached as SteamEnrichedMetadata),
-        appId,
-        shortDescription: stripHtmlToPlainSynopsis(preCached.shortDescription),
-        movies: filterEnglishMovies<SteamMovie>(preCached.movies || []).slice(0, 4),
-        screenshots: Array.isArray(preCached.screenshots) ? preCached.screenshots.slice(0, 12) : [],
-        languageOptions,
-        languageTableSchema: preCached.languageTableSchema || 'steam',
-        metadataQuality: preCached.metadataQuality || 'authoritative',
-        enrichedSource: 'steam',
-      };
-      SteamApiService.staticEnrichedMemo.set(appId, built);
-      return built;
-    }
-    SteamApiService.staticEnrichedMemo.set(appId, null);
     return null;
   }
 
@@ -763,7 +900,7 @@ export class SteamApiService {
     detailQuality?: string
   ): meta is SteamEnrichedMetadata {
     if (!meta || typeof meta !== 'object') return false;
-    if (meta.__quotaSlimmed === true) return false;
+    if (meta.__quotaSlimmed === true || meta.__digestOnly === true) return false;
     if (!(meta.name || meta.shortDescription || meta.aboutTheGame || meta.detailedDescription)) {
       return false;
     }
@@ -801,10 +938,12 @@ export class SteamApiService {
             enrichedSource: fromIdb.enrichedSource || 'steam',
           };
         }
-        // Evict poisoned/storefront_native entry stored under a Steam AppID key
+        // Evict poisoned/storefront_native/digest entry stored under a Steam AppID key
         void vaultDelete(`enriched_metadata:${appId}`);
       }
-    } catch {}
+    } catch {
+      // Ignore IDB read errors
+    }
 
     if (typeof window !== 'undefined' && window.electronAPI?.offlineVault?.getGameDetail) {
       try {
@@ -826,7 +965,9 @@ export class SteamApiService {
           void vaultSet(`enriched_metadata:${appId}`, sanitized);
           return sanitized;
         }
-      } catch {}
+      } catch {
+        // Ignore SQLite vault read errors
+      }
     }
 
     return null;
@@ -846,7 +987,9 @@ export class SteamApiService {
             enrichedAt: metadata.fetchedAt || Date.now(),
           })
           ?.catch?.(() => {});
-      } catch {}
+      } catch {
+        // Ignore SQLite vault write errors
+      }
     }
   }
 
@@ -855,12 +998,13 @@ export class SteamApiService {
     expectMacRequirements: boolean = false
   ): boolean {
     if (!meta) return false;
-    if (meta.__quotaSlimmed === true) return true;
+    if (meta.__quotaSlimmed === true || meta.__digestOnly === true) return true;
     if (typeof meta.fetchedAt === 'number' && meta.fetchedAt > 0) return false;
     const hasSysReq = Boolean(
       meta.systemRequirements?.minimum?.trim() || meta.systemRequirements?.recommended?.trim()
     );
     if (!hasSysReq) return true;
+    // Hard Invariant 3: macOS-capable titles lacking macRequirements MUST trigger re-fetch
     const hasMacReq = Boolean(
       meta.macRequirements?.minimum?.trim() || meta.macRequirements?.recommended?.trim()
     );
@@ -884,79 +1028,41 @@ export class SteamApiService {
       this.needsOnlineUpgrade(inMemoryCached, expectMacRequirements);
 
     if (inMemoryCached && !inMemoryNeedsOnlineUpgrade && (!forceRefresh || !canFetchLive)) {
-      this.setCacheEntry(appId, inMemoryCached);
       return inMemoryCached;
     }
 
-    let preCachedEnriched: SteamEnrichedMetadata | null = null;
-    const preCached = (
-      steamEnrichedCache as Record<
-        string,
-        | (Partial<SteamEnrichedMetadata> & {
-            library_capsule?: string;
-            movies?: Array<SteamMovie & { hls_h264?: string }>;
-          })
-        | undefined
-      >
-    )[String(appId)];
-    if (preCached && preCached.aboutTheGame) {
-      const normalizedMovies: SteamMovie[] = filterEnglishMovies<SteamMovie>(
-        (preCached.movies || []).map((m) => ({
-          id: m.id,
-          name: m.name,
-          thumbnail: m.thumbnail,
-          hls: m.hls || m.hls_h264 || '',
-          webm: m.webm || { 480: '', max: '' },
-          mp4: m.mp4 || { 480: '', max: '' },
-        }))
-      ).slice(0, 4);
+    const flightKey = `${appId}:${forceRefresh ? '1' : '0'}:${expectMacRequirements ? '1' : '0'}`;
+    const existingFlight = this.inFlightMetadata.get(flightKey);
+    if (existingFlight) {
+      return existingFlight;
+    }
 
-      const languageOptions =
-        Array.isArray(preCached.languageOptions) && preCached.languageOptions.length > 0
-          ? preCached.languageOptions
-          : preCached.supportedLanguages
-          ? parseSteamSupportedLanguagesString(preCached.supportedLanguages)
-          : undefined;
-
-      const rawDetailedDesc = String(preCached.detailedDescription || '');
-      const rawAbout = String(preCached.aboutTheGame || '');
-      const safeAbout = truncateHtmlSafely(rawAbout, 35000);
-      const safeDetailedDesc =
-        rawDetailedDesc === rawAbout ? safeAbout : truncateHtmlSafely(rawDetailedDesc, 35000);
-
-      const rawPreCachedCapsule = preCached.capsuleImage || preCached.library_capsule;
-      const validPreCachedCapsule =
-        typeof rawPreCachedCapsule === 'string' &&
-        rawPreCachedCapsule &&
-        !rawPreCachedCapsule.includes('184x69') &&
-        !rawPreCachedCapsule.includes('231x87')
-          ? rawPreCachedCapsule
-          : this.getStoreBrowseAssetsInstant(appId)?.capsuleImage;
-
-      const builtPreCached: SteamEnrichedMetadata = {
-        ...(preCached as SteamEnrichedMetadata),
-        appId,
-        shortDescription: stripHtmlToPlainSynopsis(preCached.shortDescription || ''),
-        detailedDescription: safeDetailedDesc,
-        aboutTheGame: safeAbout,
-        capsuleImage: validPreCachedCapsule,
-        screenshots: Array.isArray(preCached.screenshots) ? preCached.screenshots.slice(0, 12) : [],
-        movies: normalizedMovies,
-        languageOptions,
-        languageTableSchema: preCached.languageTableSchema || 'steam',
-        categories: (preCached.categories || []).map((c) => ({
-          ...c,
-          icon: getSteamCategoryIconUrl(c.id),
-        })),
-        metadataQuality: preCached.metadataQuality || 'authoritative',
-        enrichedSource: 'steam',
-      };
-      preCachedEnriched = builtPreCached;
-      if (!forceRefresh) {
-        this.setCacheEntry(appId, builtPreCached);
-        return builtPreCached;
+    const flight = this.runFetchGameMetadataInternal(
+      appId,
+      priority,
+      forceRefresh,
+      expectMacRequirements,
+      inMemoryCached
+    );
+    this.inFlightMetadata.set(flightKey, flight);
+    try {
+      return await flight;
+    } finally {
+      if (this.inFlightMetadata.get(flightKey) === flight) {
+        this.inFlightMetadata.delete(flightKey);
       }
     }
+  }
+
+  private async runFetchGameMetadataInternal(
+    appId: number,
+    priority: number,
+    forceRefresh: boolean,
+    expectMacRequirements: boolean,
+    inMemoryCached: SteamEnrichedMetadata | null
+  ): Promise<SteamEnrichedMetadata | null> {
+    const isOnline = onlineLifecycleManager.isOnline();
+    const canFetchLive = isOnline && !this.isStoreRateLimited();
 
     const persisted = await this.loadPersistedMetadata(appId);
     const persistedNeedsOnlineUpgrade =
@@ -968,7 +1074,7 @@ export class SteamApiService {
       return persisted;
     }
 
-    const fallbackMetadata = persisted || inMemoryCached || preCachedEnriched || null;
+    const fallbackMetadata = persisted || inMemoryCached || null;
 
     if (!isOnline || this.isStoreRateLimited()) {
       return fallbackMetadata;
@@ -1057,7 +1163,7 @@ export class SteamApiService {
           const data = appData.data;
 
           // Execute supplementary Steam Store requests sequentially inside the single scheduled slot
-          // so maxConcurrent on store.steampowered.com is strictly honored without re-entrant deadlock.
+          // and monitor Akamai 429/403 cooldowns so rate-limit storms trip immediately.
           const reviewsRes = !this.isStoreRateLimited()
             ? await axios
                 .get<{
@@ -1069,7 +1175,10 @@ export class SteamApiService {
                     review_score_desc?: string;
                   };
                 }>(`${baseUrl}/appreviews/${appId}?json=1&language=all`, { timeout: 6000 })
-                .catch(() => null)
+                .catch((err: unknown) => {
+                  this.recordStoreRateLimitIfNeeded(err);
+                  return null;
+                })
             : null;
 
           const storePageRes = !this.isStoreRateLimited()
@@ -1082,7 +1191,10 @@ export class SteamApiService {
                     'Accept-Language': 'en-US,en;q=0.9',
                   },
                 })
-                .catch(() => null)
+                .catch((err: unknown) => {
+                  this.recordStoreRateLimitIfNeeded(err);
+                  return null;
+                })
             : null;
 
           // Extract screenshots
@@ -1122,7 +1234,6 @@ export class SteamApiService {
             };
           });
 
-          // Filter out regional non-English trailers (e.g. CJK/European dubs) when English/international trailers exist
           const movies = filterEnglishMovies(rawMovies).slice(0, 4);
 
           // Extract review summary
@@ -1153,18 +1264,15 @@ export class SteamApiService {
             };
           }
 
-          // Extract categories (features)
           const categories: SteamCategory[] = (data.categories || []).map((c) => ({
             id: c.id,
             description: c.description,
             icon: getSteamCategoryIconUrl(c.id),
           }));
 
-          // Extract genres & tags
           const genres: string[] = (data.genres || []).map((g) => g.description);
           const tags: string[] = (data.categories || []).map((c) => c.description).slice(0, 10);
 
-          // Extract achievements
           let achievements:
             | { total: number; highlighted?: Array<{ name: string; path: string }> }
             | undefined = undefined;
@@ -1258,7 +1366,8 @@ export class SteamApiService {
             linuxRequirements: parsePlatformRequirements(data.linux_requirements),
             reviewSummary,
             supportedLanguages: data.supported_languages,
-            languageOptions: resolvedLanguageOptions.length > 0 ? resolvedLanguageOptions : undefined,
+            languageOptions:
+              resolvedLanguageOptions.length > 0 ? resolvedLanguageOptions : undefined,
             languageTableSchema: 'steam',
             legalNotice: data.legal_notice,
             drmNotice: data.drm_notice,
@@ -1301,22 +1410,7 @@ export class SteamApiService {
         gameKey
       )
       .catch((err: unknown) => {
-        const errObj =
-          err && typeof err === 'object'
-            ? (err as { response?: { status?: number }; isRateLimited?: boolean })
-            : undefined;
-        const status = errObj?.response?.status;
-        if (
-          onlineLifecycleManager.isOnline() &&
-          (status === 403 || status === 429 || errObj?.isRateLimited)
-        ) {
-          // Akamai CDN edge rate limit: pause storefront web requests for 15 minutes to let the cooldown reset cleanly
-          this.rateLimitedUntil = Date.now() + 15 * 60 * 1000;
-          requestScheduler.setCooldown('store.steampowered.com', 900);
-          console.warn(
-            `[Steam API] Akamai edge cooldown encountered (${status || 429}). Pausing web requests to store.steampowered.com for 15 minutes to allow IP cooldown to clear.`
-          );
-        } else {
+        if (!this.recordStoreRateLimitIfNeeded(err)) {
           console.warn(`Failed to fetch Steam metadata for appId ${appId}:`, err);
         }
         return fallbackMetadata;
@@ -1335,16 +1429,20 @@ export class SteamApiService {
       .schedule(
         url,
         async () => {
-          const res = await axios.get(url);
-          if (res.data?.items?.length > 0) {
-            return res.data.items[0].id;
+          const res = await axios.get<{ items?: Array<{ id?: number }> }>(url, { timeout: 7000 });
+          if (Array.isArray(res.data?.items) && res.data.items.length > 0) {
+            const firstId = res.data.items[0]?.id;
+            return typeof firstId === 'number' && firstId > 0 ? firstId : null;
           }
           return null;
         },
         priority,
         'store.steampowered.com'
       )
-      .catch(() => null);
+      .catch((err: unknown) => {
+        this.recordStoreRateLimitIfNeeded(err);
+        return null;
+      });
   }
 }
 

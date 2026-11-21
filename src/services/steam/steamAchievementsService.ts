@@ -1,147 +1,45 @@
 import axios from 'axios';
 import { CanonicalGame, StoreAchievementSummary } from '../../contracts/game';
+import { getSafeLocalStorage } from '../common/runtimeEnv';
 import { loadIntegrations } from '../integrations/integrationStorage';
 import {
   KNOWN_USER_STEAM_ACHIEVEMENTS,
   cacheUserSteamAchievements,
   type CachedAchievementEntry,
 } from '../storage/knownGameAchievements';
+import {
+  STORAGE_KEY_STEAM_ACHIEVEMENTS_LAST_SYNC,
+  achievementSummaryStore,
+} from '../storage/achievementSummaryStore';
 import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
-import { vaultGet, vaultSet } from '../storage/indexedDbVault';
+import { getDevProxyBaseForRoute } from '../network/browserDevProxy';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { scanLocalSteamAchievements } from '../system/localSystemScanner';
 
-const STORAGE_KEY_ACHIEVEMENTS_SUMMARY = 'antigravity_steam_achievements';
-const IDB_KEY_ACHIEVEMENTS_SUMMARY = 'idb_steam_achievements_summary_v1';
-const STORAGE_KEY_ACHIEVEMENTS_LAST_SYNC = 'antigravity_steam_achievements_last_sync_ts';
 const DEFAULT_ACHIEVEMENTS_SYNC_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours
-const ACHIEVEMENTS_SAVE_DEBOUNCE_MS = 250;
 
 export class SteamAchievementsService {
   private static readonly LOCAL_SCAN_STARTUP_WINDOW_MS = 30_000;
-  private inMemoryCache = new Map<number, StoreAchievementSummary>();
-  private persistedDictCache: Record<string, StoreAchievementSummary> | null = null;
-  private lastRawStorageRef: string | null = null;
-  private isDictDirty = false;
-  private pendingFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private inFlightLibrarySyncPromise: Promise<Record<number, StoreAchievementSummary>> | null = null;
   private inFlightLocalScanPromise: Promise<Record<number, CachedAchievementEntry>> | null = null;
   private lastLocalScanAt = 0;
   private lastLocalScanResults: Record<number, CachedAchievementEntry> = {};
 
-  constructor() {
-    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-      window.addEventListener('beforeunload', () => {
-        this.flushPendingSave();
-      });
-    }
-    void this.hydrateFromIndexedDb();
-  }
-
-  private async hydrateFromIndexedDb(): Promise<void> {
-    const stored = await vaultGet<Record<string, StoreAchievementSummary>>(
-      IDB_KEY_ACHIEVEMENTS_SUMMARY
-    );
-    if (!stored || typeof stored !== 'object') return;
-    const dict = this.ensurePersistedDict();
-    let added = false;
-    for (const [key, val] of Object.entries(stored)) {
-      if (!dict[key] && val && typeof val.unlocked === 'number' && typeof val.total === 'number') {
-        dict[key] = val;
-        const appId = Number(key);
-        if (appId > 0 && !this.inMemoryCache.has(appId)) {
-          this.inMemoryCache.set(appId, val);
-        }
-        added = true;
-      }
-    }
-    if (added) {
-      this.scheduleDebouncedSave();
-    }
-  }
-
-  private ensurePersistedDict(): Record<string, StoreAchievementSummary> {
-    if (this.isDictDirty && this.persistedDictCache) {
-      return this.persistedDictCache;
-    }
-    if (typeof localStorage !== 'undefined') {
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY_ACHIEVEMENTS_SUMMARY);
-        if (this.persistedDictCache !== null && raw === this.lastRawStorageRef) {
-          return this.persistedDictCache;
-        }
-        if (raw === null && this.lastRawStorageRef !== null) {
-          this.inMemoryCache.clear();
-        }
-        this.lastRawStorageRef = raw;
-        const parsed = raw ? JSON.parse(raw) : {};
-        const nextDict: Record<string, StoreAchievementSummary> =
-          parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-        this.persistedDictCache = nextDict;
-        return nextDict;
-      } catch {
-        const fallbackDict: Record<string, StoreAchievementSummary> =
-          this.persistedDictCache ?? {};
-        this.persistedDictCache = fallbackDict;
-        return fallbackDict;
-      }
-    }
-    if (!this.persistedDictCache) {
-      this.persistedDictCache = {};
-    }
-    return this.persistedDictCache;
-  }
-
   public flushPendingSave(): void {
-    if (this.pendingFlushTimer !== null) {
-      clearTimeout(this.pendingFlushTimer);
-      this.pendingFlushTimer = null;
-    }
-    if (!this.isDictDirty || !this.persistedDictCache) return;
-    this.isDictDirty = false;
-    const snapshot = { ...this.persistedDictCache };
-    void vaultSet(IDB_KEY_ACHIEVEMENTS_SUMMARY, snapshot);
-    if (typeof localStorage !== 'undefined') {
-      try {
-        const serialized = JSON.stringify(snapshot);
-        localStorage.setItem(STORAGE_KEY_ACHIEVEMENTS_SUMMARY, serialized);
-        this.lastRawStorageRef = serialized;
-      } catch {
-        // QuotaExceededError: full dictionary remains in memory and IndexedDB vault
-      }
-    }
-  }
-
-  private scheduleDebouncedSave(): void {
-    this.isDictDirty = true;
-    const isVitest =
-      typeof process !== 'undefined' &&
-      Boolean((process as { env?: Record<string, string | undefined> }).env?.VITEST);
-    if (isVitest) {
-      if (this.pendingFlushTimer === null) {
-        this.pendingFlushTimer = setTimeout(() => {
-          this.flushPendingSave();
-        }, 10);
-      }
-      return;
-    }
-    if (this.pendingFlushTimer === null) {
-      this.pendingFlushTimer = setTimeout(() => {
-        this.flushPendingSave();
-      }, ACHIEVEMENTS_SAVE_DEBOUNCE_MS);
-    }
+    achievementSummaryStore.flush('steam');
   }
 
   /**
    * Checks whether a full library achievement sync has completed within the cooldown window.
    */
   hasRecentFullSync(cooldownMs: number = DEFAULT_ACHIEVEMENTS_SYNC_COOLDOWN_MS): boolean {
-    if (typeof localStorage === 'undefined') return false;
+    const storage = getSafeLocalStorage();
+    if (!storage) return false;
     try {
-      const raw = localStorage.getItem(STORAGE_KEY_ACHIEVEMENTS_LAST_SYNC);
+      const raw = storage.getItem(STORAGE_KEY_STEAM_ACHIEVEMENTS_LAST_SYNC);
       if (!raw) return false;
       const ts = Number(raw);
-      return Boolean(ts > 0 && Date.now() - ts < cooldownMs);
+      return Boolean(Number.isFinite(ts) && ts > 0 && Date.now() - ts < cooldownMs);
     } catch {
       return false;
     }
@@ -151,10 +49,13 @@ export class SteamAchievementsService {
    * Records that a full library achievement sync has completed.
    */
   recordFullSyncCompleted(timestamp: number = Date.now()): void {
-    if (typeof localStorage === 'undefined') return;
+    const storage = getSafeLocalStorage();
+    if (!storage) return;
     try {
-      localStorage.setItem(STORAGE_KEY_ACHIEVEMENTS_LAST_SYNC, String(timestamp));
-    } catch {}
+      storage.setItem(STORAGE_KEY_STEAM_ACHIEVEMENTS_LAST_SYNC, String(timestamp));
+    } catch {
+      // Ignore storage quota errors
+    }
   }
 
   /**
@@ -218,8 +119,8 @@ export class SteamAchievementsService {
     for (const [rawId, data] of Object.entries(rawAchievements)) {
       const appId = Number(rawId);
       if (
-        !appId ||
         !Number.isFinite(appId) ||
+        appId <= 0 ||
         !data ||
         typeof data.unlocked !== 'number' ||
         typeof data.total !== 'number'
@@ -234,6 +135,7 @@ export class SteamAchievementsService {
         percentage:
           data.percentage ?? (data.total > 0 ? Math.round((data.unlocked / data.total) * 100) : 0),
         isMastered: Boolean(data.isMastered) || (data.total > 0 && data.unlocked >= data.total),
+        ...(data.lastUnlockedAt ? { lastUnlockedAt: data.lastUnlockedAt } : {}),
         source: data.source || 'live_cloud_api',
         syncedAt: data.syncedAt || nowIso,
       };
@@ -253,14 +155,7 @@ export class SteamAchievementsService {
   }
 
   public resetForTests(): void {
-    if (this.pendingFlushTimer !== null) {
-      clearTimeout(this.pendingFlushTimer);
-      this.pendingFlushTimer = null;
-    }
-    this.inMemoryCache.clear();
-    this.persistedDictCache = null;
-    this.lastRawStorageRef = null;
-    this.isDictDirty = false;
+    achievementSummaryStore.resetForTests('steam');
     this.inFlightLibrarySyncPromise = null;
     this.inFlightLocalScanPromise = null;
     this.lastLocalScanAt = 0;
@@ -274,10 +169,7 @@ export class SteamAchievementsService {
     try {
       const integrations = loadIntegrations();
       const steamInteg = integrations.find((i) => i.storefrontId === 'steam' && i.isConnected);
-      const steamId =
-        steamInteg?.credentials?.steamId ||
-        steamInteg?.accountId ||
-        '';
+      const steamId = steamInteg?.credentials?.steamId || steamInteg?.accountId || '';
       const apiKey = steamInteg?.credentials?.apiKey;
       return { steamId, apiKey };
     } catch {
@@ -286,71 +178,60 @@ export class SteamAchievementsService {
   }
 
   private getCommunityBaseUrl(): string {
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      return '/api/steam-community';
-    }
-    return 'https://steamcommunity.com';
+    return getDevProxyBaseForRoute('steamCommunity');
   }
 
   private getApiBaseUrl(): string {
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      return '/api/steam-api';
-    }
-    return 'https://api.steampowered.com';
+    return getDevProxyBaseForRoute('steamApi');
   }
 
   /**
-   * Reads cached achievements from in-memory cache or persisted dictionary.
+   * Reads cached achievements from the unified AchievementSummaryStore or verified baseline.
    */
   getCachedAchievements(appId: number): StoreAchievementSummary | null {
-    const dict = this.ensurePersistedDict();
-    if (this.inMemoryCache.has(appId)) {
-      return this.inMemoryCache.get(appId)!;
-    }
-
-    const found = dict[String(appId)];
+    if (!Number.isFinite(appId) || appId <= 0) return null;
+    const found = achievementSummaryStore.get('steam', Math.trunc(appId));
     if (found && typeof found.unlocked === 'number' && typeof found.total === 'number') {
-      const summary: StoreAchievementSummary = {
+      return {
         unlocked: found.unlocked,
         total: found.total,
         percentage:
           found.percentage ??
           (found.total > 0 ? Math.round((found.unlocked / found.total) * 100) : 0),
         isMastered: found.total > 0 && found.unlocked >= found.total,
+        ...(found.lastUnlockedAt ? { lastUnlockedAt: found.lastUnlockedAt } : {}),
         source: found.source || 'local_client_cache',
         syncedAt: found.syncedAt,
         hasConflict: found.hasConflict,
         conflictDetails: found.conflictDetails,
       };
-      this.inMemoryCache.set(appId, summary);
-      return summary;
     }
 
     // Check verified built-in user baseline
     if (KNOWN_USER_STEAM_ACHIEVEMENTS[appId]) {
       const b = KNOWN_USER_STEAM_ACHIEVEMENTS[appId];
-      const summary: StoreAchievementSummary = {
+      return {
         unlocked: b.unlocked,
         total: b.total,
         percentage: b.percentage,
         isMastered: b.total > 0 && b.unlocked >= b.total,
+        ...(b.lastUnlockedAt ? { lastUnlockedAt: b.lastUnlockedAt } : {}),
         source: 'baseline_fallback',
       };
-      this.inMemoryCache.set(appId, summary);
-      return summary;
     }
 
     return null;
   }
 
   /**
-   * Caches an achievement record in memory and schedules a debounced persistent flush.
+   * Caches an achievement record in the unified store and schedules a debounced persistent flush.
    */
   setCachedAchievement(appId: number, summary: StoreAchievementSummary): void {
-    const dict = this.ensurePersistedDict();
-    this.inMemoryCache.set(appId, summary);
-    dict[String(appId)] = summary;
-    this.scheduleDebouncedSave();
+    if (!Number.isFinite(appId) || appId <= 0) return;
+    achievementSummaryStore.set('steam', Math.trunc(appId), summary, {
+      immediate: false,
+      reconcile: false,
+    });
   }
 
   /**
@@ -376,7 +257,8 @@ export class SteamAchievementsService {
           (!p.achievements ||
             p.achievements.unlocked !== reconciled.unlocked ||
             p.achievements.total !== reconciled.total ||
-            p.achievements.hasConflict !== reconciled.hasConflict)
+            p.achievements.hasConflict !== reconciled.hasConflict ||
+            p.achievements.lastUnlockedAt !== reconciled.lastUnlockedAt)
         ) {
           changed = true;
           return {
@@ -412,14 +294,16 @@ export class SteamAchievementsService {
     // 1. If Steam Web API key is configured, try ISteamUserStats/GetPlayerAchievements
     if (apiKey && steamId) {
       try {
-        const url = `${this.getApiBaseUrl()}/ISteamUserStats/GetPlayerAchievements/v0001/?appid=${appId}&key=${apiKey}&steamid=${steamId}`;
+        const url = `${this.getApiBaseUrl()}/ISteamUserStats/GetPlayerAchievements/v0001/?appid=${encodeURIComponent(
+          String(appId)
+        )}&key=${encodeURIComponent(apiKey)}&steamid=${encodeURIComponent(steamId)}`;
         const canonicalApiUrl = `https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/?appid=${appId}`;
         const res = await requestScheduler.schedule(
           canonicalApiUrl,
           () =>
             axios.get<{
               playerstats?: {
-                achievements?: Array<{ achieved?: number }>;
+                achievements?: Array<{ achieved?: number; unlocktime?: number }>;
                 error?: string;
               };
             }>(url, { timeout: 5000 }),
@@ -442,13 +326,23 @@ export class SteamAchievementsService {
             return zeroSummary;
           }
           const total = list.length;
-          const unlocked = list.filter((a) => a.achieved === 1).length;
+          const unlockedItems = list.filter((a) => a.achieved === 1);
+          const unlocked = unlockedItems.length;
+          let maxUnlockSec = 0;
+          for (const item of unlockedItems) {
+            if (typeof item.unlocktime === 'number' && item.unlocktime > maxUnlockSec) {
+              maxUnlockSec = item.unlocktime;
+            }
+          }
+          const lastUnlockedAt =
+            maxUnlockSec > 0 ? new Date(maxUnlockSec * 1000).toISOString() : undefined;
           const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
           const liveSummary: StoreAchievementSummary = {
             unlocked,
             total,
             percentage,
             isMastered: total > 0 && unlocked >= total,
+            ...(lastUnlockedAt ? { lastUnlockedAt } : {}),
             source: 'live_cloud_api',
             syncedAt: new Date().toISOString(),
           };
@@ -502,7 +396,9 @@ export class SteamAchievementsService {
     if (steamId) {
       try {
         const isNumeric = /^\d{17}$/.test(steamId);
-        const pathSegment = isNumeric ? `profiles/${steamId}` : `id/${steamId}`;
+        const pathSegment = isNumeric
+          ? `profiles/${steamId}`
+          : `id/${encodeURIComponent(steamId)}`;
         const url = `${this.getCommunityBaseUrl()}/${pathSegment}/stats/${appId}/?xml=1`;
         const canonicalXmlUrl = `https://steamcommunity.com/${pathSegment}/stats/${appId}/?xml=1`;
         const res = await requestScheduler.schedule(
@@ -514,11 +410,12 @@ export class SteamAchievementsService {
         );
         let xml = typeof res.data === 'string' ? res.data : '';
 
-        // Older Steam titles with a custom Steam Community friendlyURL (e.g. 20920 -> TheWitcher2, 223850 -> 3DMark)
-        // HTTP-302 redirect /stats/{appId}/?xml=1 -> /stats/{friendlyName} stripping the ?xml=1 query parameter.
+        // Older Steam titles with a custom Steam Community friendlyURL redirect stripping ?xml=1
         if (!xml.includes('<achievements>') && !xml.includes('<achievement closed=')) {
           const htmlSummaryMatch =
-            xml.match(/id="topSummaryAchievements"[^>]*>\s*(\d+)\s+of\s+(\d+)\s+\(\d+%\)\s+Achievements\s+Earned/i) ||
+            xml.match(
+              /id="topSummaryAchievements"[^>]*>\s*(\d+)\s+of\s+(\d+)\s+\(\d+%\)\s+Achievements\s+Earned/i
+            ) ||
             xml.match(/content="(\d+)\s+of\s+(\d+)\s+\(\d+%\)\s+achievements\s+earned/i);
           if (htmlSummaryMatch) {
             const unlocked = Number(htmlSummaryMatch[1]);
@@ -559,7 +456,9 @@ export class SteamAchievementsService {
               if (typeof friendlyRes.data === 'string') {
                 xml = friendlyRes.data;
               }
-            } catch {}
+            } catch {
+              // Ignore friendly redirect retry errors
+            }
           }
         }
 
@@ -569,6 +468,21 @@ export class SteamAchievementsService {
           const total = allMatches.length;
           const unlocked = unlockedMatches.length;
 
+          // Extract latest unlockTimestamp from XML if present
+          let maxUnlockSec = 0;
+          if (unlocked > 0) {
+            const tsRegex = /<unlockTimestamp>(\d+)<\/unlockTimestamp>/gi;
+            let tsMatch: RegExpExecArray | null;
+            while ((tsMatch = tsRegex.exec(xml)) !== null) {
+              const sec = Number.parseInt(tsMatch[1], 10);
+              if (Number.isFinite(sec) && sec > maxUnlockSec) {
+                maxUnlockSec = sec;
+              }
+            }
+          }
+          const lastUnlockedAt =
+            maxUnlockSec > 0 ? new Date(maxUnlockSec * 1000).toISOString() : undefined;
+
           // Note: total > 0 is valid authoritative data even if unlocked is 0
           if (total > 0 || unlocked > 0) {
             const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
@@ -577,6 +491,7 @@ export class SteamAchievementsService {
               total,
               percentage,
               isMastered: total > 0 && unlocked >= total,
+              ...(lastUnlockedAt ? { lastUnlockedAt } : {}),
               source: 'live_cloud_xml',
               syncedAt: new Date().toISOString(),
             };
@@ -709,14 +624,29 @@ export class SteamAchievementsService {
           const nowIso = new Date().toISOString();
           for (const [rawId, data] of Object.entries(batchRes.achievements)) {
             const appId = Number(rawId);
-            if (!appId || !data || typeof data.unlocked !== 'number' || typeof data.total !== 'number') continue;
+            if (
+              !Number.isFinite(appId) ||
+              appId <= 0 ||
+              !data ||
+              typeof data.unlocked !== 'number' ||
+              typeof data.total !== 'number'
+            ) {
+              continue;
+            }
             if (data.total <= 0 && data.unlocked <= 0) continue;
             const existing = this.getCachedAchievements(appId) || undefined;
+            const rawLastUnlockedAt = (data as { lastUnlockedAt?: unknown }).lastUnlockedAt;
             const incoming: StoreAchievementSummary = {
               unlocked: data.unlocked,
               total: data.total,
-              percentage: data.percentage ?? (data.total > 0 ? Math.round((data.unlocked / data.total) * 100) : 0),
-              isMastered: Boolean(data.isMastered) || (data.total > 0 && data.unlocked >= data.total),
+              percentage:
+                data.percentage ??
+                (data.total > 0 ? Math.round((data.unlocked / data.total) * 100) : 0),
+              isMastered:
+                Boolean(data.isMastered) || (data.total > 0 && data.unlocked >= data.total),
+              ...(typeof rawLastUnlockedAt === 'string' && rawLastUnlockedAt
+                ? { lastUnlockedAt: rawLastUnlockedAt }
+                : {}),
               source: 'live_cloud_api',
               syncedAt: nowIso,
             };
@@ -731,11 +661,13 @@ export class SteamAchievementsService {
           }
           if (Object.keys(results).length > 0) {
             options?.onBatchUpdated?.({ ...results });
+            // Mark batch Web API sync completed only when at least one game resolved
+            this.recordFullSyncCompleted();
           }
-          // Immediately mark batch Web API sync completed so concurrent/subsequent cold-boot passes skip duplicate calls
-          this.recordFullSyncCompleted();
         }
-      } catch {}
+      } catch {
+        // Fall through to Community XML sync
+      }
     }
 
     // 2. Filter candidate games for Community XML stats verification:
@@ -759,7 +691,7 @@ export class SteamAchievementsService {
     });
 
     // Prioritize titles with highest playtime
-    const prioritized = [...candidatesForXml].sort((a, b) => {
+    const prioritized = candidatesForXml.toSorted((a, b) => {
       const aPlaytime = a.platforms.find((p) => p.platformId === 'steam')?.playtimeMinutes || 0;
       const bPlaytime = b.platforms.find((p) => p.platformId === 'steam')?.playtimeMinutes || 0;
       return bPlaytime - aPlaytime;
@@ -767,7 +699,9 @@ export class SteamAchievementsService {
 
     if (prioritized.length === 0) {
       onProgress?.(steamGames.length, steamGames.length);
-      this.recordFullSyncCompleted();
+      if (Object.keys(results).length > 0 || steamGames.length === 0) {
+        this.recordFullSyncCompleted();
+      }
       return results;
     }
 
@@ -788,7 +722,7 @@ export class SteamAchievementsService {
               cached &&
               (cached.source === 'live_cloud_xml' || cached.source === 'live_cloud_api') &&
               cached.syncedAt &&
-              Date.now() - new Date(cached.syncedAt).getTime() < 6 * 3600 * 1000
+              Date.now() - Date.parse(cached.syncedAt) < 6 * 3600 * 1000
             ) {
               results[game.steamAppId] = cached;
               return;
@@ -803,7 +737,9 @@ export class SteamAchievementsService {
               results[game.steamAppId] = ach;
               batchAdded = true;
             }
-          } catch {}
+          } catch {
+            // Skip failed title and continue batch
+          }
         })
       );
       completed = Math.min(prioritized.length, completed + batch.length);
@@ -815,15 +751,15 @@ export class SteamAchievementsService {
 
     // Persist full synchronized dictionary in a single flush
     if (Object.keys(results).length > 0) {
-      const dict = this.ensurePersistedDict();
+      const batchToMerge: Record<string, StoreAchievementSummary> = {};
       for (const [appIdKey, summary] of Object.entries(results)) {
-        dict[appIdKey] = summary;
+        batchToMerge[appIdKey] = summary;
       }
-      this.isDictDirty = true;
-      this.flushPendingSave();
+      achievementSummaryStore.mergeBatch('steam', batchToMerge, { immediate: true });
     }
 
-    if (Object.keys(results).length > 0 || steamGames.length > 0) {
+    // P0-4: Never stamp 6-hour cooldown when every request failed offline / rate-limited!
+    if (Object.keys(results).length > 0 || steamGames.length === 0) {
       this.recordFullSyncCompleted();
     }
 

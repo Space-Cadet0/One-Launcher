@@ -1,305 +1,121 @@
 import {
-  DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
-  LAUNCH_PROFILE_KEYS,
-  migrateLegacyHudConfig,
+  resolveWineDebugEnvValue,
+  sanitizeBottleDisplayScalingMode,
+  sanitizeDisplayAspectRatio,
+  sanitizeGameLaunchConfig as sanitizeContractGameLaunchConfig,
+  sanitizeGlobalBottleDisplayScalingMode,
+  sanitizeGlobalDisplayAspectRatio,
   sanitizeLaunchMethod,
-  sanitizePerformanceHudMode,
-  type BottleDisplayScalingMode,
-  type CompatibilityLayerType,
-  type DisplayAspectRatioMode,
-  type GameLaunchConfig,
-  type GlobalBottleDisplayScalingMode,
-  type GlobalDisplayAspectRatioMode,
-  type LauncherPerformanceSettings,
-  type StorefrontClientLifecyclePolicy,
-  type StorefrontLaunchProfile,
-  type VirtualDesktopResolutionPreset,
-  type WineDebugMode,
+  sanitizeLauncherPerformanceSettings,
+  sanitizeLegacyCompatLayer,
+  sanitizeStorefrontLaunchProfile,
+  sanitizeStorefrontLifecycleOverride as sanitizeContractStorefrontLifecycleOverride,
+  sanitizeVirtualDesktopResolution,
+  sanitizeWineDebugMode,
+} from '../../contracts/launchConfigSanitizers';
+import type {
+  GameLaunchConfig,
+  LauncherPerformanceSettings,
+  StorefrontClientLifecyclePolicy,
+  StorefrontLaunchProfile,
 } from '../../contracts/launcher';
 import type { StorefrontId } from '../../contracts/platform';
+
+export {
+  resolveWineDebugEnvValue,
+  sanitizeBottleDisplayScalingMode,
+  sanitizeDisplayAspectRatio,
+  sanitizeGlobalBottleDisplayScalingMode,
+  sanitizeGlobalDisplayAspectRatio,
+  sanitizeLegacyCompatLayer,
+  sanitizeVirtualDesktopResolution,
+  sanitizeWineDebugMode,
+};
 
 export const LAUNCH_CONFIGS_STORAGE_KEY = 'one_launcher_game_configs_v1';
 export const PERF_SETTINGS_STORAGE_KEY = 'one_launcher_perf_settings_v1';
 export const SELECTED_STOREFRONTS_STORAGE_KEY = 'one_launcher_selected_storefronts_v1';
 
-export function sanitizeLegacyCompatLayer(layer?: unknown): CompatibilityLayerType | undefined {
-  if (!layer) return undefined;
-  if (layer === 'whisky') return 'crossover';
-  return layer as CompatibilityLayerType;
+function isBottleLaunchProfile(profile?: Partial<StorefrontLaunchProfile> | null): boolean {
+  if (!profile || typeof profile !== 'object') return false;
+  if (profile.launchMethod === 'compatibility_layer') return true;
+  const cleanLayer = sanitizeLegacyCompatLayer(profile.compatibilityLayer);
+  if (cleanLayer && cleanLayer !== 'native') return true;
+  if (typeof profile.wineBottleName === 'string' && profile.wineBottleName.trim().length > 0) {
+    return true;
+  }
+  if (typeof profile.winePrefixPath === 'string' && profile.winePrefixPath.trim().length > 0) {
+    return true;
+  }
+  return false;
 }
 
 export function sanitizeStorefrontLifecycleOverride(
   val?: unknown,
   platformId?: StorefrontId | string
 ): 'default' | StorefrontClientLifecyclePolicy | undefined {
-  if (!val) return undefined;
-  if (val === 'default_client' && platformId === 'gog') {
+  const normalized = sanitizeContractStorefrontLifecycleOverride(val);
+  if (normalized === 'default_client' && platformId === 'gog') {
     return 'minimal_keep_running';
   }
-  if (
-    val === 'default' ||
-    val === 'minimal_and_close_if_started' ||
-    val === 'minimal_keep_running' ||
-    val === 'default_client' ||
-    val === 'fast_direct_bypass'
-  ) {
-    return val;
-  }
-  return 'default';
+  return normalized;
 }
 
-export function sanitizeWineDebugMode(val?: unknown): WineDebugMode | string | undefined {
-  if (typeof val !== 'string') return undefined;
-  const trimmed = val.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-export function sanitizeGlobalBottleDisplayScalingMode(
-  val?: unknown
-): GlobalBottleDisplayScalingMode {
-  if (
-    val === 'auto_fullscreen' ||
-    val === 'force_fullscreen' ||
-    val === 'native_driver' ||
-    val === 'windowed' ||
-    val === 'virtual_desktop'
-  ) {
-    return val;
+function applyPlatformLifecycleCoercion<T extends Partial<StorefrontLaunchProfile>>(
+  profile: T,
+  platformId?: StorefrontId | string
+): T {
+  if (!profile || typeof profile !== 'object' || !platformId) return profile;
+  if (profile.storefrontClientLifecycle === undefined) return profile;
+  const effectivePlatformId = isBottleLaunchProfile(profile) ? undefined : platformId;
+  const coerced = sanitizeStorefrontLifecycleOverride(
+    profile.storefrontClientLifecycle,
+    effectivePlatformId
+  );
+  if (coerced === profile.storefrontClientLifecycle) {
+    return profile;
   }
-  return DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.defaultBottleDisplayScalingMode ?? 'auto_fullscreen';
-}
-
-export function sanitizeBottleDisplayScalingMode(
-  val?: unknown
-): BottleDisplayScalingMode | undefined {
-  if (!val) return undefined;
-  if (
-    val === 'default' ||
-    val === 'auto_fullscreen' ||
-    val === 'force_fullscreen' ||
-    val === 'native_driver' ||
-    val === 'windowed' ||
-    val === 'virtual_desktop'
-  ) {
-    return val;
-  }
-  return 'default';
-}
-
-export function sanitizeGlobalDisplayAspectRatio(val?: unknown): GlobalDisplayAspectRatioMode {
-  if (val === 'preserve_aspect' || val === 'integer' || val === 'stretch') {
-    return val;
-  }
-  return DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.defaultDisplayAspectRatio ?? 'preserve_aspect';
-}
-
-export function sanitizeDisplayAspectRatio(val?: unknown): DisplayAspectRatioMode | undefined {
-  if (!val) return undefined;
-  if (
-    val === 'default' ||
-    val === 'preserve_aspect' ||
-    val === 'integer' ||
-    val === 'stretch'
-  ) {
-    return val;
-  }
-  return 'default';
-}
-
-export function sanitizeVirtualDesktopResolution(
-  val?: unknown
-): VirtualDesktopResolutionPreset | string | undefined {
-  if (typeof val !== 'string') return undefined;
-  const trimmed = val.trim().toLowerCase();
-  if (!trimmed) return undefined;
-  if (trimmed === 'auto' || /^\d{3,5}x\d{3,5}$/.test(trimmed)) {
-    return trimmed;
-  }
-  return undefined;
+  return {
+    ...profile,
+    storefrontClientLifecycle: coerced,
+  };
 }
 
 export function sanitizeGameLaunchConfig(cfg: GameLaunchConfig): GameLaunchConfig {
   if (!cfg || typeof cfg !== 'object') return cfg;
-  const cleanVdRes = sanitizeVirtualDesktopResolution(cfg.virtualDesktopResolution);
-  const nextCfg: GameLaunchConfig = migrateLegacyHudConfig({
-    ...cfg,
-    launchMethod: sanitizeLaunchMethod(cfg.launchMethod),
-    ...(cfg.compatibilityLayer
-      ? { compatibilityLayer: sanitizeLegacyCompatLayer(cfg.compatibilityLayer) }
-      : {}),
-    ...(cfg.storefrontClientLifecycle
-      ? {
-          storefrontClientLifecycle: sanitizeStorefrontLifecycleOverride(
-            cfg.storefrontClientLifecycle
-          ),
-        }
-      : {}),
-    ...(cfg.wineDebug !== undefined
-      ? { wineDebug: sanitizeWineDebugMode(cfg.wineDebug) }
-      : {}),
-    ...(cfg.displayScalingMode !== undefined
-      ? { displayScalingMode: sanitizeBottleDisplayScalingMode(cfg.displayScalingMode) }
-      : {}),
-    ...(cfg.displayAspectRatio !== undefined
-      ? { displayAspectRatio: sanitizeDisplayAspectRatio(cfg.displayAspectRatio) }
-      : {}),
-    ...(cfg.virtualDesktopResolution !== undefined
-      ? { virtualDesktopResolution: cleanVdRes }
-      : {}),
-  });
-  if (cfg.platformConfigs && typeof cfg.platformConfigs === 'object') {
+  const sanitized = sanitizeContractGameLaunchConfig(cfg);
+  const nextCfg: GameLaunchConfig = applyPlatformLifecycleCoercion(
+    sanitized,
+    sanitized.preferredPlatformId
+  );
+
+  if (nextCfg.platformConfigs && typeof nextCfg.platformConfigs === 'object') {
     const nextPlatCfgs: Partial<Record<StorefrontId, StorefrontLaunchProfile>> = {};
-    for (const [platId, p] of Object.entries(cfg.platformConfigs)) {
-      if (p) {
-        const cleanPlatVdRes = sanitizeVirtualDesktopResolution(p.virtualDesktopResolution);
-        nextPlatCfgs[platId as StorefrontId] = migrateLegacyHudConfig({
-          ...p,
-          ...(p.launchMethod !== undefined
-            ? { launchMethod: sanitizeLaunchMethod(p.launchMethod) }
-            : {}),
-          ...(p.compatibilityLayer
-            ? { compatibilityLayer: sanitizeLegacyCompatLayer(p.compatibilityLayer) }
-            : {}),
-          ...(p.storefrontClientLifecycle
-            ? {
-                storefrontClientLifecycle: sanitizeStorefrontLifecycleOverride(
-                  p.storefrontClientLifecycle
-                ),
-              }
-            : {}),
-          ...(p.wineDebug !== undefined
-            ? { wineDebug: sanitizeWineDebugMode(p.wineDebug) }
-            : {}),
-          ...(p.displayScalingMode !== undefined
-            ? { displayScalingMode: sanitizeBottleDisplayScalingMode(p.displayScalingMode) }
-            : {}),
-          ...(p.displayAspectRatio !== undefined
-            ? { displayAspectRatio: sanitizeDisplayAspectRatio(p.displayAspectRatio) }
-            : {}),
-          ...(p.virtualDesktopResolution !== undefined
-            ? { virtualDesktopResolution: cleanPlatVdRes }
-            : {}),
-        });
+    for (const [platId, prof] of Object.entries(nextCfg.platformConfigs)) {
+      if (prof && typeof prof === 'object') {
+        nextPlatCfgs[platId as StorefrontId] = applyPlatformLifecycleCoercion(prof, platId);
       }
     }
-    nextCfg.platformConfigs = nextPlatCfgs;
+    if (Object.keys(nextPlatCfgs).length > 0) {
+      nextCfg.platformConfigs = nextPlatCfgs;
+    }
   }
+
   return nextCfg;
 }
 
 export function sanitizePerformanceSettings(
   raw?: Partial<LauncherPerformanceSettings> | null
 ): LauncherPerformanceSettings {
-  const base = { ...DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS };
-  if (!raw || typeof raw !== 'object') return base;
-  const rawRecord = raw as Record<string, unknown>;
-  const legacyHudDefault = rawRecord.enableMetalHud === true || rawRecord.enableMangoHud === true;
-  return {
-    inGameLauncherBehavior:
-      raw.inGameLauncherBehavior === 'keep_open' ||
-      raw.inGameLauncherBehavior === 'minimize_taskbar' ||
-      raw.inGameLauncherBehavior === 'hide_tray_hibernate' ||
-      raw.inGameLauncherBehavior === 'zero_renderer_daemon'
-        ? raw.inGameLauncherBehavior
-        : base.inGameLauncherBehavior,
-    postGameLauncherBehavior:
-      raw.postGameLauncherBehavior === 'restore_window' ||
-      raw.postGameLauncherBehavior === 'stay_minimized' ||
-      raw.postGameLauncherBehavior === 'exit_launcher'
-        ? raw.postGameLauncherBehavior
-        : base.postGameLauncherBehavior,
-    pauseBackgroundSyncInGame:
-      typeof raw.pauseBackgroundSyncInGame === 'boolean'
-        ? raw.pauseBackgroundSyncInGame
-        : base.pauseBackgroundSyncInGame,
-    pauseDownloadsInGame:
-      typeof raw.pauseDownloadsInGame === 'boolean'
-        ? raw.pauseDownloadsInGame
-        : base.pauseDownloadsInGame,
-    storefrontClientLifecycle:
-      raw.storefrontClientLifecycle === 'minimal_and_close_if_started' ||
-      raw.storefrontClientLifecycle === 'minimal_keep_running' ||
-      raw.storefrontClientLifecycle === 'default_client' ||
-      raw.storefrontClientLifecycle === 'fast_direct_bypass'
-        ? raw.storefrontClientLifecycle
-        : base.storefrontClientLifecycle,
-    autoShutdownWinePrefixOnExit:
-      typeof raw.autoShutdownWinePrefixOnExit === 'boolean'
-        ? raw.autoShutdownWinePrefixOnExit
-        : base.autoShutdownWinePrefixOnExit,
-    suppressWineDebugLogging:
-      typeof raw.suppressWineDebugLogging === 'boolean'
-        ? raw.suppressWineDebugLogging
-        : base.suppressWineDebugLogging,
-    defaultBottleDisplayScalingMode: sanitizeGlobalBottleDisplayScalingMode(
-      raw.defaultBottleDisplayScalingMode
-    ),
-    defaultDisplayAspectRatio: sanitizeGlobalDisplayAspectRatio(raw.defaultDisplayAspectRatio),
-    enableFullscreenHotkey:
-      typeof raw.enableFullscreenHotkey === 'boolean'
-        ? raw.enableFullscreenHotkey
-        : (base.enableFullscreenHotkey ?? true),
-    defaultPerformanceHud:
-      typeof raw.defaultPerformanceHud === 'boolean'
-        ? raw.defaultPerformanceHud
-        : legacyHudDefault
-          ? true
-          : (base.defaultPerformanceHud ?? false),
-    ignoreLeadingTheWhenSorting:
-      typeof raw.ignoreLeadingTheWhenSorting === 'boolean'
-        ? raw.ignoreLeadingTheWhenSorting
-        : (base.ignoreLeadingTheWhenSorting ?? true),
-  };
+  return sanitizeLauncherPerformanceSettings(raw);
 }
 
 export function extractStorefrontProfile(
   config: Partial<GameLaunchConfig | StorefrontLaunchProfile>,
-  _platformId?: StorefrontId
+  platformId?: StorefrontId
 ): StorefrontLaunchProfile {
-  const profile: StorefrontLaunchProfile = {};
-  for (const key of LAUNCH_PROFILE_KEYS) {
-    const val = config[key];
-    if (val !== undefined) {
-      if (key === 'launchMethod') {
-        profile.launchMethod = sanitizeLaunchMethod(val as string);
-      } else if (key === 'compatibilityLayer') {
-        profile.compatibilityLayer = sanitizeLegacyCompatLayer(val);
-      } else if (key === 'storefrontClientLifecycle') {
-        profile.storefrontClientLifecycle = sanitizeStorefrontLifecycleOverride(val);
-      } else if (key === 'performanceHud') {
-        const cleanHud = sanitizePerformanceHudMode(val);
-        if (cleanHud !== undefined) {
-          profile.performanceHud = cleanHud;
-        }
-      } else if (key === 'wineDebug') {
-        const cleanDebug = sanitizeWineDebugMode(val);
-        if (cleanDebug !== undefined) {
-          profile.wineDebug = cleanDebug;
-        }
-      } else if (key === 'displayScalingMode') {
-        const cleanMode = sanitizeBottleDisplayScalingMode(val);
-        if (cleanMode !== undefined) {
-          profile.displayScalingMode = cleanMode;
-        }
-      } else if (key === 'displayAspectRatio') {
-        const cleanAspect = sanitizeDisplayAspectRatio(val);
-        if (cleanAspect !== undefined) {
-          profile.displayAspectRatio = cleanAspect;
-        }
-      } else if (key === 'virtualDesktopResolution') {
-        const cleanVdRes = sanitizeVirtualDesktopResolution(val);
-        if (cleanVdRes !== undefined) {
-          profile.virtualDesktopResolution = cleanVdRes;
-        }
-      } else {
-        (profile as Record<string, unknown>)[key] = val;
-      }
-    }
-  }
-  if (profile.wineMsync === true && profile.wineEsync === true) {
-    profile.wineEsync = false;
-  }
-  return profile;
+  const profile = sanitizeStorefrontLaunchProfile(config);
+  return applyPlatformLifecycleCoercion(profile, platformId);
 }
 
 export function buildMergedSaveLaunchConfig(
@@ -310,9 +126,17 @@ export function buildMergedSaveLaunchConfig(
   const targetPlatformId = platformId || config.preferredPlatformId;
   const profile = extractStorefrontProfile(config, targetPlatformId);
 
-  const mergedPlatformConfigs: Partial<Record<StorefrontId, StorefrontLaunchProfile>> = {
-    ...(existing?.platformConfigs || {}),
-  };
+  const mergedPlatformConfigs: Partial<Record<StorefrontId, StorefrontLaunchProfile>> = {};
+  if (existing?.platformConfigs) {
+    for (const [platId, p] of Object.entries(existing.platformConfigs)) {
+      if (p) {
+        mergedPlatformConfigs[platId as StorefrontId] = extractStorefrontProfile(
+          p,
+          platId as StorefrontId
+        );
+      }
+    }
+  }
 
   if (config.platformConfigs) {
     for (const [platId, p] of Object.entries(config.platformConfigs)) {
@@ -329,7 +153,7 @@ export function buildMergedSaveLaunchConfig(
     mergedPlatformConfigs[targetPlatformId] = profile;
   }
 
-  return {
+  return sanitizeGameLaunchConfig({
     gameId: config.gameId,
     ...(targetPlatformId
       ? { preferredPlatformId: targetPlatformId }
@@ -341,7 +165,7 @@ export function buildMergedSaveLaunchConfig(
     ...(Object.keys(mergedPlatformConfigs).length > 0
       ? { platformConfigs: mergedPlatformConfigs }
       : {}),
-  };
+  });
 }
 
 export function resolveLaunchConfigFromMap(
@@ -515,7 +339,11 @@ function ensureLaunchConfigsHydrated(): Record<string, GameLaunchConfig> {
 
   try {
     const raw = storage.getItem(LAUNCH_CONFIGS_STORAGE_KEY);
-    if (hasLaunchConfigsSnapshot && launchConfigsStorageRef === storage && raw === launchConfigsRawSnapshot) {
+    if (
+      hasLaunchConfigsSnapshot &&
+      launchConfigsStorageRef === storage &&
+      raw === launchConfigsRawSnapshot
+    ) {
       // Adopt Blink ExternalString pointer so subsequent checks are O(1) pointer equality
       launchConfigsRawSnapshot = raw;
       return launchConfigsCachedMap;
@@ -525,11 +353,11 @@ function ensureLaunchConfigsHydrated(): Record<string, GameLaunchConfig> {
     hasLaunchConfigsSnapshot = true;
     launchConfigsCachedMap = {};
     if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object') {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         const sanitized: Record<string, GameLaunchConfig> = {};
         for (const [gid, cfg] of Object.entries(parsed)) {
-          if (cfg && typeof cfg === 'object') {
+          if (cfg && typeof cfg === 'object' && !Array.isArray(cfg)) {
             sanitized[gid] = sanitizeGameLaunchConfig(cfg as GameLaunchConfig);
           }
         }
@@ -545,7 +373,9 @@ function ensureLaunchConfigsHydrated(): Record<string, GameLaunchConfig> {
   }
 }
 
-export function getReadonlyLocalLaunchConfigsFromStorage(): Readonly<Record<string, GameLaunchConfig>> {
+export function getReadonlyLocalLaunchConfigsFromStorage(): Readonly<
+  Record<string, GameLaunchConfig>
+> {
   return ensureLaunchConfigsHydrated();
 }
 
@@ -587,9 +417,11 @@ export function loadLocalPerformanceSettingsFromStorage(): LauncherPerformanceSe
     hasPerfSettingsSnapshot = true;
     perfSettingsCached = null;
     if (rawPerf) {
-      const parsedPerf = JSON.parse(rawPerf);
-      if (parsedPerf && typeof parsedPerf === 'object') {
-        const sanitized = sanitizePerformanceSettings(parsedPerf);
+      const parsedPerf: unknown = JSON.parse(rawPerf);
+      if (parsedPerf && typeof parsedPerf === 'object' && !Array.isArray(parsedPerf)) {
+        const sanitized = sanitizePerformanceSettings(
+          parsedPerf as Partial<LauncherPerformanceSettings>
+        );
         perfSettingsCached = sanitized;
         return { ...sanitized };
       }
@@ -641,7 +473,11 @@ export function loadSelectedStorefrontsFromStorage(): Record<string, StorefrontI
   if (!storage) return {};
   ensureLaunchConfigStorageListener();
 
-  if (!isTestEnv() && hasSelectedStorefrontsSnapshot && selectedStorefrontsStorageRef === storage) {
+  if (
+    !isTestEnv() &&
+    hasSelectedStorefrontsSnapshot &&
+    selectedStorefrontsStorageRef === storage
+  ) {
     return { ...selectedStorefrontsCachedMap };
   }
 
@@ -660,8 +496,8 @@ export function loadSelectedStorefrontsFromStorage(): Record<string, StorefrontI
     hasSelectedStorefrontsSnapshot = true;
     selectedStorefrontsCachedMap = {};
     if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
     const clean: Record<string, StorefrontId> = {};
     for (const [gameId, platId] of Object.entries(parsed)) {
       if (typeof platId === 'string' && VALID_STOREFRONT_IDS.has(platId as StorefrontId)) {

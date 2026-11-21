@@ -1,380 +1,225 @@
-import axios from 'axios';
-import { CanonicalGame, GamePlatformOwnership, StoreAchievementSummary } from '../../contracts/game';
+import {
+  CanonicalGame,
+  GamePlatformOwnership,
+  StoreAchievementSummary,
+} from '../../contracts/game';
 import {
   DetailedAchievement,
-  StorefrontAchievementsData,
   MultiStoreAchievementsMap,
-  AchievementRarityTier,
-  AchievementProgress,
+  StorefrontAchievementsData,
 } from '../../contracts/achievement';
-import { requestScheduler, RequestPriority } from '../network/requestScheduler';
+import { LruMap } from '../common/lruMap';
+import { getSafeLocalStorage } from '../common/runtimeEnv';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
-import { vaultDelete, vaultGet, vaultSet } from '../storage/indexedDbVault';
-import { steamAchievementsService } from '../steam/steamAchievementsService';
 import { steamMatcher } from '../steam/steamMatcher';
 import {
-  KNOWN_USER_STEAM_ACHIEVEMENTS,
-  KNOWN_USER_GOG_ACHIEVEMENTS,
-  KNOWN_USER_EPIC_ACHIEVEMENTS,
-  KNOWN_USER_XBOX_ACHIEVEMENTS,
-  getKnownSteamAchievements,
-  getKnownGogAchievements,
-  getKnownEpicAchievements,
-  getKnownXboxAchievements,
-} from '../storage/knownGameAchievements';
-import knownAchievementsJson from '../storage/knownGameAchievements.json';
+  isIndexedDbAvailable,
+  vaultDelete,
+  vaultEntries,
+  vaultGet,
+  vaultSet,
+} from '../storage/indexedDbVault';
+import {
+  ACHIEVEMENT_CACHE_VERSION,
+  classifyRarityTier,
+  deduplicateDetailedAchievements,
+  normalizeMultiStoreAchievementsMap,
+} from './achievementNormalizer';
+import { fetchEpicDetailedAchievementsProvider } from './epicAchievementProvider';
+import { fetchGogDetailedAchievementsProvider } from './gogAchievementProvider';
+import {
+  fetchSteamCanonicalSchemaForAppId,
+  fetchSteamDetailedAchievementsProvider,
+  fetchSteamGlobalPercentages as fetchSteamGlobalPercentagesProvider,
+} from './steamAchievementProvider';
+import { fetchXboxDetailedAchievementsProvider } from './xboxAchievementProvider';
 
-interface SteamGlobalPctItem {
-  name?: string;
-  percent?: string | number;
-}
+export { classifyRarityTier, deduplicateDetailedAchievements };
 
-interface RawRewardItem {
-  type?: string;
-  value?: string | number;
-}
+export type AchievementDetailStorefrontId = 'steam' | 'gog' | 'epic' | 'xbox';
 
-interface RawMediaAsset {
-  url?: string;
-}
+const LEGACY_LS_DETAILED_PREFIX = 'antigravity_detailed_achievements_';
+const IDB_DETAILED_PREFIX = 'detailed_achievements:';
 
-interface SteamGameAchievementApiItem {
-  internal_name?: string;
-  localized_name?: string;
-  localized_desc?: string;
-  icon?: string;
-  icon_gray?: string;
-  hidden?: boolean;
-  player_percent_unlocked?: string | number;
-  min_progress_int?: number;
-  max_progress_int?: number;
-}
-
-interface RawStoreAchievementRecord {
-  id?: string;
-  apiName?: string;
-  achievementId?: string;
-  achievement_id?: string;
-  achievement_key?: string;
-  name?: string;
-  title?: string;
-  unlockedDisplayName?: string;
-  description?: string;
-  unlockedDescription?: string;
-  lockedDescription?: string;
-  unlocked?: boolean;
-  isUnlocked?: boolean;
-  progressState?: string;
-  state?: string;
-  unlockedAt?: string | number;
-  unlockTime?: string | number;
-  date_unlocked?: string | number | null;
-  progression?: { timeUnlocked?: string };
-  iconUnlockedUrl?: string;
-  unlockedIconUrl?: string;
-  image_url_unlocked?: string;
-  iconLockedUrl?: string;
-  lockedIconUrl?: string;
-  image_url_locked?: string;
-  mediaAssets?: RawMediaAsset[];
-  globalPercentage?: number;
-  rarityPercent?: number;
-  rarity?: number | { currentPercentage?: number };
-  xp?: number;
-  tierName?: string;
-  isBaseGame?: boolean;
-  isBase?: boolean;
-  achievementSetId?: string;
-  gamerscore?: number;
-  rewards?: RawRewardItem[];
-  progress?: AchievementProgress;
-  hidden?: boolean;
-  isHidden?: boolean;
-  isSecret?: boolean;
-  visible?: boolean;
-}
-
-interface StoreAchievementsEnvelope {
-  achievements?: RawStoreAchievementRecord[];
-  items?: RawStoreAchievementRecord[];
-  total?: number;
-  unlocked?: number;
-  percentage?: number;
-  isMastered?: boolean;
-  totalCount?: number;
-  unlockedCount?: number;
-  totalGamerscore?: number;
-  earnedGamerscore?: number;
-  gamerscore?: { earned?: number; total?: number };
-  totalXp?: number;
-  earnedXp?: number;
-  xp?: { earned?: number; total?: number };
-  source?: 'live_cloud' | 'local_cache' | 'schema_fallback';
-  unlockPrecision?: 'exact' | 'summary_count_only';
-  supportsAchievements?: boolean;
-  cacheVersion?: number;
-  syncedAt?: string;
-}
-
-function getErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-function normalizeAchievementMatchKey(raw?: string | number | null): string {
-  if (raw === undefined || raw === null) return '';
-  return String(raw)
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, '');
-}
-
-function isViteBrowserDev(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    typeof window.location !== 'undefined' &&
-    window.location.protocol.startsWith('http') &&
-    (window.location.port === '3000' || window.location.port === '5173') &&
-    typeof navigator !== 'undefined' &&
-    !navigator.userAgent?.includes('jsdom') &&
-    !navigator.userAgent?.includes('Node')
-  );
-}
-
-/**
- * Classifies an achievement's rarity tier based on global unlock percentage.
- */
-export function classifyRarityTier(percentage?: number | null): AchievementRarityTier {
-  if (percentage === undefined || percentage === null || isNaN(percentage)) {
-    return 'common';
+function filterMapToOwnedStorefronts(
+  map: MultiStoreAchievementsMap,
+  game: CanonicalGame
+): MultiStoreAchievementsMap {
+  if (!game.platforms || game.platforms.length === 0) {
+    return map;
   }
-  if (percentage < 10.0) return 'ultra_rare';
-  if (percentage < 25.0) return 'rare';
-  if (percentage < 50.0) return 'uncommon';
-  return 'common';
-}
-
-/**
- * Parses XML CDATA or plain text safely.
- */
-function extractXmlTag(xml: string, tag: string): string {
-  const cdataRegex = new RegExp(`<${tag}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>`, 'i');
-  const cdataMatch = xml.match(cdataRegex);
-  if (cdataMatch) return cdataMatch[1].trim();
-
-  const plainRegex = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i');
-  const plainMatch = xml.match(plainRegex);
-  if (plainMatch) return plainMatch[1].trim();
-
-  return '';
-}
-
-function extractLiveAchievementsList(
-  raw: unknown
-): { list: RawStoreAchievementRecord[] | null; envelope: StoreAchievementsEnvelope | null } {
-  if (Array.isArray(raw)) {
-    return { list: raw as RawStoreAchievementRecord[], envelope: null };
-  }
-  if (raw && typeof raw === 'object') {
-    const env = raw as StoreAchievementsEnvelope;
-    if (Array.isArray(env.achievements)) {
-      return { list: env.achievements, envelope: env };
-    }
-    if (Array.isArray(env.items)) {
-      return { list: env.items, envelope: env };
-    }
-    return { list: null, envelope: env };
-  }
-  return { list: null, envelope: null };
-}
-
-/**
- * Deduplicates `achievements` by `ach.id` preserving first-seen order (preferring `unlocked: true`
- * when duplicates disagree) and recomputes `total`, `unlocked`, `percentage`, and `isMastered`.
- * Returns `data` untouched when no duplicate IDs are present.
- */
-export function deduplicateDetailedAchievements(
-  data: StorefrontAchievementsData
-): StorefrontAchievementsData {
-  if (!data || !Array.isArray(data.achievements) || data.achievements.length <= 1) {
-    return data;
-  }
-
-  const deduped: DetailedAchievement[] = [];
-  const indexById = new Map<string, number>();
-  let hasDuplicates = false;
-
-  for (const ach of data.achievements) {
-    const idKey = typeof ach?.id === 'string' ? ach.id.trim() : '';
-    if (idKey) {
-      const existingIdx = indexById.get(idKey);
-      if (existingIdx !== undefined) {
-        hasDuplicates = true;
-        const existing = deduped[existingIdx];
-        if (!existing.unlocked && ach.unlocked) {
-          deduped[existingIdx] = {
-            ...existing,
-            ...ach,
-            unlocked: true,
-            unlockedAt: ach.unlockedAt ?? existing.unlockedAt,
-            description: ach.description || existing.description,
-            iconUnlockedUrl: ach.iconUnlockedUrl || existing.iconUnlockedUrl,
-            iconLockedUrl: ach.iconLockedUrl || existing.iconLockedUrl,
-            globalPercentage: ach.globalPercentage ?? existing.globalPercentage,
-            rarityTier: ach.rarityTier ?? existing.rarityTier,
-            progress: ach.progress ?? existing.progress,
-          };
-        } else if (existing.unlocked === ach.unlocked) {
-          const needsBackfill =
-            (!existing.unlockedAt && Boolean(ach.unlockedAt)) ||
-            (!existing.description && Boolean(ach.description)) ||
-            (existing.globalPercentage === undefined && ach.globalPercentage !== undefined) ||
-            (!existing.progress && Boolean(ach.progress));
-          if (needsBackfill) {
-            deduped[existingIdx] = {
-              ...existing,
-              unlockedAt: existing.unlockedAt ?? ach.unlockedAt,
-              description: existing.description || ach.description,
-              globalPercentage: existing.globalPercentage ?? ach.globalPercentage,
-              rarityTier: existing.rarityTier ?? ach.rarityTier,
-              progress: existing.progress ?? ach.progress,
-            };
-          }
-        }
-        continue;
-      }
-      indexById.set(idKey, deduped.length);
-    }
-    deduped.push(ach);
-  }
-
-  const hasDoubledOrUnderstatedTotal =
-    deduped.length > 0 &&
-    (data.total < deduped.length || (deduped.length > 1 && data.total === deduped.length * 2));
-
-  if (!hasDuplicates && !hasDoubledOrUnderstatedTotal) {
-    return data;
-  }
-
-  const total = deduped.length;
-  const exactUnlocked = deduped.filter((a) => a.unlocked).length;
-  const unlocked =
-    data.unlockPrecision === 'summary_count_only' && exactUnlocked === 0
-      ? Math.min(Math.max(0, data.unlocked || 0), total)
-      : exactUnlocked;
-  const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
-
-  let hasGamerscore = false;
-  let totalGamerscore = 0;
-  let earnedGamerscore = 0;
-  let hasXp = false;
-  let totalXp = 0;
-  let earnedXp = 0;
-
-  for (const ach of deduped) {
-    if (typeof ach.gamerscore === 'number' && Number.isFinite(ach.gamerscore)) {
-      hasGamerscore = true;
-      totalGamerscore += ach.gamerscore;
-      if (ach.unlocked) earnedGamerscore += ach.gamerscore;
-    }
-    if (typeof ach.xp === 'number' && Number.isFinite(ach.xp)) {
-      hasXp = true;
-      totalXp += ach.xp;
-      if (ach.unlocked) earnedXp += ach.xp;
-    }
-  }
-
-  return {
-    ...data,
-    achievements: deduped,
-    total,
-    unlocked,
-    percentage,
-    isMastered: total > 0 && unlocked >= total,
-    ...(hasGamerscore && data.totalGamerscore !== undefined ? { totalGamerscore } : {}),
-    ...(hasGamerscore && data.earnedGamerscore !== undefined ? { earnedGamerscore } : {}),
-    ...(hasXp && data.totalXp !== undefined ? { totalXp } : {}),
-    ...(hasXp && data.earnedXp !== undefined ? { earnedXp } : {}),
-  };
-}
-
-function normalizeMultiStoreAchievementsMap(
-  map: MultiStoreAchievementsMap
-): { normalized: MultiStoreAchievementsMap; changed: boolean } {
-  let changed = false;
-  let normalized: MultiStoreAchievementsMap = map;
+  const owned = new Set<string>(game.platforms.map((p) => p.platformId));
+  let pruned = false;
+  const filtered: MultiStoreAchievementsMap = {};
   for (const key of Object.keys(map) as Array<keyof MultiStoreAchievementsMap>) {
     const entry = map[key];
     if (!entry) continue;
-    const deduped = deduplicateDetailedAchievements(entry);
-    if (deduped !== entry) {
-      if (!changed) {
-        normalized = { ...map };
-        changed = true;
-      }
-      normalized[key] = deduped;
+    if (owned.has(key)) {
+      filtered[key] = entry;
+    } else {
+      pruned = true;
     }
   }
-  return { normalized, changed };
+  return pruned ? filtered : map;
 }
 
 export class AchievementDetailService {
   public static readonly MAX_MEMORY_CACHE_ENTRIES = 60;
-  public static readonly CURRENT_CACHE_VERSION = 2;
-  private inMemoryCache = new Map<string, MultiStoreAchievementsMap>();
-  private schemaCache = new Map<string, DetailedAchievement[]>();
+  public static readonly CURRENT_CACHE_VERSION = ACHIEVEMENT_CACHE_VERSION;
 
-  public get memoryCache(): Map<string, MultiStoreAchievementsMap> {
+  private inMemoryCache = new LruMap<string, MultiStoreAchievementsMap>(
+    AchievementDetailService.MAX_MEMORY_CACHE_ENTRIES
+  );
+  private schemaCache = new LruMap<string, DetailedAchievement[]>(
+    AchievementDetailService.MAX_MEMORY_CACHE_ENTRIES
+  );
+  private gameIdToSchemaKeys = new Map<string, Set<string>>();
+  private inFlightFetches = new Map<string, Promise<MultiStoreAchievementsMap>>();
+  private cacheGeneration = 0;
+
+  public get memoryCache(): LruMap<string, MultiStoreAchievementsMap> {
     return this.inMemoryCache;
   }
 
   private setMemoryCacheEntry(gameId: string, data: MultiStoreAchievementsMap): void {
-    if (this.inMemoryCache.has(gameId)) {
-      this.inMemoryCache.delete(gameId);
-    }
     this.inMemoryCache.set(gameId, data);
-    while (this.inMemoryCache.size > AchievementDetailService.MAX_MEMORY_CACHE_ENTRIES) {
-      const oldestKey = this.inMemoryCache.keys().next().value;
-      if (oldestKey === undefined) break;
-      this.inMemoryCache.delete(oldestKey);
-    }
   }
 
-  private setSchemaCacheEntry(cacheKey: string, schema: DetailedAchievement[]): void {
-    if (this.schemaCache.has(cacheKey)) {
-      this.schemaCache.delete(cacheKey);
-    }
+  private setSchemaCacheEntry(
+    cacheKey: string,
+    schema: DetailedAchievement[],
+    gameId?: string
+  ): void {
     this.schemaCache.set(cacheKey, schema);
-    while (this.schemaCache.size > AchievementDetailService.MAX_MEMORY_CACHE_ENTRIES) {
-      const oldestKey = this.schemaCache.keys().next().value;
-      if (oldestKey === undefined) break;
-      this.schemaCache.delete(oldestKey);
+    if (gameId) {
+      let keys = this.gameIdToSchemaKeys.get(gameId);
+      if (!keys) {
+        keys = new Set<string>();
+        this.gameIdToSchemaKeys.set(gameId, keys);
+      }
+      keys.add(cacheKey);
     }
-  }
-
-  private getCommunityBaseUrl(): string {
-    if (isViteBrowserDev()) {
-      return '/api/steam-community';
-    }
-    return 'https://steamcommunity.com';
-  }
-
-  private getSteamApiBaseUrl(): string {
-    if (isViteBrowserDev()) {
-      return '/api/steam-api';
-    }
-    return 'https://api.steampowered.com';
   }
 
   /**
-   * Clears in-memory cache.
+   * Clears in-memory cache and schema cache.
    */
   clearCache(): void {
+    this.cacheGeneration += 1;
     this.inMemoryCache.clear();
     this.schemaCache.clear();
+    this.gameIdToSchemaKeys.clear();
+    this.inFlightFetches.clear();
   }
 
   /**
-   * Synchronously peeks cached multi-store detailed achievements (memory or localStorage)
+   * Clears cached detailed achievements for a specific storefront across RAM, schemaCache,
+   * legacy localStorage keys, IndexedDB vault, and SQLite offlineVault (for storefront disconnect).
+   */
+  clearStorefrontCache(storefrontId: AchievementDetailStorefrontId): void {
+    this.cacheGeneration += 1;
+
+    // 1. Prune storefront from in-memory LRU cache
+    const memUpdates: Array<{ gameId: string; next: MultiStoreAchievementsMap | null }> = [];
+    for (const [gameId, map] of this.inMemoryCache.entries()) {
+      if (map && Object.prototype.hasOwnProperty.call(map, storefrontId)) {
+        const copy: MultiStoreAchievementsMap = { ...map };
+        delete copy[storefrontId];
+        memUpdates.push({
+          gameId,
+          next: Object.keys(copy).length > 0 ? copy : null,
+        });
+      }
+    }
+    for (const { gameId, next } of memUpdates) {
+      if (next === null) {
+        this.inMemoryCache.delete(gameId);
+      } else {
+        this.inMemoryCache.set(gameId, next);
+      }
+    }
+
+    // 2. Clear schemaCache & in-flight map
+    this.schemaCache.clear();
+    this.gameIdToSchemaKeys.clear();
+    this.inFlightFetches.clear();
+
+    // 3. Prune / remove legacy localStorage keys for this storefront
+    const storage = getSafeLocalStorage();
+    if (storage) {
+      try {
+        const legacyKeys: string[] = [];
+        for (let i = 0; i < storage.length; i++) {
+          const k = storage.key(i);
+          if (k && k.startsWith(LEGACY_LS_DETAILED_PREFIX)) {
+            legacyKeys.push(k);
+          }
+        }
+        for (const key of legacyKeys) {
+          try {
+            const raw = storage.getItem(key);
+            if (!raw) continue;
+            const parsed: unknown = JSON.parse(raw);
+            if (
+              parsed &&
+              typeof parsed === 'object' &&
+              Object.prototype.hasOwnProperty.call(parsed, storefrontId)
+            ) {
+              const copy: MultiStoreAchievementsMap = {
+                ...(parsed as MultiStoreAchievementsMap),
+              };
+              delete copy[storefrontId];
+              if (Object.keys(copy).length === 0) {
+                storage.removeItem(key);
+              } else {
+                storage.setItem(key, JSON.stringify(copy));
+              }
+            }
+          } catch {
+            storage.removeItem(key);
+          }
+        }
+      } catch {
+        // Ignore restricted storage iteration errors
+      }
+    }
+
+    // 4. Asynchronously prune IndexedDB & SQLite offlineVault entries for this storefront
+    if (isIndexedDbAvailable()) {
+      void vaultEntries<string, MultiStoreAchievementsMap>()
+        .then(async (entries) => {
+          for (const [key, val] of entries) {
+            if (typeof key !== 'string' || !key.startsWith(IDB_DETAILED_PREFIX)) continue;
+            if (!val || typeof val !== 'object') continue;
+            if (!Object.prototype.hasOwnProperty.call(val, storefrontId)) continue;
+            const gameId = key.slice(IDB_DETAILED_PREFIX.length);
+            const copy: MultiStoreAchievementsMap = { ...val };
+            delete copy[storefrontId];
+            if (Object.keys(copy).length === 0) {
+              await vaultDelete(key);
+            } else {
+              await vaultSet(key, copy);
+            }
+            if (
+              typeof window !== 'undefined' &&
+              window.electronAPI?.offlineVault?.saveGameDetail
+            ) {
+              try {
+                await window.electronAPI.offlineVault
+                  .saveGameDetail({ gameId, achievements: copy })
+                  ?.catch?.(() => {});
+              } catch {
+                // Ignore SQLite mirror errors
+              }
+            }
+          }
+        })
+        .catch(() => {});
+    }
+  }
+
+  /**
+   * Synchronously peeks cached multi-store detailed achievements (memory or legacy localStorage)
    * so the Achievements modal can paint immediately on open without flashing a spinner.
    */
   peekCachedGameAchievements(gameId: string): MultiStoreAchievementsMap | null {
@@ -391,59 +236,117 @@ export class AchievementDetailService {
   }
 
   /**
-   * Evicts a single game's detailed achievement cache across memory, localStorage, and IndexedDB
-   * (used after game session exit or manual refresh).
+   * Evicts a single game's detailed achievement cache across memory, schemaCache,
+   * legacy localStorage, IndexedDB, and SQLite offlineVault.
    */
   async invalidateGame(gameId: string): Promise<void> {
     if (!gameId) return;
+    this.cacheGeneration += 1;
     this.inMemoryCache.delete(gameId);
-    if (typeof localStorage !== 'undefined') {
-      try {
-        localStorage.removeItem(`antigravity_detailed_achievements_${gameId}`);
-      } catch {}
+
+    // Clear tracked schemaCache keys + deterministic Steam ID schema key
+    const trackedKeys = this.gameIdToSchemaKeys.get(gameId);
+    if (trackedKeys) {
+      for (const k of trackedKeys) {
+        this.schemaCache.delete(k);
+      }
+      this.gameIdToSchemaKeys.delete(gameId);
     }
-    await vaultDelete(`detailed_achievements:${gameId}`);
+    const steamIdMatch = gameId.match(/^steam-(\d+)$/);
+    if (steamIdMatch?.[1]) {
+      this.schemaCache.delete(`id:${steamIdMatch[1]}`);
+    }
+
+    // Remove legacy localStorage key if present
+    const storage = getSafeLocalStorage();
+    if (storage) {
+      try {
+        storage.removeItem(`${LEGACY_LS_DETAILED_PREFIX}${gameId}`);
+      } catch {
+        // Ignore restricted storage errors
+      }
+    }
+
+    await vaultDelete(`${IDB_DETAILED_PREFIX}${gameId}`);
+
+    // Clear SQLite offlineVault achievements_json so stale SQLite rows cannot resurrect on next read
+    if (typeof window !== 'undefined' && window.electronAPI?.offlineVault?.saveGameDetail) {
+      try {
+        await window.electronAPI.offlineVault
+          .saveGameDetail({ gameId, achievements: {} })
+          ?.catch?.(() => {});
+      } catch {
+        // Ignore SQLite vault write errors
+      }
+    }
   }
 
   /**
-   * Loads cached detailed achievements from memory or localStorage, automatically
+   * Loads cached detailed achievements from RAM LRU or legacy localStorage, automatically
    * self-healing any legacy duplicate-ID entries (e.g., doubled GOG pagination payloads).
    */
   getCachedMultiStoreAchievements(gameId: string): MultiStoreAchievementsMap | null {
-    if (this.inMemoryCache.has(gameId)) {
-      const hit = this.inMemoryCache.get(gameId)!;
-      const { normalized, changed } = normalizeMultiStoreAchievementsMap(hit);
+    const memHit = this.inMemoryCache.get(gameId);
+    if (memHit) {
+      const { normalized, changed } = normalizeMultiStoreAchievementsMap(memHit);
       if (changed) {
         this.setMemoryCacheEntry(gameId, normalized);
         this.setCachedMultiStoreAchievements(gameId, normalized);
-      } else {
-        this.setMemoryCacheEntry(gameId, normalized);
       }
       return normalized;
     }
 
-    if (typeof localStorage !== 'undefined') {
+    const storage = getSafeLocalStorage();
+    if (storage) {
       try {
-        const raw = localStorage.getItem(`antigravity_detailed_achievements_${gameId}`);
+        const legacyKey = `${LEGACY_LS_DETAILED_PREFIX}${gameId}`;
+        const raw = storage.getItem(legacyKey);
         if (raw) {
           const parsed: unknown = JSON.parse(raw);
           if (parsed && typeof parsed === 'object') {
             const typed = parsed as MultiStoreAchievementsMap;
             const { normalized, changed } = normalizeMultiStoreAchievementsMap(typed);
             this.setMemoryCacheEntry(gameId, normalized);
-            if (changed) {
+            if (isIndexedDbAvailable()) {
+              // Migrate legacy localStorage entry into IndexedDB and remove unbounded LS key
+              void vaultSet(`${IDB_DETAILED_PREFIX}${gameId}`, normalized);
+              try {
+                storage.removeItem(legacyKey);
+              } catch {
+                // Ignore removal failure
+              }
+              if (changed) {
+                this.mirrorToOfflineVault(gameId, normalized);
+              }
+            } else if (changed) {
               this.setCachedMultiStoreAchievements(gameId, normalized);
             }
             return normalized;
           }
         }
-      } catch {}
+      } catch {
+        // Ignore malformed legacy storage entry
+      }
     }
     return null;
   }
 
+  private mirrorToOfflineVault(gameId: string, normalized: MultiStoreAchievementsMap): void {
+    if (typeof window !== 'undefined' && window.electronAPI?.offlineVault?.saveGameDetail) {
+      try {
+        void window.electronAPI.offlineVault
+          .saveGameDetail({ gameId, achievements: normalized })
+          ?.catch?.(() => {});
+      } catch {
+        // Ignore SQLite vault write errors
+      }
+    }
+  }
+
   /**
-   * Persists detailed achievements to memory, IndexedDB vault, SQLite vault, and localStorage.
+   * Persists detailed achievements to bounded 60-entry RAM LRU, IndexedDB vault, and SQLite vault.
+   * Avoids polluting `localStorage` when IndexedDB is available (only falls back to `localStorage`
+   * in restricted environments where IndexedDB does not exist).
    */
   setCachedMultiStoreAchievements(gameId: string, data: MultiStoreAchievementsMap): void {
     if (!data || Object.keys(data).length === 0) return;
@@ -452,22 +355,29 @@ export class AchievementDetailService {
     }
     const { normalized } = normalizeMultiStoreAchievementsMap(data);
     this.setMemoryCacheEntry(gameId, normalized);
-    void vaultSet(`detailed_achievements:${gameId}`, normalized);
-    if (typeof window !== 'undefined' && window.electronAPI?.offlineVault?.saveGameDetail) {
-      try {
-        void window.electronAPI.offlineVault
-          .saveGameDetail({ gameId, achievements: normalized })
-          ?.catch?.(() => {});
-      } catch {}
+    this.mirrorToOfflineVault(gameId, normalized);
+
+    if (isIndexedDbAvailable()) {
+      void vaultSet(`${IDB_DETAILED_PREFIX}${gameId}`, normalized);
+      // Clean up any legacy localStorage key for this game so 5MB catalog quota stays clean
+      const storage = getSafeLocalStorage();
+      if (storage) {
+        try {
+          storage.removeItem(`${LEGACY_LS_DETAILED_PREFIX}${gameId}`);
+        } catch {
+          // Ignore storage cleanup errors
+        }
+      }
+      return;
     }
-    if (typeof localStorage !== 'undefined') {
+
+    // Fallback for environments without IndexedDB (e.g. Node unit tests / restricted contexts)
+    const storage = getSafeLocalStorage();
+    if (storage) {
       try {
-        localStorage.setItem(
-          `antigravity_detailed_achievements_${gameId}`,
-          JSON.stringify(normalized)
-        );
+        storage.setItem(`${LEGACY_LS_DETAILED_PREFIX}${gameId}`, JSON.stringify(normalized));
       } catch {
-        // QuotaExceededError: detailed schema remains persisted in IndexedDB vault
+        // QuotaExceededError: data remains safely in bounded RAM LRU
       }
     }
   }
@@ -479,7 +389,7 @@ export class AchievementDetailService {
     if (syncHit && !Object.values(syncHit).some((s) => s?.schemaUnavailableOffline)) {
       return syncHit;
     }
-    const vaultHit = await vaultGet<MultiStoreAchievementsMap>(`detailed_achievements:${gameId}`);
+    const vaultHit = await vaultGet<MultiStoreAchievementsMap>(`${IDB_DETAILED_PREFIX}${gameId}`);
     if (
       vaultHit &&
       typeof vaultHit === 'object' &&
@@ -510,7 +420,9 @@ export class AchievementDetailService {
           }
           return normalized;
         }
-      } catch {}
+      } catch {
+        // Ignore SQLite vault read errors
+      }
     }
     return null;
   }
@@ -519,34 +431,7 @@ export class AchievementDetailService {
    * Fetches global achievement percentages for a Steam Game.
    */
   async fetchSteamGlobalPercentages(appId: number): Promise<Map<string, number>> {
-    const map = new Map<string, number>();
-    try {
-      const url = `${this.getSteamApiBaseUrl()}/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/?gameid=${appId}`;
-      const res = await requestScheduler.schedule(
-        url,
-        () => axios.get(url, { timeout: 6000 }),
-        RequestPriority.P0_INTERACTIVE,
-        'api.steampowered.com'
-      );
-      const list = (
-        res.data as { achievementpercentages?: { achievements?: SteamGlobalPctItem[] } } | undefined
-      )?.achievementpercentages?.achievements;
-      if (Array.isArray(list)) {
-        for (const item of list) {
-          if (item.name) {
-            const pct = parseFloat(String(item.percent ?? ''));
-            const rounded = !isNaN(pct) ? Math.round(pct * 10) / 10 : 0;
-            map.set(item.name.toLowerCase(), rounded);
-          }
-        }
-      }
-    } catch (err: unknown) {
-      console.warn(
-        `[AchievementDetailService] Global percentages fetch warning for Steam ${appId}:`,
-        getErrorMessage(err)
-      );
-    }
-    return map;
+    return fetchSteamGlobalPercentagesProvider(appId);
   }
 
   /**
@@ -558,197 +443,31 @@ export class AchievementDetailService {
     if (!game) return [];
     const titleLower = (game.title || '').toLowerCase().trim();
 
-    // Check schema memory cache
     const cacheKey = game.steamAppId ? `id:${game.steamAppId}` : `title:${titleLower}`;
-    if (this.schemaCache.has(cacheKey)) {
-      const hit = this.schemaCache.get(cacheKey)!;
-      this.setSchemaCacheEntry(cacheKey, hit);
-      return hit;
+    const cachedHit = this.schemaCache.get(cacheKey);
+    if (cachedHit) {
+      return cachedHit;
     }
 
     if (!onlineLifecycleManager.isOnline()) {
       return [];
     }
 
-    // Dynamic resolution via Steam AppID (either explicit or matched from title across GOG/Epic)
     const appId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
     if (appId) {
-      // Check known zero-achievement status
-      const knownCount = (knownAchievementsJson as Record<string, number>)[String(appId)];
-      if (knownCount === 0) {
-        this.setSchemaCacheEntry(cacheKey, []);
-        return [];
+      const parsed = await fetchSteamCanonicalSchemaForAppId(appId);
+      if (parsed.length > 0) {
+        this.setSchemaCacheEntry(cacheKey, parsed, game.id);
+        return parsed;
       }
-
-      // Primary zero-auth official REST JSON schema: IPlayerService/GetGameAchievements/v1
-      try {
-        const gameAchUrl = `${this.getSteamApiBaseUrl()}/IPlayerService/GetGameAchievements/v1/?appid=${appId}&language=english`;
-        const gameAchRes = await requestScheduler.schedule(
-          gameAchUrl,
-          () => axios.get(gameAchUrl, { timeout: 6000 }),
-          RequestPriority.P0_INTERACTIVE,
-          'api.steampowered.com'
-        );
-        const gameAchList = (
-          gameAchRes.data as { response?: { achievements?: SteamGameAchievementApiItem[] } } | undefined
-        )?.response?.achievements;
-        if (Array.isArray(gameAchList) && gameAchList.length > 0) {
-          const parsedFromPlayerService: DetailedAchievement[] = gameAchList.map(
-            (item: SteamGameAchievementApiItem, idx: number) => {
-              const apiName = String(item.internal_name || `ACH_${idx + 1}`).trim();
-              const rawPct = parseFloat(String(item.player_percent_unlocked ?? ''));
-              const pctVal = !isNaN(rawPct) ? Math.round(rawPct * 10) / 10 : undefined;
-              const rawIcon = String(item.icon || '').trim();
-              const rawGrayIcon = String(item.icon_gray || '').trim();
-              const resolveIconUrl = (src: string): string => {
-                if (!src) {
-                  return `https://shared.fastly.steamstatic.com/community_assets/images/apps/${appId}/header.jpg`;
-                }
-                if (/^https?:\/\//i.test(src)) return src;
-                if (src.startsWith('//')) return `https:${src}`;
-                return `https://shared.fastly.steamstatic.com/community_assets/images/apps/${appId}/${src.replace(/^\/+/, '')}`;
-              };
-              const iconUnlockedUrl = resolveIconUrl(rawIcon);
-              const iconLockedUrl = rawGrayIcon ? resolveIconUrl(rawGrayIcon) : iconUnlockedUrl;
-
-              return {
-                id: `steam:${appId}:${apiName.toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
-                apiName,
-                name: String(item.localized_name || apiName),
-                description: String(item.localized_desc || '').trim() || undefined,
-                unlocked: false,
-                iconUnlockedUrl,
-                iconLockedUrl,
-                globalPercentage: pctVal,
-                rarityTier: pctVal !== undefined ? classifyRarityTier(pctVal) : undefined,
-                isSecret: Boolean(item.hidden),
-                storefrontId: 'steam',
-              };
-            }
-          );
-          this.setSchemaCacheEntry(cacheKey, parsedFromPlayerService);
-          return parsedFromPlayerService;
-        }
-      } catch (err: unknown) {
-        console.warn(
-          `[AchievementDetailService] IPlayerService schema fetch warning for AppID ${appId}:`,
-          getErrorMessage(err)
-        );
-      }
-
-      // Secondary fallback (also keeps offline achieveRow HTML fixtures working — C4)
-      try {
-        const liveHtmlUrl = `${this.getCommunityBaseUrl()}/stats/${appId}/achievements/`;
-        const res = await requestScheduler.schedule(
-          liveHtmlUrl,
-          () => axios.get(liveHtmlUrl, { timeout: 4000, responseType: 'text' }),
-          RequestPriority.P0_INTERACTIVE,
-          'steamcommunity.com'
-        );
-        const html = typeof res.data === 'string' ? res.data : '';
-        if (html.includes('achieveRow')) {
-          const parsed = this.parseSteamCommunityHtml(html, appId);
-          if (parsed.length > 0) {
-            this.setSchemaCacheEntry(cacheKey, parsed);
-            return parsed;
-          }
-        }
-      } catch (err: unknown) {
-        console.warn(
-          `[AchievementDetailService] Live public schema fetch warning for AppID ${appId}:`,
-          getErrorMessage(err)
-        );
-      }
-
-      // Secondary zero-auth official fallback: ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/
-      try {
-        const url = `${this.getSteamApiBaseUrl()}/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/?gameid=${appId}`;
-        const apiRes = await requestScheduler.schedule(
-          url,
-          () => axios.get(url, { timeout: 6000 }),
-          RequestPriority.P0_INTERACTIVE,
-          'api.steampowered.com'
-        );
-        const apiList = (
-          apiRes.data as { achievementpercentages?: { achievements?: SteamGlobalPctItem[] } } | undefined
-        )?.achievementpercentages?.achievements;
-        if (Array.isArray(apiList) && apiList.length > 0) {
-          const parsedFromApi: DetailedAchievement[] = apiList.map(
-            (item: SteamGlobalPctItem, idx: number) => {
-              const rawApiName = String(item.name || `ACH_${idx + 1}`);
-              const strippedApi = rawApiName.replace(/^ACH_/i, '');
-              const rawPct = parseFloat(String(item.percent ?? ''));
-              const pctVal = !isNaN(rawPct) ? Math.round(rawPct * 10) / 10 : undefined;
-              const humanName = strippedApi
-                .replace(/_/g, ' ')
-                .replace(/([a-z])([A-Z])/g, '$1 $2')
-                .replace(/\b\w/g, (c) => c.toUpperCase());
-              const iconUrl = `https://shared.fastly.steamstatic.com/community_assets/images/apps/${appId}/header.jpg`;
-
-              return {
-                id: `steam:${appId}:${rawApiName.toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
-                apiName: rawApiName,
-                name: humanName,
-                description: undefined,
-                unlocked: false,
-                iconUnlockedUrl: iconUrl,
-                iconLockedUrl: iconUrl,
-                globalPercentage: pctVal,
-                rarityTier: pctVal !== undefined ? classifyRarityTier(pctVal) : undefined,
-                isSecret: false,
-                storefrontId: 'steam',
-              };
-            }
-          );
-          this.setSchemaCacheEntry(cacheKey, parsedFromApi);
-          return parsedFromApi;
-        }
-      } catch {}
     }
 
     return [];
   }
 
-  private parseSteamCommunityHtml(html: string, appId: number): DetailedAchievement[] {
-    const results: DetailedAchievement[] = [];
-    const rowMatches = html.split(/<div class="achieveRow\s*"/i);
-    for (let i = 1; i < rowMatches.length; i++) {
-      const block = rowMatches[i];
-      const imgMatch = block.match(/<img[^>]+src="([^">]+)"/i);
-      const nameMatch = block.match(/<h3>([^<]+)<\/h3>/i);
-      const descMatch = block.match(/<h5>([^<]*)<\/h5>/i);
-      const pctMatch = block.match(/<div class="achievePercent">([0-9.]+)%<\/div>/i);
-
-      if (nameMatch) {
-        const name = nameMatch[1].trim();
-        const desc = descMatch ? descMatch[1].trim() : '';
-        const icon = imgMatch
-          ? imgMatch[1].trim()
-          : `https://shared.fastly.steamstatic.com/community_assets/images/apps/${appId}/header.jpg`;
-        const pctVal = pctMatch ? parseFloat(pctMatch[1]) : undefined;
-
-        results.push({
-          id: `steam:${appId}:${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
-          apiName: name.toUpperCase().replace(/[^A-Z0-9]/g, '_'),
-          name,
-          description: desc || undefined,
-          unlocked: false,
-          iconUnlockedUrl: icon,
-          iconLockedUrl: icon,
-          globalPercentage: pctVal,
-          rarityTier: pctVal !== undefined ? classifyRarityTier(pctVal) : undefined,
-          isSecret: !desc,
-          storefrontId: 'steam',
-        });
-      }
-    }
-    return results;
-  }
-
   /**
-   * Fetches detailed Steam achievements via Electron main-process provider (SSR JSON + Web API +
-   * local/CrossOver binary VDF with exact partial progress), falling back to Community XML +
-   * IPlayerService schema in non-Electron environments.
+   * Fetches detailed Steam achievements via Electron main-process provider,
+   * falling back to Community XML + canonical schema in non-Electron environments.
    */
   async fetchSteamDetailedAchievements(
     appId: number,
@@ -757,360 +476,21 @@ export class AchievementDetailService {
     canonicalSchema?: DetailedAchievement[],
     lazyCanonicalSchema?: () => Promise<DetailedAchievement[]>
   ): Promise<StorefrontAchievementsData | null> {
-    const knownJsonCount = (knownAchievementsJson as Record<string, number>)[String(appId)];
-    if (knownJsonCount === 0) {
-      return {
-        storefrontId: 'steam',
-        storefrontName: 'Steam',
-        total: 0,
-        unlocked: 0,
-        percentage: 0,
-        isMastered: false,
-        achievements: [],
-        supportsAchievements: false,
-        source: 'schema_fallback',
-        unlockPrecision: 'exact',
-        cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-      };
-    }
-
-    const creds = steamAchievementsService.getActiveSteamCredentials();
-    const knownUser =
-      getKnownSteamAchievements(appId) ||
-      steamAchievementsService.getCachedAchievements(appId) ||
-      KNOWN_USER_STEAM_ACHIEVEMENTS[appId];
-    const resolvedSummaryUnlocked = Math.max(
-      existingSummary?.unlocked ?? 0,
-      knownUser ? knownUser.unlocked : 0
+    return fetchSteamDetailedAchievementsProvider(
+      appId,
+      gameTitle,
+      {
+        fetchGlobalPercentages: (id) => this.fetchSteamGlobalPercentages(id),
+        getCanonicalSchema: (g) => this.getCanonicalGameSchema(g),
+      },
+      existingSummary,
+      canonicalSchema,
+      lazyCanonicalSchema
     );
-    const resolvedSummaryTotal = Math.max(
-      existingSummary?.total ?? 0,
-      knownUser ? knownUser.total : 0
-    );
-    const ipcExistingSummary =
-      existingSummary || knownUser
-        ? { unlocked: resolvedSummaryUnlocked, total: resolvedSummaryTotal }
-        : undefined;
-    let ipcSchemaFallbackResult: StorefrontAchievementsData | null = null;
-
-    // 1. Unified Electron Main-Process Provider (SSR renderContext.queryData + Web API + Bottle Binary VDF)
-    if (typeof window !== 'undefined' && window.electronAPI?.getStoreAchievements) {
-      try {
-        const liveRes = await window.electronAPI.getStoreAchievements({
-          platformId: 'steam',
-          storefrontId: 'steam',
-          gameId: `steam-${appId}`,
-          platformGameId: String(appId),
-          steamAppId: appId,
-          steamId: creds.steamId || undefined,
-          apiKey: creds.apiKey || undefined,
-          existingSummary: ipcExistingSummary,
-          title: gameTitle,
-        });
-        const { list: rawSteamList, envelope: steamEnv } = extractLiveAchievementsList(liveRes);
-        if (rawSteamList && rawSteamList.length > 0) {
-          const achievements: DetailedAchievement[] = rawSteamList.map(
-            (rawAch: RawStoreAchievementRecord, idx: number): DetailedAchievement => {
-              const globalPct =
-                typeof rawAch.globalPercentage === 'number'
-                  ? rawAch.globalPercentage
-                  : typeof rawAch.rarity === 'number'
-                    ? rawAch.rarity
-                    : undefined;
-              const unlockedIcon =
-                rawAch.iconUnlockedUrl ||
-                rawAch.unlockedIconUrl ||
-                `https://shared.fastly.steamstatic.com/community_assets/images/apps/${appId}/header.jpg`;
-              const lockedIcon = rawAch.iconLockedUrl || rawAch.lockedIconUrl || unlockedIcon;
-              const validProgress =
-                rawAch.progress &&
-                typeof rawAch.progress.current === 'number' &&
-                typeof rawAch.progress.max === 'number' &&
-                rawAch.progress.max > 0
-                  ? {
-                      current: rawAch.progress.current,
-                      max: rawAch.progress.max,
-                      percentage:
-                        typeof rawAch.progress.percentage === 'number'
-                          ? rawAch.progress.percentage
-                          : Math.round((rawAch.progress.current / rawAch.progress.max) * 100),
-                      ...(rawAch.progress.unit ? { unit: rawAch.progress.unit } : {}),
-                    }
-                  : undefined;
-
-              return {
-                id: rawAch.id || `steam:${appId}:${rawAch.apiName || idx}`,
-                apiName: String(rawAch.apiName || rawAch.id || `STEAM_ACH_${idx + 1}`),
-                name: String(rawAch.name || rawAch.apiName || `Achievement #${idx + 1}`),
-                description: rawAch.description || undefined,
-                unlocked: Boolean(rawAch.unlocked || rawAch.isUnlocked),
-                unlockedAt: rawAch.unlockedAt ?? rawAch.unlockTime ?? undefined,
-                iconUnlockedUrl: unlockedIcon,
-                iconLockedUrl: lockedIcon,
-                globalPercentage: globalPct,
-                rarityTier: globalPct !== undefined ? classifyRarityTier(globalPct) : undefined,
-                ...(validProgress ? { progress: validProgress } : {}),
-                isSecret: Boolean(rawAch.isSecret || rawAch.hidden || rawAch.isHidden),
-                ...(typeof rawAch.isBaseGame === 'boolean' ? { isBaseGame: rawAch.isBaseGame } : {}),
-                ...(rawAch.achievementSetId ? { achievementSetId: rawAch.achievementSetId } : {}),
-                storefrontId: 'steam',
-              };
-            }
-          );
-
-          const total = achievements.length;
-          const exactUnlocked = achievements.filter((a) => a.unlocked).length;
-          const summaryUnlocked = resolvedSummaryUnlocked;
-          const envPrecision = steamEnv?.unlockPrecision;
-          const isSummaryOnly =
-            envPrecision === 'summary_count_only' ||
-            (exactUnlocked === 0 && summaryUnlocked > 0);
-          const unlocked = isSummaryOnly
-            ? Math.max(summaryUnlocked, typeof steamEnv?.unlocked === 'number' ? steamEnv.unlocked : 0)
-            : exactUnlocked;
-          const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
-
-          const ipcResult: StorefrontAchievementsData = deduplicateDetailedAchievements({
-            storefrontId: 'steam',
-            storefrontName: 'Steam',
-            total,
-            unlocked,
-            percentage,
-            isMastered: total > 0 && unlocked >= total,
-            achievements,
-            syncedAt: steamEnv?.syncedAt || new Date().toISOString(),
-            source: steamEnv?.source || (isSummaryOnly ? 'schema_fallback' : 'live_cloud'),
-            unlockPrecision: isSummaryOnly ? 'summary_count_only' : 'exact',
-            supportsAchievements: true,
-            cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-          });
-
-          if (
-            steamEnv?.source === 'schema_fallback' &&
-            exactUnlocked === 0 &&
-            Boolean(creds.steamId) &&
-            onlineLifecycleManager.isOnline()
-          ) {
-            ipcSchemaFallbackResult = ipcResult;
-          } else {
-            return ipcResult;
-          }
-        }
-      } catch {
-        // Fall through to browser XML / canonical schema fallback
-      }
-    }
-
-    if (onlineLifecycleManager.isOnline()) {
-      const steamId = creds.steamId;
-
-      let globalPercentages = new Map<string, number>();
-      try {
-        globalPercentages = await this.fetchSteamGlobalPercentages(appId);
-      } catch {}
-
-      if (steamId) {
-        const isNumeric = /^\d{17}$/.test(steamId);
-        const pathSegment = isNumeric ? `profiles/${steamId}` : `id/${steamId}`;
-        const xmlUrl = `${this.getCommunityBaseUrl()}/${pathSegment}/stats/${appId}/?xml=1`;
-
-        try {
-          const res = await requestScheduler.schedule(
-            xmlUrl,
-            () => axios.get(xmlUrl, { timeout: 8000, responseType: 'text' }),
-            RequestPriority.P0_INTERACTIVE,
-            'steamcommunity.com'
-          );
-          let xml = typeof res.data === 'string' ? res.data : '';
-
-          // Handle older Steam titles with custom Steam Community friendlyURL redirects (e.g. 20920 -> TheWitcher2)
-          if (!xml.includes('<achievement closed=') && !xml.includes('<achievements>')) {
-            const friendlyMatch = xml.match(/steamcommunity\.com\/stats\/([^/"'?]+)\/achievements/i);
-            if (friendlyMatch?.[1]) {
-              try {
-                const friendlyUrl = `${this.getCommunityBaseUrl()}/${pathSegment}/stats/${encodeURIComponent(friendlyMatch[1])}/?xml=1`;
-                const friendlyRes = await requestScheduler.schedule(
-                  friendlyUrl,
-                  () => axios.get(friendlyUrl, { timeout: 8000, responseType: 'text' }),
-                  RequestPriority.P0_INTERACTIVE,
-                  'steamcommunity.com'
-                );
-                if (typeof friendlyRes.data === 'string') {
-                  xml = friendlyRes.data;
-                }
-              } catch {}
-            }
-          }
-
-          if (xml.includes('<achievement closed=') || xml.includes('<achievements>')) {
-            const achievementBlocks = xml.split('<achievement closed="');
-            const achievements: DetailedAchievement[] = [];
-
-            for (let i = 1; i < achievementBlocks.length; i++) {
-              const rawBlock = achievementBlocks[i];
-              const isClosed = rawBlock.charAt(0) === '1';
-              const innerBlock = rawBlock.substring(rawBlock.indexOf('>') + 1);
-
-              const name = extractXmlTag(innerBlock, 'name');
-              const apiName = extractXmlTag(innerBlock, 'apiname');
-              const description = extractXmlTag(innerBlock, 'description');
-              const iconClosed = extractXmlTag(innerBlock, 'iconClosed');
-              const iconOpen = extractXmlTag(innerBlock, 'iconOpen');
-              const unlockTimestampRaw = extractXmlTag(innerBlock, 'unlockTimestamp');
-              const unlockTimestamp = unlockTimestampRaw ? parseInt(unlockTimestampRaw, 10) : undefined;
-
-              let progress: DetailedAchievement['progress'] = undefined;
-              const progressMatch = innerBlock.match(/<progress[^>]*>(\d+)\s*\/\s*(\d+)<\/progress>/i);
-              if (progressMatch) {
-                const current = parseInt(progressMatch[1], 10);
-                const max = parseInt(progressMatch[2], 10);
-                progress = {
-                  current,
-                  max,
-                  percentage: max > 0 ? Math.round((current / max) * 100) : 0,
-                };
-              }
-
-              const cleanKey = (apiName || name).toLowerCase().replace(/[^a-z0-9]/g, '');
-              let globalPct: number | undefined = undefined;
-              for (const [k, v] of globalPercentages.entries()) {
-                if (k.replace(/[^a-z0-9]/g, '') === cleanKey) {
-                  globalPct = v;
-                  break;
-                }
-              }
-
-              achievements.push({
-                id: `steam:${appId}:${apiName || name}`,
-                apiName: apiName || name,
-                name: name || apiName || `Achievement #${i}`,
-                description: description || undefined,
-                unlocked: isClosed,
-                unlockedAt: unlockTimestamp && unlockTimestamp > 0 ? unlockTimestamp * 1000 : undefined,
-                iconUnlockedUrl: iconClosed || iconOpen,
-                iconLockedUrl: iconOpen || iconClosed,
-                globalPercentage: globalPct,
-                rarityTier: globalPct !== undefined ? classifyRarityTier(globalPct) : undefined,
-                progress,
-                isSecret: !description && Boolean(name),
-                storefrontId: 'steam',
-              });
-            }
-
-            const total = achievements.length;
-            const unlocked = achievements.filter((a) => a.unlocked).length;
-            const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
-
-            return deduplicateDetailedAchievements({
-              storefrontId: 'steam',
-              storefrontName: 'Steam',
-              total,
-              unlocked,
-              percentage,
-              isMastered: total > 0 && unlocked >= total,
-              achievements,
-              syncedAt: new Date().toISOString(),
-              source: 'live_cloud',
-              unlockPrecision: 'exact',
-              supportsAchievements: true,
-              cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-            });
-          }
-        } catch (err: unknown) {
-          console.warn(
-            `[AchievementDetailService] Steam XML stats fetch failed for ${appId}:`,
-            getErrorMessage(err)
-          );
-        }
-      }
-    }
-
-    if (ipcSchemaFallbackResult) {
-      return ipcSchemaFallbackResult;
-    }
-
-    // Fallback: If live SSR/XML failed or profile is private, use canonical schema without fabricating per-item unlocks
-    const schema =
-      canonicalSchema && canonicalSchema.length > 0
-        ? canonicalSchema
-        : lazyCanonicalSchema
-          ? await lazyCanonicalSchema()
-          : onlineLifecycleManager.isOnline()
-            ? await this.getCanonicalGameSchema({
-                id: `steam-${appId}`,
-                title: gameTitle,
-                sortTitle: gameTitle,
-                steamAppId: appId,
-                platforms: [],
-                headerImage: '',
-                capsuleImage: '',
-                developers: [],
-                publishers: [],
-                genres: [],
-                tags: [],
-              })
-            : [];
-
-    const unlockedCount = resolvedSummaryUnlocked;
-    const totalCount =
-      schema.length > 0
-        ? schema.length
-        : existingSummary?.total ??
-          (knownUser ? knownUser.total : typeof knownJsonCount === 'number' ? knownJsonCount : 0);
-
-    if (schema.length > 0) {
-      const achievements: DetailedAchievement[] = schema.map((baseAch, idx) => ({
-        ...baseAch,
-        id: `steam:${appId}:${baseAch.apiName || idx}`,
-        unlocked: Boolean(baseAch.unlocked),
-        unlockedAt: baseAch.unlockedAt,
-        storefrontId: 'steam',
-      }));
-
-      const exactUnlocked = achievements.filter((a) => a.unlocked).length;
-      const effectiveUnlocked = exactUnlocked > 0 ? exactUnlocked : unlockedCount;
-      const unlockPrecision: 'exact' | 'summary_count_only' =
-        effectiveUnlocked > 0 && exactUnlocked === 0 ? 'summary_count_only' : 'exact';
-      const percentage = totalCount > 0 ? Math.round((effectiveUnlocked / totalCount) * 100) : 0;
-
-      return deduplicateDetailedAchievements({
-        storefrontId: 'steam',
-        storefrontName: 'Steam',
-        total: totalCount,
-        unlocked: effectiveUnlocked,
-        percentage,
-        isMastered: totalCount > 0 && effectiveUnlocked >= totalCount,
-        achievements,
-        syncedAt: existingSummary?.syncedAt || new Date().toISOString(),
-        source: exactUnlocked > 0 ? 'live_cloud' : 'schema_fallback',
-        unlockPrecision,
-        supportsAchievements: true,
-        cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-      });
-    }
-
-    const isOffline = !onlineLifecycleManager.isOnline();
-    const hasKnownSteamAchievements = totalCount > 0 || unlockedCount > 0;
-    const percentage = totalCount > 0 ? Math.round((unlockedCount / totalCount) * 100) : 0;
-    return {
-      storefrontId: 'steam',
-      storefrontName: 'Steam',
-      total: totalCount,
-      unlocked: unlockedCount,
-      percentage,
-      isMastered: totalCount > 0 && unlockedCount >= totalCount,
-      achievements: [],
-      syncedAt: existingSummary?.syncedAt,
-      source: 'schema_fallback',
-      unlockPrecision: unlockedCount > 0 ? 'summary_count_only' : 'exact',
-      supportsAchievements: hasKnownSteamAchievements || isOffline,
-      schemaUnavailableOffline: hasKnownSteamAchievements || isOffline,
-    };
   }
 
   /**
-   * Fetches detailed Epic Games achievements via unified cloud IPC (`store:get-achievements`)
-   * with `fetchEpicGameSchema` and canonical schema fallbacks, without fabricating unlocks or XP.
+   * Fetches detailed Epic Games achievements via unified cloud IPC with schema fallback.
    */
   async fetchEpicDetailedAchievements(
     game: CanonicalGame,
@@ -1119,270 +499,18 @@ export class AchievementDetailService {
     canonicalSchema?: DetailedAchievement[],
     lazyCanonicalSchema?: () => Promise<DetailedAchievement[]>
   ): Promise<StorefrontAchievementsData | null> {
-    const epicPlatform = game.platforms.find((p) => p.platformId === 'epic');
-    const targetId = platformGameId || epicPlatform?.platformGameId || game.id;
-    const titleLower = (game.title || '').toLowerCase().trim();
-    const epicNamespace = epicPlatform?.namespace;
-
-    const summary = existingSummary || epicPlatform?.achievements;
-    const cachedUserEpic =
-      getKnownEpicAchievements(targetId, game.title) ||
-      (epicNamespace ? getKnownEpicAchievements(epicNamespace, game.title) : undefined);
-    const userEpic =
-      (cachedUserEpic && (!summary || cachedUserEpic.unlocked >= (summary.unlocked || 0))
-        ? cachedUserEpic
-        : summary) ||
-      KNOWN_USER_EPIC_ACHIEVEMENTS[targetId] ||
-      KNOWN_USER_EPIC_ACHIEVEMENTS[`epic-${targetId}`] ||
-      KNOWN_USER_EPIC_ACHIEVEMENTS[titleLower] ||
-      summary;
-
-    const mapRawEpicItem = (rawAch: RawStoreAchievementRecord, idx: number): DetailedAchievement => {
-      const globalPct =
-        typeof rawAch.globalPercentage === 'number'
-          ? rawAch.globalPercentage
-          : typeof rawAch.rarityPercent === 'number'
-            ? rawAch.rarityPercent
-            : typeof rawAch.rarity === 'number'
-              ? rawAch.rarity
-              : undefined;
-      const unlockedIcon =
-        rawAch.iconUnlockedUrl || rawAch.unlockedIconUrl || game.headerImage || '';
-      const validProgress =
-        rawAch.progress &&
-        typeof rawAch.progress.current === 'number' &&
-        typeof rawAch.progress.max === 'number' &&
-        rawAch.progress.max > 0
-          ? {
-              current: rawAch.progress.current,
-              max: rawAch.progress.max,
-              percentage:
-                typeof rawAch.progress.percentage === 'number'
-                  ? rawAch.progress.percentage
-                  : Math.round((rawAch.progress.current / rawAch.progress.max) * 100),
-              ...(rawAch.progress.unit ? { unit: rawAch.progress.unit } : {}),
-            }
-          : undefined;
-
-      return {
-        id: rawAch.id || `epic:${targetId}:${rawAch.apiName || rawAch.achievementId || idx}`,
-        apiName: String(rawAch.apiName || rawAch.achievementId || `EPIC_ACH_${idx + 1}`),
-        name:
-          rawAch.name ||
-          rawAch.unlockedDisplayName ||
-          rawAch.title ||
-          `${game.title} Achievement #${idx + 1}`,
-        description:
-          rawAch.description ||
-          rawAch.unlockedDescription ||
-          rawAch.lockedDescription ||
-          undefined,
-        isSecret: Boolean(rawAch.hidden || rawAch.isHidden || rawAch.isSecret),
-        unlocked: Boolean(rawAch.unlocked || rawAch.unlockedAt),
-        unlockedAt: rawAch.unlockedAt || undefined,
-        iconUnlockedUrl: unlockedIcon,
-        iconLockedUrl: rawAch.iconLockedUrl || rawAch.lockedIconUrl || unlockedIcon,
-        globalPercentage: globalPct,
-        rarityTier: globalPct !== undefined ? classifyRarityTier(globalPct) : undefined,
-        ...(validProgress ? { progress: validProgress } : {}),
-        xp: typeof rawAch.xp === 'number' && Number.isFinite(rawAch.xp) ? rawAch.xp : undefined,
-        ...(rawAch.tierName ? { tierName: rawAch.tierName } : {}),
-        ...(typeof rawAch.isBaseGame === 'boolean'
-          ? { isBaseGame: rawAch.isBaseGame }
-          : typeof rawAch.isBase === 'boolean'
-            ? { isBaseGame: rawAch.isBase }
-            : {}),
-        ...(rawAch.achievementSetId ? { achievementSetId: rawAch.achievementSetId } : {}),
-        storefrontId: 'epic',
-      };
-    };
-
-    let schema: DetailedAchievement[] | null = null;
-    let schemaHasAuthoritativeUnlocks = false;
-    let liveEpicEnvelope: StoreAchievementsEnvelope | null = null;
-
-    // 1. Primary: Unified Electron Main-Process Cloud Provider (`store:get-achievements`)
-    if (typeof window !== 'undefined' && window.electronAPI?.getStoreAchievements) {
-      try {
-        const liveRes = await window.electronAPI.getStoreAchievements({
-          platformId: 'epic',
-          storefrontId: 'epic',
-          gameId: game.id,
-          platformGameId: targetId,
-          appName: epicPlatform?.storefrontAppId || targetId,
-          namespace: epicNamespace,
-          catalogItemId: epicPlatform?.catalogItemId,
-          title: game.title,
-        });
-        const { list: rawLiveList, envelope: liveEnv } = extractLiveAchievementsList(liveRes);
-        liveEpicEnvelope = liveEnv;
-        if (
-          liveEnv?.supportsAchievements === false &&
-          (!rawLiveList || rawLiveList.length === 0) &&
-          !(userEpic && (userEpic.total > 0 || userEpic.unlocked > 0))
-        ) {
-          return {
-            storefrontId: 'epic',
-            storefrontName: 'Epic Games',
-            total: 0,
-            unlocked: 0,
-            percentage: 0,
-            isMastered: false,
-            achievements: [],
-            syncedAt: liveEnv.syncedAt || new Date().toISOString(),
-            source: 'live_cloud',
-            unlockPrecision: 'exact',
-            supportsAchievements: false,
-            cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-          };
-        }
-        if (rawLiveList && rawLiveList.length > 0) {
-          schemaHasAuthoritativeUnlocks =
-            liveEnv?.unlockPrecision === 'exact' ||
-            rawLiveList.some((r) => Boolean(r.unlocked) || Boolean(r.unlockedAt) || Boolean(r.progress));
-          schema = rawLiveList.map(mapRawEpicItem);
-        }
-      } catch {
-        // Fall through to fetchEpicGameSchema
-      }
-    }
-
-    // 2. Secondary: `epic:fetch-game-schema` IPC
-    if ((!schema || schema.length === 0) && typeof window !== 'undefined' && window.electronAPI?.fetchEpicGameSchema) {
-      try {
-        const schemaRes = await window.electronAPI.fetchEpicGameSchema({
-          appName: epicPlatform?.storefrontAppId || targetId,
-          namespace: epicNamespace,
-          catalogItemId: epicPlatform?.catalogItemId,
-          title: game.title,
-        });
-        const { list: rawSchemaList } = extractLiveAchievementsList(schemaRes);
-        if (rawSchemaList && rawSchemaList.length > 0) {
-          schemaHasAuthoritativeUnlocks = rawSchemaList.some(
-            (r) => typeof r.unlocked === 'boolean' || Boolean(r.unlockedAt)
-          );
-          schema = rawSchemaList.map(mapRawEpicItem);
-        }
-      } catch {
-        // Fall back to canonical game schema
-      }
-    }
-
-    const summaryUnlockedCount = userEpic?.unlocked || 0;
-
-    if (!schema || schema.length === 0) {
-      schema =
-        canonicalSchema && canonicalSchema.length > 0
-          ? canonicalSchema
-          : lazyCanonicalSchema
-            ? await lazyCanonicalSchema()
-            : onlineLifecycleManager.isOnline()
-              ? await this.getCanonicalGameSchema(game)
-              : [];
-    }
-
-    if (!schema || schema.length === 0) {
-      const fallbackTotal = userEpic?.total || 0;
-      const fallbackPct = fallbackTotal > 0 ? Math.round((summaryUnlockedCount / fallbackTotal) * 100) : 0;
-      const isOffline = !onlineLifecycleManager.isOnline();
-      const hasKnownEpicAchievements =
-        fallbackTotal > 0 ||
-        summaryUnlockedCount > 0 ||
-        (userEpic?.xp?.total ?? 0) > 0 ||
-        (userEpic?.xp?.earned ?? 0) > 0;
-      return {
-        storefrontId: 'epic',
-        storefrontName: 'Epic Games',
-        total: fallbackTotal,
-        unlocked: summaryUnlockedCount,
-        percentage: fallbackPct,
-        isMastered: fallbackTotal > 0 && summaryUnlockedCount >= fallbackTotal,
-        ...(userEpic?.xp?.total !== undefined ? { totalXp: userEpic.xp.total } : {}),
-        ...(userEpic?.xp?.earned !== undefined ? { earnedXp: userEpic.xp.earned } : {}),
-        achievements: [],
-        syncedAt: userEpic?.syncedAt,
-        source: 'schema_fallback',
-        unlockPrecision: summaryUnlockedCount > 0 ? 'summary_count_only' : 'exact',
-        supportsAchievements: hasKnownEpicAchievements || isOffline,
-        schemaUnavailableOffline: hasKnownEpicAchievements || isOffline,
-      };
-    }
-
-    const effectiveSchema = [...schema];
-    const totalCount = Math.max(effectiveSchema.length, userEpic?.total || 0);
-
-    let sumSchemaXp = 0;
-    let sumEarnedSchemaXp = 0;
-    let hasSchemaXp = false;
-
-    const achievements: DetailedAchievement[] = effectiveSchema.map((baseAch, index) => {
-      const isUnlocked = Boolean(baseAch.unlocked);
-      const xpVal =
-        typeof baseAch.xp === 'number' && Number.isFinite(baseAch.xp) ? baseAch.xp : undefined;
-
-      if (xpVal !== undefined) {
-        hasSchemaXp = true;
-        sumSchemaXp += xpVal;
-        if (isUnlocked) sumEarnedSchemaXp += xpVal;
-      }
-
-      return {
-        ...baseAch,
-        id: baseAch.id || `epic:${targetId}:${baseAch.apiName || baseAch.name || index}`,
-        unlocked: isUnlocked,
-        unlockedAt: baseAch.unlockedAt,
-        ...(xpVal !== undefined ? { xp: xpVal } : {}),
-        storefrontId: 'epic',
-      };
-    });
-
-    const exactUnlocked = achievements.filter((a) => a.unlocked).length;
-    const hasExactUnlocks = schemaHasAuthoritativeUnlocks || exactUnlocked > 0;
-    const effectiveUnlocked = hasExactUnlocks ? exactUnlocked : summaryUnlockedCount;
-    const unlockPrecision: 'exact' | 'summary_count_only' =
-      effectiveUnlocked > 0 && !hasExactUnlocks ? 'summary_count_only' : 'exact';
-    const percentage = totalCount > 0 ? Math.round((effectiveUnlocked / totalCount) * 100) : 0;
-    const isMastered = totalCount > 0 && effectiveUnlocked >= totalCount;
-
-    const envTotalXp =
-      typeof liveEpicEnvelope?.totalXp === 'number' && liveEpicEnvelope.totalXp > 0
-        ? liveEpicEnvelope.totalXp
-        : typeof liveEpicEnvelope?.xp?.total === 'number' && liveEpicEnvelope.xp.total > 0
-          ? liveEpicEnvelope.xp.total
-          : undefined;
-    const envEarnedXp =
-      typeof liveEpicEnvelope?.earnedXp === 'number'
-        ? liveEpicEnvelope.earnedXp
-        : typeof liveEpicEnvelope?.xp?.earned === 'number'
-          ? liveEpicEnvelope.xp.earned
-          : undefined;
-
-    const resolvedTotalXp = envTotalXp ?? userEpic?.xp?.total ?? (hasSchemaXp ? sumSchemaXp : undefined);
-    const resolvedEarnedXp =
-      envEarnedXp ??
-      (hasExactUnlocks && hasSchemaXp ? sumEarnedSchemaXp : userEpic?.xp?.earned);
-
-    return deduplicateDetailedAchievements({
-      storefrontId: 'epic',
-      storefrontName: 'Epic Games',
-      total: totalCount,
-      unlocked: effectiveUnlocked,
-      percentage,
-      isMastered,
-      ...(resolvedTotalXp !== undefined ? { totalXp: resolvedTotalXp } : {}),
-      ...(resolvedEarnedXp !== undefined ? { earnedXp: resolvedEarnedXp } : {}),
-      achievements,
-      syncedAt: liveEpicEnvelope?.syncedAt || userEpic?.syncedAt || new Date().toISOString(),
-      source: hasExactUnlocks ? 'live_cloud' : 'schema_fallback',
-      unlockPrecision,
-      supportsAchievements: true,
-      cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-    });
+    return fetchEpicDetailedAchievementsProvider(
+      game,
+      (g) => this.getCanonicalGameSchema(g),
+      platformGameId,
+      existingSummary,
+      canonicalSchema,
+      lazyCanonicalSchema
+    );
   }
 
   /**
-   * Fetches detailed GOG Galaxy achievements, reconciling live per-achievement unlock records
-   * from `window.electronAPI.getStoreAchievements` against GOG / canonical schemas without fabrication.
+   * Fetches detailed GOG Galaxy achievements, reconciling live records against canonical schemas.
    */
   async fetchGogDetailedAchievements(
     game: CanonicalGame,
@@ -1391,318 +519,18 @@ export class AchievementDetailService {
     canonicalSchema?: DetailedAchievement[],
     lazyCanonicalSchema?: () => Promise<DetailedAchievement[]>
   ): Promise<StorefrontAchievementsData | null> {
-    const gogPlatform = game.platforms.find((p) => p.platformId === 'gog');
-    const targetId = platformGameId || gogPlatform?.platformGameId || game.id;
-    const titleLower = (game.title || '').toLowerCase().trim();
-
-    const summary = existingSummary || gogPlatform?.achievements;
-    const cachedUserGog = getKnownGogAchievements(targetId, game.title);
-    const userGog =
-      (cachedUserGog && (!summary || cachedUserGog.unlocked >= (summary.unlocked || 0))
-        ? cachedUserGog
-        : summary) ||
-      KNOWN_USER_GOG_ACHIEVEMENTS[targetId] ||
-      KNOWN_USER_GOG_ACHIEVEMENTS[`gog-${targetId}`] ||
-      KNOWN_USER_GOG_ACHIEVEMENTS[titleLower] ||
-      summary;
-
-    // 1. Live GOG Gameplay API per-achievement records via Electron IPC getStoreAchievements
-    let liveGogItems: RawStoreAchievementRecord[] | null = null;
-    let liveGogEnvelope: StoreAchievementsEnvelope | null = null;
-
-    if (typeof window !== 'undefined' && window.electronAPI?.getStoreAchievements) {
-      try {
-        const ipcFn = window.electronAPI.getStoreAchievements;
-        const rawLiveRes =
-          ipcFn.length >= 2
-            ? await ipcFn('gog', gogPlatform?.platformGameId || targetId)
-            : await ipcFn({
-                platformId: 'gog',
-                storefrontId: 'gog',
-                gameId: game.id,
-                platformGameId: gogPlatform?.platformGameId || targetId,
-                title: game.title,
-              });
-        const extracted = extractLiveAchievementsList(rawLiveRes);
-        liveGogItems = extracted.list;
-        liveGogEnvelope = extracted.envelope;
-      } catch {
-        // Fall through to schema reconciliation
-      }
-    }
-
-    if (
-      liveGogEnvelope?.supportsAchievements === false &&
-      (!liveGogItems || liveGogItems.length === 0) &&
-      !(userGog && (userGog.total > 0 || userGog.unlocked > 0))
-    ) {
-      return {
-        storefrontId: 'gog',
-        storefrontName: 'GOG GALAXY',
-        total: 0,
-        unlocked: 0,
-        percentage: 0,
-        isMastered: false,
-        achievements: [],
-        syncedAt: liveGogEnvelope.syncedAt || new Date().toISOString(),
-        source: 'live_cloud',
-        unlockPrecision: 'exact',
-        supportsAchievements: false,
-        cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-      };
-    }
-
-    const resolveFallbackSchema = async (): Promise<DetailedAchievement[]> => {
-      if (canonicalSchema && canonicalSchema.length > 0) return canonicalSchema;
-      if (lazyCanonicalSchema) return await lazyCanonicalSchema();
-      return onlineLifecycleManager.isOnline() ? await this.getCanonicalGameSchema(game) : [];
-    };
-
-    if (liveGogItems && liveGogItems.length > 0) {
-      const liveLooksComplete =
-        liveGogItems.some((item) => !item.date_unlocked && !item.unlocked && !item.isUnlocked) &&
-        liveGogItems.length >= (userGog?.total || 0);
-      const liveMissingAssets = liveGogItems.some(
-        (item) =>
-          (!item.image_url_unlocked && !item.iconUnlockedUrl && !item.unlockedIconUrl) ||
-          (!item.name && !item.title)
-      );
-
-      // Only pull canonical Steam schema if GOG payload is partial or missing artwork/names
-      const schema =
-        canonicalSchema && canonicalSchema.length > 0
-          ? canonicalSchema
-          : !liveLooksComplete || liveMissingAssets
-            ? await resolveFallbackSchema()
-            : [];
-
-      const schemaByKey = new Map<string, DetailedAchievement>();
-      for (const sAch of schema) {
-        const k1 = normalizeAchievementMatchKey(sAch.apiName);
-        const k2 = normalizeAchievementMatchKey(sAch.name);
-        if (k1 && !schemaByKey.has(k1)) schemaByKey.set(k1, sAch);
-        if (k2 && !schemaByKey.has(k2)) schemaByKey.set(k2, sAch);
-      }
-
-      const hasFullLiveSchema =
-        liveGogItems.some((item) => !item.date_unlocked && !item.unlocked && !item.isUnlocked) ||
-        liveGogItems.length >= Math.max(schema.length, userGog?.total || 0);
-
-      if (hasFullLiveSchema || schema.length === 0) {
-        const achievements: DetailedAchievement[] = liveGogItems.map(
-          (rawAch: RawStoreAchievementRecord, idx: number): DetailedAchievement => {
-            const rawKey = String(
-              rawAch.achievement_key ||
-                rawAch.apiName ||
-                rawAch.achievement_id ||
-                rawAch.achievementId ||
-                rawAch.id ||
-                `GOG_ACH_${idx + 1}`
-            );
-            const fallbackSchemaAch =
-              schemaByKey.get(normalizeAchievementMatchKey(rawKey)) ||
-              schemaByKey.get(normalizeAchievementMatchKey(rawAch.name || rawAch.title));
-
-            const unlockedTimestamp = rawAch.date_unlocked ?? rawAch.unlockedAt ?? undefined;
-            const isUnlocked = Boolean(
-              rawAch.unlocked || rawAch.isUnlocked || Boolean(rawAch.date_unlocked)
-            );
-            const globalPct =
-              typeof rawAch.rarity === 'number'
-                ? rawAch.rarity
-                : typeof rawAch.globalPercentage === 'number'
-                  ? rawAch.globalPercentage
-                  : typeof rawAch.rarityPercent === 'number'
-                    ? rawAch.rarityPercent
-                    : fallbackSchemaAch?.globalPercentage;
-            const unlockedIcon =
-              rawAch.image_url_unlocked ||
-              rawAch.iconUnlockedUrl ||
-              rawAch.unlockedIconUrl ||
-              fallbackSchemaAch?.iconUnlockedUrl ||
-              game.headerImage ||
-              '';
-            const lockedIcon =
-              rawAch.image_url_locked ||
-              rawAch.iconLockedUrl ||
-              rawAch.lockedIconUrl ||
-              fallbackSchemaAch?.iconLockedUrl ||
-              unlockedIcon;
-
-            return {
-              id: `gog:${targetId}:${rawAch.achievement_id || rawKey || idx}`,
-              apiName: rawKey,
-              name:
-                rawAch.name ||
-                rawAch.title ||
-                fallbackSchemaAch?.name ||
-                `${game.title} Achievement #${idx + 1}`,
-              description:
-                rawAch.description ||
-                rawAch.unlockedDescription ||
-                rawAch.lockedDescription ||
-                fallbackSchemaAch?.description ||
-                undefined,
-              unlocked: isUnlocked,
-              unlockedAt: unlockedTimestamp || undefined,
-              iconUnlockedUrl: unlockedIcon,
-              iconLockedUrl: lockedIcon,
-              globalPercentage: globalPct,
-              rarityTier: globalPct !== undefined ? classifyRarityTier(globalPct) : undefined,
-              isSecret:
-                rawAch.visible === false ||
-                Boolean(rawAch.isSecret || rawAch.hidden || rawAch.isHidden),
-              storefrontId: 'gog',
-            };
-          }
-        );
-
-        const total =
-          typeof liveGogEnvelope?.totalCount === 'number' &&
-          liveGogEnvelope.totalCount >= achievements.length
-            ? liveGogEnvelope.totalCount
-            : achievements.length;
-        const unlocked = achievements.filter((a) => a.unlocked).length;
-        const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
-
-        return deduplicateDetailedAchievements({
-          storefrontId: 'gog',
-          storefrontName: 'GOG GALAXY',
-          total,
-          unlocked,
-          percentage,
-          isMastered: total > 0 && unlocked >= total,
-          achievements,
-          syncedAt: liveGogEnvelope?.syncedAt || new Date().toISOString(),
-          source: 'live_cloud',
-          unlockPrecision: 'exact',
-          supportsAchievements: true,
-          cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-        });
-      }
-
-      // Partial live unlock list: reconcile unlocked IDs/keys against canonical schema
-      const unlockedLookup = new Map<string, string | number | undefined>();
-      for (const rawAch of liveGogItems) {
-        const isUnlocked = Boolean(
-          rawAch.unlocked || rawAch.isUnlocked || Boolean(rawAch.date_unlocked)
-        );
-        if (!isUnlocked) continue;
-        const ts = rawAch.date_unlocked ?? rawAch.unlockedAt ?? undefined;
-        for (const candidateKey of [
-          rawAch.achievement_id,
-          rawAch.achievement_key,
-          rawAch.apiName,
-          rawAch.achievementId,
-          rawAch.id,
-          rawAch.name,
-          rawAch.title,
-        ]) {
-          const normKey = normalizeAchievementMatchKey(candidateKey);
-          if (normKey && !unlockedLookup.has(normKey)) {
-            unlockedLookup.set(normKey, ts || undefined);
-          }
-        }
-      }
-
-      const reconciledAchievements: DetailedAchievement[] = schema.map((baseAch, index) => {
-        const apiKey = normalizeAchievementMatchKey(baseAch.apiName);
-        const nameKey = normalizeAchievementMatchKey(baseAch.name);
-        const matchedUnlocked = unlockedLookup.has(apiKey) || unlockedLookup.has(nameKey);
-        const matchedTs = unlockedLookup.get(apiKey) ?? unlockedLookup.get(nameKey);
-        return {
-          ...baseAch,
-          id: `gog:${targetId}:${baseAch.apiName || baseAch.name || index}`,
-          unlocked: matchedUnlocked,
-          unlockedAt: matchedUnlocked ? matchedTs : undefined,
-          storefrontId: 'gog',
-        };
-      });
-
-      const total = schema.length;
-      const unlocked = reconciledAchievements.filter((a) => a.unlocked).length;
-      const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
-
-      return deduplicateDetailedAchievements({
-        storefrontId: 'gog',
-        storefrontName: 'GOG GALAXY',
-        total,
-        unlocked,
-        percentage,
-        isMastered: total > 0 && unlocked >= total,
-        achievements: reconciledAchievements,
-        syncedAt: liveGogEnvelope?.syncedAt || new Date().toISOString(),
-        source: 'live_cloud',
-        unlockPrecision: 'exact',
-        supportsAchievements: true,
-        cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-      });
-    }
-
-    const schema = await resolveFallbackSchema();
-    const summaryUnlockedCount = userGog?.unlocked || 0;
-
-    if (!schema || schema.length === 0) {
-      const fallbackTotal = userGog?.total || 0;
-      const fallbackPct =
-        fallbackTotal > 0 ? Math.round((summaryUnlockedCount / fallbackTotal) * 100) : 0;
-      const isOffline = !onlineLifecycleManager.isOnline();
-      const hasKnownGogAchievements = fallbackTotal > 0 || summaryUnlockedCount > 0;
-      return {
-        storefrontId: 'gog',
-        storefrontName: 'GOG GALAXY',
-        total: fallbackTotal,
-        unlocked: summaryUnlockedCount,
-        percentage: fallbackPct,
-        isMastered: fallbackTotal > 0 && summaryUnlockedCount >= fallbackTotal,
-        achievements: [],
-        syncedAt: userGog?.syncedAt,
-        source: 'schema_fallback',
-        unlockPrecision: summaryUnlockedCount > 0 ? 'summary_count_only' : 'exact',
-        supportsAchievements: hasKnownGogAchievements || isOffline,
-        schemaUnavailableOffline: hasKnownGogAchievements || isOffline,
-      };
-    }
-
-    const effectiveSchema = [...schema];
-    const totalCount = Math.max(effectiveSchema.length, userGog?.total || 0);
-
-    const achievements: DetailedAchievement[] = effectiveSchema.map((baseAch, index) => ({
-      ...baseAch,
-      id: `gog:${targetId}:${baseAch.apiName || baseAch.name || index}`,
-      unlocked: Boolean(baseAch.unlocked),
-      unlockedAt: baseAch.unlockedAt,
-      storefrontId: 'gog',
-    }));
-
-    const exactUnlocked = achievements.filter((a) => a.unlocked).length;
-    const hasExactUnlocks = exactUnlocked > 0;
-    const effectiveUnlocked = hasExactUnlocks ? exactUnlocked : summaryUnlockedCount;
-    const unlockPrecision: 'exact' | 'summary_count_only' =
-      effectiveUnlocked > 0 && !hasExactUnlocks ? 'summary_count_only' : 'exact';
-    const percentage = totalCount > 0 ? Math.round((effectiveUnlocked / totalCount) * 100) : 0;
-    const isMastered = totalCount > 0 && effectiveUnlocked >= totalCount;
-
-    return deduplicateDetailedAchievements({
-      storefrontId: 'gog',
-      storefrontName: 'GOG GALAXY',
-      total: totalCount,
-      unlocked: effectiveUnlocked,
-      percentage,
-      isMastered,
-      achievements,
-      syncedAt: userGog?.syncedAt || new Date().toISOString(),
-      source: hasExactUnlocks ? 'live_cloud' : 'schema_fallback',
-      unlockPrecision,
-      supportsAchievements: true,
-      cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-    });
+    return fetchGogDetailedAchievementsProvider(
+      game,
+      (g) => this.getCanonicalGameSchema(g),
+      platformGameId,
+      existingSummary,
+      canonicalSchema,
+      lazyCanonicalSchema
+    );
   }
 
   /**
    * Fetches detailed Xbox Live / Microsoft Store achievements with Gamerscore breakdowns.
-   * Uses official Xbox Achievements v2 / DisplayCatalog via Electron IPC when available,
-   * without fabricating unlocks or synthetic 1000G Gamerscore splits.
    */
   async fetchXboxDetailedAchievements(
     game: CanonicalGame,
@@ -1711,343 +539,20 @@ export class AchievementDetailService {
     canonicalSchema?: DetailedAchievement[],
     lazyCanonicalSchema?: () => Promise<DetailedAchievement[]>
   ): Promise<StorefrontAchievementsData | null> {
-    const plat = xboxPlatform || game.platforms.find((p) => p.platformId === 'xbox');
-    const targetId =
-      plat?.xboxProductId ||
-      plat?.platformGameId ||
-      plat?.xboxTitleId ||
-      plat?.packageFamilyName ||
-      game.id;
-    const titleLower = (game.title || '').toLowerCase().trim();
-
-    const summary = existingSummary || plat?.achievements;
-    const cachedUserXbox = getKnownXboxAchievements(targetId, game.title, [
-      plat?.xboxProductId,
-      plat?.packageFamilyName,
-      plat?.xboxTitleId,
-      plat?.platformGameId,
-    ]);
-    const userXbox =
-      (cachedUserXbox &&
-      (!summary ||
-        cachedUserXbox.unlocked >= (summary.unlocked || 0) ||
-        (cachedUserXbox.gamerscore?.earned ?? 0) >= (summary.gamerscore?.earned ?? 0))
-        ? cachedUserXbox
-        : summary) ||
-      KNOWN_USER_XBOX_ACHIEVEMENTS[targetId] ||
-      KNOWN_USER_XBOX_ACHIEVEMENTS[`xbox-${targetId}`] ||
-      KNOWN_USER_XBOX_ACHIEVEMENTS[titleLower] ||
-      summary;
-
-    // 1. Live Xbox Achievements v2 via Electron IPC getStoreAchievements
-    if (typeof window !== 'undefined' && window.electronAPI?.getStoreAchievements) {
-      try {
-        const liveRes = await window.electronAPI.getStoreAchievements({
-          platformId: 'xbox',
-          storefrontId: 'xbox',
-          gameId: game.id,
-          platformGameId: plat?.platformGameId || targetId,
-          xboxProductId: plat?.xboxProductId,
-          xboxTitleId: plat?.xboxTitleId,
-          packageFamilyName: plat?.packageFamilyName,
-          title: game.title,
-        });
-        const { list: rawLiveList, envelope: liveEnvelope } = extractLiveAchievementsList(liveRes);
-        if (rawLiveList && rawLiveList.length > 0) {
-          let sumEarnedG = 0;
-          let sumTotalG = 0;
-          const achievements: DetailedAchievement[] = rawLiveList.map(
-            (rawAch: RawStoreAchievementRecord, idx: number): DetailedAchievement => {
-              const isUnlocked = Boolean(
-                rawAch.unlocked ||
-                  rawAch.progressState === 'Achieved' ||
-                  rawAch.state === 'Achieved'
-              );
-              const rawRewardVal =
-                typeof rawAch.gamerscore === 'number'
-                  ? rawAch.gamerscore
-                  : Array.isArray(rawAch.rewards) && rawAch.rewards.length > 0
-                    ? Number(
-                        rawAch.rewards.find(
-                          (r: RawRewardItem) =>
-                            !r?.type || String(r.type).toLowerCase() === 'gamerscore'
-                        )?.value ?? rawAch.rewards[0]?.value
-                      )
-                    : undefined;
-              const gVal =
-                typeof rawRewardVal === 'number' && Number.isFinite(rawRewardVal) && rawRewardVal >= 0
-                  ? Math.round(rawRewardVal)
-                  : undefined;
-              if (gVal !== undefined) {
-                sumTotalG += gVal;
-                if (isUnlocked) sumEarnedG += gVal;
-              }
-              const rarityObj =
-                rawAch.rarity && typeof rawAch.rarity === 'object' ? rawAch.rarity : undefined;
-              const globalPct =
-                typeof rawAch.globalPercentage === 'number'
-                  ? rawAch.globalPercentage
-                  : typeof rarityObj?.currentPercentage === 'number'
-                    ? rarityObj.currentPercentage
-                    : typeof rawAch.rarityPercent === 'number'
-                      ? rawAch.rarityPercent
-                      : undefined;
-              const unlockedIcon =
-                rawAch.iconUnlockedUrl ||
-                rawAch.unlockedIconUrl ||
-                rawAch.mediaAssets?.[0]?.url ||
-                game.headerImage ||
-                '';
-              return {
-                id:
-                  rawAch.id ||
-                  `xbox:${targetId}:${rawAch.apiName || rawAch.achievementId || idx}`,
-                apiName: String(
-                  rawAch.apiName || rawAch.achievementId || rawAch.id || `XBOX_ACH_${idx + 1}`
-                ),
-                name:
-                  rawAch.name ||
-                  rawAch.title ||
-                  rawAch.unlockedDisplayName ||
-                  `${game.title} Achievement #${idx + 1}`,
-                description:
-                  rawAch.description ||
-                  (isUnlocked ? rawAch.unlockedDescription : rawAch.lockedDescription) ||
-                  rawAch.unlockedDescription ||
-                  rawAch.lockedDescription ||
-                  undefined,
-                unlocked: isUnlocked,
-                unlockedAt: rawAch.unlockedAt || rawAch.progression?.timeUnlocked || undefined,
-                iconUnlockedUrl: unlockedIcon,
-                iconLockedUrl: rawAch.iconLockedUrl || rawAch.lockedIconUrl || unlockedIcon,
-                globalPercentage: globalPct,
-                rarityTier: globalPct !== undefined ? classifyRarityTier(globalPct) : undefined,
-                progress:
-                  rawAch.progress &&
-                  typeof rawAch.progress.current === 'number' &&
-                  typeof rawAch.progress.max === 'number'
-                    ? rawAch.progress
-                    : undefined,
-                isSecret: Boolean(rawAch.isSecret || rawAch.isHidden || rawAch.hidden),
-                gamerscore: gVal,
-                storefrontId: 'xbox',
-              };
-            }
-          );
-
-          const total = achievements.length;
-          const unlocked = achievements.filter((a) => a.unlocked).length;
-          const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
-          const totalGamerscore =
-            (typeof liveEnvelope?.totalGamerscore === 'number' && liveEnvelope.totalGamerscore > 0
-              ? liveEnvelope.totalGamerscore
-              : undefined) ??
-            (typeof liveEnvelope?.gamerscore?.total === 'number' && liveEnvelope.gamerscore.total > 0
-              ? liveEnvelope.gamerscore.total
-              : undefined) ??
-            (sumTotalG > 0 ? sumTotalG : userXbox?.gamerscore?.total);
-          const earnedGamerscore =
-            (typeof liveEnvelope?.earnedGamerscore === 'number'
-              ? liveEnvelope.earnedGamerscore
-              : undefined) ??
-            (typeof liveEnvelope?.gamerscore?.earned === 'number'
-              ? liveEnvelope.gamerscore.earned
-              : undefined) ??
-            (sumTotalG > 0 ? sumEarnedG : userXbox?.gamerscore?.earned);
-
-          return deduplicateDetailedAchievements({
-            storefrontId: 'xbox',
-            storefrontName: 'Xbox',
-            total,
-            unlocked,
-            percentage,
-            isMastered: total > 0 && unlocked >= total,
-            ...(totalGamerscore !== undefined ? { totalGamerscore } : {}),
-            ...(earnedGamerscore !== undefined ? { earnedGamerscore } : {}),
-            achievements,
-            syncedAt: liveEnvelope?.syncedAt || new Date().toISOString(),
-            source: 'live_cloud',
-            unlockPrecision: 'exact',
-            supportsAchievements: true,
-            cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-          });
-        }
-      } catch {
-        // Fall through to Xbox game schema / canonical schema fallback
-      }
-    }
-
-    // 2. Try Xbox Game Schema via IPC if available
-    let schema: DetailedAchievement[] | null = null;
-    let schemaHasAuthoritativeUnlocks = false;
-
-    if (typeof window !== 'undefined' && window.electronAPI?.fetchXboxGameSchema) {
-      try {
-        const schemaRes = await window.electronAPI.fetchXboxGameSchema({
-          gameId: game.id,
-          platformGameId: plat?.platformGameId || targetId,
-          xboxProductId: plat?.xboxProductId,
-          xboxTitleId: plat?.xboxTitleId,
-          packageFamilyName: plat?.packageFamilyName,
-        });
-        const { list: rawSchemaList } = extractLiveAchievementsList(schemaRes);
-        if (rawSchemaList && rawSchemaList.length > 0) {
-          schemaHasAuthoritativeUnlocks = rawSchemaList.some(
-            (r) => typeof r.unlocked === 'boolean' || Boolean(r.unlockedAt)
-          );
-          schema = rawSchemaList.map(
-            (rawAch: RawStoreAchievementRecord, idx: number): DetailedAchievement => {
-              const globalPct =
-                typeof rawAch.globalPercentage === 'number'
-                  ? rawAch.globalPercentage
-                  : typeof rawAch.rarityPercent === 'number'
-                    ? rawAch.rarityPercent
-                    : undefined;
-              const gVal =
-                typeof rawAch.gamerscore === 'number' && Number.isFinite(rawAch.gamerscore)
-                  ? rawAch.gamerscore
-                  : undefined;
-              const unlockedIcon =
-                rawAch.iconUnlockedUrl || rawAch.unlockedIconUrl || game.headerImage || '';
-              return {
-                id: rawAch.id || `xbox:${targetId}:${rawAch.apiName || idx}`,
-                apiName: String(rawAch.apiName || rawAch.id || `XBOX_ACH_${idx + 1}`),
-                name: rawAch.name || rawAch.title || `${game.title} Achievement #${idx + 1}`,
-                description:
-                  rawAch.description ||
-                  rawAch.unlockedDescription ||
-                  rawAch.lockedDescription ||
-                  undefined,
-                isSecret: Boolean(rawAch.isSecret || rawAch.hidden || rawAch.isHidden),
-                unlocked: Boolean(rawAch.unlocked || rawAch.unlockedAt),
-                unlockedAt: rawAch.unlockedAt || undefined,
-                iconUnlockedUrl: unlockedIcon,
-                iconLockedUrl: rawAch.iconLockedUrl || rawAch.lockedIconUrl || unlockedIcon,
-                globalPercentage: globalPct,
-                rarityTier: globalPct !== undefined ? classifyRarityTier(globalPct) : undefined,
-                gamerscore: gVal,
-                storefrontId: 'xbox',
-              };
-            }
-          );
-        }
-      } catch {
-        // Fall back to canonical game schema
-      }
-    }
-
-    const summaryUnlockedCount = userXbox?.unlocked || 0;
-
-    if (!schema || schema.length === 0) {
-      schema =
-        canonicalSchema && canonicalSchema.length > 0
-          ? canonicalSchema
-          : lazyCanonicalSchema
-            ? await lazyCanonicalSchema()
-            : onlineLifecycleManager.isOnline()
-              ? await this.getCanonicalGameSchema(game)
-              : [];
-    }
-
-    if (!schema || schema.length === 0) {
-      const fallbackTotal = userXbox?.total || 0;
-      const fallbackPct =
-        fallbackTotal > 0 ? Math.round((summaryUnlockedCount / fallbackTotal) * 100) : 0;
-      const hasSummaryProgress =
-        summaryUnlockedCount > 0 || (userXbox?.gamerscore?.earned ?? 0) > 0;
-      const isOffline = !onlineLifecycleManager.isOnline();
-      const hasKnownXboxAchievements =
-        fallbackTotal > 0 || hasSummaryProgress || (userXbox?.gamerscore?.total ?? 0) > 0;
-      return {
-        storefrontId: 'xbox',
-        storefrontName: 'Xbox',
-        total: fallbackTotal,
-        unlocked: summaryUnlockedCount,
-        percentage: fallbackPct,
-        isMastered: fallbackTotal > 0 && summaryUnlockedCount >= fallbackTotal,
-        ...(userXbox?.gamerscore?.total !== undefined
-          ? { totalGamerscore: userXbox.gamerscore.total }
-          : {}),
-        ...(userXbox?.gamerscore?.earned !== undefined
-          ? { earnedGamerscore: userXbox.gamerscore.earned }
-          : {}),
-        achievements: [],
-        syncedAt: userXbox?.syncedAt,
-        source: 'schema_fallback',
-        unlockPrecision: hasSummaryProgress ? 'summary_count_only' : 'exact',
-        supportsAchievements: hasKnownXboxAchievements || isOffline,
-        schemaUnavailableOffline: hasKnownXboxAchievements || isOffline,
-      };
-    }
-
-    const effectiveSchema = [...schema];
-    const totalCount = Math.max(effectiveSchema.length, userXbox?.total || 0);
-
-    let sumSchemaTotalG = 0;
-    let sumSchemaEarnedG = 0;
-    let hasSchemaGamerscore = false;
-
-    const achievements: DetailedAchievement[] = effectiveSchema.map((baseAch, index) => {
-      const isUnlocked = Boolean(baseAch.unlocked);
-      const gVal =
-        typeof baseAch.gamerscore === 'number' &&
-        Number.isFinite(baseAch.gamerscore) &&
-        baseAch.gamerscore >= 0
-          ? baseAch.gamerscore
-          : undefined;
-
-      if (gVal !== undefined) {
-        hasSchemaGamerscore = true;
-        sumSchemaTotalG += gVal;
-        if (isUnlocked) sumSchemaEarnedG += gVal;
-      }
-
-      return {
-        ...baseAch,
-        id: `xbox:${targetId}:${baseAch.apiName || baseAch.name || index}`,
-        unlocked: isUnlocked,
-        unlockedAt: baseAch.unlockedAt,
-        ...(gVal !== undefined ? { gamerscore: gVal } : {}),
-        storefrontId: 'xbox',
-      };
-    });
-
-    const exactUnlocked = achievements.filter((a) => a.unlocked).length;
-    const hasExactUnlocks = schemaHasAuthoritativeUnlocks || exactUnlocked > 0;
-    const effectiveUnlocked = hasExactUnlocks ? exactUnlocked : summaryUnlockedCount;
-    const hasSummaryProgress =
-      effectiveUnlocked > 0 || (userXbox?.gamerscore?.earned ?? 0) > 0;
-    const unlockPrecision: 'exact' | 'summary_count_only' =
-      hasSummaryProgress && !hasExactUnlocks ? 'summary_count_only' : 'exact';
-    const percentage = totalCount > 0 ? Math.round((effectiveUnlocked / totalCount) * 100) : 0;
-    const isMastered = totalCount > 0 && effectiveUnlocked >= totalCount;
-
-    const totalGamerscore =
-      userXbox?.gamerscore?.total ?? (hasSchemaGamerscore ? sumSchemaTotalG : undefined);
-    const earnedGamerscore =
-      userXbox?.gamerscore?.earned ??
-      (hasExactUnlocks && hasSchemaGamerscore ? sumSchemaEarnedG : undefined);
-
-    return deduplicateDetailedAchievements({
-      storefrontId: 'xbox',
-      storefrontName: 'Xbox',
-      total: totalCount,
-      unlocked: effectiveUnlocked,
-      percentage,
-      isMastered,
-      ...(totalGamerscore !== undefined ? { totalGamerscore } : {}),
-      ...(earnedGamerscore !== undefined ? { earnedGamerscore } : {}),
-      achievements,
-      syncedAt: userXbox?.syncedAt || new Date().toISOString(),
-      source: hasExactUnlocks ? 'live_cloud' : 'schema_fallback',
-      unlockPrecision,
-      supportsAchievements: true,
-    });
+    return fetchXboxDetailedAchievementsProvider(
+      game,
+      (g) => this.getCanonicalGameSchema(g),
+      xboxPlatform,
+      existingSummary,
+      canonicalSchema,
+      lazyCanonicalSchema
+    );
   }
 
   /**
    * Main entry point: Fetches and aggregates complete detailed achievements across all
-   * storefront platforms the game is owned on.
+   * storefront platforms the game is actually owned on, with per-(gameId, forceRefresh)
+   * in-flight request coalescing.
    */
   async fetchGameAchievements(
     game: CanonicalGame,
@@ -2055,14 +560,38 @@ export class AchievementDetailService {
   ): Promise<MultiStoreAchievementsMap> {
     if (!game) return {};
 
+    const flightKey = `${game.id}:${forceRefresh ? '1' : '0'}`;
+    const existingFlight = this.inFlightFetches.get(flightKey);
+    if (existingFlight) {
+      return existingFlight;
+    }
+
+    const capturedGen = this.cacheGeneration;
+    const flight = this.runFetchGameAchievementsInternal(game, forceRefresh, capturedGen);
+    this.inFlightFetches.set(flightKey, flight);
+    try {
+      return await flight;
+    } finally {
+      if (this.inFlightFetches.get(flightKey) === flight) {
+        this.inFlightFetches.delete(flightKey);
+      }
+    }
+  }
+
+  private async runFetchGameAchievementsInternal(
+    game: CanonicalGame,
+    forceRefresh: boolean,
+    capturedGen: number
+  ): Promise<MultiStoreAchievementsMap> {
     const steamPlat = game.platforms.find((p) => p.platformId === 'steam');
     const epicPlat = game.platforms.find((p) => p.platformId === 'epic');
     const gogPlat = game.platforms.find((p) => p.platformId === 'gog');
     const xboxPlat = game.platforms.find((p) => p.platformId === 'xbox');
 
-    const cached =
+    const rawCached =
       this.getCachedMultiStoreAchievements(game.id) ||
       (await this.getVaultCachedMultiStoreAchievements(game.id));
+    const cached = rawCached ? filterMapToOwnedStorefronts(rawCached, game) : null;
     const hasUsableCached = Boolean(
       cached &&
         Object.keys(cached).length > 0 &&
@@ -2073,8 +602,6 @@ export class AchievementDetailService {
       return cached!;
     }
 
-    // Check cached records first, invalidating if any platform has newly unlocked trophies
-    // (or when running with Electron IPC and cached records are pre-v2 / summary_count_only — C4).
     const hasElectronIpc =
       typeof window !== 'undefined' && Boolean(window.electronAPI?.getStoreAchievements);
     if (!forceRefresh && hasUsableCached && cached) {
@@ -2103,8 +630,7 @@ export class AchievementDetailService {
     const result: MultiStoreAchievementsMap = {};
     const fetchPromises: Promise<void>[] = [];
 
-    // Lazy shared canonical schema promise: native store APIs (Steam SSR/VDF, GOG gameplay,
-    // Epic cloud, Xbox v2) never block on a serial Steam schema request unless fallback is needed.
+    // Lazy shared canonical schema promise: native store APIs never block on a serial Steam schema request
     let sharedCanonicalSchemaPromise: Promise<DetailedAchievement[]> | null = null;
     const getSharedCanonicalSchema = (): Promise<DetailedAchievement[]> => {
       if (!onlineLifecycleManager.isOnline()) return Promise.resolve([]);
@@ -2114,17 +640,18 @@ export class AchievementDetailService {
       return sharedCanonicalSchemaPromise;
     };
 
-    // 1. Steam platform
+    // 1. Steam platform — P0-2 CRITICAL GATE: ONLY fetch Steam achievements when the user ACTUALLY OWNS Steam!
+    // Never bleed a phantom Steam tab onto GOG/Epic/Xbox-only games that merely have a cross-referenced `steamAppId`.
     const targetSteamAppId =
       game.steamAppId ||
       (steamPlat?.platformGameId ? parseInt(steamPlat.platformGameId, 10) : undefined);
 
-    if (targetSteamAppId) {
+    if (steamPlat && targetSteamAppId) {
       fetchPromises.push(
         this.fetchSteamDetailedAchievements(
           targetSteamAppId,
           game.title,
-          steamPlat?.achievements,
+          steamPlat.achievements,
           undefined,
           getSharedCanonicalSchema
         )
@@ -2209,7 +736,11 @@ export class AchievementDetailService {
       (entry) => entry?.schemaUnavailableOffline === true
     );
 
-    if (Object.keys(result).length > 0 && !hasOfflineUnavailable) {
+    if (
+      capturedGen === this.cacheGeneration &&
+      Object.keys(result).length > 0 &&
+      !hasOfflineUnavailable
+    ) {
       this.setCachedMultiStoreAchievements(game.id, result);
     }
 
