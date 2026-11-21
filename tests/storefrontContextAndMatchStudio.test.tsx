@@ -672,12 +672,14 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
         expect(loaded.text).toContain('Currently Routed To:');
         expect(loaded.text).toContain('(Platform ID: 1207659012)');
 
-        // Candidate card renders clickable Store Page button
-        const storePageButtons = findElements(
+        // Candidate card renders semantic external Store Page anchor link
+        const storePageLinks = findElements(
           loaded.vnode,
-          (el) => el.type === 'button' && getTextContent(el).includes('Store Page')
+          (el) => el.type === 'a' && getTextContent(el).includes('Store Page')
         );
-        expect(storePageButtons.length).toBeGreaterThan(0);
+        expect(storePageLinks.length).toBeGreaterThan(0);
+        expect(String(storePageLinks[0].props?.href || '')).toMatch(/^https:\/\//);
+        expect(storePageLinks[0].props?.rel).toBe('noopener noreferrer');
       } finally {
         getSuggestedSpy.mockRestore();
       }

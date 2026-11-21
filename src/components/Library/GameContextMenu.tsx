@@ -28,6 +28,27 @@ export interface GameContextMenuProps {
   onHideGame?: (game: CanonicalGame) => void;
 }
 
+function getDirectMenuItems(
+  root: HTMLElement | null,
+  excludeContainer?: HTMLElement | null
+): HTMLButtonElement[] {
+  if (!root) return [];
+  const all = Array.from(
+    root.querySelectorAll<HTMLButtonElement>('button[role^="menuitem"]:not(:disabled)')
+  );
+  if (!excludeContainer) return all;
+  return all.filter((item) => !excludeContainer.contains(item));
+}
+
+function scheduleMenuFocus(fn: () => void): () => void {
+  if (typeof requestAnimationFrame === 'function') {
+    const id = requestAnimationFrame(fn);
+    return () => cancelAnimationFrame(id);
+  }
+  const timer = setTimeout(fn, 0);
+  return () => clearTimeout(timer);
+}
+
 export const GameContextMenu: React.FC<GameContextMenuProps> = ({
   isOpen,
   x,
@@ -44,7 +65,9 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
 }) => {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const submenuRef = useRef<HTMLDivElement | null>(null);
+  const submenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
   const [isSubmenuOpen, setIsSubmenuOpen] = useState(false);
   const [coords, setCoords] = useState<{ x: number; y: number }>({ x, y });
   const [flyLeft, setFlyLeft] = useState(false);
@@ -71,6 +94,15 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
     },
     [clearCloseTimer]
   );
+
+  const focusSubmenuItem = useCallback((target: 'first' | 'last') => {
+    scheduleMenuFocus(() => {
+      const items = getDirectMenuItems(submenuRef.current);
+      if (items.length === 0) return;
+      const item = target === 'first' ? items[0] : items[items.length - 1];
+      item?.focus({ preventScroll: true });
+    });
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -110,7 +142,35 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
     }
   }, [isOpen, x, y, clearCloseTimer]);
 
-  // Handle outside click, window scroll, and escape key
+  // Move keyboard focus into the ARIA menu when opened and restore on Escape/close if focus stayed inside
+  useEffect(() => {
+    if (!isOpen || !game) return;
+    if (typeof document !== 'undefined' && typeof HTMLElement !== 'undefined') {
+      previousFocusRef.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    }
+    const cancelFocus = scheduleMenuFocus(() => {
+      const items = getDirectMenuItems(menuRef.current, submenuRef.current);
+      items[0]?.focus({ preventScroll: true });
+    });
+    return () => {
+      cancelFocus();
+      const prevEl = previousFocusRef.current;
+      previousFocusRef.current = null;
+      if (
+        prevEl &&
+        typeof document !== 'undefined' &&
+        document.contains(prevEl) &&
+        (!document.activeElement ||
+          document.activeElement === document.body ||
+          menuRef.current?.contains(document.activeElement))
+      ) {
+        prevEl.focus({ preventScroll: true });
+      }
+    };
+  }, [isOpen, game?.id]);
+
+  // Handle outside click, passive capture window scroll, and escape key
   useEffect(() => {
     if (!isOpen) return;
 
@@ -136,7 +196,7 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
 
     const timer = setTimeout(() => {
       document.addEventListener('mousedown', handleClickOutside);
-      window.addEventListener('scroll', handleScroll, true);
+      window.addEventListener('scroll', handleScroll, { capture: true, passive: true });
       document.addEventListener('keydown', handleKeyDown);
     }, 50);
 
@@ -148,9 +208,95 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
     };
   }, [isOpen, onClose]);
 
+  const handleMainMenuKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (submenuRef.current && submenuRef.current.contains(e.target as Node)) {
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+        return;
+      }
+      if (e.key === 'Tab') {
+        onClose();
+        return;
+      }
+      const openSubmenuKey = flyLeft ? 'ArrowLeft' : 'ArrowRight';
+      if (e.key === openSubmenuKey && document.activeElement === submenuTriggerRef.current) {
+        e.preventDefault();
+        e.stopPropagation();
+        openSubmenu();
+        focusSubmenuItem('first');
+        return;
+      }
+      if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) {
+        return;
+      }
+      const items = getDirectMenuItems(menuRef.current, submenuRef.current);
+      if (items.length === 0) return;
+      const currentIdx = items.indexOf(document.activeElement as HTMLButtonElement);
+      const nextIdx =
+        e.key === 'Home'
+          ? 0
+          : e.key === 'End'
+            ? items.length - 1
+            : currentIdx < 0
+              ? e.key === 'ArrowUp'
+                ? items.length - 1
+                : 0
+              : (currentIdx + (e.key === 'ArrowUp' ? -1 : 1) + items.length) % items.length;
+      e.preventDefault();
+      e.stopPropagation();
+      items[nextIdx]?.focus({ preventScroll: true });
+    },
+    [flyLeft, focusSubmenuItem, onClose, openSubmenu]
+  );
+
+  const handleSubmenuKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      const closeSubmenuKey = flyLeft ? 'ArrowRight' : 'ArrowLeft';
+      if (e.key === 'Escape' || e.key === closeSubmenuKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        clearCloseTimer();
+        setIsSubmenuOpen(false);
+        submenuTriggerRef.current?.focus({ preventScroll: true });
+        return;
+      }
+      if (e.key === 'Tab') {
+        onClose();
+        return;
+      }
+      if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) {
+        return;
+      }
+      const items = getDirectMenuItems(submenuRef.current);
+      if (items.length === 0) return;
+      const currentIdx = items.indexOf(document.activeElement as HTMLButtonElement);
+      const nextIdx =
+        e.key === 'Home'
+          ? 0
+          : e.key === 'End'
+            ? items.length - 1
+            : currentIdx < 0
+              ? e.key === 'ArrowUp'
+                ? items.length - 1
+                : 0
+              : (currentIdx + (e.key === 'ArrowUp' ? -1 : 1) + items.length) % items.length;
+      e.preventDefault();
+      e.stopPropagation();
+      items[nextIdx]?.focus({ preventScroll: true });
+    },
+    [clearCloseTimer, flyLeft, onClose]
+  );
+
   if (!isOpen || !game) return null;
 
   const flyUp = typeof window !== 'undefined' && coords.y + 420 > window.innerHeight;
+  const menuItemFocusClass =
+    'focus-visible:outline-none focus-visible:bg-[#1b2838] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#66c0f4]';
 
   return (
     <div
@@ -161,7 +307,8 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
         left: `${coords.x}px`,
         top: `${coords.y}px`,
       }}
-      className="fixed z-[9999] w-56 rounded-md bg-[#16202d] border border-[#2a475e] shadow-[0_10px_35px_rgba(0,0,0,0.9)] py-1.5 select-none text-xs text-slate-200 animate-in fade-in zoom-in-95 duration-100"
+      className="fixed z-[9999] w-56 rounded-md bg-[#16202d] border border-[#2a475e] shadow-[0_10px_35px_rgba(0,0,0,0.9)] py-1.5 select-none text-xs text-slate-200"
+      onKeyDown={handleMainMenuKeyDown}
       onClick={(e) => e.stopPropagation()}
       onContextMenu={(e) => {
         e.preventDefault();
@@ -184,10 +331,13 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
           onClose();
           onFixMatch(game);
         }}
-        className="w-full min-h-6 flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[#1b2838] hover:text-[#66c0f4] transition-colors cursor-pointer group"
+        className={`w-full min-h-6 flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[#1b2838] hover:text-[#66c0f4] transition-colors cursor-pointer group ${menuItemFocusClass}`}
       >
-        <Wand className="w-4 h-4 text-[#66c0f4] group-hover:scale-110 transition-transform" />
-        <span className="font-medium">Fix Match & Metadata...</span>
+        <Wand
+          aria-hidden="true"
+          className="w-4 h-4 text-[#66c0f4] group-hover:scale-110 transition-transform"
+        />
+        <span className="font-medium">Fix Match &amp; Metadata...</span>
       </button>
 
       {/* Action 2: Sync Store Media (This Game) */}
@@ -199,9 +349,12 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
           onClose();
           onSyncStoreMedia(game);
         }}
-        className="w-full min-h-6 flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[#1b2838] hover:text-white transition-colors cursor-pointer group"
+        className={`w-full min-h-6 flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[#1b2838] hover:text-white transition-colors cursor-pointer group ${menuItemFocusClass}`}
       >
-        <Film className="w-4 h-4 text-purple-400 group-hover:scale-110 transition-transform" />
+        <Film
+          aria-hidden="true"
+          className="w-4 h-4 text-purple-400 group-hover:scale-110 transition-transform"
+        />
         <span>Sync Store Media (This Game)</span>
       </button>
 
@@ -215,9 +368,12 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
             onClose();
             onViewAchievements(game);
           }}
-          className="w-full min-h-6 flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[#1b2838] hover:text-amber-400 transition-colors cursor-pointer group"
+          className={`w-full min-h-6 flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[#1b2838] hover:text-amber-400 transition-colors cursor-pointer group ${menuItemFocusClass}`}
         >
-          <Trophy className="w-4 h-4 text-amber-400 group-hover:scale-110 transition-transform" />
+          <Trophy
+            aria-hidden="true"
+            className="w-4 h-4 text-amber-400 group-hover:scale-110 transition-transform"
+          />
           <span>View Achievements...</span>
         </button>
       )}
@@ -229,23 +385,30 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
         onMouseLeave={() => scheduleCloseSubmenu(260)}
       >
         <button
+          ref={submenuTriggerRef}
           type="button"
           role="menuitem"
           aria-haspopup="menu"
           aria-expanded={isSubmenuOpen}
           onClick={() => {
             clearCloseTimer();
-            setIsSubmenuOpen((prev) => !prev);
+            setIsSubmenuOpen((prev) => {
+              const next = !prev;
+              if (next) {
+                focusSubmenuItem('first');
+              }
+              return next;
+            });
           }}
-          className={`w-full min-h-6 flex items-center justify-between px-3 py-2 text-left transition-colors cursor-pointer ${
+          className={`w-full min-h-6 flex items-center justify-between px-3 py-2 text-left transition-colors cursor-pointer ${menuItemFocusClass} ${
             isSubmenuOpen ? 'bg-[#1b2838] text-white' : 'hover:bg-[#1b2838] hover:text-white'
           }`}
         >
           <div className="flex items-center gap-2.5">
-            <FolderPlus className="w-4 h-4 text-sky-400" />
+            <FolderPlus aria-hidden="true" className="w-4 h-4 text-sky-400" />
             <span>Assign to Collection</span>
           </div>
-          <ChevronRight className="w-3.5 h-3.5 text-slate-300" />
+          <ChevronRight aria-hidden="true" className="w-3.5 h-3.5 text-slate-300" />
         </button>
 
         {/* Branching Submenu with continuous hover bridge corridor */}
@@ -263,7 +426,8 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
             <div
               role="menu"
               aria-label="Collections submenu"
-              className="w-52 max-h-72 overflow-y-auto rounded-md bg-[#16202d] border border-[#2a475e] shadow-[0_10px_25px_rgba(0,0,0,0.85)] py-1.5 animate-in fade-in zoom-in-95 duration-100 custom-scrollbar"
+              onKeyDown={handleSubmenuKeyDown}
+              className="w-52 max-h-72 overflow-y-auto rounded-md bg-[#16202d] border border-[#2a475e] shadow-[0_10px_25px_rgba(0,0,0,0.85)] py-1.5"
             >
               <div className="px-3 py-1 border-b border-[#2a475e]/60 mb-1 text-[10px] uppercase font-bold text-slate-300 tracking-wider">
                 Collections
@@ -285,7 +449,7 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
                       onClick={() => {
                         onToggleCollection(col.id, game.id);
                       }}
-                      className="w-full min-h-6 flex items-center justify-between px-3 py-1.5 text-left hover:bg-[#1b2838] hover:text-white transition-colors cursor-pointer text-xs"
+                      className={`w-full min-h-6 flex items-center justify-between px-3 py-1.5 text-left hover:bg-[#1b2838] hover:text-white transition-colors cursor-pointer text-xs ${menuItemFocusClass}`}
                     >
                       <div className="flex items-center gap-2 min-w-0 pr-2">
                         <CollectionIcon
@@ -299,7 +463,10 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
                         <span className="truncate">{col.name}</span>
                       </div>
                       {isAssigned && (
-                        <Check className="w-3.5 h-3.5 text-[#66c0f4] shrink-0 font-bold" />
+                        <Check
+                          aria-hidden="true"
+                          className="w-3.5 h-3.5 text-[#66c0f4] shrink-0 font-bold"
+                        />
                       )}
                     </button>
                   );
@@ -315,9 +482,9 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
                   onClose();
                   onManageCollections(game);
                 }}
-                className="w-full min-h-6 flex items-center gap-2 px-3 py-2 text-left hover:bg-[#1b2838] hover:text-[#66c0f4] transition-colors cursor-pointer text-xs text-slate-200 font-medium"
+                className={`w-full min-h-6 flex items-center gap-2 px-3 py-2 text-left hover:bg-[#1b2838] hover:text-[#66c0f4] transition-colors cursor-pointer text-xs text-slate-200 font-medium ${menuItemFocusClass}`}
               >
-                <Sliders className="w-3.5 h-3.5 text-[#66c0f4]" />
+                <Sliders aria-hidden="true" className="w-3.5 h-3.5 text-[#66c0f4]" />
                 <span>Manage Collections...</span>
               </button>
             </div>
@@ -338,9 +505,12 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
               onClose();
               onHideGame(game);
             }}
-            className="w-full min-h-6 flex items-center gap-2.5 px-3 py-2 text-left text-rose-300 hover:bg-rose-950/50 hover:text-white transition-colors cursor-pointer group"
+            className={`w-full min-h-6 flex items-center gap-2.5 px-3 py-2 text-left text-rose-300 hover:bg-rose-950/50 hover:text-white transition-colors cursor-pointer group ${menuItemFocusClass}`}
           >
-            <EyeOff className="w-4 h-4 text-rose-400 group-hover:scale-110 transition-transform shrink-0" />
+            <EyeOff
+              aria-hidden="true"
+              className="w-4 h-4 text-rose-400 group-hover:scale-110 transition-transform shrink-0"
+            />
             <span>Hide / Suppress from Library</span>
           </button>
         </div>

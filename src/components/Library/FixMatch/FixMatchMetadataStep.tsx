@@ -22,6 +22,7 @@ import {
   isXboxStoreCandidateId,
 } from '../../../services/scraper/metadataScraperService';
 import { getTierColor } from '../../../services/critic/criticUtils';
+import { sanitizeAllowedStoreUri } from '../../../services/common/htmlSanitizer';
 import { openExternalStoreUrl } from './fixMatchTypes';
 
 export interface FixMatchMetadataStepProps {
@@ -88,6 +89,7 @@ export function renderFixMatchMetadataStep({
     igdbId: scrapedBundle.igdbId,
     xboxProductId: isXboxBundle ? scrapedBundle.matchedId : undefined,
   });
+  const safeTargetStoreUrl = targetStoreUrl ? sanitizeAllowedStoreUri(targetStoreUrl) : '';
 
   const displayReleaseDate = activeReleaseDate || scrapedBundle.releaseDate;
   const displayDevelopers = activeDevelopers.length
@@ -121,16 +123,18 @@ export function renderFixMatchMetadataStep({
               Steam ID: {scrapedBundle.steamAppId}
             </span>
           ) : null}
-          {targetStoreUrl && (
-            <button
-              type="button"
-              onClick={(e) => openExternalStoreUrl(targetStoreUrl, e)}
+          {safeTargetStoreUrl && (
+            <a
+              href={safeTargetStoreUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => openExternalStoreUrl(safeTargetStoreUrl, e)}
               className="min-h-6 inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#131c27] hover:bg-[#2a475e] border border-[#2a475e] text-[10px] font-semibold text-[#66c0f4] hover:text-white transition-colors cursor-pointer"
               title={`Open ${targetLabel.toUpperCase()} store page in browser`}
             >
               <ExternalLink aria-hidden="true" className="w-3 h-3" />
               <span>Store Page</span>
-            </button>
+            </a>
           )}
         </div>
       </div>
@@ -169,7 +173,7 @@ export function renderFixMatchMetadataStep({
               value={metadataSearchTerm}
               onChange={(e) => onMetadataSearchTermChange(e.target.value)}
               placeholder="Search game metadata across Steam, GOG, Epic, Xbox & IGDB..."
-              className="w-full pl-9 pr-8 py-1.5 rounded-md bg-[#16202d] border border-[#2a475e] text-white placeholder-slate-400 text-xs focus:outline-none focus:border-[#66c0f4] transition-colors"
+              className="w-full pl-9 pr-8 py-1.5 rounded-md bg-[#16202d] border border-[#2a475e] text-white placeholder-slate-400 text-xs focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60 transition-colors"
             />
             {metadataSearchTerm && (
               <button
@@ -214,6 +218,7 @@ export function renderFixMatchMetadataStep({
                   igdbId: srcOpt.igdbId,
                   xboxProductId: isXboxSrc ? srcOpt.matchedId : undefined,
                 });
+              const safeSrcStoreUrl = srcStoreUrl ? sanitizeAllowedStoreUri(srcStoreUrl) : '';
               return (
                 <div
                   key={srcOpt.id}
@@ -235,12 +240,14 @@ export function renderFixMatchMetadataStep({
                     <span>•</span>
                     <span>{srcOpt.sourceLabel}</span>
                   </button>
-                  {srcStoreUrl && (
-                    <button
-                      type="button"
+                  {safeSrcStoreUrl && (
+                    <a
+                      href={safeSrcStoreUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
                       aria-label={`Open ${displaySrcBadge.toUpperCase()} store page for ${srcOpt.title}`}
                       onClick={(e) => {
-                        openExternalStoreUrl(srcStoreUrl, e);
+                        openExternalStoreUrl(safeSrcStoreUrl, e);
                       }}
                       className={`min-w-6 min-h-6 px-2 py-1.5 border-l flex items-center justify-center gap-1 cursor-pointer transition-colors ${
                         isActive
@@ -250,7 +257,7 @@ export function renderFixMatchMetadataStep({
                       title={`Open ${displaySrcBadge.toUpperCase()} store page for ${srcOpt.title} in browser`}
                     >
                       <ExternalLink aria-hidden="true" className="w-3 h-3" />
-                    </button>
+                    </a>
                   )}
                 </div>
               );
@@ -298,7 +305,7 @@ export function renderFixMatchMetadataStep({
               type="text"
               value={customTitle}
               onChange={(e) => onCustomTitleChange(e.target.value)}
-              className="w-full px-3 py-1.5 rounded bg-[#16202d] border border-[#2a475e] text-sm text-white font-medium focus:outline-none focus:border-[#66c0f4]"
+              className="w-full px-3 py-1.5 rounded bg-[#16202d] border border-[#2a475e] text-sm text-white font-medium focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60"
             />
           </div>
 
@@ -466,7 +473,7 @@ export function renderFixMatchMetadataStep({
               value={selectedBlurb}
               onChange={(e) => onSelectedBlurbChange(e.target.value)}
               rows={3}
-              className="w-full p-2.5 rounded bg-[#16202d] border border-[#2a475e] text-xs text-slate-100 placeholder-slate-400 focus:outline-none focus:border-[#66c0f4] leading-relaxed"
+              className="w-full p-2.5 rounded bg-[#16202d] border border-[#2a475e] text-xs text-slate-100 placeholder-slate-400 focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60 leading-relaxed"
               placeholder="Enter synopsis blurb..."
             />
           </div>

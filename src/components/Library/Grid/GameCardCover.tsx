@@ -507,9 +507,13 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
       if (fallbackHeaderUrl && !headerFallbackFailed) {
         return (
           <div className="grid-cover-fallback relative w-full h-full flex flex-col items-center justify-center text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] overflow-hidden select-none">
-            <div
+            <img
+              src={fallbackHeaderUrl}
+              alt=""
               aria-hidden="true"
-              className="absolute inset-0 w-full h-full scale-125 blur-md opacity-40 brightness-75 pointer-events-none"
+              loading={imgLoading}
+              decoding="async"
+              className="absolute inset-0 w-full h-full object-cover scale-125 blur-md opacity-40 brightness-75 pointer-events-none"
             />
             <img
               src={fallbackHeaderUrl}
@@ -608,10 +612,9 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
                     onlineLifecycleManager.isOnline() &&
                     typeof igdbCoverService.verifyAndRecordDeadSteamCover === 'function'
                   ) {
-                    void igdbCoverService.verifyAndRecordDeadSteamCover(
-                      appIdNum,
-                      unwrappedCurrentSrc
-                    );
+                    void igdbCoverService
+                      .verifyAndRecordDeadSteamCover(appIdNum, unwrappedCurrentSrc)
+                      .catch(() => {});
                   }
                 } else if (isUnhashed600x900 && !isUserExplicitCover) {
                   if (isUnhashed1x && isKnownDeadSteamCover(appIdNum)) {

@@ -12,21 +12,22 @@ import {
 import { LibraryFilterIndex } from '../../services/filter/libraryFilterIndex';
 import { launcherService } from '../../services/launcher/launcherService';
 import { normalizeTagKey } from '../../services/tags/gameTagResolver';
-import { VirtualListRows } from '../Common/VirtualContainers';
 import { useSafeDeferredValue, useSafeId } from '../../utils/useSafeId';
+import { RotateCcw, X } from 'lucide-react';
+import { OS_OPTIONS, TAG_PREVIEW_LIMIT } from './FilterPanel/filterPanelConstants';
 import {
-  Monitor,
-  Award,
-  Tags,
-  Tag,
-  Sparkles,
-  Calendar,
-  Building2,
-  RotateCcw,
-  X,
-  Search,
-  Check,
-} from 'lucide-react';
+  renderOsCompatibilitySection,
+  renderRatingAndReviewsSection,
+} from './FilterPanel/FilterOsAndRatingSections';
+import {
+  renderFeaturesSection,
+  renderGenresSection,
+} from './FilterPanel/FilterGenresAndFeaturesSections';
+import { renderReleaseDateSection } from './FilterPanel/FilterReleaseDateSection';
+import {
+  renderCreatorSection,
+  renderTagsSection,
+} from './FilterPanel/FilterCreatorAndTagsSections';
 
 export interface LibraryFilterPanelProps {
   filterState: LibraryFilterState;
@@ -37,74 +38,6 @@ export interface LibraryFilterPanelProps {
   totalCount: number;
   onClose?: () => void;
 }
-
-const OS_OPTIONS: {
-  id: OsCompatibilityFilterOption;
-  label: string;
-  sublabel: string;
-}[] = [
-  { id: 'mac_native', label: 'macOS Native', sublabel: 'Apple Silicon / Intel' },
-  { id: 'windows_native', label: 'Windows Native', sublabel: 'PC Direct' },
-  { id: 'mac_compat_layer', label: 'CrossOver / Wine (Mac)', sublabel: 'Compatibility Layer' },
-];
-
-const CRITIC_TIER_OPTIONS: {
-  id: CriticTierFilterOption;
-  label: string;
-  range: string;
-  badgeClass: string;
-}[] = [
-  {
-    id: 'mighty',
-    label: 'Mighty',
-    range: '84+',
-    badgeClass: 'border-amber-500/50 text-amber-300 bg-amber-500/10',
-  },
-  {
-    id: 'strong',
-    label: 'Strong',
-    range: '74–83',
-    badgeClass: 'border-purple-500/50 text-purple-300 bg-purple-500/10',
-  },
-  {
-    id: 'fair',
-    label: 'Fair',
-    range: '66–73',
-    badgeClass: 'border-sky-500/50 text-sky-300 bg-sky-500/10',
-  },
-  {
-    id: 'weak',
-    label: 'Weak',
-    range: '<66',
-    badgeClass: 'border-emerald-500/50 text-emerald-300 bg-emerald-500/10',
-  },
-];
-
-const MIN_SCORE_OPTIONS: (number | null)[] = [null, 60, 70, 80, 90];
-
-const REVIEW_SENTIMENT_OPTIONS: {
-  id: ReviewSentimentFilterOption;
-  label: string;
-}[] = [
-  { id: 'overwhelmingly_positive', label: 'Overwhelmingly Positive' },
-  { id: 'very_positive', label: 'Very Positive' },
-  { id: 'mostly_positive', label: 'Mostly Positive' },
-  { id: 'mixed', label: 'Mixed' },
-  { id: 'negative', label: 'Negative' },
-];
-
-const FEATURE_OPTIONS: {
-  id: FeatureFilterOption;
-  label: string;
-}[] = [
-  { id: 'singleplayer', label: 'Single-player' },
-  { id: 'coop', label: 'Co-op' },
-  { id: 'multiplayer', label: 'Multiplayer / PvP' },
-  { id: 'controller', label: 'Controller Support' },
-  { id: 'cloud_saves', label: 'Cloud Saves' },
-  { id: 'achievements', label: 'Achievements' },
-  { id: 'hdr', label: 'HDR' },
-];
 
 export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
   filterState = DEFAULT_LIBRARY_FILTER_STATE,
@@ -276,7 +209,6 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
     [selectedTags]
   );
 
-  const TAG_PREVIEW_LIMIT = 40;
   const allTagCounts = filterIndex.tagCounts || [];
   const normalizedTagQuery = deferredTagSearch.trim().toLowerCase();
 
@@ -301,44 +233,10 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
     return extraSelected.length > 0 ? [...topSlice, ...extraSelected] : topSlice;
   }, [filteredTags, isTagListCollapsed, selectedTagKeySet]);
 
-  const renderCreatorItem = (creator: LibraryFilterIndex['creatorCounts'][number]) => {
-    const isSelected = selectedCreatorSet.has(creator.key);
-    const roleLabel =
-      creator.role === 'both'
-        ? 'Dev & Pub'
-        : creator.role === 'developer'
-          ? 'Dev'
-          : 'Pub';
-    return (
-      <button
-        key={creator.key}
-        type="button"
-        data-testid={`filter-creator-${creator.key}`}
-        aria-pressed={isSelected}
-        onClick={() => toggleCreator(creator.key)}
-        className={`w-full min-h-6 flex items-center justify-between px-2.5 py-1.5 rounded border text-left text-[11px] transition-all cursor-pointer ${
-          isSelected
-            ? 'bg-steam-accent/20 border-steam-accent text-white font-semibold shadow-sm'
-            : 'bg-[#16202d]/70 border-steam-border/50 text-steam-text hover:border-steam-accent/50 hover:text-white'
-        }`}
-      >
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="truncate">{creator.name}</span>
-          <span className="px-1.5 py-0.2 rounded bg-black/30 border border-white/10 text-[9px] uppercase tracking-wider text-steam-subtext shrink-0">
-            {roleLabel}
-          </span>
-        </div>
-        <span className="text-[10px] text-steam-subtext font-mono ml-2 shrink-0">
-          {creator.count}
-        </span>
-      </button>
-    );
-  };
-
   return (
     <div
       data-testid="library-filter-panel"
-      className="w-full rounded-lg bg-[#131b26] border border-steam-border/80 shadow-2xl overflow-hidden text-xs text-steam-text animate-in fade-in duration-150"
+      className="w-full rounded-lg bg-[#131b26] border border-steam-border/80 shadow-2xl overflow-hidden text-xs text-steam-text motion-safe:transition-opacity motion-safe:duration-150"
     >
       {/* Top Header Bar */}
       <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 bg-[#172130] border-b border-steam-border/70">
@@ -385,624 +283,82 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
 
       {/* Responsive Facet Grid */}
       <div className="p-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-        {/* Category 1: Operating System / OS & Compatibility */}
-        <div
-          data-testid="filter-cat-os"
-          className="rounded-md bg-[#0f1620] border border-steam-border/50 p-3.5 flex flex-col gap-2.5"
-        >
-          <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
-            <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Monitor aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
-              <span>
-                {supportsWindowsTranslation ? '1. OS & Compatibility' : '1. Operating System'}
-              </span>
-            </div>
-            {activeVisibleOsCount > 0 && (
-              <span className="text-[10px] text-steam-accent font-semibold">
-                {activeVisibleOsCount} selected
-              </span>
-            )}
-          </div>
+        {renderOsCompatibilitySection({
+          supportsWindowsTranslation,
+          visibleOsOptions,
+          activeVisibleOsCount,
+          filterState,
+          filterIndex,
+          toggleOsOption,
+        })}
 
-          <div className="flex flex-col gap-1.5">
-            {visibleOsOptions.map((opt) => {
-              const isSelected = filterState.osCompatibility.includes(opt.id);
-              const count = filterIndex.osCounts[opt.id] ?? 0;
-              return (
-                <button
-                  key={opt.id}
-                  type="button"
-                  data-testid={`filter-os-${opt.id}`}
-                  aria-pressed={isSelected}
-                  onClick={() => toggleOsOption(opt.id)}
-                  className={`w-full min-h-6 flex items-center justify-between px-2.5 py-2 rounded border text-left transition-all cursor-pointer ${
-                    isSelected
-                      ? 'bg-steam-accent/20 border-steam-accent text-white font-semibold shadow-sm'
-                      : 'bg-[#16202d]/70 border-steam-border/50 text-steam-text hover:border-steam-accent/50 hover:text-white'
-                  }`}
-                >
-                  <div className="flex items-center gap-2 min-w-0">
-                    <div
-                      className={`w-3.5 h-3.5 rounded flex items-center justify-center border shrink-0 ${
-                        isSelected
-                          ? 'bg-steam-accent border-steam-accent text-black'
-                          : 'border-steam-border bg-black/40'
-                      }`}
-                    >
-                      {isSelected && <Check aria-hidden="true" className="w-2.5 h-2.5 stroke-[3]" />}
-                    </div>
-                    <div className="truncate">
-                      <div className="text-xs leading-tight">{opt.label}</div>
-                      <div className="text-[10px] text-steam-subtext">{opt.sublabel}</div>
-                    </div>
-                  </div>
-                  <span className="px-1.5 py-0.5 rounded bg-black/40 text-[10px] text-steam-subtext font-mono shrink-0">
-                    {count}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
+        {renderRatingAndReviewsSection({
+          filterState,
+          filterIndex,
+          onChange,
+          toggleCriticTier,
+          toggleReviewSentiment,
+        })}
 
-        {/* Category 2: Rating */}
-        <div
-          data-testid="filter-cat-rating"
-          className="rounded-md bg-[#0f1620] border border-steam-border/50 p-3.5 flex flex-col gap-3"
-        >
-          <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
-            <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Award aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
-              <span>2. Rating &amp; Reviews</span>
-            </div>
-          </div>
+        {renderGenresSection({
+          genreSearchInputId,
+          genreSearch,
+          setGenreSearch,
+          filteredGenres,
+          filterState,
+          onChange,
+          toggleGenre,
+        })}
 
-          {/* Critic Tier Pills */}
-          <div className="space-y-1.5">
-            <div className="text-[10px] font-semibold uppercase tracking-wider text-steam-subtext">
-              Critic Tier
-            </div>
-            <div className="grid grid-cols-2 gap-1.5">
-              {CRITIC_TIER_OPTIONS.map((tier) => {
-                const isSelected = filterState.criticTiers.includes(tier.id);
-                const count = filterIndex.criticTierCounts[tier.id] ?? 0;
-                return (
-                  <button
-                    key={tier.id}
-                    type="button"
-                    data-testid={`filter-tier-${tier.id}`}
-                    aria-pressed={isSelected}
-                    onClick={() => toggleCriticTier(tier.id)}
-                    className={`min-h-6 flex items-center justify-between px-2 py-1.5 rounded border text-[11px] transition-all cursor-pointer ${
-                      isSelected
-                        ? 'bg-steam-accent/20 border-steam-accent text-white font-semibold shadow-sm'
-                        : 'bg-[#16202d]/70 border-steam-border/50 text-steam-text hover:border-steam-accent/50 hover:text-white'
-                    }`}
-                  >
-                    <span className="truncate">
-                      {tier.label}{' '}
-                      <span className="text-[10px] text-steam-subtext">({tier.range})</span>
-                    </span>
-                    <span className="text-[10px] text-steam-subtext font-mono ml-1">{count}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+        {renderFeaturesSection({
+          filterState,
+          filterIndex,
+          toggleFeature,
+        })}
 
-          {/* Minimum Critic Score Segmented Selector */}
-          <div className="space-y-1.5">
-            <div className="text-[10px] font-semibold uppercase tracking-wider text-steam-subtext">
-              Minimum Critic Score
-            </div>
-            <div className="grid grid-cols-5 gap-1 bg-[#16202d] p-0.5 rounded border border-steam-border/60">
-              {MIN_SCORE_OPTIONS.map((score) => {
-                const isSelected = filterState.minCriticScore === score;
-                const testId =
-                  score === null ? 'filter-min-score-any' : `filter-min-score-${score}`;
-                return (
-                  <button
-                    key={String(score)}
-                    type="button"
-                    data-testid={testId}
-                    aria-pressed={isSelected}
-                    onClick={() => onChange({ ...filterState, minCriticScore: score })}
-                    className={`min-h-6 py-1 rounded text-[11px] font-semibold transition-colors cursor-pointer ${
-                      isSelected
-                        ? 'bg-steam-accent text-black shadow-sm'
-                        : 'text-steam-text hover:text-white'
-                    }`}
-                  >
-                    {score === null ? 'Any' : `${score}+`}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+        {renderReleaseDateSection({
+          includeUnknownYearId,
+          minYear,
+          maxYear,
+          fromYear,
+          toYear,
+          fromPct,
+          toPct,
+          isYearFilterActive,
+          filterState,
+          filterIndex,
+          onChange,
+          applyEraPreset,
+        })}
 
-          {/* Player Review Sentiment Pills */}
-          <div className="space-y-1.5">
-            <div className="text-[10px] font-semibold uppercase tracking-wider text-steam-subtext">
-              Player Review Sentiment
-            </div>
-            <div className="flex flex-wrap gap-1">
-              {REVIEW_SENTIMENT_OPTIONS.map((sent) => {
-                const isSelected = filterState.reviewSentiments.includes(sent.id);
-                const count = filterIndex.reviewSentimentCounts[sent.id] ?? 0;
-                return (
-                  <button
-                    key={sent.id}
-                    type="button"
-                    data-testid={`filter-review-${sent.id}`}
-                    aria-pressed={isSelected}
-                    onClick={() => toggleReviewSentiment(sent.id)}
-                    className={`min-h-6 inline-flex items-center gap-1 px-2 py-1 rounded border text-[10px] transition-all cursor-pointer ${
-                      isSelected
-                        ? 'bg-steam-accent/20 border-steam-accent text-white font-semibold'
-                        : 'bg-[#16202d]/70 border-steam-border/50 text-steam-text hover:border-steam-accent/50 hover:text-white'
-                    }`}
-                  >
-                    <span>{sent.label}</span>
-                    <span className="text-steam-subtext font-mono">({count})</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </div>
+        {renderCreatorSection({
+          creatorSearchInputId,
+          creatorSearch,
+          setCreatorSearch,
+          creatorScrollRef,
+          creatorScrollHeight,
+          filteredCreators,
+          selectedCreatorSet,
+          creatorsCount: filterState.creators.length,
+          toggleCreator,
+        })}
 
-        {/* Category 3: Genres */}
-        <div
-          data-testid="filter-cat-genres"
-          className="rounded-md bg-[#0f1620] border border-steam-border/50 p-3.5 flex flex-col gap-2.5"
-        >
-          <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
-            <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Tags aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
-              <span>3. Genres</span>
-            </div>
-            {/* ANY / ALL Match Mode Toggle */}
-            <div className="inline-flex items-center rounded bg-[#16202d] border border-steam-border/60 p-0.5 text-[10px]">
-              <button
-                type="button"
-                data-testid="filter-genre-mode-any"
-                aria-pressed={filterState.genreMatchMode === 'any'}
-                onClick={() => onChange({ ...filterState, genreMatchMode: 'any' })}
-                className={`min-w-6 min-h-6 px-2 py-0.5 rounded font-semibold transition-colors cursor-pointer ${
-                  filterState.genreMatchMode === 'any'
-                    ? 'bg-steam-accent text-black'
-                    : 'text-steam-subtext hover:text-white'
-                }`}
-                title="Match games with ANY selected genre (OR)"
-              >
-                ANY
-              </button>
-              <button
-                type="button"
-                data-testid="filter-genre-mode-all"
-                aria-pressed={filterState.genreMatchMode === 'all'}
-                onClick={() => onChange({ ...filterState, genreMatchMode: 'all' })}
-                className={`min-w-6 min-h-6 px-2 py-0.5 rounded font-semibold transition-colors cursor-pointer ${
-                  filterState.genreMatchMode === 'all'
-                    ? 'bg-steam-accent text-black'
-                    : 'text-steam-subtext hover:text-white'
-                }`}
-                title="Match games with ALL selected genres (AND)"
-              >
-                ALL
-              </button>
-            </div>
-          </div>
-
-          {/* Search Genres Input */}
-          <div className="relative">
-            <label htmlFor={genreSearchInputId} className="sr-only">
-              Search genres
-            </label>
-            <Search aria-hidden="true" className="w-3 h-3 text-steam-subtext absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-            <input
-              id={genreSearchInputId}
-              type="text"
-              data-testid="filter-genre-search"
-              value={genreSearch}
-              onChange={(e) => setGenreSearch(e.target.value)}
-              placeholder="Search genres..."
-              className="w-full bg-[#16202d] border border-steam-border/60 rounded pl-7 pr-2.5 py-1 text-xs text-white placeholder-steam-subtext focus:outline-none focus:border-steam-accent"
-            />
-          </div>
-
-          {/* Scrollable Multi-Select Genre List */}
-          <div className="max-h-44 overflow-y-auto pr-1 flex flex-wrap gap-1.5">
-            {filteredGenres.length === 0 ? (
-              <div className="text-[11px] text-steam-subtext italic py-2">No matching genres</div>
-            ) : (
-              filteredGenres.map((genre) => {
-                const isSelected = filterState.genres.some(
-                  (g) => g.toLowerCase().trim() === genre.key
-                );
-                return (
-                  <button
-                    key={genre.key}
-                    type="button"
-                    data-testid={`filter-genre-${genre.key}`}
-                    aria-pressed={isSelected}
-                    onClick={() => toggleGenre(genre.key)}
-                    className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded border text-[11px] transition-all cursor-pointer ${
-                      isSelected
-                        ? 'bg-steam-accent/20 border-steam-accent text-white font-semibold shadow-sm'
-                        : 'bg-[#16202d]/70 border-steam-border/50 text-steam-text hover:border-steam-accent/50 hover:text-white'
-                    }`}
-                  >
-                    <span>{genre.label}</span>
-                    <span className="text-[10px] text-steam-subtext font-mono">
-                      ({genre.count})
-                    </span>
-                  </button>
-                );
-              })
-            )}
-          </div>
-        </div>
-
-        {/* Category 4: Features & Capabilities */}
-        <div
-          data-testid="filter-cat-features"
-          className="rounded-md bg-[#0f1620] border border-steam-border/50 p-3.5 flex flex-col gap-2.5"
-        >
-          <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
-            <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Sparkles aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
-              <span>4. Features &amp; Capabilities</span>
-            </div>
-            {filterState.features.length > 0 && (
-              <span className="text-[10px] text-steam-accent font-semibold">
-                {filterState.features.length} selected
-              </span>
-            )}
-          </div>
-
-          <div className="grid grid-cols-2 gap-1.5">
-            {FEATURE_OPTIONS.map((feat) => {
-              const isSelected = filterState.features.includes(feat.id);
-              const count = filterIndex.featureCounts[feat.id] ?? 0;
-              return (
-                <button
-                  key={feat.id}
-                  type="button"
-                  data-testid={`filter-feature-${feat.id}`}
-                  aria-pressed={isSelected}
-                  onClick={() => toggleFeature(feat.id)}
-                  className={`min-h-6 flex items-center justify-between px-2.5 py-1.5 rounded border text-[11px] transition-all cursor-pointer ${
-                    isSelected
-                      ? 'bg-steam-accent/20 border-steam-accent text-white font-semibold shadow-sm'
-                      : 'bg-[#16202d]/70 border-steam-border/50 text-steam-text hover:border-steam-accent/50 hover:text-white'
-                  }`}
-                >
-                  <span className="truncate">{feat.label}</span>
-                  <span className="text-[10px] text-steam-subtext font-mono ml-1">{count}</span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* Category 5: Release Date — To / From Two-Point Slider */}
-        <div
-          data-testid="filter-cat-release-date"
-          className="rounded-md bg-[#0f1620] border border-steam-border/50 p-3.5 flex flex-col gap-3"
-        >
-          <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
-            <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Calendar aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
-              <span>5. Release Date</span>
-            </div>
-            <span
-              data-testid="release-year-range-readout"
-              className={`px-2 py-0.5 rounded font-mono text-[11px] font-semibold border ${
-                isYearFilterActive
-                  ? 'bg-steam-accent/20 border-steam-accent/50 text-steam-accent'
-                  : 'bg-[#16202d] border-steam-border/60 text-white'
-              }`}
-            >
-              {fromYear} — {toYear}
-            </span>
-          </div>
-
-          {/* Two-Point Dual-Range Slider */}
-          <div className="px-1 pt-1">
-            <div className="relative h-6 flex items-center">
-              <div className="h-1.5 w-full rounded-full bg-[#1a222f]" />
-              <div
-                className="bg-[#66c0f4] h-1.5 rounded-full absolute pointer-events-none"
-                style={{
-                  left: `${fromPct}%`,
-                  width: `${Math.max(0, toPct - fromPct)}%`,
-                }}
-              />
-              <input
-                type="range"
-                aria-label="Release year from"
-                data-testid="release-year-slider-from"
-                min={minYear}
-                max={maxYear}
-                step={1}
-                value={fromYear}
-                style={{ zIndex: fromYear >= maxYear - 1 ? 5 : 3 }}
-                onChange={(e) => {
-                  const nextFrom = Math.min(Number(e.target.value), toYear);
-                  const nextRange: [number, number] | null =
-                    nextFrom <= minYear && toYear >= maxYear ? null : [nextFrom, toYear];
-                  onChange({ ...filterState, releaseYearRange: nextRange });
-                }}
-                className="dual-range-input absolute inset-0 w-full h-full m-0"
-              />
-              <input
-                type="range"
-                aria-label="Release year to"
-                data-testid="release-year-slider-to"
-                min={minYear}
-                max={maxYear}
-                step={1}
-                value={toYear}
-                style={{ zIndex: 4 }}
-                onChange={(e) => {
-                  const nextTo = Math.max(Number(e.target.value), fromYear);
-                  const nextRange: [number, number] | null =
-                    fromYear <= minYear && nextTo >= maxYear ? null : [fromYear, nextTo];
-                  onChange({ ...filterState, releaseYearRange: nextRange });
-                }}
-                className="dual-range-input absolute inset-0 w-full h-full m-0"
-              />
-            </div>
-            <div className="flex items-center justify-between text-[10px] text-steam-subtext font-mono mt-0.5">
-              <span>{minYear}</span>
-              <span>{maxYear}</span>
-            </div>
-          </div>
-
-          {/* Quick Era Preset Pills */}
-          <div className="flex flex-wrap gap-1">
-            {[
-              { label: 'All Years', from: null, to: null },
-              { label: '2020s', from: 2020, to: 2029 },
-              { label: '2010s', from: 2010, to: 2019 },
-              { label: '2000s', from: 2000, to: 2009 },
-              { label: '≤ 1999', from: minYear, to: 1999 },
-            ].map((era) => {
-              const isAll = era.from === null;
-              const expectedFrom =
-                era.from !== null ? Math.max(minYear, Math.min(maxYear, era.from)) : minYear;
-              const expectedTo =
-                era.to !== null
-                  ? Math.max(expectedFrom, Math.min(maxYear, era.to))
-                  : maxYear;
-              const isSelected = isAll
-                ? !isYearFilterActive
-                : isYearFilterActive && fromYear === expectedFrom && toYear === expectedTo;
-              return (
-                <button
-                  key={era.label}
-                  type="button"
-                  aria-pressed={isSelected}
-                  onClick={() => applyEraPreset(era.from, era.to)}
-                  className={`min-h-6 px-2 py-0.5 rounded border text-[10px] font-semibold transition-colors cursor-pointer ${
-                    isSelected
-                      ? 'bg-steam-accent text-black border-steam-accent'
-                      : 'bg-[#16202d] border-steam-border/60 text-steam-subtext hover:text-white'
-                  }`}
-                >
-                  {era.label}
-                </button>
-              );
-            })}
-          </div>
-
-          {/* Include games with unknown release date */}
-          <label
-            htmlFor={includeUnknownYearId}
-            className="inline-flex items-center gap-2 text-[11px] text-steam-subtext hover:text-white cursor-pointer select-none pt-0.5"
-          >
-            <input
-              id={includeUnknownYearId}
-              type="checkbox"
-              data-testid="release-year-include-unknown"
-              checked={filterState.includeUnknownReleaseYear}
-              onChange={(e) =>
-                onChange({
-                  ...filterState,
-                  includeUnknownReleaseYear: e.target.checked,
-                })
-              }
-              className="rounded border-steam-border bg-[#16202d] text-steam-accent focus:ring-0 cursor-pointer"
-            />
-            <span>
-              Include games with unknown release date ({filterIndex.unknownReleaseYearCount})
-            </span>
-          </label>
-        </div>
-
-        {/* Category 6: Creator (Developers & Publishers) — Virtualized */}
-        <div
-          data-testid="filter-cat-creator"
-          className="rounded-md bg-[#0f1620] border border-steam-border/50 p-3.5 flex flex-col gap-2.5"
-        >
-          <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
-            <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Building2 aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
-              <span>6. Creator</span>
-            </div>
-            {filterState.creators.length > 0 && (
-              <span className="text-[10px] text-steam-accent font-semibold">
-                {filterState.creators.length} selected
-              </span>
-            )}
-          </div>
-
-          {/* Search Creators Input */}
-          <div className="relative">
-            <label htmlFor={creatorSearchInputId} className="sr-only">
-              Search developers or publishers
-            </label>
-            <Search aria-hidden="true" className="w-3 h-3 text-steam-subtext absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-            <input
-              id={creatorSearchInputId}
-              type="text"
-              data-testid="filter-creator-search"
-              value={creatorSearch}
-              onChange={(e) => setCreatorSearch(e.target.value)}
-              placeholder="Search developers or publishers..."
-              className="w-full bg-[#16202d] border border-steam-border/60 rounded pl-7 pr-2.5 py-1 text-xs text-white placeholder-steam-subtext focus:outline-none focus:border-steam-accent"
-            />
-          </div>
-
-          {/* Virtualized Scrollable Multi-Select Creator List */}
-          <div
-            ref={creatorScrollRef}
-            className="max-h-44 overflow-y-auto pr-1 flex flex-col gap-1"
-          >
-            {filteredCreators.length === 0 ? (
-              <div className="text-[11px] text-steam-subtext italic py-2">
-                No matching developers or publishers
-              </div>
-            ) : filteredCreators.length > 30 && creatorScrollHeight > 0 ? (
-              <VirtualListRows
-                items={filteredCreators}
-                scrollElement={creatorScrollRef.current}
-                estimatedItemHeight={30}
-                itemGapPx={4}
-                overscan={6}
-                getItemKey={(c) => c.key}
-                renderItem={(c) => renderCreatorItem(c)}
-              />
-            ) : (
-              filteredCreators.map((creator) => renderCreatorItem(creator))
-            )}
-          </div>
-        </div>
-
-        {/* Category 7: Tags (Full-Width Row Matching 3. Genres) */}
-        <div
-          data-testid="filter-cat-tags"
-          className="md:col-span-2 xl:col-span-3 rounded-md bg-[#0f1620] border border-steam-border/50 p-3.5 flex flex-col gap-2.5"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-steam-border/40 pb-2">
-            <div className="flex items-center gap-2 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Tag aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
-              <span>7. Tags</span>
-              {selectedTags.length > 0 && (
-                <span className="text-[10px] text-steam-accent font-semibold normal-case tracking-normal">
-                  {selectedTags.length} selected
-                </span>
-              )}
-            </div>
-            {/* ANY / ALL Match Mode Toggle */}
-            <div className="inline-flex items-center rounded bg-[#16202d] border border-steam-border/60 p-0.5 text-[10px]">
-              <button
-                type="button"
-                data-testid="filter-tag-mode-any"
-                aria-pressed={tagMatchMode === 'any'}
-                onClick={() => onChange({ ...filterState, tagMatchMode: 'any' })}
-                className={`min-w-6 min-h-6 px-2 py-0.5 rounded font-semibold transition-colors cursor-pointer ${
-                  tagMatchMode === 'any'
-                    ? 'bg-steam-accent text-black'
-                    : 'text-steam-subtext hover:text-white'
-                }`}
-                title="Match games with ANY selected tag (OR)"
-              >
-                ANY
-              </button>
-              <button
-                type="button"
-                data-testid="filter-tag-mode-all"
-                aria-pressed={tagMatchMode === 'all'}
-                onClick={() => onChange({ ...filterState, tagMatchMode: 'all' })}
-                className={`min-w-6 min-h-6 px-2 py-0.5 rounded font-semibold transition-colors cursor-pointer ${
-                  tagMatchMode === 'all'
-                    ? 'bg-steam-accent text-black'
-                    : 'text-steam-subtext hover:text-white'
-                }`}
-                title="Match games with ALL selected tags (AND)"
-              >
-                ALL
-              </button>
-            </div>
-          </div>
-
-          {/* Search Tags Input */}
-          <div className="relative">
-            <label htmlFor={tagSearchInputId} className="sr-only">
-              Search tags
-            </label>
-            <Search aria-hidden="true" className="w-3 h-3 text-steam-subtext absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-            <input
-              id={tagSearchInputId}
-              type="text"
-              data-testid="filter-tag-search"
-              value={tagSearch}
-              onChange={(e) => setTagSearch(e.target.value)}
-              autoComplete="off"
-              autoCorrect="off"
-              autoCapitalize="none"
-              spellCheck={false}
-              placeholder="Search tags..."
-              className="w-full bg-[#16202d] border border-steam-border/60 rounded pl-7 pr-7 py-1 text-xs text-white placeholder-steam-subtext focus:outline-none focus:border-steam-accent"
-            />
-            {tagSearch.length > 0 && (
-              <button
-                type="button"
-                data-testid="filter-tag-search-clear"
-                aria-label="Clear tag search"
-                onClick={() => setTagSearch('')}
-                className="min-w-6 min-h-6 inline-flex items-center justify-center absolute right-1 top-1/2 -translate-y-1/2 text-steam-subtext hover:text-white rounded cursor-pointer"
-              >
-                <X aria-hidden="true" className="w-3 h-3" />
-              </button>
-            )}
-          </div>
-
-          {/* Scrollable Multi-Select Tag Cloud */}
-          <div className="max-h-44 overflow-y-auto pr-1 flex flex-wrap gap-1.5 items-center">
-            {visibleTags.length === 0 ? (
-              <div className="text-[11px] text-steam-subtext italic py-2">No matching tags</div>
-            ) : (
-              <>
-                {visibleTags.map((tag) => {
-                  const isSelected = selectedTagKeySet.has(tag.key);
-                  return (
-                    <button
-                      key={tag.key}
-                      type="button"
-                      data-testid={`filter-tag-${tag.key}`}
-                      aria-pressed={isSelected}
-                      onClick={() => toggleTag(tag.key)}
-                      className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded border text-[11px] transition-all cursor-pointer ${
-                        isSelected
-                          ? 'bg-steam-accent/20 border-steam-accent text-white font-semibold shadow-sm'
-                          : 'bg-[#16202d]/70 border-steam-border/50 text-steam-text hover:border-steam-accent/50 hover:text-white'
-                      }`}
-                    >
-                      <span>{tag.label}</span>
-                      <span className="text-[10px] text-steam-subtext font-mono">
-                        ({tag.count})
-                      </span>
-                    </button>
-                  );
-                })}
-                {isTagSearchEmpty && filteredTags.length > TAG_PREVIEW_LIMIT && (
-                  <button
-                    type="button"
-                    data-testid="filter-tags-show-all"
-                    aria-expanded={showAllTags}
-                    onClick={() => setShowAllTags((prev) => !prev)}
-                    className="min-h-6 inline-flex items-center px-2.5 py-1 rounded border border-steam-accent/40 bg-steam-accent/10 hover:bg-steam-accent/20 text-steam-accent hover:text-white text-[11px] font-semibold transition-colors cursor-pointer"
-                  >
-                    {showAllTags ? 'Show fewer tags' : `Show all ${filteredTags.length} tags`}
-                  </button>
-                )}
-              </>
-            )}
-          </div>
-        </div>
+        {renderTagsSection({
+          tagSearchInputId,
+          tagSearch,
+          setTagSearch,
+          selectedTagsCount: selectedTags.length,
+          tagMatchMode,
+          filterState,
+          onChange,
+          visibleTags,
+          filteredTagsCount: filteredTags.length,
+          selectedTagKeySet,
+          isTagSearchEmpty,
+          showAllTags,
+          setShowAllTags,
+          toggleTag,
+        })}
       </div>
     </div>
   );
