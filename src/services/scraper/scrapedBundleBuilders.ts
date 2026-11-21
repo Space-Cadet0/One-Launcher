@@ -315,7 +315,12 @@ async function scrapeSteamMatchDetails(
     originalGame?.releaseDate
   );
   const igdbCover =
-    igdbCoverService.getIgdbCoverInstant(candidate.title, steamAppId) ||
+    igdbCoverService.getIgdbCoverInstant(
+      candidate.title,
+      steamAppId,
+      originalGame?.id,
+      igdbReleaseYear
+    ) ||
     (await withTimeoutFallback(
       igdbCoverService
         .fetchIgdbCover(candidate.title, igdbReleaseYear, Priority.P0_INTERACTIVE)
@@ -908,7 +913,12 @@ async function scrapeXboxMatchDetails(
     ),
     (async () => {
       return (
-        igdbCoverService.getIgdbCoverInstant(candidate.title, crossStoreSteamAppId) ||
+        igdbCoverService.getIgdbCoverInstant(
+          candidate.title,
+          crossStoreSteamAppId,
+          originalGame?.id,
+          xboxReleaseYear
+        ) ||
         (await withTimeoutFallback(
           igdbCoverService
             .fetchIgdbCover(candidate.title, xboxReleaseYear, Priority.P0_INTERACTIVE)
@@ -1113,7 +1123,12 @@ async function scrapeIgdbMatchDetails(
     (async () => {
       return (
         candidate.capsuleImage ||
-        igdbCoverService.getIgdbCoverInstant(candidate.title, crossStoreSteamAppId) ||
+        igdbCoverService.getIgdbCoverInstant(
+          candidate.title,
+          crossStoreSteamAppId,
+          originalGame?.id,
+          igdbReleaseYear
+        ) ||
         (await withTimeoutFallback(
           igdbCoverService
             .fetchIgdbCover(candidate.title, igdbReleaseYear, Priority.P0_INTERACTIVE)
