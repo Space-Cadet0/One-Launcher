@@ -6,12 +6,16 @@ import type {
   XboxSubscriptionSummary,
 } from '../../contracts/game';
 import type { StorefrontCredentials } from '../../contracts/integration';
-import { XBOX_USER_LIBRARY } from '../storage/storefrontLibraries';
 import { steamMatcher } from '../steam/steamMatcher';
 import { steamApi } from '../steam/steamApi';
 import { RequestPriority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 import { isMicrosoftStoreCdnUrl, sanitizeStoreReleaseDate } from '../common/titleUtils';
+import { getAlphabeticalTitleSortKey } from '../common/titleSortUtils';
+import { hasElectronBridge } from '../common/runtimeEnv';
+
+const DEFAULT_XBOX_ACCOUNT_NAME = 'Xbox Live Account';
+const DEFAULT_XBOX_AVATAR_URL = 'https://assets.xboxservices.com/assets/default-gamerpic.png';
 
 export interface XboxSyncAccountResult {
   accountName: string;
@@ -272,7 +276,7 @@ export class XboxIntegrationService {
   async syncXboxAccount(
     credentials?: XboxSyncCredentialsInput
   ): Promise<XboxSyncAccountResult> {
-    if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
+    if (hasElectronBridge() && window.electronAPI?.syncStore) {
       const payload = credentials
         ? {
             ...credentials,
@@ -286,12 +290,12 @@ export class XboxIntegrationService {
         throw new Error(res?.error || 'Failed to synchronize Xbox / Game Pass library.');
       }
 
+      // Never fall back to secret token fields (e.g., credentials?.webToken) for display names
       const accountName =
         res.modernGamertag ||
         res.gamertag ||
         res.accountName ||
-        credentials?.webToken ||
-        'Xbox Live Account';
+        DEFAULT_XBOX_ACCOUNT_NAME;
 
       const matchedSteamIds: number[] = [];
       let games: CanonicalGame[] = Array.isArray(res.games)
@@ -322,6 +326,7 @@ export class XboxIntegrationService {
 
             return {
               ...g,
+              sortTitle: getAlphabeticalTitleSortKey(g.title, true),
               ...(matchedAppId ? { steamAppId: matchedAppId } : {}),
               releaseDate: sanitizedDate,
               ...(nextEnriched ? { enrichedMetadata: nextEnriched } : {}),
@@ -333,7 +338,14 @@ export class XboxIntegrationService {
       if (matchedSteamIds.length > 0 && onlineLifecycleManager.isOnline()) {
         const browseMap = await steamApi
           .fetchStoreBrowseAssetsBatch(matchedSteamIds, RequestPriority.P1_VIEWPORT)
-          .catch(() => new Map());
+          .catch((err: unknown) => {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            console.warn(
+              '[XboxIntegration] Failed to fetch Steam browse assets batch:',
+              errMsg
+            );
+            return new Map();
+          });
         if (browseMap.size > 0) {
           games = games.map((g) => {
             if (!g.steamAppId) return g;
@@ -386,20 +398,15 @@ export class XboxIntegrationService {
       };
     }
 
-    const accountName = credentials?.webToken || 'Xbox Live Account';
-    const avatarUrl = 'https://assets.xboxservices.com/assets/default-gamerpic.png';
-    const games = XBOX_USER_LIBRARY.map((g) => ({
-      ...g,
-      isVerifiedEntitlement: true,
-    }));
+    // Non-Electron fallback: never leak token fields into accountName and never mark authoritative
     return {
-      accountName,
-      gamertag: accountName,
-      modernGamertag: accountName,
-      avatarUrl,
+      accountName: DEFAULT_XBOX_ACCOUNT_NAME,
+      gamertag: DEFAULT_XBOX_ACCOUNT_NAME,
+      modernGamertag: DEFAULT_XBOX_ACCOUNT_NAME,
+      avatarUrl: DEFAULT_XBOX_AVATAR_URL,
       syncMode: credentials?.syncMode || 'owned_and_played',
-      games,
-      authoritativeComplete: true,
+      games: [],
+      authoritativeComplete: false,
       subscriptionChanged: false,
     };
   }
@@ -418,7 +425,7 @@ export class XboxIntegrationService {
   }
 
   async getXboxConnectionStatus(refreshSubscription = false) {
-    if (typeof window !== 'undefined' && window.electronAPI?.getXboxStatus) {
+    if (hasElectronBridge() && window.electronAPI?.getXboxStatus) {
       return window.electronAPI.getXboxStatus({ refreshSubscription });
     }
     return null;
@@ -427,7 +434,7 @@ export class XboxIntegrationService {
   async updateXboxSyncMode(
     syncMode: XboxGamePassSyncMode
   ): Promise<{ success: boolean; syncMode?: XboxGamePassSyncMode; error?: string }> {
-    if (typeof window !== 'undefined' && window.electronAPI?.setXboxSyncMode) {
+    if (hasElectronBridge() && window.electronAPI?.setXboxSyncMode) {
       return window.electronAPI.setXboxSyncMode(syncMode);
     }
     return { success: true, syncMode };
@@ -436,11 +443,12 @@ export class XboxIntegrationService {
   async fetchUserAchievements(
     pfns?: string[]
   ): Promise<Record<string, StoreAchievementSummary | unknown>> {
-    if (typeof window !== 'undefined' && window.electronAPI?.fetchXboxAchievements) {
+    if (hasElectronBridge() && window.electronAPI?.fetchXboxAchievements) {
       try {
         return (await window.electronAPI.fetchXboxAchievements(pfns ? { pfns } : undefined)) || {};
-      } catch (err) {
-        console.warn('[XboxIntegration] Failed to fetch Xbox achievements:', err);
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.warn('[XboxIntegration] Failed to fetch Xbox achievements:', errMsg);
         return {};
       }
     }

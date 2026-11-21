@@ -8,11 +8,15 @@ export interface EpicCodenameMapping {
   iconUrl?: string;
 }
 
+/**
+ * Legacy empty map preserved for backwards compatibility with existing imports.
+ * Contains zero hardcoded game titles, IDs, or codenames.
+ */
 export const KNOWN_EPIC_APP_NAMES: Record<string, EpicCodenameMapping> = {};
 
 /**
- * Legacy set preserved as an empty symbol export for backwards compatibility.
- * Epic internal project codename detection now relies exclusively on structural
+ * Legacy empty set preserved for backwards compatibility with existing imports.
+ * Epic internal project codename detection relies exclusively on structural
  * metadata/identifier heuristics rather than hardcoded per-account wordlists.
  */
 export const UNMAPPED_EPIC_INTERNAL_CODENAMES: ReadonlySet<string> = new Set<string>();
@@ -46,7 +50,7 @@ function hasRealArtworkUrl(url?: string): boolean {
 /**
  * Structural detector for unmapped Epic internal project codenames / private sandbox stubs.
  * Never flags installed games, mapped titles, titles with real storefront metadata/artwork,
- * multi-word titles, or verified Title-Cased standalone storefront titles (e.g. "Hades", "Control", "Celeste").
+ * multi-word titles, or verified single-word Title-Cased standalone storefront titles.
  */
 export function hasStructuralEpicCodenameTraits(input: EpicCodenameInspectionInput): boolean {
   const rawTitle = (input.title || '').trim();
@@ -91,12 +95,12 @@ export function hasStructuralEpicCodenameTraits(input: EpicCodenameInspectionInp
     return false;
   }
 
-  // 1. Strictly all-lowercase single-token identifier (e.g. "snapdragon", "staging_branch")
+  // 1. Strictly all-lowercase single-token identifier (e.g. "staging_branch")
   if (rawTitle === lowerTitle && /^[a-z][a-z0-9_-]{2,31}$/.test(rawTitle)) {
     return true;
   }
 
-  // 2. Mid-word camelCase / PascalCase internal compound project alias without spaces (e.g. "CobaltFalcon", "CrimsonHarbor")
+  // 2. Mid-word camelCase / PascalCase internal compound project alias without spaces (e.g. "CobaltFalcon")
   if (/[a-z][A-Z]/.test(rawTitle) && /^[A-Za-z][A-Za-z0-9_-]{3,39}$/.test(rawTitle)) {
     return true;
   }
