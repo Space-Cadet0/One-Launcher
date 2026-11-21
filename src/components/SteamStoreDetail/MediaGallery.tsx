@@ -1,21 +1,32 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import type Hls from 'hls.js';
 import { SteamScreenshot, SteamMovie } from '../../contracts/steam';
-import { toOlMediaUrl, unwrapOlMediaUrl } from '../../contracts/network';
-import { launcherService } from '../../services/launcher/launcherService';
+import { toOlMediaUrl } from '../../contracts/network';
 import { onlineLifecycleManager } from '../../services/network/onlineLifecycleManager';
 import { isModalOverlayOpen } from '../../utils/modalOverlayLock';
 import { isNonEnglishRegionalMovieName } from '../../services/steam/steamApi';
-import { ModalShell } from '../Common/ModalShell';
 import {
   Play,
   ChevronLeft,
   ChevronRight,
   Maximize2,
-  X,
   Image as ImageIcon,
   ExternalLink,
 } from 'lucide-react';
+import {
+  MediaItem,
+  normalizeMediaUrl,
+  extractYouTubeId,
+  setBoundedFlag,
+  addBoundedSetEntry,
+  prefersReducedMotion,
+  isTrustedEmbedHost,
+  loadHlsModule,
+  shouldSuspendMediaPlayback,
+} from './MediaGallery/mediaGalleryUtils';
+import { GalleryLightboxModal } from './MediaGallery/GalleryLightboxModal';
+
+export { prefersReducedMotion };
 
 interface MediaGalleryProps {
   screenshots: SteamScreenshot[];
@@ -32,106 +43,7 @@ interface MediaGalleryProps {
   xboxTitleId?: string | null;
 }
 
-type MediaItem =
-  | { type: 'movie'; movie: SteamMovie }
-  | { type: 'screenshot'; screenshot: SteamScreenshot };
-
-function normalizeMediaUrl(url?: string | null): string {
-  if (!url) return '';
-  const trimmed = url.trim();
-  if (trimmed.startsWith('//') && !trimmed.startsWith('///')) {
-    return `https:${trimmed}`;
-  }
-  return trimmed;
-}
-
-function extractYouTubeId(url?: string): string | null {
-  if (!url) return null;
-  const match = url.match(
-    /(?:youtu\.be\/|youtube(?:-nocookie)?\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})/
-  );
-  return match && match[1] ? match[1] : null;
-}
-
-const MAX_BOUNDED_MEDIA_ENTRIES = 500;
-
-function setBoundedFlag(
-  prev: Record<string, boolean>,
-  key: string,
-  maxEntries = MAX_BOUNDED_MEDIA_ENTRIES
-): Record<string, boolean> {
-  if (!key || prev[key]) return prev;
-  const keys = Object.keys(prev);
-  if (keys.length < maxEntries) {
-    return { ...prev, [key]: true };
-  }
-  const next: Record<string, boolean> = {};
-  const startIdx = keys.length - maxEntries + 1;
-  for (let i = startIdx; i < keys.length; i += 1) {
-    next[keys[i]] = prev[keys[i]];
-  }
-  next[key] = true;
-  return next;
-}
-
-function addBoundedSetEntry(
-  set: Set<string>,
-  key: string,
-  maxEntries = MAX_BOUNDED_MEDIA_ENTRIES
-): void {
-  if (set.has(key)) return;
-  while (set.size >= maxEntries) {
-    const oldest = set.values().next().value;
-    if (oldest === undefined) break;
-    set.delete(oldest);
-  }
-  set.add(key);
-}
-
-export function prefersReducedMotion(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    typeof window.matchMedia === 'function' &&
-    Boolean(window.matchMedia('(prefers-reduced-motion: reduce)').matches)
-  );
-}
-
-function isTrustedEmbedHost(rawUrl?: string): boolean {
-  if (!rawUrl) return false;
-  try {
-    const host = new URL(rawUrl).hostname.toLowerCase();
-    return (
-      host === 'youtube.com' ||
-      host === 'www.youtube.com' ||
-      host === 'm.youtube.com' ||
-      host === 'youtube-nocookie.com' ||
-      host === 'www.youtube-nocookie.com' ||
-      host === 'youtu.be' ||
-      host === 'wistia.net' ||
-      host.endsWith('.wistia.net') ||
-      host === 'player.vimeo.com'
-    );
-  } catch {
-    return false;
-  }
-}
-
-async function loadHlsModule(): Promise<typeof Hls> {
-  if (import.meta.env?.MODE === 'test') {
-    const mod = await import('hls.js');
-    return mod.default;
-  }
-  const mod = await import('hls.js/dist/hls.light.mjs');
-  return mod.default;
-}
-
-function shouldSuspendMediaPlayback(): boolean {
-  return (
-    launcherService.getRunningGames().length > 0 ||
-    launcherService.isInGameHibernating() ||
-    (typeof document !== 'undefined' && Boolean(document.hidden))
-  );
-}
+const MAX_HLS_MEDIA_ERROR_RECOVERIES = 2;
 
 const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
   movie,
@@ -254,6 +166,7 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
     let cancelled = false;
     let hlsInstance: Hls | null = null;
     let networkRetryCount = 0;
+    let mediaErrorRecoveries = 0;
     setIsError(false);
 
     const startPlaybackIfAllowed = () => {
@@ -273,6 +186,15 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
       } else {
         setIsError(true);
       }
+    };
+
+    const teardownHlsAndFallback = () => {
+      hlsInstance?.stopLoad();
+      hlsInstance?.detachMedia();
+      hlsInstance?.destroy();
+      hlsInstance = null;
+      hlsRef.current = null;
+      fallbackToDirectMp4OrError();
     };
 
     if (hlsUrl) {
@@ -305,41 +227,47 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
               }
 
               hlsInstance.on(HlsModule.Events.ERROR, (_event, data) => {
-                if (data.fatal) {
-                  switch (data.type) {
-                    case HlsModule.ErrorTypes.NETWORK_ERROR:
-                      if (
-                        networkRetryCount < 1 &&
-                        onlineLifecycleManager.isOnline() &&
-                        !shouldSuspendMediaPlayback()
-                      ) {
-                        networkRetryCount += 1;
-                        console.warn('HLS network error, attempting single recovery...', data);
-                        hlsInstance?.startLoad();
+                if (!data.fatal) return;
+                switch (data.type) {
+                  case HlsModule.ErrorTypes.NETWORK_ERROR:
+                    if (
+                      networkRetryCount < 1 &&
+                      onlineLifecycleManager.isOnline() &&
+                      !shouldSuspendMediaPlayback()
+                    ) {
+                      networkRetryCount += 1;
+                      console.warn('HLS network error, attempting single recovery...', data);
+                      hlsInstance?.startLoad();
+                    } else {
+                      console.warn('HLS fatal network error, stopping stream...', data);
+                      teardownHlsAndFallback();
+                    }
+                    break;
+                  case HlsModule.ErrorTypes.MEDIA_ERROR:
+                    if (mediaErrorRecoveries < MAX_HLS_MEDIA_ERROR_RECOVERIES) {
+                      mediaErrorRecoveries += 1;
+                      if (mediaErrorRecoveries === 2) {
+                        console.warn(
+                          'HLS media error, swapping audio codec & recovering (2/2)...',
+                          data
+                        );
+                        hlsInstance?.swapAudioCodec();
                       } else {
-                        console.warn('HLS fatal network error, stopping stream...', data);
-                        hlsInstance?.stopLoad();
-                        hlsInstance?.detachMedia();
-                        hlsInstance?.destroy();
-                        hlsInstance = null;
-                        hlsRef.current = null;
-                        fallbackToDirectMp4OrError();
+                        console.warn('HLS media error, attempting recovery (1/2)...', data);
                       }
-                      break;
-                    case HlsModule.ErrorTypes.MEDIA_ERROR:
-                      console.warn('HLS media error, attempting recovery...', data);
                       hlsInstance?.recoverMediaError();
-                      break;
-                    default:
-                      console.warn('HLS unrecoverable fatal error:', data);
-                      hlsInstance?.stopLoad();
-                      hlsInstance?.detachMedia();
-                      hlsInstance?.destroy();
-                      hlsInstance = null;
-                      hlsRef.current = null;
-                      fallbackToDirectMp4OrError();
-                      break;
-                  }
+                    } else {
+                      console.warn(
+                        'HLS fatal media error exceeded recovery cap, falling back...',
+                        data
+                      );
+                      teardownHlsAndFallback();
+                    }
+                    break;
+                  default:
+                    console.warn('HLS unrecoverable fatal error:', data);
+                    teardownHlsAndFallback();
+                    break;
                 }
               });
             } else {
@@ -393,6 +321,7 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
       moviePosterUrl || (ytId ? `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg` : '');
 
     const handleOpenExternal = (e: React.MouseEvent) => {
+      e.preventDefault();
       e.stopPropagation();
       if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
         window.electronAPI.openExternal(watchUrl);
@@ -428,7 +357,7 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
             )}
             <div className="absolute inset-0 bg-black/45 flex flex-col items-center justify-center gap-3 transition-opacity group-hover/video:bg-black/30">
               <div className="w-16 h-16 rounded-full bg-steam-accent/30 border-2 border-steam-accent flex items-center justify-center text-white shadow-2xl transform group-hover/video:scale-110 transition-transform">
-                <Play className="w-7 h-7 fill-white translate-x-0.5" />
+                <Play className="w-7 h-7 fill-white translate-x-0.5" aria-hidden="true" />
               </div>
               <span className="text-sm font-semibold tracking-wide text-white drop-shadow bg-black/70 px-3 py-1 rounded">
                 {movie.name}
@@ -452,10 +381,12 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
         )}
 
         {/* Action Pill to Open Trailer Directly in Browser */}
-        <button
-          type="button"
+        <a
+          href={watchUrl}
+          target="_blank"
+          rel="noopener noreferrer"
           onClick={handleOpenExternal}
-          className="absolute top-3 right-3 z-30 flex items-center gap-1.5 min-h-6 px-3 py-1.5 rounded-full bg-black/90 hover:bg-[#c4302b] text-white text-xs font-semibold shadow-xl border border-white/20 transition-all cursor-pointer group/yt"
+          className="absolute top-3 right-3 z-30 flex items-center gap-1.5 min-h-6 px-3 py-1.5 rounded-full bg-black/90 hover:bg-[#c4302b] text-white text-xs font-semibold shadow-xl border border-white/20 transition-all cursor-pointer group/yt focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-steam-accent"
           title={ytId ? 'Watch on YouTube in browser' : 'Open trailer in browser'}
         >
           {ytId ? (
@@ -467,11 +398,11 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
               <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
             </svg>
           ) : (
-            <ExternalLink className="w-3.5 h-3.5" />
+            <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
           )}
           <span>{ytId ? 'Watch on YouTube' : 'Open in Browser'}</span>
-          <ExternalLink className="w-3 h-3 opacity-70 group-hover/yt:opacity-100" />
-        </button>
+          <ExternalLink className="w-3 h-3 opacity-70 group-hover/yt:opacity-100" aria-hidden="true" />
+        </a>
       </div>
     );
   }
@@ -502,7 +433,7 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
         )}
         <div className="absolute inset-0 bg-black/35 flex flex-col items-center justify-center gap-3 transition-opacity group-hover/video:bg-black/20">
           <div className="w-16 h-16 rounded-full bg-steam-accent/35 border-2 border-steam-accent flex items-center justify-center text-white shadow-2xl transform group-hover/video:scale-110 transition-transform">
-            <Play className="w-7 h-7 fill-white translate-x-0.5" />
+            <Play className="w-7 h-7 fill-white translate-x-0.5" aria-hidden="true" />
           </div>
           <span className="text-sm font-semibold tracking-wide text-white drop-shadow bg-black/60 px-3 py-1 rounded">
             {movie.name}
@@ -567,7 +498,7 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
           className="absolute inset-0 bg-black/35 flex flex-col items-center justify-center gap-3 cursor-pointer transition-opacity group-hover/video:bg-black/20 border-0 p-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-steam-accent"
         >
           <div className="w-16 h-16 rounded-full bg-steam-accent/35 border-2 border-steam-accent flex items-center justify-center text-white shadow-2xl transform group-hover/video:scale-110 transition-transform">
-            <Play className="w-7 h-7 fill-white translate-x-0.5" />
+            <Play className="w-7 h-7 fill-white translate-x-0.5" aria-hidden="true" />
           </div>
           <span className="text-sm font-semibold tracking-wide text-white drop-shadow bg-black/60 px-3 py-1 rounded">
             {movie.name}
@@ -578,7 +509,7 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
       {isError && (
         <div className="absolute inset-0 bg-black/90 flex flex-col items-center justify-center gap-3 text-steam-subtext text-xs p-6 text-center z-20">
           <div className="w-12 h-12 rounded-full bg-red-500/10 border border-red-500/30 flex items-center justify-center text-red-400">
-            <Play className="w-5 h-5 translate-x-0.5 opacity-60" />
+            <Play className="w-5 h-5 translate-x-0.5 opacity-60" aria-hidden="true" />
           </div>
           <div className="flex flex-col gap-1 max-w-sm">
             <span className="font-semibold text-sm text-white">Trailer Stream Unavailable</span>
@@ -609,7 +540,7 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
               rel="noopener noreferrer"
               className="flex items-center gap-1.5 min-h-6 px-3 py-1.5 rounded bg-[#c4302b]/90 hover:bg-[#c4302b] text-white font-medium text-xs shadow transition-colors cursor-pointer"
             >
-              <ExternalLink className="w-3.5 h-3.5" />
+              <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
               Watch on YouTube
             </a>
           </div>
@@ -646,7 +577,6 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
 
   const preloadedSetRef = useRef<Set<string>>(new Set());
   const thumbStripRef = useRef<HTMLDivElement>(null);
-  const modalThumbStripRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setIsOnline(onlineLifecycleManager.isOnline());
@@ -665,7 +595,7 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
     };
   }, []);
 
-  // Filter out regional non-English trailers (e.g. Chinese/Japanese/Italian/French dubs) when English trailers exist, matching official Steam store
+  // Filter out regional non-English trailers when English trailers exist, matching official Steam store
   const hasEnglishMovies = movies.some((m) => !isNonEnglishRegionalMovieName(m.name));
   const visibleMovies = hasEnglishMovies
     ? movies.filter((m) => !isNonEnglishRegionalMovieName(m.name))
@@ -731,14 +661,21 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
       ? [{ id: 0, pathThumbnail: resolvedHeaderImage, pathFull: resolvedHeaderImage }]
       : [];
 
+  // Reset carousel ONLY when switching to a different gameId (never on live metadata/launcher updates!)
   useEffect(() => {
     setActiveIndex(0);
+    setLightboxIndex(null);
     setHeaderFallbackFailed(false);
-  }, [screenshots, movies, gameId]);
+  }, [gameId]);
 
+  // Clamp activeIndex cleanly if the media list shrinks for the same game
   useEffect(() => {
-    if (activeIndex >= items.length && items.length > 0) {
-      setActiveIndex(0);
+    if (items.length === 0) {
+      if (activeIndex !== 0) {
+        setActiveIndex(0);
+      }
+    } else if (activeIndex >= items.length) {
+      setActiveIndex(items.length - 1);
     }
   }, [items.length, activeIndex]);
 
@@ -770,7 +707,6 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
       }
     };
 
-    // Preload active screenshot + next 1 adjacent screenshot in primary showcase
     for (const offset of [0, 1]) {
       const target = items[activeIndex + offset];
       if (target?.type === 'screenshot') {
@@ -779,7 +715,6 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
       }
     }
 
-    // Preload active lightbox screenshot + next 1 adjacent screenshot
     if (lightboxIndex !== null && allScreenshots.length > 0) {
       for (const offset of [0, 1]) {
         const idx = (lightboxIndex + offset + allScreenshots.length) % allScreenshots.length;
@@ -796,41 +731,10 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
     gameId,
   ]);
 
-  // Keyboard arrow navigation for lightbox (Escape is handled natively by ModalShell <dialog>)
-  useEffect(() => {
-    if (lightboxIndex === null || allScreenshots.length <= 1) return;
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'ArrowLeft') {
-        setLightboxIndex((prev) =>
-          prev !== null && prev > 0 ? prev - 1 : allScreenshots.length - 1
-        );
-      } else if (e.key === 'ArrowRight') {
-        setLightboxIndex((prev) =>
-          prev !== null && prev < allScreenshots.length - 1 ? prev + 1 : 0
-        );
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [lightboxIndex, allScreenshots.length]);
-
-  // Scroll active modal thumbnail into view
-  useEffect(() => {
-    if (lightboxIndex === null || !modalThumbStripRef.current) return;
-    const strip = modalThumbStripRef.current;
-    if (strip.children[lightboxIndex]) {
-      const child = strip.children[lightboxIndex] as HTMLElement;
-      child.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
-    }
-  }, [lightboxIndex]);
-
   const activeItem = items[activeIndex] || (items.length > 0 ? items[0] : null);
 
   const selectItem = (index: number) => {
     setActiveIndex(index);
-    // Smooth scroll the active thumbnail into view
     const strip = thumbStripRef.current;
     if (strip && strip.children[index]) {
       const child = strip.children[index] as HTMLElement;
@@ -848,6 +752,22 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
       setLightboxIndex(0);
     }
   };
+
+  const handleMarkFullLoaded = useCallback((url: string) => {
+    setLoadedFullUrls((prev) => setBoundedFlag(prev, url));
+  }, []);
+
+  const handleMarkThumbFailed = useCallback((url: string) => {
+    setFailedThumbUrls((prev) => setBoundedFlag(prev, url));
+  }, []);
+
+  const handleMarkFullFailed = useCallback((url: string) => {
+    setFailedFullUrls((prev) => setBoundedFlag(prev, url));
+  }, []);
+
+  const handleCloseLightbox = useCallback(() => {
+    setLightboxIndex(null);
+  }, []);
 
   return (
     <div className="w-full flex flex-col gap-2.5">
@@ -884,9 +804,7 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                     data-testid="media-gallery-screenshot-thumb-base"
                     src={thumbSrc}
                     alt="Screenshot preview"
-                    onError={() =>
-                      setFailedThumbUrls((prev) => setBoundedFlag(prev, thumbSrc))
-                    }
+                    onError={() => handleMarkThumbFailed(thumbSrc)}
                     className="w-full h-full object-cover select-none transition-transform duration-300 group-hover:scale-[1.01]"
                     decoding="async"
                   />
@@ -898,12 +816,8 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                     data-testid="media-gallery-screenshot-full"
                     src={fullSrc}
                     alt="Screenshot"
-                    onLoad={() =>
-                      setLoadedFullUrls((prev) => setBoundedFlag(prev, fullSrc))
-                    }
-                    onError={() =>
-                      setFailedFullUrls((prev) => setBoundedFlag(prev, fullSrc))
-                    }
+                    onLoad={() => handleMarkFullLoaded(fullSrc)}
+                    onError={() => handleMarkFullFailed(fullSrc)}
                     className={`absolute inset-0 w-full h-full object-cover select-none transition-all duration-150 group-hover:scale-[1.01] ${
                       isFullReady ? 'opacity-100' : 'opacity-0'
                     }`}
@@ -914,9 +828,9 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                 )}
                 {bothFailed ? (
                   <div className="w-full h-full flex flex-col items-center justify-center gap-2 bg-gradient-to-br from-[#16202d] to-[#0e141d] px-6 text-center select-none">
-                    <ImageIcon className="w-7 h-7 text-steam-subtext/60" />
+                    <ImageIcon className="w-7 h-7 text-steam-subtext/60" aria-hidden="true" />
                     {title && (
-                      <span className="text-sm font-semibold text-steam-light tracking-wide">
+                      <span className="text-sm font-semibold text-steam-text tracking-wide">
                         {title}
                       </span>
                     )}
@@ -937,7 +851,7 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                     className="absolute bottom-3 right-3 z-10 inline-flex items-center justify-center min-w-7 min-h-7 p-1.5 bg-black/70 hover:bg-black/90 text-white rounded border border-white/20 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity cursor-pointer"
                     title="Expand screenshot"
                   >
-                    <Maximize2 className="w-4 h-4" />
+                    <Maximize2 className="w-4 h-4" aria-hidden="true" />
                   </button>
                 )}
               </div>
@@ -963,9 +877,9 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
               />
             ) : (
               <div className="w-full h-full flex flex-col items-center justify-center gap-2 bg-gradient-to-br from-[#16202d] to-[#0e141d] px-6 text-center select-none">
-                <ImageIcon className="w-7 h-7 text-steam-subtext/60" />
+                <ImageIcon className="w-7 h-7 text-steam-subtext/60" aria-hidden="true" />
                 {title && (
-                  <span className="text-sm font-semibold text-steam-light tracking-wide">
+                  <span className="text-sm font-semibold text-steam-text tracking-wide">
                     {title}
                   </span>
                 )}
@@ -990,7 +904,7 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
               className="flex-shrink-0 w-8 h-[65px] bg-black/70 hover:bg-[#67c1f5]/30 disabled:opacity-30 disabled:hover:bg-black/70 text-white flex items-center justify-center transition-all z-10 cursor-pointer"
               aria-label="Previous thumbnail"
             >
-              <ChevronLeft className="w-4 h-4 text-steam-accent" />
+              <ChevronLeft className="w-4 h-4 text-steam-accent" aria-hidden="true" />
             </button>
 
             {/* Scrollable Thumbnails List */}
@@ -1023,9 +937,7 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                       <img
                         src={thumbUrl}
                         alt={item.type === 'movie' ? item.movie.name : `Thumbnail ${idx + 1}`}
-                        onError={() =>
-                          setFailedThumbUrls((prev) => setBoundedFlag(prev, thumbUrl))
-                        }
+                        onError={() => handleMarkThumbFailed(thumbUrl)}
                         className="w-full h-full object-cover"
                         loading="lazy"
                         decoding="async"
@@ -1033,13 +945,13 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                       />
                     ) : (
                       <div className="w-full h-full flex items-center justify-center bg-[#16202d]">
-                        <ImageIcon className="w-4 h-4 text-steam-subtext/50" />
+                        <ImageIcon className="w-4 h-4 text-steam-subtext/50" aria-hidden="true" />
                       </div>
                     )}
                     {item.type === 'movie' && (
                       <div className="absolute inset-0 bg-black/30 flex items-center justify-center">
                         <div className="p-1 rounded-full bg-black/60 border border-white/40">
-                          <Play className="w-3 h-3 fill-white text-white translate-x-0.5" />
+                          <Play className="w-3 h-3 fill-white text-white translate-x-0.5" aria-hidden="true" />
                         </div>
                       </div>
                     )}
@@ -1056,7 +968,7 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
               className="flex-shrink-0 w-8 h-[65px] bg-black/70 hover:bg-[#67c1f5]/30 disabled:opacity-30 disabled:hover:bg-black/70 text-white flex items-center justify-center transition-all z-10 cursor-pointer"
               aria-label="Next thumbnail"
             >
-              <ChevronRight className="w-4 h-4 text-steam-accent" />
+              <ChevronRight className="w-4 h-4 text-steam-accent" aria-hidden="true" />
             </button>
           </div>
 
@@ -1077,175 +989,19 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
 
       {/* Dedicated Top-Layer Modal for Screenshots via ModalShell */}
       {lightboxIndex !== null && allScreenshots[lightboxIndex] && (
-        <ModalShell
-          isOpen={true}
-          onClose={() => setLightboxIndex(null)}
-          ariaLabel={`Screenshot ${lightboxIndex + 1} of ${allScreenshots.length}`}
-          testId="screenshot-lightbox-modal"
-          className="relative w-[1140px] max-w-[94vw] h-[780px] max-h-[88vh] bg-[#101722] border border-[#2a475e] rounded-xl shadow-2xl flex flex-col overflow-hidden select-none"
-        >
-          {/* Header */}
-          <div className="flex items-center justify-between px-4 py-3 bg-[#182333] border-b border-[#2a475e]/70 flex-shrink-0">
-            <div className="flex items-center gap-2 text-sm text-steam-light font-medium">
-              <ImageIcon className="w-4 h-4 text-steam-accent" />
-              <span>
-                Screenshot {lightboxIndex + 1} of {allScreenshots.length}
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              {isOnline && allScreenshots[lightboxIndex].pathFull && (
-                <a
-                  href={unwrapOlMediaUrl(allScreenshots[lightboxIndex].pathFull)}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-1.5 min-h-6 px-2.5 py-1 text-xs font-medium text-steam-subtext hover:text-white bg-[#212f45] hover:bg-[#2d405e] rounded border border-white/10 transition-colors"
-                  title="Open full resolution in browser"
-                >
-                  <ExternalLink className="w-3.5 h-3.5" />
-                  <span>Full Res</span>
-                </a>
-              )}
-              <button
-                type="button"
-                aria-label="Close screenshot viewer"
-                onClick={() => setLightboxIndex(null)}
-                className="flex items-center gap-1.5 min-w-6 min-h-6 px-2.5 py-1 text-xs font-semibold bg-[#2a384d] hover:bg-[#3d5170] text-white rounded border border-white/10 transition-colors cursor-pointer"
-                title="Close (Esc)"
-              >
-                <X className="w-4 h-4" />
-                <span className="text-[10px] uppercase tracking-wider text-steam-subtext">
-                  Esc
-                </span>
-              </button>
-            </div>
-          </div>
-
-          {/* Main Image Stage */}
-          <div className="flex-1 min-h-0 relative flex items-center justify-center bg-black/95 p-3 select-none overflow-hidden">
-            {allScreenshots.length > 1 && (
-              <button
-                type="button"
-                aria-label="Previous screenshot"
-                onClick={() =>
-                  setLightboxIndex((prev) =>
-                    prev !== null && prev > 0 ? prev - 1 : allScreenshots.length - 1
-                  )
-                }
-                className="absolute left-3 top-1/2 -translate-y-1/2 z-20 w-11 h-16 rounded bg-black/60 hover:bg-[#67c1f5]/30 text-white flex items-center justify-center transition-all border border-white/10 hover:border-steam-accent shadow-lg cursor-pointer"
-                title="Previous screenshot (Left arrow)"
-              >
-                <ChevronLeft className="w-7 h-7 text-steam-accent" />
-              </button>
-            )}
-
-            {(() => {
-              const currentShot = allScreenshots[lightboxIndex];
-              const thumbSrc = currentShot.pathThumbnail || currentShot.pathFull;
-              const fullSrc = currentShot.pathFull;
-              const thumbFailed = Boolean(failedThumbUrls[thumbSrc]);
-              const fullFailed = Boolean(failedFullUrls[fullSrc]);
-              const isFullReady =
-                !fullFailed &&
-                (Boolean(loadedFullUrls[fullSrc]) || (thumbSrc === fullSrc && !thumbFailed));
-              return (
-                <div className="relative w-full h-full flex items-center justify-center">
-                  {!thumbFailed && (
-                    <img
-                      key={`lightbox-thumb-${currentShot.id}-${thumbSrc}`}
-                      src={thumbSrc}
-                      alt={`Screenshot ${lightboxIndex + 1} preview`}
-                      onError={() =>
-                        setFailedThumbUrls((prev) => setBoundedFlag(prev, thumbSrc))
-                      }
-                      className="max-w-full max-h-full object-contain rounded shadow-2xl"
-                      decoding="sync"
-                    />
-                  )}
-                  {!fullFailed && (
-                    <img
-                      key={`lightbox-full-${currentShot.id}-${fullSrc}`}
-                      src={fullSrc}
-                      alt={`Screenshot ${lightboxIndex + 1}`}
-                      onLoad={() =>
-                        setLoadedFullUrls((prev) => setBoundedFlag(prev, fullSrc))
-                      }
-                      onError={() =>
-                        setFailedFullUrls((prev) => setBoundedFlag(prev, fullSrc))
-                      }
-                      className={`absolute max-w-full max-h-full object-contain rounded shadow-2xl transition-opacity duration-150 ${
-                        isFullReady ? 'opacity-100' : 'opacity-0'
-                      }`}
-                      loading="eager"
-                      decoding="async"
-                    />
-                  )}
-                </div>
-              );
-            })()}
-
-            {allScreenshots.length > 1 && (
-              <button
-                type="button"
-                aria-label="Next screenshot"
-                onClick={() =>
-                  setLightboxIndex((prev) =>
-                    prev !== null && prev < allScreenshots.length - 1 ? prev + 1 : 0
-                  )
-                }
-                className="absolute right-3 top-1/2 -translate-y-1/2 z-20 w-11 h-16 rounded bg-black/60 hover:bg-[#67c1f5]/30 text-white flex items-center justify-center transition-all border border-white/10 hover:border-steam-accent shadow-lg cursor-pointer"
-                title="Next screenshot (Right arrow)"
-              >
-                <ChevronRight className="w-7 h-7 text-steam-accent" />
-              </button>
-            )}
-          </div>
-
-          {/* Bottom Thumbnail Strip */}
-          {allScreenshots.length > 1 && (
-            <div className="p-2.5 bg-[#141d2b] border-t border-[#2a475e]/70 flex-shrink-0">
-              <div
-                ref={modalThumbStripRef}
-                className="flex items-center gap-2 overflow-x-auto scrollbar-none py-1 px-1 scroll-smooth w-full select-none"
-                style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
-              >
-                {allScreenshots.map((shot, idx) => {
-                  const isSelected = idx === lightboxIndex;
-                  const shotThumb = shot.pathThumbnail || shot.pathFull;
-                  const isShotThumbFailed = !shotThumb || Boolean(failedThumbUrls[shotThumb]);
-                  return (
-                    <button
-                      key={shot.id ?? idx}
-                      type="button"
-                      aria-pressed={isSelected}
-                      onClick={() => setLightboxIndex(idx)}
-                      className={`relative flex-shrink-0 w-24 h-14 rounded overflow-hidden transition-all bg-black cursor-pointer ${
-                        isSelected
-                          ? 'border-2 border-steam-accent ring-2 ring-steam-accent/40 scale-105'
-                          : 'border border-white/10 opacity-60 hover:opacity-100 hover:border-steam-subtext'
-                      }`}
-                    >
-                      {!isShotThumbFailed ? (
-                        <img
-                          src={shotThumb}
-                          alt={`Thumbnail ${idx + 1}`}
-                          onError={() =>
-                            setFailedThumbUrls((prev) => setBoundedFlag(prev, shotThumb))
-                          }
-                          className="w-full h-full object-cover"
-                          loading="lazy"
-                        />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center bg-[#16202d]">
-                          <ImageIcon className="w-4 h-4 text-steam-subtext/50" />
-                        </div>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </ModalShell>
+        <GalleryLightboxModal
+          lightboxIndex={lightboxIndex}
+          allScreenshots={allScreenshots}
+          isOnline={isOnline}
+          loadedFullUrls={loadedFullUrls}
+          failedThumbUrls={failedThumbUrls}
+          failedFullUrls={failedFullUrls}
+          onSelectIndex={setLightboxIndex}
+          onClose={handleCloseLightbox}
+          onMarkFullLoaded={handleMarkFullLoaded}
+          onMarkThumbFailed={handleMarkThumbFailed}
+          onMarkFullFailed={handleMarkFullFailed}
+        />
       )}
     </div>
   );

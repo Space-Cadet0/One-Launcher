@@ -200,7 +200,7 @@ interface PlatformBadgesProps {
   connectedStorefronts?: StorefrontId[];
 }
 
-export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
+const PlatformBadgesImpl: React.FC<PlatformBadgesProps> = ({
   platforms,
   game,
   gameTitle,
@@ -214,7 +214,7 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
   const effectiveSteamAppId = steamAppId || game?.steamAppId;
 
   const connectedSet = React.useMemo(() => {
-    if (connectedStorefronts && connectedStorefronts.length > 0) {
+    if (connectedStorefronts !== undefined) {
       return new Set<StorefrontId>(connectedStorefronts);
     }
     try {
@@ -315,16 +315,18 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
           );
 
           return targetUrl ? (
-            <button
+            <a
               key={p.platformId}
-              type="button"
+              href={targetUrl}
+              target="_blank"
+              rel="noopener noreferrer"
               aria-label={`Open on ${name}`}
               onClick={(e) => handleBadgeClick(targetUrl, e)}
               className={badgeClassName}
               title={badgeTitle}
             >
               {badgeInner}
-            </button>
+            </a>
           ) : (
             <div key={p.platformId} className={badgeClassName} title={badgeTitle}>
               {badgeInner}
@@ -437,15 +439,17 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
           );
 
           return targetUrl ? (
-            <button
+            <a
               key={p.platformId}
-              type="button"
+              href={targetUrl}
+              target="_blank"
+              rel="noopener noreferrer"
               onClick={(e) => handleBadgeClick(targetUrl, e)}
               className={stackedClassName}
               title={stackedTitle}
             >
               {stackedInner}
-            </button>
+            </a>
           ) : (
             <div key={p.platformId} className={stackedClassName} title={stackedTitle}>
               {stackedInner}
@@ -552,15 +556,17 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
         );
 
         return targetUrl ? (
-          <button
+          <a
             key={p.platformId}
-            type="button"
+            href={targetUrl}
+            target="_blank"
+            rel="noopener noreferrer"
             onClick={(e) => handleBadgeClick(targetUrl, e)}
             className={pillClassName}
             title={pillTitle}
           >
             {pillInner}
-          </button>
+          </a>
         ) : (
           <span key={p.platformId} className={pillClassName} title={pillTitle}>
             {pillInner}
@@ -570,3 +576,5 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
     </div>
   );
 };
+
+export const PlatformBadges: React.FC<PlatformBadgesProps> = React.memo(PlatformBadgesImpl);

@@ -97,7 +97,7 @@ export interface SteamSidebarNoticesProps {
   externalStorefrontHandoff?: string | null;
 }
 
-export const SteamSidebarNotices: React.FC<SteamSidebarNoticesProps> = ({
+const SteamSidebarNoticesImpl: React.FC<SteamSidebarNoticesProps> = ({
   title,
   steamAppId,
   genres,
@@ -547,3 +547,7 @@ export const SteamSidebarNotices: React.FC<SteamSidebarNoticesProps> = ({
     </div>
   );
 };
+
+export const SteamSidebarNotices: React.FC<SteamSidebarNoticesProps> = React.memo(
+  SteamSidebarNoticesImpl
+);

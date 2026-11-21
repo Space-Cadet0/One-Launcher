@@ -41,7 +41,7 @@ function computePreferredOsTab(
   return 'windows';
 }
 
-export const SystemRequirements: React.FC<SystemRequirementsProps> = ({
+const SystemRequirementsImpl: React.FC<SystemRequirementsProps> = ({
   gameId,
   requirements,
   macRequirements,
@@ -234,3 +234,7 @@ export const SystemRequirements: React.FC<SystemRequirementsProps> = ({
     </div>
   );
 };
+
+export const SystemRequirements: React.FC<SystemRequirementsProps> = React.memo(
+  SystemRequirementsImpl
+);

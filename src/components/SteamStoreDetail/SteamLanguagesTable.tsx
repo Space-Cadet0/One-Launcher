@@ -73,15 +73,19 @@ export const SteamLanguagesTable: React.FC<SteamLanguagesTableProps> = ({
   }
 
   const displayedLanguages = isExpanded ? languages : languages.slice(0, 5);
-  const hasAnyAudio = languages.some((l) => l.hasAudio);
 
   const renderSupportCell = (supported?: boolean) => (
-    <td className="checkcol" aria-label={supported ? 'Supported' : 'Not supported'}>
+    <td className="checkcol">
       {supported ? (
-        <span aria-hidden="true" className="check">
-          ✔
-        </span>
-      ) : null}
+        <>
+          <span aria-hidden="true" className="check">
+            ✔
+          </span>
+          <span className="sr-only">Supported</span>
+        </>
+      ) : (
+        <span className="sr-only">Not supported</span>
+      )}
     </td>
   );
 
@@ -141,12 +145,13 @@ export const SteamLanguagesTable: React.FC<SteamLanguagesTableProps> = ({
             <tbody>
               {displayedLanguages.map((lang, idx) => (
                 <tr key={idx}>
-                  <td
+                  <th
+                    scope="row"
                     className="lang-name text-left font-normal truncate max-w-[140px]"
                     title={lang.name}
                   >
                     {lang.name}
-                  </td>
+                  </th>
                   {renderSupportCell(lang.hasAudio)}
                   {renderSupportCell(lang.hasInterface)}
                 </tr>
@@ -183,12 +188,13 @@ export const SteamLanguagesTable: React.FC<SteamLanguagesTableProps> = ({
           <tbody>
             {displayedLanguages.map((lang, idx) => (
               <tr key={idx}>
-                <td
+                <th
+                  scope="row"
                   className="lang-name text-left font-normal truncate max-w-[110px]"
                   title={lang.name}
                 >
                   {lang.name}
-                </td>
+                </th>
                 {renderSupportCell(lang.hasInterface)}
                 {renderSupportCell(lang.hasAudio)}
                 {renderSupportCell(lang.hasSubtitles)}
@@ -199,12 +205,6 @@ export const SteamLanguagesTable: React.FC<SteamLanguagesTableProps> = ({
       </div>
 
       {renderExpandToggle()}
-
-      {hasAnyAudio && (
-        <div className="text-[10px] text-[#94a3b8] italic mt-1">
-          *languages with full audio support
-        </div>
-      )}
     </div>
   );
 };
