@@ -399,7 +399,11 @@ describe('Phase 3: 1-Click Bottle Steam Provisioning & Zero-Duplicate Cross-Bott
     appsDir: string;
     bottlesDir: string;
   } {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    const rawRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    const root =
+      typeof fs.realpathSync.native === 'function'
+        ? fs.realpathSync.native(rawRoot)
+        : fs.realpathSync(rawRoot);
     tempDirs.push(root);
     const homedir = path.join(root, 'home');
     const userDataDir = path.join(root, 'userData');
@@ -576,17 +580,19 @@ describe('Phase 3: 1-Click Bottle Steam Provisioning & Zero-Duplicate Cross-Bott
 
       // Verify symlinks point directly to canonical physical realpath
       expect(fs.lstatSync(targetQuakeDir).isSymbolicLink()).toBe(true);
-      expect(fs.realpathSync(targetQuakeDir)).toBe(fs.realpathSync(quake.gameDir));
+      expect(fs.realpathSync.native(targetQuakeDir)).toBe(fs.realpathSync.native(quake.gameDir));
       expect(fs.existsSync(path.join(targetBottle.steamappsDir, 'appmanifest_2320.acf'))).toBe(true);
 
       const targetSharedDir = path.join(targetBottle.steamappsDir, 'common', 'Steamworks Shared');
       expect(fs.lstatSync(targetSharedDir).isSymbolicLink()).toBe(true);
-      expect(fs.realpathSync(targetSharedDir)).toBe(fs.realpathSync(sharedRedist.gameDir));
+      expect(fs.realpathSync.native(targetSharedDir)).toBe(
+        fs.realpathSync.native(sharedRedist.gameDir)
+      );
       expect(fs.existsSync(path.join(targetBottle.steamappsDir, 'appmanifest_228980.acf'))).toBe(true);
 
       const targetExtDir = path.join(targetBottle.steamappsDir, 'common', 'Portal 2');
       expect(fs.lstatSync(targetExtDir).isSymbolicLink()).toBe(true);
-      expect(fs.realpathSync(targetExtDir)).toBe(fs.realpathSync(extGame.gameDir));
+      expect(fs.realpathSync.native(targetExtDir)).toBe(fs.realpathSync.native(extGame.gameDir));
       expect(fs.existsSync(path.join(targetBottle.steamappsDir, 'appmanifest_620.acf'))).toBe(true);
 
       // Verify skipped bad/downloading manifests
@@ -613,7 +619,7 @@ describe('Phase 3: 1-Click Bottle Steam Provisioning & Zero-Duplicate Cross-Bott
       await setupOrchestrator.linkInstalledSteamAppsIntoBottle(thirdBottle.bottlePath, linkOpts);
       const thirdQuakeLink = path.join(thirdBottle.steamappsDir, 'common', 'Quake 2');
       expect(fs.lstatSync(thirdQuakeLink).isSymbolicLink()).toBe(true);
-      expect(fs.readlinkSync(thirdQuakeLink)).toBe(fs.realpathSync(quake.gameDir));
+      expect(fs.realpathSync.native(thirdQuakeLink)).toBe(fs.realpathSync.native(quake.gameDir));
     });
   });
 
@@ -831,7 +837,7 @@ describe('Phase 3: 1-Click Bottle Steam Provisioning & Zero-Duplicate Cross-Bott
       expect(setupRes.outcomes[0]?.status).toBe('completed');
       const linkedQuakeDir = path.join(target.steamappsDir, 'common', 'Quake 2');
       expect(fs.lstatSync(linkedQuakeDir).isSymbolicLink()).toBe(true);
-      expect(fs.realpathSync(linkedQuakeDir)).toBe(fs.realpathSync(quake.gameDir));
+      expect(fs.realpathSync.native(linkedQuakeDir)).toBe(fs.realpathSync.native(quake.gameDir));
       expect(fs.existsSync(path.join(target.steamappsDir, 'appmanifest_2320.acf'))).toBe(true);
 
       // Simulate guided login: Steam opens, user signs in, Steam creates fresh libraryfolders.vdf (empty apps), then closes

@@ -237,8 +237,15 @@ function resolveWineLibraryPathInBottle(bottlePath, driveCRoot, rawLibPath) {
       addCandidate(path.join(driveCRoot, ...relSegments));
     }
 
-    // 3. Canonical `Z:\...` -> host root `/...`
+    // 3. Canonical `Z:\...` -> host root `/...` (and host drive root on win32 test/host runners)
     if (driveLower === 'z') {
+      const bottleDriveMatch =
+        bottlePath && typeof bottlePath === 'string'
+          ? bottlePath.trim().match(/^([a-zA-Z]:)[\\/]/)
+          : null;
+      if (bottleDriveMatch) {
+        addCandidate(path.win32.join(`${bottleDriveMatch[1]}\\`, ...relSegments));
+      }
       addCandidate('/' + relSegments.join('/'));
     }
   }

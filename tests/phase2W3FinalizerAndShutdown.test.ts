@@ -71,7 +71,9 @@ async function sendLoopbackRpcCall(
 const tempDirs: string[] = [];
 
 function makeTempDir(prefix: string): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `ol-p2w3-${prefix}-`));
+  const raw = fs.mkdtempSync(path.join(os.tmpdir(), `ol-p2w3-${prefix}-`));
+  const dir =
+    typeof fs.realpathSync.native === 'function' ? fs.realpathSync.native(raw) : fs.realpathSync(raw);
   tempDirs.push(dir);
   return dir;
 }
@@ -385,10 +387,10 @@ describe('Phase 2 W3 — Session Finalizer, Cloud Barrier Handoff & Ordered Clie
       const wineBin = path.join(binDir, 'wine');
       const wineserverBin = path.join(binDir, 'wineserver-arm64');
       const wineserverLog = path.join(tmp, 'wineserver.log');
-      fs.writeFileSync(wineBin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      fs.writeFileSync(wineBin, '#!/usr/bin/env node\nprocess.exit(0);\n', { mode: 0o755 });
       fs.writeFileSync(
         wineserverBin,
-        `#!/bin/sh\necho "WINESERVER:$1:$CX_BOTTLE" >> "${wineserverLog}"\nexit 0\n`,
+        `#!/usr/bin/env node\nconst fs = require('node:fs');\nfs.appendFileSync(${JSON.stringify(wineserverLog)}, 'WINESERVER:' + (process.argv[2] || '') + ':' + (process.env.CX_BOTTLE || '') + '\\n');\nprocess.exit(0);\n`,
         { mode: 0o755 }
       );
       fs.writeFileSync(
@@ -1061,8 +1063,8 @@ describe('Phase 2 W3 — GOG/Epic URI Barriers & Chained Publisher Ordered Shutd
       fs.mkdirSync(binDir, { recursive: true });
       const wineBin = path.join(binDir, 'wine');
       const wineserverBin = path.join(binDir, 'wineserver');
-      fs.writeFileSync(wineBin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-      fs.writeFileSync(wineserverBin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      fs.writeFileSync(wineBin, '#!/usr/bin/env node\nprocess.exit(0);\n', { mode: 0o755 });
+      fs.writeFileSync(wineserverBin, '#!/usr/bin/env node\nprocess.exit(0);\n', { mode: 0o755 });
 
       const timeline: string[] = [];
       let eaStillAlive = true;

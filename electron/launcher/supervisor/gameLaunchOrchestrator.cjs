@@ -229,7 +229,9 @@ function areSameBottleDirPath(pathA, pathB) {
   if (norm(pathA) === norm(pathB)) return true;
   try {
     if (fs.existsSync(pathA) && fs.existsSync(pathB)) {
-      return norm(fs.realpathSync(pathA)) === norm(fs.realpathSync(pathB));
+      const realpathFn =
+        typeof fs.realpathSync.native === 'function' ? fs.realpathSync.native : fs.realpathSync;
+      return norm(realpathFn(pathA)) === norm(realpathFn(pathB));
     }
   } catch {}
   return false;
@@ -4683,7 +4685,7 @@ async function launchGameInternal(
                         ]) || path.join(steamRootDir, 'steamapps', 'common', installBasename);
                       if (
                         fs.existsSync(candidateLocalCommon) &&
-                        fs.realpathSync(candidateLocalCommon) === fs.realpathSync(localInstallDir)
+                        areSameBottleDirPath(candidateLocalCommon, localInstallDir)
                       ) {
                         effectiveWatchDir = candidateLocalCommon;
                       }
@@ -5833,7 +5835,7 @@ async function launchGameInternal(
           const macSteamAppMatch =
             platform === 'darwin' &&
             (typeof options.spawnFn !== 'function' || options.forceMacOpenSteamInTest === true)
-              ? String(steamLaunchSpec.binaryPath).match(/^(.*?\.app)(?:\/|$)/i)
+              ? String(steamLaunchSpec.binaryPath).match(/^(.*?\.app)(?:[\\/]|$)/i)
               : null;
           if (macSteamAppMatch && macSteamAppMatch[1] && steamLaunchSpec.useMinimalBinarySpawn) {
             const stage1Child = spawnImpl(

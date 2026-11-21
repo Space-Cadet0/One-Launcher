@@ -2081,7 +2081,9 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
       );
 
       // Simulate a non-archive download (e.g. ReleaseNotes.pdf from CodeWeavers)
-      await new Promise((r) => setTimeout(r, 20));
+      await vi.waitFor(() => {
+        expect(typeof docSessionListeners['will-download']).toBe('function');
+      }, { timeout: 3000, interval: 10 });
       const nonArchiveItem = {
         getURL: () => 'https://www.codeweavers.com/preview/ReleaseNotes.pdf',
         getURLChain: () => ['https://www.codeweavers.com/preview/ReleaseNotes.pdf'],
@@ -3119,7 +3121,9 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
       );
 
       // Allow async setup (e.g. disk space check) to complete and attach will-download
-      await new Promise((r) => setTimeout(r, 20));
+      await vi.waitFor(() => {
+        expect(typeof willDownloadCb).toBe('function');
+      }, { timeout: 3000, interval: 10 });
 
       // Verify will-download listener was attached
       expect(willDownloadCb).toBeDefined();

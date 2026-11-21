@@ -14,7 +14,8 @@ const chainedPublisherLauncher = require('../electron/launcher/supervisor/chaine
 const compatRegistry = require('../electron/launcher/mac/compatLayerRegistryAndDetection.cjs');
 
 function makeTempDir(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const raw = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return typeof fs.realpathSync.native === 'function' ? fs.realpathSync.native(raw) : fs.realpathSync(raw);
 }
 
 function buildMinimalPeBuffer(machine: 0x014c | 0x8664 = 0x8664): Buffer {
@@ -368,7 +369,7 @@ describe('Phase 2 W2: Game Launch Orchestrator & Chained Publisher Specs', () =>
         'utf8'
       );
 
-      const zWineExtPath = `Z:\\\\${externalLib.replace(/^\/+/, '').replace(/\//g, '\\\\')}`;
+      const zWineExtPath = `Z:\\\\${externalLib.replace(/^(?:[A-Za-z]:)?[\\/]+/, '').replace(/[\\/]/g, '\\\\')}`;
       const mountedBottle = createFakeBottle(bottlesDir, 'MountedSteamBottle', {
         wineArch: 'win64',
         withSteam: true,
