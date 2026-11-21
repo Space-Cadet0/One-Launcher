@@ -11,15 +11,20 @@ import {
   DisplayAspectRatioMode,
   GlobalBottleDisplayScalingMode,
   GlobalDisplayAspectRatioMode,
+  InstalledGameRecord,
   LaunchMethod,
   resolveDefaultBottleForLayer,
   ResolvedLaunchModePreview,
   VirtualDesktopResolutionPreset,
 } from '../../../contracts/launcher';
+import type { StorefrontId } from '../../../contracts/platform';
 import { Cpu } from 'lucide-react';
 import {
+  extractBottleNameFromPath,
+  findCompatibleRunnerForBottle,
   hasBottleArchitectureMismatch,
   isArm64NamedBottle,
+  isBottleNameCompatibleWithRunner,
   resolveBottleArchitectureFromLayers,
 } from '../../../services/launcher/bottleArchitectureUtils';
 import { environmentSetupService } from '../../../services/launcher/environmentSetupService';
@@ -217,6 +222,10 @@ export interface CompatibilityLayerSectionProps {
   /** @deprecated Compatibility & Engine Tweaks now renders directly in the main Compatibility & Graphics card */
   compatOverrideCount?: number;
   renderSectionPart?: 'all' | 'primary' | 'advanced';
+  installedRecord?: Pick<InstalledGameRecord, 'installPath' | 'executablePath'>;
+  platformId?: StorefrontId;
+  isFastDirectActive?: boolean;
+  onAlignToInstallBottle?: (runnerType: CompatibilityLayerType, bottleName: string) => void;
   /** @deprecated Legacy embedded runner management props retained optional for call-site compatibility */
   activeRunnerProgress?: CompatibilityRunnerProgressEvent;
   isCheckingUpdates?: boolean;
@@ -507,7 +516,17 @@ function CompatibilityLayerSectionImpl(
   );
   const effectiveBottleControlValue = isBottleOrphanForDowngradedHost ? '' : wineBottleName;
 
-  const defaultResolvedBottle = resolveDefaultBottleForLayer(
+  const effectivePlatformId: StorefrontId = props.platformId ?? preview.platformId;
+  const effectiveIsFastDirectActive =
+    props.isFastDirectActive ?? Boolean(preview.resolvedPolicy?.isFastDirectBypass);
+  const installBottleName = extractBottleNameFromPath(
+    props.installedRecord?.installPath ||
+      props.installedRecord?.executablePath ||
+      preview.installPath ||
+      preview.executablePath
+  );
+
+  const baseDefaultResolvedBottle = resolveDefaultBottleForLayer(
     effectiveActiveLayer || {
       type: effectiveCompatSelectValue,
       availableBottles: effectiveAvailableBottles,
@@ -515,6 +534,19 @@ function CompatibilityLayerSectionImpl(
     effectiveCompatSelectValue,
     effectiveRunnerDescriptor.defaultBottleName
   );
+  const matchedInstallBottle =
+    installBottleName &&
+    effectiveAvailableBottles.find(
+      (b) => b.toLowerCase() === installBottleName.toLowerCase()
+    );
+  const defaultResolvedBottle =
+    matchedInstallBottle &&
+    isBottleNameCompatibleWithRunner(matchedInstallBottle, effectiveCompatSelectValue, {
+      layer: effectiveActiveLayer,
+      allLayers: layersForBottleLookup,
+    })
+      ? matchedInstallBottle
+      : baseDefaultResolvedBottle;
   const effectiveSelectedBottleName =
     effectiveBottleControlValue.trim() || defaultResolvedBottle || '';
   const hasBottleArchMismatch = hasBottleArchitectureMismatch(
@@ -522,6 +554,62 @@ function CompatibilityLayerSectionImpl(
     effectiveCompatSelectValue,
     { allLayers: layersForBottleLookup }
   );
+
+  const lookupBottleDetails = (
+    bottleName: string
+  ): NonNullable<CompatibilityLayerInfo['bottleDetails']>[string] | undefined => {
+    const trimmed = bottleName.trim();
+    if (!trimmed) return undefined;
+    const lower = trimmed.toLowerCase();
+    const readFromLayer = (layer?: CompatibilityLayerInfo) => {
+      const details = layer?.bottleDetails;
+      if (!details) return undefined;
+      if (details[trimmed]) return details[trimmed];
+      for (const [key, value] of Object.entries(details)) {
+        if (key.trim().toLowerCase() === lower) {
+          return value;
+        }
+      }
+      return undefined;
+    };
+    const fromEffective = readFromLayer(effectiveActiveLayer);
+    if (fromEffective) return fromEffective;
+    for (const layer of layersForBottleLookup) {
+      if (!layer || layer === effectiveActiveLayer) continue;
+      const found = readFromLayer(layer);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  const targetBottleDetails = lookupBottleDetails(effectiveSelectedBottleName);
+
+  const hasInstallBottleMismatch = Boolean(
+    installBottleName &&
+      effectiveSelectedBottleName &&
+      installBottleName.toLowerCase() !== effectiveSelectedBottleName.toLowerCase()
+  );
+  const recommendedInstallRunner =
+    hasInstallBottleMismatch && installBottleName
+      ? findCompatibleRunnerForBottle(installBottleName, detectedLayers, {
+          hostPlatform: preview.hostPlatform || 'darwin',
+          hostArch,
+        })
+      : null;
+  const recommendedInstallRunnerLabel = recommendedInstallRunner
+    ? COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === recommendedInstallRunner.type)
+        ?.shortLabel || recommendedInstallRunner.name
+    : undefined;
+  const handleAlignToInstallBottle = (
+    runnerType: CompatibilityLayerType,
+    bottleName: string
+  ) => {
+    if (props.onAlignToInstallBottle) {
+      props.onAlignToInstallBottle(runnerType, bottleName);
+      return;
+    }
+    onSelectCompatibilityLayer(runnerType);
+    onChangeWineBottleName(bottleName);
+  };
 
   const isAdvancedDisplayModeActive =
     effectiveDisplayScalingMode === 'force_fullscreen' ||
@@ -591,6 +679,13 @@ function CompatibilityLayerSectionImpl(
             resolvedBottleFolderPath,
             onOpenBottleFolder,
             onOpenRunnerManager: handleOpenRunnerManager,
+            platformId: effectivePlatformId,
+            isFastDirectActive: effectiveIsFastDirectActive,
+            installBottleName,
+            targetBottleDetails,
+            recommendedInstallRunner,
+            recommendedInstallRunnerLabel,
+            onAlignToInstallBottle: handleAlignToInstallBottle,
           })}
 
           {renderCompatGraphicsControls({

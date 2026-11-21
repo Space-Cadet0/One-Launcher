@@ -41,7 +41,10 @@ import {
   resolveCanonicalKernelAntiCheatDisplayName,
   type NormalizedChainedHandoffId,
 } from '../integrations/catalogSanitizer';
-import { isBottleNameCompatibleWithRunner } from './bottleArchitectureUtils';
+import {
+  extractBottleNameFromPath,
+  isBottleNameCompatibleWithRunner,
+} from './bottleArchitectureUtils';
 import { sanitizeStorefrontLifecycleOverride } from './launchConfigStore';
 
 function resolveChainedPublisherDisplayName(
@@ -53,6 +56,70 @@ function resolveChainedPublisherDisplayName(
     return mapped || explicitExternalLauncher.trim();
   }
   return mapChainedHandoffIdToExternalLauncher(handoffId);
+}
+
+function formatChainedPublisherMinimizedSupportNote(
+  handoffId?: NormalizedChainedHandoffId
+): string {
+  if (handoffId === 'ubisoft') {
+    return 'passes minimized launch flags (-minimized) where supported';
+  }
+  if (handoffId === 'rockstar') {
+    return 'passes minimized launch flags (-minmode) where supported';
+  }
+  return 'applies minimized launch flags where supported';
+}
+
+function buildChainedPublisherLifecycleNote(
+  publisherName: string,
+  handoffId: NormalizedChainedHandoffId | undefined,
+  effectiveLifecycle: StorefrontClientLifecyclePolicy
+): string {
+  const minimizedNote = formatChainedPublisherMinimizedSupportNote(handoffId);
+  if (effectiveLifecycle === 'default_client') {
+    return `Publisher DRM requires launching ${publisherName} (no direct client bypass); Standard Client opens ${publisherName} normally and leaves it running after exit.`;
+  }
+  if (effectiveLifecycle === 'minimal_keep_running') {
+    return `Publisher DRM requires launching ${publisherName} (no direct client bypass); One Launcher ${minimizedNote} and keeps ${publisherName} warm between sessions.`;
+  }
+  return `Publisher DRM requires launching ${publisherName} (no direct client bypass); One Launcher ${minimizedNote} and manages post-exit cloud-sync grace + automatic shutdown under Silent & Auto-Close.`;
+}
+
+function lookupBottleHasSteamFromLayers(
+  bottleName: string | undefined,
+  activeLayer: CompatibilityLayerInfo | undefined,
+  layers: ReadonlyArray<CompatibilityLayerInfo>
+): boolean | undefined {
+  const trimmed = typeof bottleName === 'string' ? bottleName.trim() : '';
+  if (!trimmed) return undefined;
+  const lower = trimmed.toLowerCase();
+
+  const readFromLayer = (layer?: CompatibilityLayerInfo): boolean | undefined => {
+    const details = layer?.bottleDetails;
+    if (!details) return undefined;
+    if (typeof details[trimmed]?.hasSteam === 'boolean') {
+      return details[trimmed].hasSteam;
+    }
+    for (const [key, val] of Object.entries(details)) {
+      if (key.trim().toLowerCase() === lower && typeof val?.hasSteam === 'boolean') {
+        return val.hasSteam;
+      }
+    }
+    return undefined;
+  };
+
+  const activeVal = readFromLayer(activeLayer);
+  if (typeof activeVal === 'boolean') {
+    return activeVal;
+  }
+  for (const layer of layers) {
+    if (layer === activeLayer) continue;
+    const val = readFromLayer(layer);
+    if (typeof val === 'boolean') {
+      return val;
+    }
+  }
+  return undefined;
 }
 
 export const COMPATIBILITY_RUNNER_DESCRIPTORS: CompatibilityRunnerDescriptor[] = [
@@ -379,8 +446,14 @@ export function computeFastMinimalLaunchAdvisory(
         ? `Chained Host Publisher Handoff (Xbox Game Pass → ${publisherName})`
         : `Chained Compatibility Bottle (Xbox Game Pass → ${publisherName} inside CrossOver / Wine)`;
     const footprintBenefit = `Cloud saves & Game Pass entitlement sync managed by ${publisherName} (requires one-time Xbox ↔ ${publisherName} account link)`;
+    const chainedLifecycleNote = buildChainedPublisherLifecycleNote(
+      publisherName,
+      normalizedHandoff,
+      policy.effectiveLifecycle
+    );
     const warnings = [
       `Cloud saves & Game Pass entitlement sync managed by ${publisherName} (requires one-time Xbox ↔ ${publisherName} account link).`,
+      chainedLifecycleNote,
       ...(hasMacKernelAntiCheat && isBattlEyeKernelAntiCheat(kernelAntiCheatLabel)
         ? [
             'Online multiplayer sessions requiring BattlEye (BEDaisy.sys) cannot load inside macOS Wine/CrossOver bottles; offline Story Mode (-nobattleye) remains playable where supported.',
@@ -400,6 +473,41 @@ export function computeFastMinimalLaunchAdvisory(
         hasMacKernelAntiCheat && isBattlEyeKernelAntiCheat(kernelAntiCheatLabel)
           ? 'warning'
           : 'info',
+      badgeLabel: footprintBenefit,
+      headline: title,
+      consequences: warnings,
+    };
+  }
+
+  if (
+    normalizedHandoff &&
+    publisherName &&
+    normalizedHandoff !== String(params.platformId).toLowerCase()
+  ) {
+    const chainedLifecycleNote = buildChainedPublisherLifecycleNote(
+      publisherName,
+      normalizedHandoff,
+      policy.effectiveLifecycle
+    );
+    const title =
+      params.hostPlatform === 'win32'
+        ? `Chained Publisher Handoff → ${publisherName}`
+        : `Chained Compatibility Bottle → ${publisherName} inside CrossOver / Wine`;
+    const footprintBenefit = `Publisher DRM requires ${publisherName} — managed post-exit cloud-sync grace & auto-close under Silent & Auto-Close`;
+    const warnings = [
+      chainedLifecycleNote,
+      `Cloud saves & entitlement sync managed by ${publisherName}.`,
+    ];
+    return {
+      isActive: false,
+      title,
+      footprintBenefit,
+      warnings,
+      recommendation:
+        params.hostPlatform === 'win32'
+          ? `Sign in to ${publisherName} on Windows; use Silent & Auto-Close so One Launcher waits for cloud-sync grace before closing ${publisherName} on exit.`
+          : `Sign in to ${publisherName} inside your CrossOver / Wine bottle; use Silent & Auto-Close so One Launcher waits for cloud-sync grace before closing ${publisherName} on exit.`,
+      severity: 'info',
       badgeLabel: footprintBenefit,
       headline: title,
       consequences: warnings,
@@ -662,6 +770,11 @@ export function buildStorefrontLaunchPolicyView(
   // Xbox / PC Game Pass (Chained Publisher Handoff + Native Windows ActivateApplication + macOS Bottle Clientless XGR)
   if (platformId === 'xbox') {
     if (normalizedViewHandoff && viewPublisherName) {
+      const chainedLifecycleNote = buildChainedPublisherLifecycleNote(
+        viewPublisherName,
+        normalizedViewHandoff,
+        cleanLifecycle
+      );
       if (!isWinHost) {
         return {
           cardHeading,
@@ -678,19 +791,22 @@ export function buildStorefrontLaunchPolicyView(
                 : 'info',
             badgeLabel: `Chained Bottle • ${viewPublisherName}`,
             headline: `Chained Compatibility Bottle (Xbox Game Pass → ${viewPublisherName} inside CrossOver / Wine)`,
-            footprintSummary: `Cloud saves & Game Pass entitlement sync managed by ${viewPublisherName} (requires one-time Xbox ↔ ${viewPublisherName} account link).`,
+            footprintSummary: `Cloud saves & Game Pass entitlement sync managed by ${viewPublisherName} (requires one-time Xbox ↔ ${viewPublisherName} account link). ${chainedLifecycleNote}`,
             includedFeatures: [
               `One Launcher sets up and launches ${viewPublisherName} inside your CrossOver / Wine bottle`,
               `Cloud saves & Game Pass entitlement sync managed by ${viewPublisherName} (requires one-time Xbox ↔ ${viewPublisherName} account link)`,
+              `One Launcher ${formatChainedPublisherMinimizedSupportNote(normalizedViewHandoff)} and manages post-exit cloud-sync grace + automatic shutdown under Silent & Auto-Close`,
             ],
-            excludedOrTradeoffs:
-              hasMacViewKernelAntiCheat && isBattlEyeKernelAntiCheat(viewKernelAntiCheatLabel)
+            excludedOrTradeoffs: [
+              `Publisher DRM requires launching ${viewPublisherName} (direct client bypass is not supported)`,
+              ...(hasMacViewKernelAntiCheat && isBattlEyeKernelAntiCheat(viewKernelAntiCheatLabel)
                 ? [
                     'Online multiplayer requiring BattlEye (BEDaisy.sys) cannot load inside macOS Wine/CrossOver bottles; offline Story Mode (-nobattleye) remains playable where supported',
                   ]
                 : [
                     `Sign in to ${viewPublisherName} inside the bottle with the account linked to your Xbox profile`,
-                  ],
+                  ]),
+            ],
           },
         };
       }
@@ -707,12 +823,14 @@ export function buildStorefrontLaunchPolicyView(
           severity: 'info',
           badgeLabel: `Chained Publisher • ${viewPublisherName}`,
           headline: `Chained Host Publisher Handoff (Xbox Game Pass → ${viewPublisherName})`,
-          footprintSummary: `Cloud saves & Game Pass entitlement sync managed by ${viewPublisherName} (requires one-time Xbox ↔ ${viewPublisherName} account link).`,
+          footprintSummary: `Cloud saves & Game Pass entitlement sync managed by ${viewPublisherName} (requires one-time Xbox ↔ ${viewPublisherName} account link). ${chainedLifecycleNote}`,
           includedFeatures: [
             `Delegates download, launch, and entitlement verification to ${viewPublisherName} on Windows`,
             `Cloud saves & Game Pass entitlement sync managed by ${viewPublisherName} (requires one-time Xbox ↔ ${viewPublisherName} account link)`,
+            `One Launcher ${formatChainedPublisherMinimizedSupportNote(normalizedViewHandoff)} and manages post-exit cloud-sync grace + automatic shutdown under Silent & Auto-Close`,
           ],
           excludedOrTradeoffs: [
+            `Publisher DRM requires launching ${viewPublisherName} (direct client bypass is not supported)`,
             `Requires signing in to ${viewPublisherName} with the account linked to your Xbox profile`,
           ],
         },
@@ -870,6 +988,67 @@ export function buildStorefrontLaunchPolicyView(
       dropdownOptions: xboxOptions,
       selectedDropdownValue: selectedXboxValue,
       infoBox: xboxInfoBox,
+    };
+  }
+
+  // Non-Xbox Chained Publisher Handoffs (EA, Ubisoft Connect, Battle.net, Rockstar, Riot)
+  if (
+    normalizedViewHandoff &&
+    viewPublisherName &&
+    normalizedViewHandoff !== String(platformId).toLowerCase()
+  ) {
+    const chainedLifecycleNote = buildChainedPublisherLifecycleNote(
+      viewPublisherName,
+      normalizedViewHandoff,
+      cleanLifecycle
+    );
+    const chainedOptions: StorefrontPolicyOptionDescriptor[] = [
+      {
+        value: 'default_client',
+        label: `Standard ${viewPublisherName} Client (Full Window, Keep Running)`,
+      },
+      {
+        value: 'minimal_keep_running',
+        label: `Minimal ${viewPublisherName} (Minimized Where Supported) — Keep Warm`,
+      },
+      {
+        value: 'minimal_and_close_if_started',
+        label: `Silent & Auto-Close — Post-Exit Cloud-Sync Grace + Auto-Close ${viewPublisherName} (Recommended)`,
+        isRecommended: true,
+      },
+    ];
+    const selectedChainedValue: StorefrontClientLifecyclePolicy =
+      cleanLifecycle === 'fast_direct_bypass' ? 'minimal_and_close_if_started' : cleanLifecycle;
+    return {
+      cardHeading: isBottleContext
+        ? `Bottle ${viewPublisherName} Launch Policy`
+        : `${viewPublisherName} Launch Policy`,
+      isBottleContext,
+      showDropdown: true,
+      dropdownOptions: chainedOptions,
+      selectedDropdownValue: selectedChainedValue,
+      infoBox: {
+        policyKey: selectedChainedValue,
+        cardHeading: isBottleContext
+          ? `Bottle ${viewPublisherName} Launch Policy`
+          : `${viewPublisherName} Launch Policy`,
+        severity: selectedChainedValue === 'minimal_and_close_if_started' ? 'optimal' : 'info',
+        badgeLabel:
+          selectedChainedValue === 'minimal_and_close_if_started'
+            ? `Publisher DRM • Cloud-Sync Grace + Auto-Close`
+            : `Publisher DRM • ${viewPublisherName}`,
+        headline: isBottleContext
+          ? `Chained Publisher Launch (${viewPublisherName} inside CrossOver / Wine)`
+          : `Chained Publisher Launch (${viewPublisherName})`,
+        footprintSummary: chainedLifecycleNote,
+        includedFeatures: [
+          `Cloud saves & DRM entitlement verification handled by ${viewPublisherName}`,
+          `One Launcher ${formatChainedPublisherMinimizedSupportNote(normalizedViewHandoff)} and manages post-exit cloud-sync grace + automatic shutdown under Silent & Auto-Close`,
+        ],
+        excludedOrTradeoffs: [
+          `Publisher DRM requires launching ${viewPublisherName} — Fast Direct Bypass is not available for chained publisher DRM titles`,
+        ],
+      },
     };
   }
 
@@ -1047,11 +1226,7 @@ export function buildStorefrontLaunchPolicyView(
         isBottleContext,
         showDropdown: false,
         dropdownOptions: [],
-        selectedDropdownValue: isBottleContext
-          ? cleanLifecycle
-          : cleanLifecycle === 'default_client'
-            ? 'minimal_keep_running'
-            : cleanLifecycle,
+        selectedDropdownValue: cleanLifecycle,
         infoBox: {
           policyKey: 'protocol_delegated',
           cardHeading,
@@ -1184,8 +1359,12 @@ export function buildStorefrontLaunchPolicyView(
       };
     }
 
-    // GOG Native (Direct mode) — 3 options ordered closest-to-standard first -> furthest bypass last
+    // GOG Native (Direct mode) — 4 options ordered closest-to-standard first -> furthest bypass last
     const gogOptions: StorefrontPolicyOptionDescriptor[] = [
+      {
+        value: 'default_client',
+        label: 'Standard GOG Galaxy Client (Full Window, Keep Open)',
+      },
       {
         value: 'minimal_keep_running',
         label: `Silent Background GOG Galaxy — Keep Running in ${trayOrMenuLabel}`,
@@ -1201,8 +1380,7 @@ export function buildStorefrontLaunchPolicyView(
       },
     ];
 
-    const selectedGogValue: StorefrontClientLifecyclePolicy =
-      cleanLifecycle === 'default_client' ? 'minimal_keep_running' : cleanLifecycle;
+    const selectedGogValue: StorefrontClientLifecyclePolicy = cleanLifecycle;
 
     let gogInfoBox: StorefrontPolicyInfoBox;
     if (selectedGogValue === 'fast_direct_bypass') {
@@ -1222,6 +1400,27 @@ export function buildStorefrontLaunchPolicyView(
         excludedOrTradeoffs: [
           'GOG Achievements / Trophies DO NOT work when GOG Galaxy is bypassed',
           'GOG Shift+Tab Overlay, Leaderboards & Galaxy SDK P2P Multiplayer are disabled',
+        ],
+      };
+    } else if (selectedGogValue === 'default_client') {
+      gogInfoBox = {
+        policyKey: 'default_client',
+        cardHeading,
+        severity: 'info',
+        badgeLabel: 'Standard Footprint • Full GOG Galaxy UI',
+        headline: 'Standard GOG Galaxy Desktop Client (Full Window Kept Open)',
+        footprintSummary:
+          'Direct mode + Standard GOG Galaxy opens the full GOG Galaxy desktop window and keeps it running for live GOG Achievements / Trophies, Leaderboards & Galaxy SDK Multiplayer while One Launcher syncs standalone gogdl Cloud Saves.',
+        includedFeatures: [
+          'Two-way GOG Cloud Save Sync via standalone gogdl CLI (pre-launch + post-exit)',
+          'Live GOG Achievements / Trophies, Leaderboards & Galaxy SDK Multiplayer via GalaxyCommunication',
+          'Full GOG Galaxy desktop window stays accessible during and after gameplay',
+        ],
+        excludedOrTradeoffs: [
+          'Uses ~250–450 MB RAM and keeps the GOG Galaxy desktop window open after exiting the game',
+          isWinHost
+            ? 'Shift+Tab in-game overlay injection requires GOG Galaxy Client Protocol mode'
+            : 'Shift+Tab in-game overlay injection on macOS requires GOG Galaxy Client Protocol mode',
         ],
       };
     } else if (selectedGogValue === 'minimal_keep_running') {
@@ -1556,9 +1755,11 @@ export interface BuildEffectiveLaunchModePreviewParams {
   usesGalaxySdk?: boolean;
   isClientlessXboxInstall?: boolean;
   installedStorefrontClients?: Partial<Record<StorefrontId, boolean>>;
+  targetBottleHasSteam?: boolean;
 }
 
 export type BuildLaunchModePreviewParams = BuildEffectiveLaunchModePreviewParams;
+export type ResolveLaunchModePreviewInput = BuildEffectiveLaunchModePreviewParams;
 
 export function resolveMacArchitectureLabel(hostArch?: string): 'Intel Mac' | 'Apple Silicon' {
   if (hostArch && /^(x64|ia32|x86_64|x86|intel|amd64)$/i.test(hostArch.trim())) {
@@ -1818,13 +2019,34 @@ export function buildEffectiveLaunchModePreview(
       layer: activeLayer,
       allLayers: layers,
     });
+  const effectiveRunnerTypeForBottle =
+    fallbackSupportedLayerType || activeLayer?.type || 'crossover';
+  const installBottleName = extractBottleNameFromPath(installPath || executablePath);
+  const matchedInstallBottle =
+    installBottleName &&
+    activeLayer?.availableBottles?.find(
+      (b) => b.toLowerCase() === installBottleName.toLowerCase()
+    );
+  const preferredInstallBottle =
+    matchedInstallBottle &&
+    isBottleNameCompatibleWithRunner(matchedInstallBottle, effectiveRunnerTypeForBottle, {
+      layer: activeLayer,
+      allLayers: layers,
+    })
+      ? matchedInstallBottle
+      : undefined;
   const bottleName =
     (draftBottleCompatible ? rawDraftBottle : '') ||
+    preferredInstallBottle ||
     resolveDefaultBottleForLayer(
       activeLayer,
       fallbackSupportedLayerType || activeLayer?.type,
       selectedDescriptor?.defaultBottleName
     );
+  const resolvedTargetBottleHasSteam: boolean | undefined =
+    typeof params.targetBottleHasSteam === 'boolean'
+      ? params.targetBottleHasSteam
+      : lookupBottleHasSteamFromLayers(bottleName, activeLayer, layers);
 
   let hasMacInstaller = false;
   let hasWinInstaller = true;
@@ -1922,7 +2144,7 @@ export function buildEffectiveLaunchModePreview(
       rawConfiguredLaunchMethod === 'compatibility_layer');
   const rawLifecycleOverride = sanitizeStorefrontLifecycleOverride(
     draftConfig?.storefrontClientLifecycle ?? savedConfig?.storefrontClientLifecycle,
-    isBottlePreviewContext ? undefined : platformId
+    undefined
   );
 
   const isNativeBuild =
@@ -2250,32 +2472,42 @@ export function buildEffectiveLaunchModePreview(
     }
 
     if (platformId === 'xbox' && isChainedHandoff && chainedPublisherName) {
+      const chainedLifecycleSummary = buildChainedPublisherLifecycleNote(
+        chainedPublisherName,
+        chainedHandoffId,
+        resolvedPolicy.effectiveLifecycle
+      );
       if (hostPlatform === 'win32') {
         return {
           modeLabel: `Chained Host Publisher Handoff (Xbox Game Pass → ${chainedPublisherName})`,
-          cloudSaveSummary: `Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} (requires one-time Xbox ↔ ${chainedPublisherName} account link)`,
+          cloudSaveSummary: `Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} (requires one-time Xbox ↔ ${chainedPublisherName} account link). ${chainedLifecycleSummary}`,
         };
       }
       return {
         modeLabel: `Chained Compatibility Bottle (Xbox Game Pass → ${chainedPublisherName} inside CrossOver / Wine)`,
         cloudSaveSummary: hasMacBattlEyeWarning
-          ? `Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} (requires one-time Xbox ↔ ${chainedPublisherName} account link; BattlEye BEDaisy.sys online multiplayer blocked on macOS)`
-          : `Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} (requires one-time Xbox ↔ ${chainedPublisherName} account link)`,
+          ? `Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} (requires one-time Xbox ↔ ${chainedPublisherName} account link; BattlEye BEDaisy.sys online multiplayer blocked on macOS). ${chainedLifecycleSummary}`
+          : `Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} (requires one-time Xbox ↔ ${chainedPublisherName} account link). ${chainedLifecycleSummary}`,
       };
     }
 
     if (isChainedHandoff && chainedPublisherName) {
+      const chainedLifecycleSummary = buildChainedPublisherLifecycleNote(
+        chainedPublisherName,
+        chainedHandoffId,
+        resolvedPolicy.effectiveLifecycle
+      );
       if (hostPlatform === 'win32') {
         return {
           modeLabel: `Chained Host Publisher Handoff (${storeName} → ${chainedPublisherName})`,
-          cloudSaveSummary: `Cloud saves & entitlement sync managed by ${chainedPublisherName} (requires linked ${storeName} ↔ ${chainedPublisherName} account)`,
+          cloudSaveSummary: `Cloud saves & entitlement sync managed by ${chainedPublisherName} (requires linked ${storeName} ↔ ${chainedPublisherName} account). ${chainedLifecycleSummary}`,
         };
       }
       return {
         modeLabel: `Chained Compatibility Bottle (${storeName} → ${chainedPublisherName} inside CrossOver / Wine)`,
         cloudSaveSummary: hasMacBattlEyeWarning
-          ? `Cloud saves & entitlement sync managed by ${chainedPublisherName} (requires linked ${storeName} ↔ ${chainedPublisherName} account; BattlEye BEDaisy.sys online multiplayer blocked on macOS)`
-          : `Cloud saves & entitlement sync managed by ${chainedPublisherName} (requires linked ${storeName} ↔ ${chainedPublisherName} account)`,
+          ? `Cloud saves & entitlement sync managed by ${chainedPublisherName} (requires linked ${storeName} ↔ ${chainedPublisherName} account; BattlEye BEDaisy.sys online multiplayer blocked on macOS). ${chainedLifecycleSummary}`
+          : `Cloud saves & entitlement sync managed by ${chainedPublisherName} (requires linked ${storeName} ↔ ${chainedPublisherName} account). ${chainedLifecycleSummary}`,
       };
     }
 
@@ -2323,14 +2555,20 @@ export function buildEffectiveLaunchModePreview(
     }
 
     if (platformId === 'steam') {
+      const isBottleSteamMissing =
+        isBottlePreviewContext &&
+        !isFastDirectActive &&
+        resolvedTargetBottleHasSteam === false;
       return {
         modeLabel:
           hostPlatform === 'win32' || hasMacInstaller
             ? 'Steam Client Pipeline'
             : `Bottle Steam Pipeline (${layerName})`,
-        cloudSaveSummary: isLifecycleFastBypass
+        cloudSaveSummary: isLifecycleFastBypass || isFastDirectActive
           ? 'Fast Direct Binary Bypass (bypasses Steam Cloud Sync)'
-          : 'Two-way Steam Cloud Save Sync',
+          : isBottleSteamMissing
+            ? `Warning: Windows Steam is NOT installed in bottle "${bottleName || 'selected bottle'}" — Steam Client & Cloud Saves unavailable until runner/bottle is aligned or Steam is installed`
+            : 'Two-way Steam Cloud Save Sync',
       };
     }
 
@@ -2348,6 +2586,17 @@ export function buildEffectiveLaunchModePreview(
       ? executablePath.split(/[\\/]/).pop() || 'the game executable'
       : 'the game executable';
     const antiCheatLabel = resolvedKernelAntiCheatLabel || 'Windows Kernel Anti-Cheat';
+    const isBottleSteamMissing =
+      platformId === 'steam' &&
+      !isFastDirectActive &&
+      resolvedTargetBottleHasSteam === false;
+    const isBottleSteamStandardClient =
+      platformId === 'steam' &&
+      !isFastDirectActive &&
+      resolvedPolicy.effectiveLifecycle === 'default_client';
+    const bottleSteamModeLabel = isBottleSteamStandardClient
+      ? 'Standard Bottle Steam Client (Full Window, steam.exe -applaunch)'
+      : 'Silent Bottle Steam (steam.exe -silent -applaunch)';
 
     const bottleAutoDesc = hasMacRing0HardBlock
       ? `Unsupported on macOS Bottle: ${antiCheatLabel} requires a Windows ring-0 kernel driver that cannot load inside macOS Wine/CrossOver bottles.${
@@ -2364,7 +2613,11 @@ export function buildEffectiveLaunchModePreview(
             : isFastDirectActive
               ? formatDirectBypassCloudNote(targetExeLabel, `via ${layerName}${bottleSuffix}`)
               : platformId === 'steam'
-                ? `Silent Client + Cloud Sync: runs via ${layerName}${bottleSuffix} using silent bottle Steam (steam.exe -silent -applaunch) — syncs Steam Cloud Saves both ways (two-stage pre-launch download + post-exit upload) with Achievements & DRM support.`
+                ? isBottleSteamMissing
+                  ? `Warning: Windows Steam is NOT installed in ${layerName}${bottleSuffix} — Steam Client & Cloud Saves are unavailable until runner/bottle is aligned or Steam is installed.`
+                  : isBottleSteamStandardClient
+                    ? `${bottleSteamModeLabel}: runs via ${layerName}${bottleSuffix} — syncs Steam Cloud Saves both ways (pre-launch download + post-exit upload) with full Steam window, Achievements & DRM support.`
+                    : `Silent Client + Cloud Sync: runs via ${layerName}${bottleSuffix} using ${bottleSteamModeLabel} — syncs Steam Cloud Saves both ways (two-stage pre-launch download + post-exit upload) with Achievements & DRM support.`
                 : platformId === 'gog'
                   ? `Bottle GOG + Cloud Sync: runs via ${layerName}${bottleSuffix} with Bottle GOG Galaxy SDK support (governed by Bottle GOG Launch Policy below) and syncs Cloud Saves both ways (pre-launch download + post-exit upload) via One Launcher's standalone gogdl CLI.`
                   : platformId === 'xbox'
@@ -2388,7 +2641,9 @@ export function buildEffectiveLaunchModePreview(
                     ? `Pin ${layerName}${bottleSuffix} and graphics overrides — bypasses Xbox App while syncing Xbox Connected Storage Cloud Saves both ways.`
                     : `Pin ${layerName}${bottleSuffix} and graphics overrides — bypasses Epic Games Launcher while syncing Cloud Saves both ways via standalone legendary CLI.`
               : platformId === 'steam'
-                ? `Pin ${layerName}${bottleSuffix} and graphics overrides with Silent Bottle Steam + Cloud Sync — syncs Steam Cloud Saves both ways (pre-launch download + post-exit upload) via silent bottle Steam.`
+                ? isBottleSteamMissing
+                  ? `Pin ${layerName}${bottleSuffix} and graphics overrides — Warning: Windows Steam is NOT installed in bottle "${bottleName || 'selected bottle'}" (Steam Client & Cloud Saves unavailable until runner/bottle is aligned or Steam is installed).`
+                  : `Pin ${layerName}${bottleSuffix} and graphics overrides with ${bottleSteamModeLabel} — syncs Steam Cloud Saves both ways (pre-launch download + post-exit upload).`
                 : platformId === 'gog'
                   ? `Pin ${layerName}${bottleSuffix} and graphics overrides — syncs Cloud Saves both ways (pre-launch download + post-exit upload) via One Launcher's standalone gogdl CLI.`
                   : platformId === 'xbox'
@@ -2412,7 +2667,9 @@ export function buildEffectiveLaunchModePreview(
                     ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} in clientless XGR mode (syncs Xbox Connected Storage Cloud Saves both ways).`
                     : `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} in clientless EOS mode (syncs Cloud Saves both ways via standalone legendary CLI).`
               : platformId === 'steam'
-                ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} — syncs Steam Cloud Saves both ways (pre-launch download + post-exit upload) via silent bottle Steam.`
+                ? isBottleSteamMissing
+                  ? `Warning: Windows Steam is NOT installed in ${layerName}${bottleSuffix} — Steam Client & Cloud Saves unavailable until runner/bottle is aligned or Steam is installed.`
+                  : `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} — syncs Steam Cloud Saves both ways (pre-launch download + post-exit upload) via ${bottleSteamModeLabel}.`
                 : platformId === 'gog'
                   ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} — syncs Cloud Saves both ways (pre-launch download + post-exit upload) via standalone gogdl CLI.`
                   : platformId === 'xbox'

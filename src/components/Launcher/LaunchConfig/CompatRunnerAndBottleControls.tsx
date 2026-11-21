@@ -1,17 +1,20 @@
 import React from 'react';
-import { AlertTriangle, CheckCircle2, FolderOpen, Wrench } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, FolderOpen, Info, Wrench } from 'lucide-react';
 import type {
   CompatibilityLayerInfo,
   CompatibilityLayerType,
   CompatibilityLayerUpdateInfo,
   CompatibilityRunnerDescriptor,
 } from '../../../contracts/launcher';
+import type { StorefrontId } from '../../../contracts/platform';
 import { formatRunnerOptionLabel } from './launchConfigHelpers';
 import {
   LAUNCH_BUTTON_FOCUS_CLASSES,
   LAUNCH_TEXT_INPUT_CLASSES,
   LaunchSelect,
 } from './LaunchConfigControls';
+
+export type BottleDetailsEntry = NonNullable<CompatibilityLayerInfo['bottleDetails']>[string];
 
 export interface CompatRunnerAndBottleControlsParams {
   visibleCompatLayerOptions: ReadonlyArray<{
@@ -39,6 +42,13 @@ export interface CompatRunnerAndBottleControlsParams {
   resolvedBottleFolderPath?: string;
   onOpenBottleFolder?: () => void;
   onOpenRunnerManager: () => void;
+  platformId?: StorefrontId;
+  isFastDirectActive?: boolean;
+  installBottleName?: string | null;
+  targetBottleDetails?: BottleDetailsEntry;
+  recommendedInstallRunner?: CompatibilityLayerInfo | null;
+  recommendedInstallRunnerLabel?: string;
+  onAlignToInstallBottle?: (runnerType: CompatibilityLayerType, bottleName: string) => void;
 }
 
 export function renderCompatRunnerAndBottleControls({
@@ -64,7 +74,27 @@ export function renderCompatRunnerAndBottleControls({
   resolvedBottleFolderPath,
   onOpenBottleFolder,
   onOpenRunnerManager,
+  platformId,
+  isFastDirectActive = false,
+  installBottleName,
+  targetBottleDetails,
+  recommendedInstallRunner,
+  recommendedInstallRunnerLabel,
+  onAlignToInstallBottle,
 }: CompatRunnerAndBottleControlsParams): React.ReactElement {
+  const hasInstallBottleMismatch = Boolean(
+    installBottleName &&
+      effectiveSelectedBottleName &&
+      installBottleName.toLowerCase() !== effectiveSelectedBottleName.toLowerCase()
+  );
+  const showSteamReadinessChip = Boolean(
+    platformId === 'steam' && typeof targetBottleDetails?.hasSteam === 'boolean'
+  );
+  const isBottleSteamMissing = Boolean(
+    platformId === 'steam' &&
+      !isFastDirectActive &&
+      targetBottleDetails?.hasSteam === false
+  );
   return (
     <>
       {/* Primary 1 & 2: Compatibility Layer & Bottle */}
@@ -202,6 +232,35 @@ export function renderCompatRunnerAndBottleControls({
                 Update v{effectiveUpdateInfo.latestVersion}
               </span>
             )}
+            {showSteamReadinessChip &&
+              (targetBottleDetails?.hasSteam === false ? (
+                <span
+                  data-testid="compat-bottle-steam-readiness-chip"
+                  data-steam-readiness="missing"
+                  className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-rose-500/15 border border-rose-400/40 text-rose-200"
+                >
+                  <AlertTriangle className="w-3 h-3 text-rose-400 shrink-0" aria-hidden="true" />
+                  <span>No Steam in Bottle</span>
+                </span>
+              ) : targetBottleDetails?.steamSignedIn === false ? (
+                <span
+                  data-testid="compat-bottle-steam-readiness-chip"
+                  data-steam-readiness="sign_in_needed"
+                  className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-500/15 border border-amber-400/40 text-amber-200"
+                >
+                  <AlertTriangle className="w-3 h-3 text-amber-400 shrink-0" aria-hidden="true" />
+                  <span>Steam Sign-In Needed</span>
+                </span>
+              ) : (
+                <span
+                  data-testid="compat-bottle-steam-readiness-chip"
+                  data-steam-readiness="ready"
+                  className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-400/35 text-emerald-200"
+                >
+                  <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" aria-hidden="true" />
+                  <span>Steam Ready</span>
+                </span>
+              ))}
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5 shrink-0">
@@ -248,6 +307,59 @@ export function renderCompatRunnerAndBottleControls({
             <Wrench className="w-3 h-3" aria-hidden="true" />
             <span>Manage Runners &amp; Bottles…</span>
           </button>
+        </div>
+      )}
+
+      {hasInstallBottleMismatch && installBottleName && (
+        <div
+          data-testid="compat-install-bottle-mismatch-warning"
+          role="status"
+          aria-live="polite"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-amber-950/45 border border-amber-500/45 px-3 py-2 text-xs text-amber-100"
+        >
+          <div className="flex items-start gap-2 min-w-0 flex-1">
+            <Info className="w-3.5 h-3.5 text-amber-300 shrink-0 mt-0.5" aria-hidden="true" />
+            <span className="leading-snug">
+              Installed in bottle{' '}
+              <strong className="text-white">&ldquo;{installBottleName}&rdquo;</strong>, while the
+              selected target bottle is{' '}
+              <strong className="text-white">&ldquo;{effectiveSelectedBottleName}&rdquo;</strong>.
+              Local saves and storefront installs in &ldquo;{installBottleName}&rdquo; are isolated
+              from &ldquo;{effectiveSelectedBottleName}&rdquo;.
+            </span>
+          </div>
+          {recommendedInstallRunner && onAlignToInstallBottle && (
+            <button
+              type="button"
+              data-testid="compat-align-install-bottle-btn"
+              onClick={() =>
+                onAlignToInstallBottle(recommendedInstallRunner.type, installBottleName)
+              }
+              className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-[11px] font-semibold text-sky-100 hover:text-white transition-colors cursor-pointer shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+            >
+              <span>
+                Switch to {recommendedInstallRunnerLabel || recommendedInstallRunner.name} (
+                {installBottleName})
+              </span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {isBottleSteamMissing && (
+        <div
+          data-testid="compat-bottle-steam-missing-warning"
+          role="alert"
+          className="flex items-start gap-2 rounded-lg bg-rose-950/55 border border-rose-500/50 px-3 py-2 text-xs text-rose-100"
+        >
+          <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" aria-hidden="true" />
+          <span className="leading-snug">
+            <strong className="text-rose-200">No Steam in Bottle:</strong> Bottle &ldquo;
+            {effectiveSelectedBottleName}&rdquo; does not have Windows Steam installed. Steam Client
+            &amp; Steam Cloud Saves will not work until you switch to a bottle with Steam, install
+            Windows Steam into &ldquo;{effectiveSelectedBottleName}&rdquo;, or enable Fast Bottle
+            Launch (disables Steam Cloud).
+          </span>
         </div>
       )}
     </>

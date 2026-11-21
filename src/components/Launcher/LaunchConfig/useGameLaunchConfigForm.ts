@@ -19,7 +19,11 @@ import {
   StorefrontLaunchProfile,
   VirtualDesktopResolutionPreset,
 } from '../../../contracts/launcher';
-import { isBottleNameCompatibleWithRunner } from '../../../services/launcher/bottleArchitectureUtils';
+import {
+  extractBottleNameFromPath,
+  findCompatibleRunnerForBottle,
+  isBottleNameCompatibleWithRunner,
+} from '../../../services/launcher/bottleArchitectureUtils';
 import {
   launcherService,
   COMPATIBILITY_RUNNER_DESCRIPTORS,
@@ -202,19 +206,46 @@ export function useGameLaunchConfigForm({
         drafts?.[targetPlatId] ?? launcherService.getLaunchConfig(game.id, targetPlatId);
       const hostArch =
         typeof launcherService.getHostArch === 'function' ? launcherService.getHostArch() : 'arm64';
+      const rawLayers = layersOverride || detectedLayers;
       const parsed = parseLaunchConfigProfileFields({
         game,
         targetPlatId,
         source,
-        allRawLayers: layersOverride || detectedLayers,
+        allRawLayers: rawLayers,
         hostArch,
       });
+
+      let initialCompatibilityLayer = parsed.compatibilityLayer;
+      let initialSignature = parsed.signature;
+      if (!source?.compatibilityLayer) {
+        const platRec = game.platforms.find((p) => p.platformId === targetPlatId);
+        const instRec = launcherService.getInstalledRecordForGame(game, targetPlatId);
+        const instBottle = extractBottleNameFromPath(
+          instRec?.installPath ||
+            instRec?.executablePath ||
+            platRec?.installPath ||
+            platRec?.executablePath
+        );
+        const validInitLayers = rawLayers.filter(
+          (l) => l.available !== false && isHostSupportedCompatRunner(l.type, hostArch)
+        );
+        const affinityLayer = instBottle
+          ? findCompatibleRunnerForBottle(instBottle, validInitLayers, { hostArch })
+          : null;
+        if (affinityLayer && affinityLayer.type !== initialCompatibilityLayer) {
+          initialCompatibilityLayer = affinityLayer.type;
+          initialSignature =
+            patchLaunchConfigSignature(parsed.signature, {
+              compatibilityLayer: initialCompatibilityLayer,
+            }) || parsed.signature;
+        }
+      }
 
       setLaunchMethod(parsed.launchMethod);
       setCustomExecutablePath(parsed.customExecutablePath);
       setWorkingDirectory(parsed.workingDirectory);
       setLaunchArguments(parsed.launchArguments);
-      setCompatibilityLayer(parsed.compatibilityLayer);
+      setCompatibilityLayer(initialCompatibilityLayer);
       setWineBottleName(parsed.wineBottleName);
       setWinePrefixPath(parsed.winePrefixPath);
       setCrossoverGraphicsBackend(parsed.crossoverGraphicsBackend);
@@ -237,7 +268,7 @@ export function useGameLaunchConfigForm({
       setInGameLauncherBehavior(parsed.inGameLauncherBehavior);
       setStorefrontClientLifecycle(parsed.storefrontClientLifecycle);
       setBaselineFieldsByPlatform((prev) =>
-        prev[targetPlatId] !== undefined ? prev : { ...prev, [targetPlatId]: parsed.signature }
+        prev[targetPlatId] !== undefined ? prev : { ...prev, [targetPlatId]: initialSignature }
       );
       clearRunnerFeedback();
     },
@@ -397,10 +428,24 @@ export function useGameLaunchConfigForm({
         currentHostArch
       );
       if ((!activeSource?.compatibilityLayer || !isSourceLayerHostSupported) && validLayers.length > 0) {
-        const autoLayer = validLayers[0].type;
+        const activePlatRec = game.platforms.find((p) => p.platformId === currentPlatId);
+        const activeInstalledRec = launcherService.getInstalledRecordForGame(game, currentPlatId);
+        const detectedInstallBottle = extractBottleNameFromPath(
+          activeInstalledRec?.installPath ||
+            activeInstalledRec?.executablePath ||
+            activePlatRec?.installPath ||
+            activePlatRec?.executablePath
+        );
+        const affinityLayer = detectedInstallBottle
+          ? findCompatibleRunnerForBottle(detectedInstallBottle, validLayers, {
+              hostArch: currentHostArch,
+            })
+          : null;
+        const chosenAutoLayerInfo = affinityLayer || validLayers[0];
+        const autoLayer = chosenAutoLayerInfo.type;
         setCompatibilityLayer((prev) => (prev === autoLayer ? prev : autoLayer));
         const rawSavedBottle = activeSource?.wineBottleName || '';
-        const autoLayerBottles = validLayers[0].availableBottles || [];
+        const autoLayerBottles = chosenAutoLayerInfo.availableBottles || [];
         const isBottleValidForAuto =
           !rawSavedBottle ||
           (isBottleNameCompatibleWithRunner(rawSavedBottle, autoLayer, { allLayers: layers }) &&
@@ -524,12 +569,35 @@ export function useGameLaunchConfigForm({
     [activeInstalledDisplay, activeInstalledVer, activeInstalledBuild]
   );
 
-  const defaultBottleForLayer = resolveDefaultBottleForLayer(
+  const installedRecord = isOpen
+    ? launcherService.getInstalledRecordForGame(game, preferredPlatformId)
+    : undefined;
+  const activePlatformRecord = game.platforms.find((p) => p.platformId === preferredPlatformId);
+  const installBottleName = extractBottleNameFromPath(
+    installedRecord?.installPath ||
+      installedRecord?.executablePath ||
+      activePlatformRecord?.installPath ||
+      activePlatformRecord?.executablePath
+  );
+
+  const baseDefaultBottleForLayer = resolveDefaultBottleForLayer(
     activeLayer,
     compatibilityLayer,
     selectedRunnerDescriptor?.defaultBottleName
   );
-  const effectiveResolvedBottle = wineBottleName.trim() || defaultBottleForLayer;
+  const matchedInstallBottleInActiveLayer =
+    installBottleName &&
+    availableBottles.find((b) => b.toLowerCase() === installBottleName.toLowerCase());
+  const defaultBottleForLayer =
+    matchedInstallBottleInActiveLayer &&
+    isBottleNameCompatibleWithRunner(matchedInstallBottleInActiveLayer, compatibilityLayer, {
+      layer: activeLayer,
+      allLayers: detectedLayers,
+    })
+      ? matchedInstallBottleInActiveLayer
+      : baseDefaultBottleForLayer;
+  const effectiveSelectedBottleName = wineBottleName.trim() || defaultBottleForLayer || '';
+  const effectiveResolvedBottle = effectiveSelectedBottleName || undefined;
   const resolvedBottleFolderPath =
     winePrefixPath.trim() ||
     (activeLayer?.bottlesDir
@@ -537,10 +605,6 @@ export function useGameLaunchConfigForm({
         ? `${activeLayer.bottlesDir.replace(/\/+$/, '')}/${effectiveResolvedBottle}`
         : activeLayer.bottlesDir
       : undefined);
-
-  const installedRecord = isOpen
-    ? launcherService.getInstalledRecordForGame(game, preferredPlatformId)
-    : undefined;
 
   const hostCapabilities = resolveFormHostCapabilities();
   const explicitRendererPlatform =
@@ -630,6 +694,18 @@ export function useGameLaunchConfigForm({
       fallbackGlobalLifecycle: perfSettings.storefrontClientLifecycle,
     });
 
+  const isFastDirectActive = Boolean(
+    preview.resolvedPolicy?.isFastDirectBypass ??
+      (effectiveStorefrontClientLifecycle === 'fast_direct_bypass' ||
+        activeDisplayMethod === 'direct')
+  );
+
+  const chainedLauncherHandoff =
+    installedRecord?.chainedLauncherHandoff || activePlatformRecord?.chainedLauncherHandoff;
+  const externalStorefrontHandoff =
+    installedRecord?.externalStorefrontHandoff || activePlatformRecord?.externalStorefrontHandoff;
+  const externalLauncher = activePlatformRecord?.externalLauncher;
+
   const fastLaunchAdvisory = launcherService.getFastMinimalLaunchAdvisory({
     platformId: preview.platformId,
     detectedBuildType: preview.detectedBuildType,
@@ -639,6 +715,9 @@ export function useGameLaunchConfigForm({
     globalStorefrontLifecycle: perfSettings.storefrontClientLifecycle,
     isInstalled: preview.isInstalled,
     executablePath: preview.executablePath,
+    chainedLauncherHandoff,
+    externalStorefrontHandoff,
+    externalLauncher,
   });
 
   const policyView = launcherService.getStorefrontLaunchPolicyView({
@@ -648,6 +727,9 @@ export function useGameLaunchConfigForm({
     effectiveLifecycle: effectiveStorefrontClientLifecycle,
     isInstalled: preview.isInstalled,
     hostPlatform,
+    chainedLauncherHandoff,
+    externalStorefrontHandoff,
+    externalLauncher,
   });
 
   const isMacNativeBuild =
@@ -793,6 +875,7 @@ export function useGameLaunchConfigForm({
     isNativeInstalledBuild,
     activeDisplayMethod,
     preview,
+    perfSettings,
     wineMsync,
     wineEsync,
     loadFormFieldsForPlatform,
@@ -816,6 +899,7 @@ export function useGameLaunchConfigForm({
     isNativeInstalledBuild,
     activeDisplayMethod,
     preview,
+    perfSettings,
     wineMsync,
     wineEsync,
     loadFormFieldsForPlatform,
@@ -950,6 +1034,20 @@ export function useGameLaunchConfigForm({
     setWineBottleName(value);
   }, []);
 
+  const handleAlignToInstallBottle = useCallback(
+    (runnerType: CompatibilityLayerType, bottleName: string) => {
+      const cur = latestRef.current;
+      compatEditEpochByPlatformRef.current[cur.preferredPlatformId] =
+        (compatEditEpochByPlatformRef.current[cur.preferredPlatformId] ?? 0) + 1;
+      userEditedCompatPlatformsRef.current.add(cur.preferredPlatformId);
+      userResetPendingDetectPlatformsRef.current.delete(cur.preferredPlatformId);
+      setCompatibilityLayer(runnerType);
+      setWineBottleName(bottleName);
+      clearRunnerFeedback();
+    },
+    [clearRunnerFeedback]
+  );
+
   const handleSetCrossoverHighResolutionMode = useCallback((value: boolean | undefined) => {
     setCrossoverHighResolutionMode(value === false ? false : undefined);
   }, []);
@@ -1002,11 +1100,24 @@ export function useGameLaunchConfigForm({
   }, []);
 
   const handleChangeStorefrontClientLifecycle = useCallback(
-    (val: StorefrontClientLifecyclePolicy) => {
+    (val: 'default' | StorefrontClientLifecyclePolicy) => {
       setStorefrontClientLifecycle(val);
       const cur = latestRef.current;
+      const effectiveVal: StorefrontClientLifecyclePolicy =
+        val === 'default'
+          ? resolveEffectiveUiStorefrontLifecycle({
+              preferredPlatformId: cur.preferredPlatformId,
+              isBottleContext:
+                !cur.isWindowsHost &&
+                (cur.preview.detectedBuildType === 'windows_exe_on_mac' ||
+                  cur.activeDisplayMethod === 'compatibility_layer' ||
+                  cur.preview.visibleSections.compatibilityLayer),
+              storefrontClientLifecycle: 'default',
+              fallbackGlobalLifecycle: cur.perfSettings.storefrontClientLifecycle,
+            })
+          : val;
       if (cur.isNativeInstalledBuild && cur.preferredPlatformId === 'steam') {
-        if (val === 'fast_direct_bypass') {
+        if (effectiveVal === 'fast_direct_bypass') {
           setLaunchMethod('direct');
         } else if (
           (cur.launchMethod === 'direct' || cur.activeDisplayMethod === 'direct') &&
@@ -1018,7 +1129,7 @@ export function useGameLaunchConfigForm({
         !cur.isWindowsHost &&
         cur.preferredPlatformId !== 'custom' &&
         cur.launchMethod === 'direct' &&
-        val !== 'fast_direct_bypass'
+        effectiveVal !== 'fast_direct_bypass'
       ) {
         setLaunchMethod(
           cur.preview.availableModes.includes('auto')
@@ -1057,7 +1168,21 @@ export function useGameLaunchConfigForm({
       (l) => l.available !== false && isHostSupportedCompatRunner(l.type, resetHostArch)
     );
     const resetPreview = launcherService.resolveEffectiveLaunchModePreview(game, targetPlatId, {});
-    const resetLayer: CompatibilityLayerType = validLayers[0]?.type || 'crossover';
+    const resetInstalledRec = launcherService.getInstalledRecordForGame(game, targetPlatId);
+    const resetPlatRec = game.platforms.find((p) => p.platformId === targetPlatId);
+    const resetInstallBottle = extractBottleNameFromPath(
+      resetInstalledRec?.installPath ||
+        resetInstalledRec?.executablePath ||
+        resetPlatRec?.installPath ||
+        resetPlatRec?.executablePath
+    );
+    const resetAffinityLayer = resetInstallBottle
+      ? findCompatibleRunnerForBottle(resetInstallBottle, validLayers, {
+          hostArch: resetHostArch,
+        })
+      : null;
+    const resetLayer: CompatibilityLayerType =
+      resetAffinityLayer?.type || validLayers[0]?.type || 'crossover';
     if (latestRef.current.preferredPlatformId !== targetPlatId) {
       return;
     }
@@ -1321,6 +1446,10 @@ export function useGameLaunchConfigForm({
     activeLayer,
     activeUpdateInfo,
     availableBottles,
+    installedRecord,
+    installBottleName,
+    effectiveSelectedBottleName,
+    isFastDirectActive,
     activeInstalledVer,
     activeSecondaryBuildText,
     resolvedBottleFolderPath,
@@ -1357,6 +1486,7 @@ export function useGameLaunchConfigForm({
     handleDownloadRunner: runnerLifecycle.handleDownloadRunner,
     handleOpenBottleFolder,
     handleSelectCompatibilityLayer,
+    handleAlignToInstallBottle,
     handleToggleCrossoverDlss,
     handleToggleForceLargeAddressAware,
     handleToggleWineMsync,

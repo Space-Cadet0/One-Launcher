@@ -28,6 +28,22 @@ import {
 } from './launchConfigHelpers';
 import { LAUNCH_BUTTON_FOCUS_CLASSES, LaunchSelect } from './LaunchConfigControls';
 
+export function formatShortStorefrontPolicyLabel(
+  policy: StorefrontClientLifecyclePolicy
+): string {
+  switch (policy) {
+    case 'fast_direct_bypass':
+      return 'Fast Direct Bypass';
+    case 'default_client':
+      return 'Standard Client';
+    case 'minimal_keep_running':
+      return 'Minimal & Keep Warm';
+    case 'minimal_and_close_if_started':
+    default:
+      return 'Silent & Auto-Close';
+  }
+}
+
 export interface StorefrontLifecycleSectionProps {
   idPrefix?: string;
   isWindowsHost: boolean;
@@ -37,7 +53,9 @@ export interface StorefrontLifecycleSectionProps {
   inGameLauncherBehavior: 'default' | InGameLauncherBehavior;
   onChangeInGameLauncherBehavior: (value: 'default' | InGameLauncherBehavior) => void;
   storefrontClientLifecycle: 'default' | StorefrontClientLifecyclePolicy;
-  onChangeStorefrontClientLifecycle: (value: StorefrontClientLifecyclePolicy) => void;
+  onChangeStorefrontClientLifecycle: (
+    value: 'default' | StorefrontClientLifecyclePolicy
+  ) => void;
   policyView?: StorefrontLaunchPolicyView;
   /** Read-only global settings snapshot used purely for "Use Global Default (...)" labels */
   perfSettings: LauncherPerformanceSettings;
@@ -72,6 +90,13 @@ function StorefrontLifecycleSectionImpl({
       preview.visibleSections.compatibilityLayer);
 
   const showStorefrontSection = preferredPlatformId !== 'custom';
+  const supportsGlobalInheritance = !(
+    isBottleContext &&
+    (preferredPlatformId === 'epic' || preferredPlatformId === 'xbox')
+  );
+  const globalPolicyShortLabel = formatShortStorefrontPolicyLabel(
+    perfSettings.storefrontClientLifecycle
+  );
 
   const effectiveLifecycle: StorefrontClientLifecyclePolicy =
     resolveEffectiveUiStorefrontLifecycle({
@@ -376,12 +401,28 @@ function StorefrontLifecycleSectionImpl({
 
           {resolvedPolicyView.showDropdown && (
             <div className="space-y-1.5">
-              <label
-                htmlFor="storefront-client-lifecycle-select"
-                className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
-              >
-                {resolvedPolicyView.cardHeading} Mode
-              </label>
+              <div className="flex flex-wrap items-center justify-between gap-1">
+                <label
+                  htmlFor="storefront-client-lifecycle-select"
+                  className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
+                >
+                  {resolvedPolicyView.cardHeading} Mode
+                </label>
+                {supportsGlobalInheritance && (
+                  <span
+                    data-testid="storefront-lifecycle-inheritance-badge"
+                    className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold ${
+                      storefrontClientLifecycle === 'default'
+                        ? 'bg-slate-500/15 border-slate-500/35 text-steam-subtext'
+                        : 'bg-sky-500/15 border-sky-500/30 text-sky-300'
+                    }`}
+                  >
+                    {storefrontClientLifecycle === 'default'
+                      ? 'Using Global Default'
+                      : 'Per-Game Override'}
+                  </span>
+                )}
+              </div>
               <LaunchSelect
                 id="storefront-client-lifecycle-select"
                 aria-label={resolvedPolicyView.cardHeading}
@@ -389,10 +430,15 @@ function StorefrontLifecycleSectionImpl({
                 value={resolvedPolicyView.selectedDropdownValue}
                 onChange={(e) =>
                   onChangeStorefrontClientLifecycle(
-                    e.target.value as StorefrontClientLifecyclePolicy
+                    e.target.value as 'default' | StorefrontClientLifecyclePolicy
                   )
                 }
               >
+                {supportsGlobalInheritance && (
+                  <option value="default">
+                    Use Global Default ({globalPolicyShortLabel})
+                  </option>
+                )}
                 {resolvedPolicyView.dropdownOptions.map((opt) => (
                   <option key={opt.value} value={opt.value}>
                     {opt.label}

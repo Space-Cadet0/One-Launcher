@@ -7,6 +7,7 @@
  */
 
 import {
+  isRunnerSupportedOnHost,
   resolveDefaultBottleForLayer,
   type CompatibilityLayerInfo,
   type CompatibilityLayerType,
@@ -29,6 +30,125 @@ export const DEFAULT_ARM64_BOTTLE_NAME = 'OneLauncher-arm64';
 
 const ARM64_BOTTLE_SUFFIX_RE = /-arm64$/i;
 const DEFAULT_WIN64_BOTTLE_RE = /^OneLauncher$/i;
+const BOTTLE_PATH_SEGMENT_RE = /(?:^|[\\/])Bottles[\\/]([^\\/]+)(?:[\\/]|$)/i;
+
+/**
+ * Extracts the CrossOver / Wine bottle folder name from a POSIX or Windows path
+ * pointing inside `/.../Bottles/<BottleName>/...` (or ending at `/.../Bottles/<BottleName>`).
+ */
+export function extractBottleNameFromPath(p?: string | null): string | null {
+  if (typeof p !== 'string') return null;
+  const trimmed = p.trim();
+  if (!trimmed) return null;
+  const match = BOTTLE_PATH_SEGMENT_RE.exec(trimmed);
+  const candidate = match?.[1]?.trim() || '';
+  if (!candidate || candidate === '.' || candidate === '..') {
+    return null;
+  }
+  return candidate;
+}
+
+function lookupBottleArchCaseInsensitive(
+  bottleName: string,
+  layers: ReadonlyArray<LayerWithBottleDetails | undefined>
+): BottleArchitecture | undefined {
+  const lower = bottleName.toLowerCase();
+  for (const layer of layers) {
+    const details = layer?.bottleDetails;
+    if (!details) continue;
+    const direct = details[bottleName]?.wineArch;
+    if (direct) return direct;
+    for (const [key, value] of Object.entries(details)) {
+      if (key.toLowerCase() === lower && value?.wineArch) {
+        return value.wineArch;
+      }
+    }
+  }
+  return undefined;
+}
+
+function layerKnowsBottle(layer: CompatibilityLayerInfo, bottleNameLower: string): boolean {
+  if (layer.availableBottles?.some((b) => b.trim().toLowerCase() === bottleNameLower)) {
+    return true;
+  }
+  if (layer.bottleDetails) {
+    for (const key of Object.keys(layer.bottleDetails)) {
+      if (key.trim().toLowerCase() === bottleNameLower) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Picks the best installed, host-supported compatibility runner for `bottleName`,
+ * checking `bottleDetails[bottleName]?.wineArch` (falling back to bottle name suffix)
+ * and preferring `crossover_preview` -> `crossover` for `win64` and
+ * `crossover_preview_arm64` for `arm64`.
+ */
+export function findCompatibleRunnerForBottle(
+  bottleName: string,
+  detectedLayers: CompatibilityLayerInfo[],
+  options?: { hostPlatform?: string; hostArch?: string }
+): CompatibilityLayerInfo | null {
+  const trimmed = typeof bottleName === 'string' ? bottleName.trim() : '';
+  if (!trimmed || !Array.isArray(detectedLayers) || detectedLayers.length === 0) {
+    return null;
+  }
+
+  const trimmedLower = trimmed.toLowerCase();
+  const detectedArch = lookupBottleArchCaseInsensitive(trimmed, detectedLayers);
+  const targetArch: BottleArchitecture =
+    detectedArch ?? (isArm64NamedBottle(trimmed) ? 'arm64' : 'win64');
+
+  const hostPlatform = options?.hostPlatform || 'darwin';
+  const fallbackHostArch =
+    options?.hostArch || detectedLayers.find((layer) => Boolean(layer?.hostArch))?.hostArch;
+
+  const compatibleCandidates = detectedLayers.filter((layer) => {
+    if (!layer || layer.available === false || layer.type === 'native') {
+      return false;
+    }
+    const runnerHostArch = options?.hostArch ?? layer.hostArch ?? fallbackHostArch;
+    if (!isRunnerSupportedOnHost(layer.type, hostPlatform, runnerHostArch).supported) {
+      return false;
+    }
+    if (Array.isArray(layer.supportedBottleArches) && layer.supportedBottleArches.length > 0) {
+      return layer.supportedBottleArches.includes(targetArch);
+    }
+    if (targetArch === 'arm64') {
+      return layer.type === 'crossover_preview_arm64';
+    }
+    return isBottleRecordCompatibleWithRunner(
+      { name: trimmed, wineArch: targetArch },
+      layer.type,
+      { strictArm64NameMatch: false }
+    );
+  });
+
+  if (compatibleCandidates.length === 0) {
+    return null;
+  }
+
+  const preferenceOrder: readonly CompatibilityLayerType[] =
+    targetArch === 'arm64'
+      ? ['crossover_preview_arm64']
+      : ['crossover_preview', 'crossover', 'gptk', 'wine'];
+
+  const rankOf = (type: CompatibilityLayerType): number => {
+    const idx = preferenceOrder.indexOf(type);
+    return idx === -1 ? preferenceOrder.length : idx;
+  };
+
+  const candidatesWithBottle = compatibleCandidates.filter((layer) =>
+    layerKnowsBottle(layer, trimmedLower)
+  );
+  const pool = candidatesWithBottle.length > 0 ? candidatesWithBottle : compatibleCandidates;
+
+  const sorted = [...pool].sort((a, b) => rankOf(a.type) - rankOf(b.type));
+  return sorted[0] ?? null;
+}
 
 /**
  * Returns the required bottle architecture for a CrossOver runner, or `null` when
