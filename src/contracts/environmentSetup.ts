@@ -266,6 +266,7 @@ export interface EnvironmentSetupTaskOutcome {
   error?: string;
   installedPath?: string;
   openedExternalUrl?: string;
+  steamRestartRequired?: boolean;
 }
 
 export interface RunEnvironmentSetupResult {

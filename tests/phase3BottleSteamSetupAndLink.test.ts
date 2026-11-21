@@ -10,6 +10,7 @@ const nodeRequire = createRequire(import.meta.url);
 interface LinkSteamAppsResult {
   linkedCount: number;
   linkedAppIds: number[];
+  needsVdfSync?: boolean;
 }
 
 interface SetupOutcomeLike {
@@ -17,6 +18,7 @@ interface SetupOutcomeLike {
   action: string;
   status: string;
   installedPath?: string;
+  steamRestartRequired?: boolean;
   message?: string;
   error?: string;
 }
@@ -135,7 +137,15 @@ interface BottleDisplayControllerMod {
 }
 
 interface EngineStateRegistryMod {
-  activeSessions: Map<string, { pollTimer?: ReturnType<typeof setInterval> | null; displayStatusTimer?: ReturnType<typeof setInterval> | null }>;
+  activeSessions: Map<
+    string,
+    {
+      winePrefix?: string;
+      finalized?: boolean;
+      pollTimer?: ReturnType<typeof setInterval> | null;
+      displayStatusTimer?: ReturnType<typeof setInterval> | null;
+    }
+  >;
   pendingBottleLaunches: Map<string, unknown>;
   pendingStorefrontLaunches: Map<string, unknown>;
   invalidateScanCaches: (opts?: Record<string, unknown>) => void;
@@ -1216,6 +1226,286 @@ describe('Phase 3: 1-Click Bottle Steam Provisioning & Zero-Duplicate Cross-Bott
       const watchDirFlagIdx = watchSpawn ? watchSpawn.args.indexOf('--watch-dir') : -1;
       const watchDirVal = watchDirFlagIdx >= 0 ? watchSpawn?.args[watchDirFlagIdx + 1] : '';
       expect(watchDirVal).toBe('C:\\Program Files (x86)\\Steam\\steamapps\\common\\Quake 2');
+    });
+  });
+
+  describe('8. Round-2 Hardening Regressions (P1-2, P2-2, P2-3, P3-1, P3-3)', () => {
+    it('P1-2a: gracefully closes idle warm steam.exe in target bottle during Branch 1 link_only and syncs libraryfolders.vdf', async () => {
+      const sb = makeSandbox('p3-r2-warm-steam-idle-');
+      createFakeCrossOverApp(sb.appsDir, 'CrossOver.app');
+      createFakeCrossOverApp(sb.appsDir, 'CrossOver Preview arm64.app');
+
+      const src = createSyntheticBottle(sb.bottlesDir, 'OneLauncher', {
+        wineArch: 'win64',
+        withSteam: true,
+        signedIn: true,
+      });
+      seedPhysicalSteamGame(src.steamappsDir, {
+        appId: 2320,
+        name: 'Quake II',
+        installdir: 'Quake 2',
+        sizeOnDisk: '654321000',
+      });
+      const target = createSyntheticBottle(sb.bottlesDir, 'OneLauncher-arm64', {
+        wineArch: 'arm64',
+        withSteam: true,
+        signedIn: true,
+      });
+      const targetVdfPath = path.join(target.steamappsDir, 'libraryfolders.vdf');
+      fs.writeFileSync(targetVdfPath, buildLibraryFoldersVdf({}), 'utf8');
+
+      let steamRunning = true;
+      const closeClientSpy = vi.fn(async () => {
+        steamRunning = false;
+      });
+      const warmPsLine = `WINEPREFIX=${target.bottlePath} C:\\Program Files (x86)\\Steam\\steam.exe -silent`;
+
+      const setupRes = await setupOrchestrator.runEnvironmentSetupTasks(
+        {
+          tasks: [
+            {
+              componentId: 'bottle_steam',
+              action: 'install_client',
+              runnerType: 'crossover_preview_arm64',
+              bottleName: 'OneLauncher-arm64',
+            },
+          ],
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir: sb.homedir,
+          userDataDir: sb.userDataDir,
+          customApplicationsDir: sb.appsDir,
+          skipNetwork: true,
+          getProcessListOutput: () => (steamRunning ? warmPsLine : ''),
+          closeClientFn: closeClientSpy,
+        }
+      );
+
+      expect(setupRes.success).toBe(true);
+      expect(closeClientSpy).toHaveBeenCalledTimes(1);
+      expect(setupRes.outcomes[0]?.steamRestartRequired).toBeUndefined();
+      expect(fs.readFileSync(targetVdfPath, 'utf8')).toContain('\t\t\t"2320"\t\t"654321000"\n');
+    });
+
+    it('P1-2b: preserves warm steam.exe when an active game session is running in target bottle and returns steamRestartRequired note', async () => {
+      const sb = makeSandbox('p3-r2-warm-steam-busy-');
+      createFakeCrossOverApp(sb.appsDir, 'CrossOver.app');
+      createFakeCrossOverApp(sb.appsDir, 'CrossOver Preview arm64.app');
+
+      const src = createSyntheticBottle(sb.bottlesDir, 'OneLauncher', {
+        wineArch: 'win64',
+        withSteam: true,
+        signedIn: true,
+      });
+      seedPhysicalSteamGame(src.steamappsDir, {
+        appId: 2320,
+        name: 'Quake II',
+        installdir: 'Quake 2',
+        sizeOnDisk: '654321000',
+      });
+      const target = createSyntheticBottle(sb.bottlesDir, 'OneLauncher-arm64', {
+        wineArch: 'arm64',
+        withSteam: true,
+        signedIn: true,
+      });
+      const targetVdfPath = path.join(target.steamappsDir, 'libraryfolders.vdf');
+      const initialVdf = buildLibraryFoldersVdf({});
+      fs.writeFileSync(targetVdfPath, initialVdf, 'utf8');
+
+      engineStateRegistry.activeSessions.set('steam-99999', {
+        winePrefix: target.bottlePath,
+        finalized: false,
+      });
+
+      const closeClientSpy = vi.fn(async () => {});
+      const warmPsLine = `WINEPREFIX=${target.bottlePath} C:\\Program Files (x86)\\Steam\\steam.exe -silent`;
+
+      const setupRes = await setupOrchestrator.runEnvironmentSetupTasks(
+        {
+          tasks: [
+            {
+              componentId: 'bottle_steam',
+              action: 'install_client',
+              runnerType: 'crossover_preview_arm64',
+              bottleName: 'OneLauncher-arm64',
+            },
+          ],
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir: sb.homedir,
+          userDataDir: sb.userDataDir,
+          customApplicationsDir: sb.appsDir,
+          skipNetwork: true,
+          mockProcessListOutput: warmPsLine,
+          closeClientFn: closeClientSpy,
+        }
+      );
+
+      expect(setupRes.success).toBe(true);
+      expect(closeClientSpy).not.toHaveBeenCalled();
+      expect(setupRes.outcomes[0]?.steamRestartRequired).toBe(true);
+      expect(setupRes.outcomes[0]?.message).toContain(
+        'Restart Steam in "OneLauncher-arm64" after your active game closes so Steam loads the newly linked library.'
+      );
+      expect(fs.readFileSync(targetVdfPath, 'utf8')).toBe(initialVdf);
+    });
+
+    it('P2-2: rejects reverse-containment symlinks pointing to "/" or an ancestor of targetBottle / targetCommonDir', async () => {
+      const sb = makeSandbox('p3-r2-ancestor-loop-');
+      createFakeCrossOverApp(sb.appsDir, 'CrossOver.app');
+
+      const src = createSyntheticBottle(sb.bottlesDir, 'OneLauncher', { withSteam: true });
+      const target = createSyntheticBottle(sb.bottlesDir, 'OneLauncher-arm64', {
+        wineArch: 'arm64',
+        withSteam: true,
+      });
+
+      // Malicious source entries pointing to '/', bottlesDir (ancestor), and targetBottle itself
+      fs.symlinkSync('/', path.join(src.steamappsDir, 'common', 'RootEscape'), 'dir');
+      fs.writeFileSync(
+        path.join(src.steamappsDir, 'appmanifest_70001.acf'),
+        buildAcfContent({ appId: 70001, name: 'RootEscape', installdir: 'RootEscape' }),
+        'utf8'
+      );
+      fs.symlinkSync(sb.bottlesDir, path.join(src.steamappsDir, 'common', 'AncestorLoop'), 'dir');
+      fs.writeFileSync(
+        path.join(src.steamappsDir, 'appmanifest_70002.acf'),
+        buildAcfContent({ appId: 70002, name: 'AncestorLoop', installdir: 'AncestorLoop' }),
+        'utf8'
+      );
+      fs.symlinkSync(
+        target.bottlePath,
+        path.join(src.steamappsDir, 'common', 'TargetBottleSelf'),
+        'dir'
+      );
+      fs.writeFileSync(
+        path.join(src.steamappsDir, 'appmanifest_70003.acf'),
+        buildAcfContent({ appId: 70003, name: 'TargetBottleSelf', installdir: 'TargetBottleSelf' }),
+        'utf8'
+      );
+
+      const res = await setupOrchestrator.linkInstalledSteamAppsIntoBottle(target.bottlePath, {
+        platform: 'darwin',
+        homedir: sb.homedir,
+        customApplicationsDir: sb.appsDir,
+        mockProcessListOutput: '',
+      });
+
+      expect(res).toEqual({ linkedCount: 0, linkedAppIds: [] });
+      expect(fs.existsSync(path.join(target.steamappsDir, 'appmanifest_70001.acf'))).toBe(false);
+      expect(fs.existsSync(path.join(target.steamappsDir, 'appmanifest_70002.acf'))).toBe(false);
+      expect(fs.existsSync(path.join(target.steamappsDir, 'appmanifest_70003.acf'))).toBe(false);
+    });
+
+    it('P2-3: uninstallGame cleans cross-bottle symlinks and manifests in standalone ~/Games/OneLauncher/Prefixes/* bottles', async () => {
+      const sb = makeSandbox('p3-r2-uninstall-standalone-prefix-');
+      createFakeCrossOverApp(sb.appsDir, 'CrossOver.app');
+
+      const physBottle = createSyntheticBottle(sb.bottlesDir, 'OneLauncher', {
+        wineArch: 'win64',
+        withSteam: true,
+      });
+      const quake = seedPhysicalSteamGame(physBottle.steamappsDir, {
+        appId: 2320,
+        name: 'Quake II',
+        installdir: 'Quake 2',
+        exeName: 'quake2ex_steam.exe',
+      });
+
+      const standalonePrefixesDir = path.join(sb.homedir, 'Games', 'OneLauncher', 'Prefixes');
+      fs.mkdirSync(standalonePrefixesDir, { recursive: true });
+      const standalonePrefix = createSyntheticBottle(standalonePrefixesDir, 'WineStandalone', {
+        wineArch: 'win64',
+        withSteam: true,
+      });
+
+      const linkRes = await setupOrchestrator.linkInstalledSteamAppsIntoBottle(
+        standalonePrefix.bottlePath,
+        {
+          platform: 'darwin',
+          homedir: sb.homedir,
+          customApplicationsDir: sb.appsDir,
+          mockProcessListOutput: '',
+        }
+      );
+      expect(linkRes.linkedAppIds).toEqual([2320]);
+      const standaloneLink = path.join(standalonePrefix.steamappsDir, 'common', 'Quake 2');
+      expect(fs.lstatSync(standaloneLink).isSymbolicLink()).toBe(true);
+
+      const uninstallRes = await gameVerifyAndUninstall.uninstallGame(
+        {
+          gameId: 'steam-2320',
+          platformId: 'steam',
+          platformGameId: '2320',
+          title: 'Quake II',
+          installPath: quake.gameDir,
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir: sb.homedir,
+          userDataDir: sb.userDataDir,
+          customApplicationsDir: sb.appsDir,
+          allowDeleteFiles: true,
+        }
+      );
+
+      expect(uninstallRes.success).toBe(true);
+      expect(fs.existsSync(quake.gameDir)).toBe(false);
+      expect(() => fs.lstatSync(standaloneLink)).toThrow();
+      expect(
+        fs.existsSync(path.join(standalonePrefix.steamappsDir, 'appmanifest_2320.acf'))
+      ).toBe(false);
+    });
+
+    it('P3-3: syncTargetBottleLibraryFoldersVdf skips orphan manifests lacking common/<installdir> and actively-downloading manifests', async () => {
+      const sb = makeSandbox('p3-r2-vdf-filter-');
+      createFakeCrossOverApp(sb.appsDir, 'CrossOver.app');
+      const src = createSyntheticBottle(sb.bottlesDir, 'OneLauncher', { withSteam: true });
+      seedPhysicalSteamGame(src.steamappsDir, {
+        appId: 2320,
+        name: 'Quake II',
+        installdir: 'Quake 2',
+        sizeOnDisk: '654321000',
+      });
+
+      const target = createSyntheticBottle(sb.bottlesDir, 'OneLauncher-arm64', {
+        wineArch: 'arm64',
+        withSteam: true,
+      });
+      const vdfPath = path.join(target.steamappsDir, 'libraryfolders.vdf');
+      fs.writeFileSync(vdfPath, buildLibraryFoldersVdf({}), 'utf8');
+
+      // Seed an orphan ACF (missing common/GhostApp) and an actively-downloading ACF inside target
+      fs.writeFileSync(
+        path.join(target.steamappsDir, 'appmanifest_88801.acf'),
+        buildAcfContent({ appId: 88801, name: 'GhostApp', installdir: 'GhostApp' }),
+        'utf8'
+      );
+      seedPhysicalSteamGame(target.steamappsDir, {
+        appId: 88802,
+        name: 'DownloadingApp',
+        installdir: 'DownloadingApp',
+        stateFlags: '1026',
+        bytesToDownload: '50000',
+        bytesDownloaded: '100',
+      });
+
+      await setupOrchestrator.linkInstalledSteamAppsIntoBottle(target.bottlePath, {
+        platform: 'darwin',
+        homedir: sb.homedir,
+        customApplicationsDir: sb.appsDir,
+        mockProcessListOutput: '',
+      });
+
+      const updatedVdf = fs.readFileSync(vdfPath, 'utf8');
+      expect(updatedVdf).toContain('\t\t\t"2320"\t\t"654321000"\n');
+      expect(updatedVdf).not.toContain('"88801"');
+      expect(updatedVdf).not.toContain('"88802"');
     });
   });
 });

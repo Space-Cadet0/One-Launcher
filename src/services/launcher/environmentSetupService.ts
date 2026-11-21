@@ -31,7 +31,7 @@ import type {
   SetupWizardStepId,
   StartGuidedClientLoginRequest,
 } from '../../contracts/environmentSetup';
-import type { CompatibilityLayerType } from '../../contracts/launcher';
+import type { CompatibilityLayerInfo, CompatibilityLayerType } from '../../contracts/launcher';
 import { isBottleCompatibleWithRunner } from '../../contracts/launchPolicyResolver';
 import type { StorefrontId } from '../../contracts/platform';
 import { launcherService } from './launcherService';
@@ -74,6 +74,7 @@ export interface ProvisionBottleSteamParams {
   bottleName: string;
   needsInstall: boolean;
   needsSignIn: boolean;
+  requiredAppId?: number;
   onPhaseChange?: (message: string) => void;
 }
 
@@ -82,8 +83,48 @@ export interface ProvisionBottleSteamResult {
   installed: boolean;
   authenticated: boolean;
   cancelled?: boolean;
+  steamRestartRequired?: boolean;
+  detectedLayers?: CompatibilityLayerInfo[];
   message: string;
   error?: string;
+}
+
+function lookupBottleDetailsInLayers(
+  layers: CompatibilityLayerInfo[] | undefined,
+  runnerType: Exclude<CompatibilityLayerType, 'native'>,
+  bottleName: string
+): NonNullable<CompatibilityLayerInfo['bottleDetails']>[string] | undefined {
+  if (!Array.isArray(layers) || layers.length === 0) return undefined;
+  const trimmed = bottleName.trim();
+  if (!trimmed) return undefined;
+  const lower = trimmed.toLowerCase();
+  const normalizeDir = (dir?: string): string =>
+    (dir || '').trim().replace(/[\\/]+$/, '').toLowerCase();
+  const readFromLayer = (layer?: CompatibilityLayerInfo) => {
+    const details = layer?.bottleDetails;
+    if (!details) return undefined;
+    if (details[trimmed]) return details[trimmed];
+    for (const [key, value] of Object.entries(details)) {
+      if (key.trim().toLowerCase() === lower) {
+        return value;
+      }
+    }
+    return undefined;
+  };
+  const exactLayer = layers.find((layer) => layer && layer.type === runnerType);
+  const exactDetails = readFromLayer(exactLayer);
+  if (exactDetails) return exactDetails;
+  const exactDir = normalizeDir(exactLayer?.bottlesDir);
+  for (const layer of layers) {
+    if (!layer || layer === exactLayer) continue;
+    if (exactDir) {
+      const layerDir = normalizeDir(layer.bottlesDir);
+      if (layerDir && layerDir !== exactDir) continue;
+    }
+    const found = readFromLayer(layer);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 function isVitestRuntime(): boolean {
@@ -1675,6 +1716,16 @@ export class EnvironmentSetupService {
       }
     });
 
+    const refreshBottleState = async (): Promise<CompatibilityLayerInfo[] | undefined> => {
+      const [layersRes] = await Promise.allSettled([
+        launcherService.detectCompatibilityLayers(),
+        launcherService.detectInstalledStorefrontClients(),
+      ]);
+      return layersRes.status === 'fulfilled' && Array.isArray(layersRes.value)
+        ? layersRes.value
+        : undefined;
+    };
+
     let installed = false;
     try {
       const initialMsg = params.needsInstall
@@ -1713,17 +1764,22 @@ export class EnvironmentSetupService {
         bottleSteamOutcome?.status === 'cancelled' ||
         isCancelled();
       if (step1Cancelled) {
-        if (installed) {
-          await Promise.allSettled([
-            launcherService.detectCompatibilityLayers(),
-            launcherService.detectInstalledStorefrontClients(),
-          ]);
-        }
+        const freshLayers = installed ? await refreshBottleState() : undefined;
+        const freshDetails = lookupBottleDetailsInLayers(
+          freshLayers,
+          nonNativeRunnerType,
+          trimmedBottle
+        );
+        const resolvedInstalled =
+          typeof freshDetails?.hasSteam === 'boolean' ? freshDetails.hasSteam : installed;
+        const resolvedAuthenticated =
+          typeof freshDetails?.steamSignedIn === 'boolean' ? freshDetails.steamSignedIn : false;
         return {
           success: false,
-          installed,
-          authenticated: false,
+          installed: resolvedInstalled,
+          authenticated: resolvedAuthenticated,
           cancelled: true,
+          ...(freshLayers ? { detectedLayers: freshLayers } : {}),
           message: `Cancelled Steam setup in "${trimmedBottle}".`,
         };
       }
@@ -1755,32 +1811,45 @@ export class EnvironmentSetupService {
           autoCloseOnSuccess: true,
         });
 
-        await Promise.allSettled([
-          launcherService.detectCompatibilityLayers(),
-          launcherService.detectInstalledStorefrontClients(),
-        ]);
+        const freshLayers = await refreshBottleState();
+        const freshDetails = lookupBottleDetailsInLayers(
+          freshLayers,
+          nonNativeRunnerType,
+          trimmedBottle
+        );
+        const resolvedInstalled =
+          typeof freshDetails?.hasSteam === 'boolean' ? freshDetails.hasSteam : true;
 
         const step2Cancelled = Boolean(loginResult.cancelled) || isCancelled();
         if (step2Cancelled) {
+          const cancelledAuth =
+            typeof freshDetails?.steamSignedIn === 'boolean'
+              ? freshDetails.steamSignedIn
+              : Boolean(loginResult.authenticated);
           return {
             success: false,
-            installed: true,
-            authenticated: Boolean(loginResult.authenticated),
+            installed: resolvedInstalled,
+            authenticated: cancelledAuth,
             cancelled: true,
+            ...(freshLayers ? { detectedLayers: freshLayers } : {}),
             message: `Windows Steam is installed in "${trimmedBottle}", but sign-in was cancelled.`,
           };
         }
 
-        const authenticated = Boolean(loginResult.authenticated);
-        if (!loginResult.success || !authenticated) {
+        const authenticated =
+          typeof freshDetails?.steamSignedIn === 'boolean'
+            ? Boolean(loginResult.authenticated) && freshDetails.steamSignedIn
+            : Boolean(loginResult.authenticated);
+        if (!loginResult.success || !authenticated || !resolvedInstalled) {
           const errMsg =
             loginResult.error ||
             loginResult.message ||
             `Steam sign-in in "${trimmedBottle}" did not complete.`;
           return {
             success: false,
-            installed: true,
+            installed: resolvedInstalled,
             authenticated,
+            ...(freshLayers ? { detectedLayers: freshLayers } : {}),
             message: errMsg,
             error: errMsg,
           };
@@ -1788,22 +1857,67 @@ export class EnvironmentSetupService {
 
         return {
           success: true,
-          installed: true,
+          installed: resolvedInstalled,
           authenticated: true,
+          ...(bottleSteamOutcome?.steamRestartRequired ? { steamRestartRequired: true } : {}),
+          ...(freshLayers ? { detectedLayers: freshLayers } : {}),
           message:
             loginResult.message || `Steam is ready and signed in inside "${trimmedBottle}".`,
         };
       }
 
-      await Promise.allSettled([
-        launcherService.detectCompatibilityLayers(),
-        launcherService.detectInstalledStorefrontClients(),
-      ]);
+      const freshLayers = await refreshBottleState();
+      const freshDetails = lookupBottleDetailsInLayers(
+        freshLayers,
+        nonNativeRunnerType,
+        trimmedBottle
+      );
+      const resolvedInstalled =
+        typeof freshDetails?.hasSteam === 'boolean' ? freshDetails.hasSteam : true;
+      const resolvedAuthenticated =
+        typeof freshDetails?.steamSignedIn === 'boolean' ? freshDetails.steamSignedIn : false;
+
+      if (!resolvedInstalled) {
+        const notInstalledMsg = `Windows Steam is not installed in "${trimmedBottle}".`;
+        return {
+          success: false,
+          installed: false,
+          authenticated: false,
+          ...(freshLayers ? { detectedLayers: freshLayers } : {}),
+          message: notInstalledMsg,
+          error: notInstalledMsg,
+        };
+      }
+
+      const requiredAppId =
+        typeof params.requiredAppId === 'number' &&
+        Number.isInteger(params.requiredAppId) &&
+        params.requiredAppId > 0
+          ? params.requiredAppId
+          : undefined;
+      if (
+        requiredAppId !== undefined &&
+        Array.isArray(freshDetails?.installedSteamAppIds) &&
+        !freshDetails.installedSteamAppIds.includes(requiredAppId)
+      ) {
+        const missingLinkMsg = `Could not find an installed local copy of AppID ${requiredAppId} in another bottle to link into "${trimmedBottle}".`;
+        return {
+          success: false,
+          installed: resolvedInstalled,
+          authenticated: resolvedAuthenticated,
+          ...(bottleSteamOutcome?.steamRestartRequired ? { steamRestartRequired: true } : {}),
+          ...(freshLayers ? { detectedLayers: freshLayers } : {}),
+          message: missingLinkMsg,
+          error: missingLinkMsg,
+        };
+      }
 
       return {
         success: true,
-        installed: true,
-        authenticated: true,
+        installed: resolvedInstalled,
+        authenticated: resolvedAuthenticated,
+        ...(bottleSteamOutcome?.steamRestartRequired ? { steamRestartRequired: true } : {}),
+        ...(freshLayers ? { detectedLayers: freshLayers } : {}),
         message:
           bottleSteamOutcome?.message || `Linked installed Steam games into "${trimmedBottle}".`,
       };

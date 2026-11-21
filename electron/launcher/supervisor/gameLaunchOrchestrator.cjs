@@ -18,6 +18,7 @@ const {
   buildSafeChildEnvironment,
 } = require('../securityAndPathUtils.cjs');
 const {
+  resolveDriveCPathCaseInsensitive,
   readWinePrefixShellFolders,
   resolveBottleSteamExe,
   resolveBundledXboxWinLauncherExePath,
@@ -4673,12 +4674,13 @@ async function launchGameInternal(
                   try {
                     const installBasename = path.basename(localInstallDir);
                     if (installBasename && installBasename !== '.' && installBasename !== '..') {
-                      const candidateLocalCommon = path.join(
-                        path.dirname(bottleSteamExe),
-                        'steamapps',
-                        'common',
-                        installBasename
-                      );
+                      const steamRootDir = path.dirname(bottleSteamExe);
+                      const candidateLocalCommon =
+                        resolveDriveCPathCaseInsensitive(steamRootDir, [
+                          'steamapps',
+                          'common',
+                          installBasename,
+                        ]) || path.join(steamRootDir, 'steamapps', 'common', installBasename);
                       if (
                         fs.existsSync(candidateLocalCommon) &&
                         fs.realpathSync(candidateLocalCommon) === fs.realpathSync(localInstallDir)

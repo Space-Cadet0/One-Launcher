@@ -129,6 +129,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
   }, [onOpenRunnerSetup]);
 
   const isBusy = form.isSaving;
+  const isBottleSteamFixActive = Boolean(form.bottleSteamFixState?.active);
 
   const handleCloseAttemptWhilePrevented = useCallback(() => {
     if (!isBusy && form.hasUnsavedChanges) {
@@ -623,7 +624,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             type="button"
             data-testid="reset-launch-config-btn"
             onClick={form.handleResetDefaults}
-            disabled={isBusy}
+            disabled={isBusy || isBottleSteamFixActive}
             className={`inline-flex items-center gap-1.5 min-h-[28px] px-3 py-2 rounded-lg bg-[#17212e] hover:bg-[#223144] border border-[#2a475e] text-xs font-semibold text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
           >
             <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
@@ -659,7 +660,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
               data-testid="launch-config-save-btn"
               data-has-unsaved-changes={form.hasUnsavedChanges ? 'true' : 'false'}
               onClick={form.handleSave}
-              disabled={form.isSaving}
+              disabled={form.isSaving || isBottleSteamFixActive}
               className={`inline-flex items-center gap-1.5 min-h-[28px] px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
               style={{
                 background: 'linear-gradient(to right, #059669 0%, #047857 100%)',
