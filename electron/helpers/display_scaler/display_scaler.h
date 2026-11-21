@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,6 +27,9 @@ extern "C" {
 
 /* Maximum OS-union DEVMODE entries for non-legacy / 64-bit targets */
 #define DS_MAX_UNION_MODES 128u
+
+/* Shared INI read buffer size (accommodates deep macOS Wine prefix control/status paths) */
+#define DS_INI_BUF_BYTES 2048u
 
 typedef enum ds_scaling_mode_e {
     DS_MODE_PASSTHROUGH      = 0,
@@ -266,6 +270,217 @@ typedef struct ds_gl_ctx_entry_s {
 
 /* op: 0 = lookup (-1 unknown / 0 native / 1 wined3d), 1 = record native, 2 = record wined3d, -1 = remove */
 int ds_gl_ctx_map_op(ds_gl_ctx_entry_t *slots, size_t cap, uintptr_t key, int op);
+
+/* Per-HGLRC FBO/texture/renderbuffer ownership table (prevents cross-context leaks on switch) */
+typedef struct ds_gl_game_fbo_s {
+    uint32_t fbo_id;
+    uint32_t color_tex;
+    uint32_t depth_rb;
+    int32_t  w;
+    int32_t  h;
+    uint32_t game_draw_fbo;
+    uint32_t game_read_fbo;
+} ds_gl_game_fbo_t;
+
+typedef struct ds_gl_color_fbo_s {
+    uint32_t fbo_id;
+    uint32_t tex_id;
+    int32_t  w;
+    int32_t  h;
+} ds_gl_color_fbo_t;
+
+typedef struct ds_gl_ctx_fbo_slot_s {
+    uintptr_t         ctx_key;
+    ds_gl_game_fbo_t  game;
+    ds_gl_color_fbo_t sharp;
+    ds_gl_color_fbo_t w3d;
+    uint32_t          last_used_gen;
+} ds_gl_ctx_fbo_slot_t;
+
+ds_gl_ctx_fbo_slot_t *ds_gl_ctx_fbo_acquire(
+    ds_gl_ctx_fbo_slot_t *slots,
+    size_t                cap,
+    uintptr_t             ctx_key,
+    bool                  create,
+    uint32_t             *io_gen,
+    ds_gl_ctx_fbo_slot_t *out_evicted
+);
+
+bool ds_gl_ctx_fbo_remove(
+    ds_gl_ctx_fbo_slot_t *slots,
+    size_t                cap,
+    uintptr_t             ctx_key,
+    ds_gl_ctx_fbo_slot_t *out_removed
+);
+
+/* LRU game_hdc <-> host_hdc map slot selection (protects active bound GL DC from eviction) */
+#define DS_MAX_GL_DC_MAP 16u
+
+typedef struct ds_gl_dc_entry_s {
+    uintptr_t game_hdc;
+    uintptr_t host_hdc;
+    uintptr_t host_hwnd;
+    uint32_t  last_used_gen;
+} ds_gl_dc_entry_t;
+
+size_t ds_gl_dc_map_select_slot(
+    const ds_gl_dc_entry_t *slots,
+    size_t                  cap,
+    uintptr_t               game_hdc,
+    uintptr_t               cur_host_hwnd,
+    uintptr_t               protected_host_hdc
+);
+
+/* WoW64-aware RAWINPUT block validation & alignment (8-byte QWORD under WoW64/x64, 16 vs 24 B header) */
+typedef struct ds_rawinput_step_s {
+    size_t mouse_offset;
+    size_t next_step;
+} ds_rawinput_step_t;
+
+bool ds_rawinput_validate_block(
+    uint32_t            dw_size,
+    uint32_t            cb_size_header,
+    size_t              remaining_bytes,
+    bool                is_wow64,
+    bool                is_64bit,
+    ds_rawinput_step_t *out_step
+);
+
+/* Khronos Vulkan VkFilter parity helper (0 = VK_FILTER_NEAREST, 1 = VK_FILTER_LINEAR) */
+static inline uint32_t ds_vk_choose_blit_filter(ds_aspect_mode_t aspect, ds_scale_filter_t filter)
+{
+    return (aspect == DS_ASPECT_INTEGER || filter == DS_FILTER_NEAREST) ? 0u : 1u;
+}
+
+/* Overflow-safe PE32/PE32+ export directory RVA lookup shared by launcher & ASan harness */
+static inline bool ds_pe_rva_to_file_off_checked(
+    const uint8_t *buf,
+    size_t         fsize,
+    size_t         sec_off,
+    uint16_t       nsec,
+    uint32_t       rva,
+    size_t         min_bytes,
+    size_t        *out_off
+)
+{
+    if (!buf || !out_off || min_bytes > fsize) return false;
+    for (uint16_t si = 0; si < nsec; si++) {
+        size_t sh = sec_off + (size_t)si * 40u;
+        if (sh > fsize || fsize - sh < 40u) return false;
+        uint32_t vs = 0, va = 0, rs = 0, ro = 0;
+        memcpy(&vs, buf + sh + 8, 4);
+        memcpy(&va, buf + sh + 12, 4);
+        memcpy(&rs, buf + sh + 16, 4);
+        memcpy(&ro, buf + sh + 20, 4);
+        if ((size_t)ro > fsize || (size_t)rs > fsize - (size_t)ro) continue;
+        uint32_t span = (vs > rs) ? vs : rs;
+        if (rva >= va && (uint32_t)(rva - va) < span) {
+            uint32_t delta = rva - va;
+            if (delta < rs && min_bytes <= (size_t)(rs - delta)) {
+                size_t file_off = (size_t)ro + (size_t)delta;
+                if (file_off <= fsize && min_bytes <= fsize - file_off) {
+                    *out_off = file_off;
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+static inline uint32_t ds_find_pe_export_rva_in_buf(const uint8_t *buf, size_t fsize, const char *export_name)
+{
+    if (!buf || !export_name || !export_name[0] || fsize < 64u) return 0u;
+    if (buf[0] != 'M' || buf[1] != 'Z') return 0u;
+    size_t ename_len = strlen(export_name);
+
+    uint32_t pe_off32 = 0;
+    memcpy(&pe_off32, buf + 0x3c, 4);
+    size_t pe_off = (size_t)pe_off32;
+    if (pe_off < 64u || pe_off > fsize - 24u) return 0u;
+    if (memcmp(buf + pe_off, "PE\0\0", 4) != 0) return 0u;
+
+    uint16_t nsec = 0, opt_sz = 0, magic = 0;
+    memcpy(&nsec, buf + pe_off + 6, 2);
+    memcpy(&opt_sz, buf + pe_off + 20, 2);
+    size_t opt_off = pe_off + 24u;
+    if (nsec == 0 || opt_sz < 96u || (size_t)opt_sz > fsize - opt_off) return 0u;
+
+    memcpy(&magic, buf + opt_off, 2);
+    size_t num_rva_rel = 0, dd_rel = 0;
+    if (magic == 0x010bu) {
+        num_rva_rel = 92u;
+        dd_rel = 96u;
+    } else if (magic == 0x020bu) {
+        num_rva_rel = 108u;
+        dd_rel = 112u;
+    } else {
+        return 0u;
+    }
+    if (dd_rel + 8u > (size_t)opt_sz) return 0u;
+
+    uint32_t num_rva = 0;
+    memcpy(&num_rva, buf + opt_off + num_rva_rel, 4);
+    if (num_rva < 1u) return 0u;
+
+    size_t sec_off = opt_off + (size_t)opt_sz;
+    if (sec_off > fsize || (size_t)nsec > (fsize - sec_off) / 40u) return 0u;
+
+    uint32_t exp_rva = 0, exp_sz = 0;
+    memcpy(&exp_rva, buf + opt_off + dd_rel, 4);
+    memcpy(&exp_sz, buf + opt_off + dd_rel + 4u, 4);
+    if (exp_rva == 0u || exp_sz < 40u) return 0u;
+
+    size_t exp_off = 0;
+    if (!ds_pe_rva_to_file_off_checked(buf, fsize, sec_off, nsec, exp_rva, 40u, &exp_off)) {
+        return 0u;
+    }
+
+    uint32_t num_funcs = 0, num_names = 0, funcs_rva = 0, names_rva = 0, ords_rva = 0;
+    memcpy(&num_funcs, buf + exp_off + 20u, 4);
+    memcpy(&num_names, buf + exp_off + 24u, 4);
+    memcpy(&funcs_rva, buf + exp_off + 28u, 4);
+    memcpy(&names_rva, buf + exp_off + 32u, 4);
+    memcpy(&ords_rva,  buf + exp_off + 36u, 4);
+    if (num_funcs == 0u || num_names == 0u || num_funcs > fsize / 4u || num_names > fsize / 4u) {
+        return 0u;
+    }
+
+    size_t funcs_off = 0, names_off = 0, ords_off = 0;
+    if (!ds_pe_rva_to_file_off_checked(buf, fsize, sec_off, nsec, funcs_rva, (size_t)num_funcs * 4u, &funcs_off) ||
+        !ds_pe_rva_to_file_off_checked(buf, fsize, sec_off, nsec, names_rva, (size_t)num_names * 4u, &names_off) ||
+        !ds_pe_rva_to_file_off_checked(buf, fsize, sec_off, nsec, ords_rva,  (size_t)num_names * 2u, &ords_off)) {
+        return 0u;
+    }
+
+    for (uint32_t ni = 0; ni < num_names; ni++) {
+        uint32_t nm_rva = 0;
+        memcpy(&nm_rva, buf + names_off + (size_t)ni * 4u, 4);
+        size_t nm_off = 0;
+        if (!ds_pe_rva_to_file_off_checked(buf, fsize, sec_off, nsec, nm_rva, 1u, &nm_off)) {
+            continue;
+        }
+        size_t avail = fsize - nm_off;
+        if (ename_len < avail &&
+            memcmp(buf + nm_off, export_name, ename_len) == 0 &&
+            buf[nm_off + ename_len] == '\0') {
+            uint16_t ord_idx = 0;
+            memcpy(&ord_idx, buf + ords_off + (size_t)ni * 2u, 2);
+            if ((uint32_t)ord_idx < num_funcs) {
+                uint32_t fn_rva = 0;
+                memcpy(&fn_rva, buf + funcs_off + (size_t)ord_idx * 4u, 4);
+                /* Reject forwarded export strings pointing inside the export directory itself */
+                if (fn_rva >= exp_rva && (uint32_t)(fn_rva - exp_rva) < exp_sz) {
+                    return 0u;
+                }
+                return fn_rva;
+            }
+            return 0u;
+        }
+    }
+    return 0u;
+}
 
 /* Pure Tier 1 64-bit sub-native exclusive-fullscreen window geometry predicate */
 bool ds_is_subnative_exclusive_fullscreen_window(

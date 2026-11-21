@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { suite, test, beforeEach, afterEach, assert, makeTempDir, cleanupTempDirs, createSyntheticBottle } = require('../harness/index.cjs');
+const nativeOracle = require('../harness/native_oracle.cjs');
 
 const macNativeInstaller = require('../../../electron/launcher/macNativeInstallerAndCodesign.cjs');
 
@@ -78,19 +79,29 @@ suite('Tier 1 — Feature F1: Elimination of OneLauncherBackdropWnd & Display Sh
     id: 'F1-04',
     feature: 'F1',
     tier: 1,
-    description: 'Primary game window bounds span full physical panel (0, 0, screen_w, screen_h)',
+    description: 'Primary game window bounds span full physical panel (mon_x, mon_y, mon_w, mon_h)',
   }, () => {
     const windowCPath = path.resolve(__dirname, '../../../electron/helpers/display_scaler/display_scaler_window.c');
     const source = fs.readFileSync(windowCPath, 'utf8');
 
-    // Contract: SetWindowPos must cover (0, 0, screen_w, screen_h)
-    const coversFullPanel = /SetWindowPos\s*\(\s*hwnd[^,]*,\s*HWND_TOPMOST\s*,\s*0\s*,\s*0\s*,\s*g_ds\.real_screen_w\s*,\s*g_ds\.real_screen_h/m.test(source) ||
-      /SetWindowPos\s*\(\s*hwnd[^,]*,\s*HWND_TOPMOST\s*,\s*0\s*,\s*0\s*,\s*screen_w\s*,\s*screen_h/m.test(source);
+    // Contract: SetWindowPos must span full target monitor panel (0, 0, screen_w, screen_h on primary; mon_x, mon_y, mon_w, mon_h generalized)
+    const coversFullPanel =
+      /SetWindowPos\s*\(\s*hwnd[^,]*,\s*HWND_TOPMOST\s*,\s*0\s*,\s*0\s*,\s*g_ds\.real_screen_w\s*,\s*g_ds\.real_screen_h/m.test(source) ||
+      /SetWindowPos\s*\(\s*hwnd[^,]*,\s*HWND_TOPMOST\s*,\s*0\s*,\s*0\s*,\s*screen_w\s*,\s*screen_h/m.test(source) ||
+      /SetWindowPos\s*\(\s*hwnd[^,]*,\s*HWND_TOPMOST\s*,\s*mon_x\s*,\s*mon_y\s*,\s*mon_w\s*,\s*mon_h/m.test(source);
 
     assert.ok(
       coversFullPanel,
-      'F1 contract violation: hwnd_game must cover (0, 0, real_screen_w, real_screen_h) to auto-hide macOS menu bar and dock'
+      'F1 contract violation: hwnd_game must cover full monitor panel (mon_x, mon_y, mon_w, mon_h) to auto-hide macOS menu bar and dock'
     );
+
+    // Behavioral verification against compiled C11 ds_compute_viewport oracle
+    const vp = nativeOracle.invokeNativeViewport(3024, 1964, 0, 640, 480, 'preserve');
+    assert.ok(vp && vp.ok, 'Native C11 viewport computation must succeed');
+    assert.strictEqual(vp.usableX, 0, 'Full-panel usableX must be 0');
+    assert.strictEqual(vp.usableY, 0, 'Full-panel usableY must be 0');
+    assert.strictEqual(vp.usableW, 3024, 'Full-panel usableW must span full panel width');
+    assert.strictEqual(vp.usableH, 1964, 'Full-panel usableH must span full panel height');
   });
 
   test({

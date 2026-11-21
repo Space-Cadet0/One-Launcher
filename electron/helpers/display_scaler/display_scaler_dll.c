@@ -5,6 +5,7 @@
  */
 
 #include "display_scaler_internal.h"
+#include "../common_process_denylist.h"
 #include <tlhelp32.h>
 #include <shellapi.h>
 #include <stdarg.h>
@@ -38,20 +39,20 @@ void ds_unlock(void)
 
 bool ds_is_internal_call(void)
 {
-    if (g_ds.tls_depth_idx == TLS_OUT_OF_INDEXES) return false;
+    if (!g_ds.lock_initialized || g_ds.tls_depth_idx == TLS_OUT_OF_INDEXES) return false;
     return (uintptr_t)TlsGetValue(g_ds.tls_depth_idx) > 0;
 }
 
 void ds_enter_internal(void)
 {
-    if (g_ds.tls_depth_idx == TLS_OUT_OF_INDEXES) return;
+    if (!g_ds.lock_initialized || g_ds.tls_depth_idx == TLS_OUT_OF_INDEXES) return;
     uintptr_t cur = (uintptr_t)TlsGetValue(g_ds.tls_depth_idx);
     TlsSetValue(g_ds.tls_depth_idx, (LPVOID)(cur + 1));
 }
 
 void ds_leave_internal(void)
 {
-    if (g_ds.tls_depth_idx == TLS_OUT_OF_INDEXES) return;
+    if (!g_ds.lock_initialized || g_ds.tls_depth_idx == TLS_OUT_OF_INDEXES) return;
     uintptr_t cur = (uintptr_t)TlsGetValue(g_ds.tls_depth_idx);
     if (cur > 0) {
         TlsSetValue(g_ds.tls_depth_idx, (LPVOID)(cur - 1));
@@ -60,7 +61,7 @@ void ds_leave_internal(void)
 
 uintptr_t ds_suspend_internal_depth(void)
 {
-    if (g_ds.tls_depth_idx == TLS_OUT_OF_INDEXES) return 0;
+    if (!g_ds.lock_initialized || g_ds.tls_depth_idx == TLS_OUT_OF_INDEXES) return 0;
     uintptr_t cur = (uintptr_t)TlsGetValue(g_ds.tls_depth_idx);
     if (cur > 0) {
         TlsSetValue(g_ds.tls_depth_idx, (LPVOID)0);
@@ -70,7 +71,7 @@ uintptr_t ds_suspend_internal_depth(void)
 
 void ds_restore_internal_depth(uintptr_t saved_depth)
 {
-    if (g_ds.tls_depth_idx == TLS_OUT_OF_INDEXES || saved_depth == 0) return;
+    if (!g_ds.lock_initialized || g_ds.tls_depth_idx == TLS_OUT_OF_INDEXES || saved_depth == 0) return;
     TlsSetValue(g_ds.tls_depth_idx, (LPVOID)saved_depth);
 }
 
@@ -112,6 +113,19 @@ BOOL ds_set_window_pos_dpi(HWND hwnd, HWND after, int x, int y, int w, int h, UI
     return ok;
 }
 
+BOOL ds_get_rect_dpi(HWND hwnd, RECT *out_rc, bool client_rect)
+{
+    if (!hwnd || !out_rc) return FALSE;
+    HANDLE prev_dpi = ds_dpi_guard_enter_for_hwnd(hwnd);
+    ds_enter_internal();
+    BOOL ok = client_rect
+        ? (g_ds.real_GetClientRect ? g_ds.real_GetClientRect(hwnd, out_rc) : GetClientRect(hwnd, out_rc))
+        : (g_ds.real_GetWindowRect ? g_ds.real_GetWindowRect(hwnd, out_rc) : GetWindowRect(hwnd, out_rc));
+    ds_leave_internal();
+    ds_dpi_guard_leave(prev_dpi);
+    return ok;
+}
+
 static const WCHAR *ds_basename_w(const WCHAR *path)
 {
     if (!path) return L"";
@@ -124,7 +138,7 @@ static const WCHAR *ds_basename_w(const WCHAR *path)
     return base;
 }
 
-#define DS_MOD_CACHE_SLOTS 32u
+#define DS_MOD_CACHE_SLOTS 64u
 #define DS_MODF_VALID      (1u << 0)
 #define DS_MODF_SELF       (1u << 1)
 #define DS_MODF_WINED3D    (1u << 2)
@@ -140,14 +154,53 @@ static const WCHAR *ds_basename_w(const WCHAR *path)
 typedef struct {
     HMODULE  hmod;
     uint32_t flags;
+    uint32_t patched_gen;
 } ds_mod_cache_entry_t;
 
 static ds_mod_cache_entry_t s_mod_cache[DS_MOD_CACHE_SLOTS];
+static volatile LONG s_iat_patch_gen = 1;
 
-DS_ALWAYS_INLINE void ds_invalidate_mod_cache(void)
+static ds_mod_cache_entry_t *ds_mod_cache_probe_locked(HMODULE hmod, bool for_insert)
 {
+    size_t start = (size_t)((((uintptr_t)hmod >> 16) ^ ((uintptr_t)hmod >> 4)) & (DS_MOD_CACHE_SLOTS - 1u));
+    ds_mod_cache_entry_t *first_empty = NULL;
+    for (size_t probe = 0; probe < DS_MOD_CACHE_SLOTS; probe++) {
+        ds_mod_cache_entry_t *e = &s_mod_cache[(start + probe) & (DS_MOD_CACHE_SLOTS - 1u)];
+        if (e->hmod == hmod && (e->flags & DS_MODF_VALID) != 0) {
+            return e;
+        }
+        if ((e->flags & DS_MODF_VALID) == 0) {
+            if (!first_empty) first_empty = e;
+            break;
+        }
+    }
+    if (!for_insert) return NULL;
+    return first_empty ? first_empty : &s_mod_cache[start];
+}
+
+static bool ds_mod_is_patched_at_gen(HMODULE hmod, uint32_t gen)
+{
+    if (!hmod || hmod == g_ds.self_hmod) return true;
     if (g_ds.lock_initialized) ds_lock();
-    memset(s_mod_cache, 0, sizeof(s_mod_cache));
+    ds_mod_cache_entry_t *e = ds_mod_cache_probe_locked(hmod, false);
+    bool done = (e != NULL && e->patched_gen == gen);
+    if (g_ds.lock_initialized) ds_unlock();
+    return done;
+}
+
+static void ds_mod_cache_store(HMODULE hmod, uint32_t flags, uint32_t patched_gen)
+{
+    if (!hmod) return;
+    if (g_ds.lock_initialized) ds_lock();
+    ds_mod_cache_entry_t *e = ds_mod_cache_probe_locked(hmod, true);
+    if (e->hmod != hmod) {
+        e->hmod = hmod;
+        e->patched_gen = 0;
+    }
+    e->flags = flags;
+    if (patched_gen != 0u) {
+        e->patched_gen = patched_gen;
+    }
     if (g_ds.lock_initialized) ds_unlock();
 }
 
@@ -228,10 +281,10 @@ static bool ds_classify_caller_module(const void *ret_addr, uint32_t *out_flags)
         return true;
     }
 
-    size_t slot = (size_t)((((uintptr_t)hmod >> 16) ^ ((uintptr_t)hmod >> 4)) & (DS_MOD_CACHE_SLOTS - 1u));
     if (g_ds.lock_initialized) ds_lock();
-    if (s_mod_cache[slot].hmod == hmod && (s_mod_cache[slot].flags & DS_MODF_VALID) != 0) {
-        uint32_t cached = s_mod_cache[slot].flags;
+    ds_mod_cache_entry_t *ce = ds_mod_cache_probe_locked(hmod, false);
+    if (ce != NULL) {
+        uint32_t cached = ce->flags;
         if (g_ds.lock_initialized) ds_unlock();
         if (out_flags) *out_flags = cached;
         return true;
@@ -244,10 +297,7 @@ static bool ds_classify_caller_module(const void *ret_addr, uint32_t *out_flags)
         return false;
     }
     uint32_t computed = ds_compute_mod_flags_by_base(ds_basename_w(mod_path));
-    if (g_ds.lock_initialized) ds_lock();
-    s_mod_cache[slot].hmod = hmod;
-    s_mod_cache[slot].flags = computed;
-    if (g_ds.lock_initialized) ds_unlock();
+    ds_mod_cache_store(hmod, computed, 0u);
 
     if (out_flags) *out_flags = computed;
     return true;
@@ -275,6 +325,9 @@ bool ds_should_virtualize_rect_for_caller(const void *ret_addr)
 {
     if (g_ds.lock_initialized) ds_lock();
     bool skip_modern = (ds_is_modern_tier_locked() && !ds_is_vulkan_d3d9_subnative_locked());
+    bool w3d_gl = g_ds.wined3d_uses_gl;
+    bool legacy_d3d = g_ds.legacy_d3d_loaded;
+    bool w3d_vk = g_ds.wined3d_uses_vulkan;
     if (g_ds.lock_initialized) ds_unlock();
     if (skip_modern) {
         return false;
@@ -292,9 +345,9 @@ bool ds_should_virtualize_rect_for_caller(const void *ret_addr)
          * before GL context creation when Vulkan is NOT positively detected), preserving
          * Frame-0 OpenGL Y-flipping while keeping Vulkan-backed WineD3D unvirtualized.
          */
-        return (g_ds.wined3d_uses_gl || (g_ds.legacy_d3d_loaded && !g_ds.wined3d_uses_vulkan));
+        return (w3d_gl || (legacy_d3d && !w3d_vk));
     }
-    if ((flags & (DS_MODF_D3D9 | DS_MODF_D3D8 | DS_MODF_DDRAW)) != 0 && g_ds.wined3d_uses_vulkan) {
+    if ((flags & (DS_MODF_D3D9 | DS_MODF_D3D8 | DS_MODF_DDRAW)) != 0 && w3d_vk) {
         return false;
     }
     if ((flags & DS_MODF_PHYS_SURF) != 0) {
@@ -319,21 +372,17 @@ static bool ds_current_exe_in_multisz(const char *msz, bool on_err)
 DS_ALWAYS_INLINE bool ds_is_passthrough_chaining_process(void)
 {
     static const char k_chain_msz[] =
-        "cmd.exe\0powershell.exe\0rundll32.exe\0steam.exe\0"
-        "galaxyclient.exe\0galaxyclienthelper.exe\0galaxycommunication.exe\0"
-        "epicgameslauncher.exe\0eadesktop.exe\0upc.exe\0";
+        ONE_DENYLIST_SHELL_MSZ
+        ONE_DENYLIST_STOREFRONT_CLIENTS_MSZ
+        ONE_DENYLIST_GALAXY_CHAIN_MSZ;
     return ds_current_exe_in_multisz(k_chain_msz, false);
 }
 
 DS_ALWAYS_INLINE bool ds_should_ignore_current_process(void)
 {
     static const char k_ignored_msz[] =
-        "services.exe\0plugplay.exe\0rpcss.exe\0winedevice.exe\0"
-        "explorer.exe\0wineboot.exe\0conhost.exe\0svchost.exe\0"
-        "reg.exe\0regedit.exe\0regsvr32.exe\0msiexec.exe\0"
-        "one_display_launcher_x86.exe\0one_display_launcher_x64.exe\0"
-        "one_xgr_win_launcher.exe\0one_xgr_win_launcher_x86.exe\0"
-        "steamwebhelper.exe\0steamservice.exe\0epicwebhelper.exe\0";
+        ONE_DENYLIST_WINE_SYSTEM_MSZ
+        ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ;
     return ds_current_exe_in_multisz(k_ignored_msz, true);
 }
 
@@ -387,6 +436,14 @@ bool ds_is_passthrough_locked(void)
 {
     return (g_ds.scaling_mode == DS_MODE_PASSTHROUGH ||
             g_ds.presenter_tier == DS_PRESENTER_MODERN_PASSTHROUGH);
+}
+
+bool ds_is_passthrough_safe(void)
+{
+    if (g_ds.lock_initialized) ds_lock();
+    bool pt = ds_is_passthrough_locked();
+    if (g_ds.lock_initialized) ds_unlock();
+    return pt;
 }
 
 bool ds_update_presenter_tier_locked(void)
@@ -850,10 +907,18 @@ static LONG ds_change_display_settings_common(
     }
     bool call_real = ds_is_internal_call();
     bool vk_d3d9 = false;
+    int32_t snap_real_hz = 60, snap_real_w = 0, snap_real_h = 0, snap_phys_w = 0, snap_phys_h = 0;
+    bool snap_pref_16 = false;
     if (!call_real) {
         ds_lock();
         bool modern_tier = ds_is_modern_tier_locked();
         vk_d3d9 = ds_is_vulkan_d3d9_locked();
+        snap_real_hz = g_ds.real_hz;
+        snap_real_w = g_ds.real_screen_w;
+        snap_real_h = g_ds.real_screen_h;
+        snap_phys_w = g_ds.phys_screen_w;
+        snap_phys_h = g_ds.phys_screen_h;
+        snap_pref_16 = ds_prefer_16bpp_ddraw();
         ds_unlock();
         call_real = (modern_tier && !vk_d3d9);
     }
@@ -867,23 +932,23 @@ static LONG ds_change_display_settings_common(
                 w = (dm_fields & DM_PELSWIDTH) ? (int32_t)dm->dmPelsWidth : 0;
                 h = (dm_fields & DM_PELSHEIGHT) ? (int32_t)dm->dmPelsHeight : 0;
                 bpp = (dm_fields & DM_BITSPERPEL) ? (int32_t)dm->dmBitsPerPel : 0;
-                hz = (dm_fields & DM_DISPLAYFREQUENCY) ? (int32_t)dm->dmDisplayFrequency : g_ds.real_hz;
+                hz = (dm_fields & DM_DISPLAYFREQUENCY) ? (int32_t)dm->dmDisplayFrequency : snap_real_hz;
             } else {
                 const DEVMODEA *dm = (const DEVMODEA *)lpDevMode;
                 dm_fields = dm->dmFields;
                 w = (dm_fields & DM_PELSWIDTH) ? (int32_t)dm->dmPelsWidth : 0;
                 h = (dm_fields & DM_PELSHEIGHT) ? (int32_t)dm->dmPelsHeight : 0;
                 bpp = (dm_fields & DM_BITSPERPEL) ? (int32_t)dm->dmBitsPerPel : 0;
-                hz = (dm_fields & DM_DISPLAYFREQUENCY) ? (int32_t)dm->dmDisplayFrequency : g_ds.real_hz;
+                hz = (dm_fields & DM_DISPLAYFREQUENCY) ? (int32_t)dm->dmDisplayFrequency : snap_real_hz;
             }
         }
         if (vk_d3d9) {
             if (!lpDevMode) {
                 return ds_handle_vulkan_d3d9_change_display(true, 0, 0, dwFlags);
             }
-            int32_t vw = (dm_fields & DM_PELSWIDTH) ? w : g_ds.phys_screen_w;
-            int32_t vh = (dm_fields & DM_PELSHEIGHT) ? h : g_ds.phys_screen_h;
-            if (vw < g_ds.phys_screen_w || vh < g_ds.phys_screen_h) {
+            int32_t vw = (dm_fields & DM_PELSWIDTH) ? w : snap_phys_w;
+            int32_t vh = (dm_fields & DM_PELSHEIGHT) ? h : snap_phys_h;
+            if (vw < snap_phys_w || vh < snap_phys_h) {
                 return ds_handle_vulkan_d3d9_change_display(false, vw, vh, dwFlags);
             }
             if ((dwFlags & CDS_TEST) == 0) {
@@ -900,9 +965,9 @@ static LONG ds_change_display_settings_common(
             if (!lpDevMode) {
                 return ds_handle_change_display_mode(true, 0, 0, 0, 0, dwFlags, caller_ret);
             }
-            if ((dm_fields & DM_PELSWIDTH) == 0) w = g_ds.real_screen_w;
-            if ((dm_fields & DM_PELSHEIGHT) == 0) h = g_ds.real_screen_h;
-            if (ds_prefer_16bpp_ddraw() && (bpp > 16 || bpp == 0) && w <= 640 && h <= 480) {
+            if ((dm_fields & DM_PELSWIDTH) == 0) w = snap_real_w;
+            if ((dm_fields & DM_PELSHEIGHT) == 0) h = snap_real_h;
+            if (snap_pref_16 && (bpp > 16 || bpp == 0) && w <= 640 && h <= 480) {
                 bpp = 16;
                 if (is_wide) {
                     ((DEVMODEW *)lpDevMode)->dmBitsPerPel = 16;
@@ -1310,7 +1375,7 @@ static LONG WINAPI hook_D3DKMTEscape(const ds_d3dkmt_escape_t *desc)
     if (!real_fn) {
         return (LONG)0xC0000002L;
     }
-    if (!g_ds.is_wine || ds_is_internal_call() || ds_is_passthrough_locked() || !desc ||
+    if (!g_ds.is_wine || ds_is_internal_call() || ds_is_passthrough_safe() || !desc ||
         desc->Type != DS_WINE_D3DKMT_ESCAPE_SET_PRESENT_RECT ||
         desc->PrivateDriverDataSize != (UINT)sizeof(RECT) ||
         desc->pPrivateDriverData == NULL) {
@@ -1323,7 +1388,10 @@ static LONG WINAPI hook_D3DKMTEscape(const ds_d3dkmt_escape_t *desc)
     int32_t rc_h = src_rc->bottom - src_rc->top;
 
     if (target_hwnd != NULL && target_hwnd != GetDesktopWindow() && rc_w > 0 && rc_h > 0) {
-        if (g_ds.hwnd_game == NULL) {
+        ds_lock();
+        HWND cur_game = g_ds.hwnd_game;
+        ds_unlock();
+        if (cur_game == NULL) {
             ds_attach_and_apply_game_window(target_hwnd, rc_w, rc_h);
         }
         ds_lock();
@@ -1362,7 +1430,7 @@ static LONG WINAPI hook_D3DKMTEscape(const ds_d3dkmt_escape_t *desc)
     return real_fn(desc);
 }
 
-DS_ALWAYS_INLINE void ds_compute_centered_windowed_bounds(HWND hWnd, int32_t client_w, int32_t client_h, int *out_x, int *out_y, int *out_w, int *out_h)
+static void ds_compute_centered_windowed_bounds(HWND hWnd, int32_t client_w, int32_t client_h, int *out_x, int *out_y, int *out_w, int *out_h)
 {
     DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_STYLE);
     DWORD cur_exstyle = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_EXSTYLE);
@@ -1370,24 +1438,36 @@ DS_ALWAYS_INLINE void ds_compute_centered_windowed_bounds(HWND hWnd, int32_t cli
     if (g_ds.real_AdjustWindowRectEx) {
         g_ds.real_AdjustWindowRectEx(&wrc, cur_style, FALSE, cur_exstyle);
     }
+    ds_lock();
+    int32_t mx = g_ds.win_mon_x;
+    int32_t my = g_ds.win_mon_y;
+    int32_t mw = g_ds.real_screen_w;
+    int32_t mh = g_ds.real_screen_h;
+    ds_unlock();
     int ww = wrc.right - wrc.left;
     int wh = wrc.bottom - wrc.top;
-    int wx = g_ds.win_mon_x + (g_ds.real_screen_w - ww) / 2;
-    int wy = g_ds.win_mon_y + (g_ds.real_screen_h - wh) / 2;
-    *out_x = wx < g_ds.win_mon_x ? g_ds.win_mon_x : wx;
-    *out_y = wy < g_ds.win_mon_y ? g_ds.win_mon_y : wy;
+    int wx = mx + (mw - ww) / 2;
+    int wy = my + (mh - wh) / 2;
+    *out_x = wx < mx ? mx : wx;
+    *out_y = wy < my ? my : wy;
     *out_w = ww;
     *out_h = wh;
 }
 
-DS_ALWAYS_INLINE bool ds_is_hwnd_already_full_panel_internal(HWND hWnd)
+static bool ds_is_hwnd_already_full_panel_internal(HWND hWnd)
 {
     RECT cur_rc = { 0, 0, 0, 0 };
-    return IsWindowVisible(hWnd) &&
-           g_ds.real_GetWindowRect && g_ds.real_GetWindowRect(hWnd, &cur_rc) &&
-           cur_rc.left == g_ds.win_mon_x && cur_rc.top == g_ds.win_mon_y &&
-           (cur_rc.right - cur_rc.left) == g_ds.real_screen_w &&
-           (cur_rc.bottom - cur_rc.top) == g_ds.real_screen_h;
+    if (!IsWindowVisible(hWnd) || !g_ds.real_GetWindowRect || !g_ds.real_GetWindowRect(hWnd, &cur_rc)) {
+        return false;
+    }
+    ds_lock();
+    bool match = (
+        cur_rc.left == g_ds.win_mon_x && cur_rc.top == g_ds.win_mon_y &&
+        (cur_rc.right - cur_rc.left) == g_ds.real_screen_w &&
+        (cur_rc.bottom - cur_rc.top) == g_ds.real_screen_h
+    );
+    ds_unlock();
+    return match;
 }
 
 static BOOL ds_call_real_pos_or_move(HWND hWnd, HWND after, int x, int y, int cx, int cy, UINT uFlags, BOOL bRepaint, bool is_move)
@@ -1406,12 +1486,17 @@ static BOOL ds_set_or_move_window_common(
         ds_ensure_runtime_started();
     }
     if (is_move ? (!g_ds.real_MoveWindow) : (!g_ds.real_SetWindowPos)) return FALSE;
-    if (ds_is_internal_call() || !hWnd || (is_move && ds_is_passthrough_locked())) {
+    if (ds_is_internal_call() || !hWnd || (is_move && ds_is_passthrough_safe())) {
         return ds_call_real_pos_or_move(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags, bRepaint, is_move);
     }
 
-    if (!is_move && g_ds.hwnd_game == NULL && (uFlags & SWP_HIDEWINDOW) == 0) {
-        ds_attach_and_apply_game_window(hWnd, (uFlags & SWP_NOSIZE) == 0 ? cx : 0, (uFlags & SWP_NOSIZE) == 0 ? cy : 0);
+    if (!is_move && (uFlags & SWP_HIDEWINDOW) == 0) {
+        ds_lock();
+        HWND cur_game = g_ds.hwnd_game;
+        ds_unlock();
+        if (cur_game == NULL) {
+            ds_attach_and_apply_game_window(hWnd, (uFlags & SWP_NOSIZE) == 0 ? cx : 0, (uFlags & SWP_NOSIZE) == 0 ? cy : 0);
+        }
     }
 
     bool sys_caller = ds_is_system_renderer_caller(caller_ret);
@@ -1815,6 +1900,50 @@ static bool ds_get_client_origin_internal(HWND hwnd, POINT *out)
     return ok != FALSE;
 }
 
+/* mode: 0 = phys->virt, 1 = phys->virt (warp), 2 = virt->phys (warp), 3 = virt->phys (subrect) */
+static bool ds_map_screen_point_locked(int32_t ix, int32_t iy, int mode, int32_t *ox, int32_t *oy)
+{
+    *ox = ix;
+    *oy = iy;
+    int32_t vw = g_ds.virt_w, vh = g_ds.virt_h;
+    if (vw <= 0 || vh <= 0) return false;
+    int32_t dx = 0, dy = 0, dw = 0, dh = 0, orig_x = 0, orig_y = 0;
+    if (g_ds.fullscreen_active && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0) {
+        dx = g_ds.win_mon_x + g_ds.vp.dst_x;
+        dy = g_ds.win_mon_y + g_ds.vp.dst_y;
+        dw = g_ds.vp.dst_w;
+        dh = g_ds.vp.dst_h;
+    } else {
+        int32_t ws = ds_get_windowed_scale_locked();
+        POINT orig;
+        if (ws <= 1 || !ds_get_client_origin_internal(g_ds.hwnd_game, &orig)) return false;
+        orig_x = orig.x;
+        orig_y = orig.y;
+        dx = orig_x;
+        dy = orig_y;
+        dw = vw * ws;
+        dh = vh * ws;
+    }
+    int32_t rx = 0, ry = 0, pw = 1, ph = 1;
+    if (mode == 0) {
+        ds_map_cursor_phys_to_virt(ix, iy, dx, dy, dw, dh, vw, vh, &rx, &ry);
+        *ox = orig_x + rx;
+        *oy = orig_y + ry;
+        return true;
+    }
+    if (mode == 1) {
+        ds_cursor_resolve_get_pos(&g_ds.warp, ix, iy, dx, dy, dw, dh, vw, vh, &rx, &ry);
+        *ox = orig_x + rx;
+        *oy = orig_y + ry;
+        return true;
+    }
+    if (mode == 2) {
+        ds_cursor_record_warp(&g_ds.warp, ix - orig_x, iy - orig_y, dx, dy, dw, dh, vw, vh, ox, oy);
+        return true;
+    }
+    return ds_map_subrect_virt_to_phys(ix - orig_x, iy - orig_y, 1, 1, dx, dy, dw, dh, vw, vh, ox, oy, &pw, &ph);
+}
+
 static BOOL WINAPI hook_GetCursorPos(LPPOINT lpPoint)
 {
     if (!lpPoint || !g_ds.real_GetCursorPos) return FALSE;
@@ -1826,42 +1955,10 @@ static BOOL WINAPI hook_GetCursorPos(LPPOINT lpPoint)
         *lpPoint = phys;
         return TRUE;
     }
-
+    int32_t vx = phys.x, vy = phys.y;
     ds_lock();
-    bool fs_active = (g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0 && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0);
-    int32_t win_scale = ds_get_windowed_scale_locked();
-    HWND hwnd_game = g_ds.hwnd_game;
-    int32_t vw = g_ds.virt_w;
-    int32_t vh = g_ds.virt_h;
-    int32_t vx = phys.x;
-    int32_t vy = phys.y;
-    if (fs_active) {
-        ds_cursor_resolve_get_pos(
-            &g_ds.warp,
-            phys.x,
-            phys.y,
-            g_ds.win_mon_x + g_ds.vp.dst_x,
-            g_ds.win_mon_y + g_ds.vp.dst_y,
-            g_ds.vp.dst_w,
-            g_ds.vp.dst_h,
-            vw,
-            vh,
-            &vx,
-            &vy
-        );
-    } else if (win_scale > 1) {
-        POINT orig;
-        if (ds_get_client_origin_internal(hwnd_game, &orig)) {
-            int32_t rel_vx = 0, rel_vy = 0;
-            ds_cursor_resolve_get_pos(
-                &g_ds.warp, phys.x, phys.y, orig.x, orig.y, vw * win_scale, vh * win_scale, vw, vh, &rel_vx, &rel_vy
-            );
-            vx = orig.x + rel_vx;
-            vy = orig.y + rel_vy;
-        }
-    }
+    (void)ds_map_screen_point_locked(phys.x, phys.y, 1, &vx, &vy);
     ds_unlock();
-
     lpPoint->x = vx;
     lpPoint->y = vy;
     return TRUE;
@@ -1873,35 +1970,9 @@ static BOOL WINAPI hook_SetCursorPos(int X, int Y)
     if (ds_is_internal_call() || !ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
         return g_ds.real_SetCursorPos(X, Y);
     }
-
-    int32_t px = X;
-    int32_t py = Y;
+    int32_t px = X, py = Y;
     ds_lock();
-    int32_t win_scale = ds_get_windowed_scale_locked();
-    HWND hwnd_game = g_ds.hwnd_game;
-    if (g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0 && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0) {
-        ds_cursor_record_warp(
-            &g_ds.warp,
-            X,
-            Y,
-            g_ds.win_mon_x + g_ds.vp.dst_x,
-            g_ds.win_mon_y + g_ds.vp.dst_y,
-            g_ds.vp.dst_w,
-            g_ds.vp.dst_h,
-            g_ds.virt_w,
-            g_ds.virt_h,
-            &px,
-            &py
-        );
-    } else if (win_scale > 1) {
-        POINT orig;
-        if (ds_get_client_origin_internal(hwnd_game, &orig)) {
-            ds_cursor_record_warp(
-                &g_ds.warp, X - orig.x, Y - orig.y, orig.x, orig.y,
-                g_ds.virt_w * win_scale, g_ds.virt_h * win_scale, g_ds.virt_w, g_ds.virt_h, &px, &py
-            );
-        }
-    }
+    (void)ds_map_screen_point_locked(X, Y, 2, &px, &py);
     ds_unlock();
     return g_ds.real_SetCursorPos(px, py);
 }
@@ -1981,33 +2052,10 @@ static DWORD WINAPI hook_GetMessagePos(void)
 
     int32_t px = (int32_t)(short)LOWORD(raw);
     int32_t py = (int32_t)(short)HIWORD(raw);
-    int32_t vx = px;
-    int32_t vy = py;
-    bool mapped = false;
-
+    int32_t vx = px, vy = py;
     ds_lock();
-    int32_t win_scale = ds_get_windowed_scale_locked();
-    HWND hwnd_game = g_ds.hwnd_game;
-    int32_t vw = g_ds.virt_w;
-    int32_t vh = g_ds.virt_h;
-    if (g_ds.fullscreen_active && vw > 0 && vh > 0 && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0) {
-        ds_map_cursor_phys_to_virt(
-            px, py, g_ds.win_mon_x + g_ds.vp.dst_x, g_ds.win_mon_y + g_ds.vp.dst_y,
-            g_ds.vp.dst_w, g_ds.vp.dst_h, vw, vh, &vx, &vy
-        );
-        mapped = true;
-    } else if (win_scale > 1 && vw > 0 && vh > 0) {
-        POINT orig;
-        if (ds_get_client_origin_internal(hwnd_game, &orig)) {
-            int32_t rel_vx = 0, rel_vy = 0;
-            ds_map_cursor_phys_to_virt(px, py, orig.x, orig.y, vw * win_scale, vh * win_scale, vw, vh, &rel_vx, &rel_vy);
-            vx = orig.x + rel_vx;
-            vy = orig.y + rel_vy;
-            mapped = true;
-        }
-    }
+    bool mapped = ds_map_screen_point_locked(px, py, 0, &vx, &vy);
     ds_unlock();
-
     return mapped ? (DWORD)MAKELONG((WORD)(short)vx, (WORD)(short)vy) : raw;
 }
 
@@ -2020,13 +2068,20 @@ static LONG ds_remap_raw_axis(LONG raw_v, double base, double span, int32_t dst_
     return (LONG)(norm + 0.5);
 }
 
-static void ds_remap_rawinput_mouse_packet(RAWINPUT *raw)
+static void ds_remap_rawinput_mouse_packet(uint8_t *raw_bytes, size_t pkt_size, size_t mouse_offset)
 {
-    if (!raw || raw->header.dwType != RIM_TYPEMOUSE) {
+    if (!raw_bytes || pkt_size < mouse_offset + sizeof(RAWMOUSE)) {
         return;
     }
+    /* dwType is always the first DWORD of RAWINPUTHEADER on both 32-bit (16 B) and 64-bit/WoW64 (24 B) */
+    DWORD dw_type = 0;
+    memcpy(&dw_type, raw_bytes, sizeof(DWORD));
+    if (dw_type != RIM_TYPEMOUSE) {
+        return;
+    }
+    RAWMOUSE *mouse = (RAWMOUSE *)(void *)(raw_bytes + mouse_offset);
     /* Preserve relative 3D camera mickeys 1:1; only remap normalized absolute coords */
-    if ((raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+    if ((mouse->usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
         return;
     }
 
@@ -2054,7 +2109,7 @@ static void ds_remap_rawinput_mouse_packet(RAWINPUT *raw)
     double base_y = 0.0;
     double span_w = (double)rsw;
     double span_h = (double)rsh;
-    if ((raw->data.mouse.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0 && g_ds.real_GetSystemMetrics) {
+    if ((mouse->usFlags & MOUSE_VIRTUAL_DESKTOP) != 0 && g_ds.real_GetSystemMetrics) {
         ds_enter_internal();
         int32_t vx0 = g_ds.real_GetSystemMetrics(SM_XVIRTUALSCREEN);
         int32_t vy0 = g_ds.real_GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -2078,8 +2133,8 @@ static void ds_remap_rawinput_mouse_packet(RAWINPUT *raw)
         }
     }
 
-    raw->data.mouse.lLastX = ds_remap_raw_axis(raw->data.mouse.lLastX, base_x, span_w, mon_x + vp.dst_x, vp.dst_w);
-    raw->data.mouse.lLastY = ds_remap_raw_axis(raw->data.mouse.lLastY, base_y, span_h, mon_y + vp.dst_y, vp.dst_h);
+    mouse->lLastX = ds_remap_raw_axis(mouse->lLastX, base_x, span_w, mon_x + vp.dst_x, vp.dst_w);
+    mouse->lLastY = ds_remap_raw_axis(mouse->lLastY, base_y, span_h, mon_y + vp.dst_y, vp.dst_h);
 }
 
 static UINT WINAPI hook_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData, PUINT pcbSize, UINT cbSizeHeader)
@@ -2089,10 +2144,17 @@ static UINT WINAPI hook_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPV
     if (res != (UINT)-1 &&
         pData != NULL &&
         uiCommand == RID_INPUT &&
-        res >= (UINT)sizeof(RAWINPUTHEADER) &&
         !ds_is_internal_call() &&
         ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
-        ds_remap_rawinput_mouse_packet((RAWINPUT *)pData);
+#if defined(_WIN64)
+        bool is_64 = true;
+#else
+        bool is_64 = false;
+#endif
+        ds_rawinput_step_t step;
+        if (ds_rawinput_validate_block((uint32_t)res, (uint32_t)cbSizeHeader, (size_t)res, g_ds.is_wow64, is_64, &step)) {
+            ds_remap_rawinput_mouse_packet((uint8_t *)pData, (size_t)res, step.mouse_offset);
+        }
     }
     return res;
 }
@@ -2100,22 +2162,34 @@ static UINT WINAPI hook_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPV
 static UINT WINAPI hook_GetRawInputBuffer(PRAWINPUT pData, PUINT pcbSize, UINT cbSizeHeader)
 {
     if (!g_ds.real_GetRawInputBuffer) return (UINT)-1;
+    UINT in_buf_bytes = (pcbSize != NULL) ? *pcbSize : 0u;
     UINT res = g_ds.real_GetRawInputBuffer(pData, pcbSize, cbSizeHeader);
     if (res != (UINT)-1 &&
         res > 0 &&
         pData != NULL &&
+        in_buf_bytes >= sizeof(RAWINPUTHEADER) &&
         !ds_is_internal_call() &&
         ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
-        uint8_t *cur = (uint8_t *)pData;
-        for (UINT i = 0; i < res; i++) {
-            RAWINPUT *pkt = (RAWINPUT *)(void *)cur;
-            if (pkt->header.dwSize < sizeof(RAWINPUTHEADER)) {
+#if defined(_WIN64)
+        bool is_64 = true;
+#else
+        bool is_64 = false;
+#endif
+        uint8_t *base = (uint8_t *)pData;
+        size_t off = 0u;
+        for (UINT i = 0; i < res && off + 8u <= (size_t)in_buf_bytes; i++) {
+            /* dwSize is the second DWORD of RAWINPUTHEADER on both 16-byte and 24-byte headers */
+            DWORD dw_size = 0;
+            memcpy(&dw_size, base + off + 4u, sizeof(DWORD));
+            ds_rawinput_step_t step;
+            if (!ds_rawinput_validate_block((uint32_t)dw_size, (uint32_t)cbSizeHeader, (size_t)in_buf_bytes - off, g_ds.is_wow64, is_64, &step)) {
                 break;
             }
-            ds_remap_rawinput_mouse_packet(pkt);
-            size_t step = ((size_t)pkt->header.dwSize + sizeof(ULONG_PTR) - 1u) & ~(sizeof(ULONG_PTR) - 1u);
-            if (step == 0) break;
-            cur += step;
+            ds_remap_rawinput_mouse_packet(base + off, (size_t)dw_size, step.mouse_offset);
+            if (step.next_step == 0u || step.next_step > (size_t)in_buf_bytes - off) {
+                break;
+            }
+            off += step.next_step;
         }
     }
     return res;
@@ -2231,26 +2305,10 @@ static HWND WINAPI hook_WindowFromPoint(POINT Point)
     ds_lock();
     HWND hwnd_game = g_ds.hwnd_game;
     HWND hwnd_gl_host = g_ds.hwnd_gl_host;
-    int32_t win_scale = ds_get_windowed_scale_locked();
-    int32_t vw = g_ds.virt_w, vh = g_ds.virt_h;
-    int32_t px = phys.x, py = phys.y, pw = 1, ph = 1;
-    if (g_ds.fullscreen_active && vw > 0 && vh > 0 && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0) {
-        if (ds_map_subrect_virt_to_phys(
-                Point.x, Point.y, 1, 1,
-                g_ds.win_mon_x + g_ds.vp.dst_x, g_ds.win_mon_y + g_ds.vp.dst_y,
-                g_ds.vp.dst_w, g_ds.vp.dst_h, vw, vh, &px, &py, &pw, &ph)) {
-            phys.x = px;
-            phys.y = py;
-        }
-    } else if (win_scale > 1 && vw > 0 && vh > 0) {
-        POINT orig;
-        if (ds_get_client_origin_internal(hwnd_game, &orig) &&
-            ds_map_subrect_virt_to_phys(
-                Point.x - orig.x, Point.y - orig.y, 1, 1,
-                orig.x, orig.y, vw * win_scale, vh * win_scale, vw, vh, &px, &py, &pw, &ph)) {
-            phys.x = px;
-            phys.y = py;
-        }
+    int32_t px = phys.x, py = phys.y;
+    if (ds_map_screen_point_locked(Point.x, Point.y, 3, &px, &py)) {
+        phys.x = px;
+        phys.y = py;
     }
     ds_unlock();
 
@@ -2473,35 +2531,36 @@ static void ds_append_kv_if_missing_w(WCHAR **buf, size_t *len, size_t *cap, con
     }
 }
 
-typedef struct {
-    uint16_t field_off;
-    char     key[36];
-} ds_path_env_t;
+#define DS_PATH_ENV_LIST(X) \
+    X(dll_x86,      "ONE_LAUNCHER_SCALER_DLL_X86") \
+    X(dll_x64,      "ONE_LAUNCHER_SCALER_DLL_X64") \
+    X(launcher_x86, "ONE_LAUNCHER_LAUNCHER_EXE_X86") \
+    X(launcher_x64, "ONE_LAUNCHER_LAUNCHER_EXE_X64") \
+    X(control_file, "ONE_LAUNCHER_DISPLAY_CONTROL_FILE") \
+    X(status_file,  "ONE_LAUNCHER_DISPLAY_STATUS_FILE") \
+    X(trace_file,   "ONE_LAUNCHER_DISPLAY_TRACE_FILE")
 
-static const ds_path_env_t k_ds_path_envs[] = {
-    { (uint16_t)offsetof(ds_runtime_t, dll_x86),      "ONE_LAUNCHER_SCALER_DLL_X86" },
-    { (uint16_t)offsetof(ds_runtime_t, dll_x64),      "ONE_LAUNCHER_SCALER_DLL_X64" },
-    { (uint16_t)offsetof(ds_runtime_t, launcher_x86), "ONE_LAUNCHER_LAUNCHER_EXE_X86" },
-    { (uint16_t)offsetof(ds_runtime_t, launcher_x64), "ONE_LAUNCHER_LAUNCHER_EXE_X64" },
-    { (uint16_t)offsetof(ds_runtime_t, control_file), "ONE_LAUNCHER_DISPLAY_CONTROL_FILE" },
-    { (uint16_t)offsetof(ds_runtime_t, status_file),  "ONE_LAUNCHER_DISPLAY_STATUS_FILE" },
-    { (uint16_t)offsetof(ds_runtime_t, trace_file),   "ONE_LAUNCHER_DISPLAY_TRACE_FILE" },
-};
+#define DS_PATH_ENV_OFF_ITEM(field, key) ((uint16_t)offsetof(ds_runtime_t, field)),
+#define DS_PATH_ENV_KEY_ITEM(field, key) key "\0"
+
+static const uint16_t k_ds_path_env_offs[] = { DS_PATH_ENV_LIST(DS_PATH_ENV_OFF_ITEM) };
+static const char k_ds_path_env_keys_msz[] = DS_PATH_ENV_LIST(DS_PATH_ENV_KEY_ITEM);
 
 DS_ALWAYS_INLINE WCHAR *ds_path_env_field(size_t idx)
 {
-    return (WCHAR *)(void *)((uint8_t *)&g_ds + k_ds_path_envs[idx].field_off);
+    return (WCHAR *)(void *)((uint8_t *)&g_ds + k_ds_path_env_offs[idx]);
 }
 
 static WCHAR *ds_build_merged_child_env_w(LPVOID caller_env, DWORD caller_flags)
 {
     if (!caller_env) {
-        /* When inheriting parent's env block, ensure auto-discovered paths/session files are exported */
-        for (size_t i = 0; i < 6; i++) {
+        /* DS-09: Iterate all 7 path/session/trace env keys (including trace_file) */
+        const char *k = k_ds_path_env_keys_msz;
+        for (size_t i = 0; i < sizeof(k_ds_path_env_offs) / sizeof(k_ds_path_env_offs[0]); i++, k += strlen(k) + 1) {
             WCHAR *f = ds_path_env_field(i);
             if (f[0]) {
                 WCHAR wk[48];
-                ds_ascii_to_w(k_ds_path_envs[i].key, wk, 48);
+                ds_ascii_to_w(k, wk, 48);
                 SetEnvironmentVariableW(wk, f);
             }
         }
@@ -2561,8 +2620,9 @@ static WCHAR *ds_build_merged_child_env_w(LPVOID caller_env, DWORD caller_flags)
     }
 
     ds_lock();
-    for (size_t i = 0; i < sizeof(k_ds_path_envs) / sizeof(k_ds_path_envs[0]); i++) {
-        ds_append_kv_if_missing_w(&out_buf, &out_len, &out_cap, k_ds_path_envs[i].key, ds_path_env_field(i));
+    const char *pk = k_ds_path_env_keys_msz;
+    for (size_t i = 0; i < sizeof(k_ds_path_env_offs) / sizeof(k_ds_path_env_offs[0]); i++, pk += strlen(pk) + 1) {
+        ds_append_kv_if_missing_w(&out_buf, &out_len, &out_cap, pk, ds_path_env_field(i));
     }
     ds_unlock();
 
@@ -2663,7 +2723,7 @@ typedef BOOL (WINAPI *pfn_ShellExecuteExW_t)(SHELLEXECUTEINFOW *);
 
 static void ds_ensure_shell32_loaded(bool allow_load_library)
 {
-    if (g_ds.real_ShellExecuteExW) return;
+    if (InterlockedCompareExchangePointer((PVOID volatile *)&g_ds.real_ShellExecuteExW, NULL, NULL) != NULL) return;
     HMODULE sh32 = GetModuleHandleW(L"shell32.dll");
     if (!sh32 && allow_load_library) {
         ds_enter_internal();
@@ -2671,10 +2731,13 @@ static void ds_ensure_shell32_loaded(bool allow_load_library)
         ds_leave_internal();
     }
     if (sh32 && g_ds.real_GetProcAddress) {
-        g_ds.real_ShellExecuteA   = (void *)(uintptr_t)g_ds.real_GetProcAddress(sh32, "ShellExecuteA");
-        g_ds.real_ShellExecuteW   = (void *)(uintptr_t)g_ds.real_GetProcAddress(sh32, "ShellExecuteW");
-        g_ds.real_ShellExecuteExA = (void *)(uintptr_t)g_ds.real_GetProcAddress(sh32, "ShellExecuteExA");
-        g_ds.real_ShellExecuteExW = (void *)(uintptr_t)g_ds.real_GetProcAddress(sh32, "ShellExecuteExW");
+        static const char k_sh32_msz[] = "ShellExecuteA\0ShellExecuteW\0ShellExecuteExA\0ShellExecuteExW\0";
+        void **slots[4] = { &g_ds.real_ShellExecuteA, &g_ds.real_ShellExecuteW, &g_ds.real_ShellExecuteExA, &g_ds.real_ShellExecuteExW };
+        const char *nm = k_sh32_msz;
+        for (int i = 0; i < 4; i++, nm += strlen(nm) + 1) {
+            void *fn = (void *)(uintptr_t)g_ds.real_GetProcAddress(sh32, nm);
+            if (fn) InterlockedCompareExchangePointer((PVOID volatile *)slots[i], fn, NULL);
+        }
     }
 }
 
@@ -2844,17 +2907,11 @@ static BOOL WINAPI hook_ShellExecuteExW(SHELLEXECUTEINFOW *pExecInfo)
             WCHAR *cmdline = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, max_cmd * sizeof(WCHAR));
             if (cmdline) {
                 if (is_batch) {
-                    if (param_len > 0) {
-                        _snwprintf(cmdline, max_cmd - 1, L"\"%ls\" /s /c \"\"%ls\" %ls\"", comspec, resolved_exe, params);
-                    } else {
-                        _snwprintf(cmdline, max_cmd - 1, L"\"%ls\" /s /c \"\"%ls\"\"", comspec, resolved_exe);
-                    }
+                    _snwprintf(cmdline, max_cmd - 1, L"\"%ls\" /s /c \"\"%ls\"%ls%ls\"",
+                               comspec, resolved_exe, param_len ? L" " : L"", params);
                 } else {
-                    if (param_len > 0) {
-                        _snwprintf(cmdline, max_cmd - 1, L"\"%ls\" %ls", resolved_exe, params);
-                    } else {
-                        _snwprintf(cmdline, max_cmd - 1, L"\"%ls\"", resolved_exe);
-                    }
+                    _snwprintf(cmdline, max_cmd - 1, L"\"%ls\"%ls%ls",
+                               resolved_exe, param_len ? L" " : L"", params);
                 }
                 cmdline[max_cmd - 1] = L'\0';
 
@@ -3037,7 +3094,6 @@ static HMODULE WINAPI hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
 #define DS_HK_MOD_GL32 3u
 
 typedef struct ds_hook_entry_s {
-    const char *name;
     void       *hook_fn;
     uint16_t    real_off;
     uint8_t     flags;
@@ -3051,107 +3107,118 @@ DS_ALWAYS_INLINE void **ds_hk_real_slot(const ds_hook_entry_t *e)
     return (void **)(void *)((uint8_t *)&g_ds + e->real_off);
 }
 
-static const ds_hook_entry_t k_ds_hook_table[] = {
-    { "LoadLibraryA",         (void *)(uintptr_t)hook_LoadLibraryA,         DS_HK_OFF(real_LoadLibraryA),         DS_HK_LOADER, 0 },
-    { "LoadLibraryW",         (void *)(uintptr_t)hook_LoadLibraryW,         DS_HK_OFF(real_LoadLibraryW),         DS_HK_LOADER, 0 },
-    { "LoadLibraryExA",       (void *)(uintptr_t)hook_LoadLibraryExA,       DS_HK_OFF(real_LoadLibraryExA),       DS_HK_LOADER, 0 },
-    { "LoadLibraryExW",       (void *)(uintptr_t)hook_LoadLibraryExW,       DS_HK_OFF(real_LoadLibraryExW),       DS_HK_LOADER, 0 },
-    { "CreateProcessA",       (void *)(uintptr_t)hook_CreateProcessA,       DS_HK_OFF(real_CreateProcessA),       DS_HK_LOADER, 0 },
-    { "CreateProcessW",       (void *)(uintptr_t)hook_CreateProcessW,       DS_HK_OFF(real_CreateProcessW),       DS_HK_LOADER, 0 },
-    { "ShellExecuteA",        (void *)(uintptr_t)hook_ShellExecuteA,        DS_HK_OFF(real_ShellExecuteA),        DS_HK_LOADER | DS_HK_SHELL, 0 },
-    { "ShellExecuteW",        (void *)(uintptr_t)hook_ShellExecuteW,        DS_HK_OFF(real_ShellExecuteW),        DS_HK_LOADER | DS_HK_SHELL, 0 },
-    { "ShellExecuteExA",      (void *)(uintptr_t)hook_ShellExecuteExA,      DS_HK_OFF(real_ShellExecuteExA),      DS_HK_LOADER | DS_HK_SHELL, 0 },
-    { "ShellExecuteExW",      (void *)(uintptr_t)hook_ShellExecuteExW,      DS_HK_OFF(real_ShellExecuteExW),      DS_HK_LOADER | DS_HK_SHELL, 0 },
-    { "GetProcAddress",       (void *)(uintptr_t)hook_GetProcAddress,       DS_HK_OFF(real_GetProcAddress),       0, 0 },
-    { "EnumDisplaySettingsA",   (void *)(uintptr_t)hook_EnumDisplaySettingsA,   DS_HK_OFF(real_EnumDisplaySettingsA),   0, DS_HK_MOD_U32 },
-    { "EnumDisplaySettingsW",   (void *)(uintptr_t)hook_EnumDisplaySettingsW,   DS_HK_OFF(real_EnumDisplaySettingsW),   0, DS_HK_MOD_U32 },
-    { "EnumDisplaySettingsExA", (void *)(uintptr_t)hook_EnumDisplaySettingsExA, DS_HK_OFF(real_EnumDisplaySettingsExA), 0, DS_HK_MOD_U32 },
-    { "EnumDisplaySettingsExW", (void *)(uintptr_t)hook_EnumDisplaySettingsExW, DS_HK_OFF(real_EnumDisplaySettingsExW), 0, DS_HK_MOD_U32 },
-    { "ChangeDisplaySettingsA",   (void *)(uintptr_t)hook_ChangeDisplaySettingsA,   DS_HK_OFF(real_ChangeDisplaySettingsA),   0, DS_HK_MOD_U32 },
-    { "ChangeDisplaySettingsW",   (void *)(uintptr_t)hook_ChangeDisplaySettingsW,   DS_HK_OFF(real_ChangeDisplaySettingsW),   0, DS_HK_MOD_U32 },
-    { "ChangeDisplaySettingsExA", (void *)(uintptr_t)hook_ChangeDisplaySettingsExA, DS_HK_OFF(real_ChangeDisplaySettingsExA), 0, DS_HK_MOD_U32 },
-    { "ChangeDisplaySettingsExW", (void *)(uintptr_t)hook_ChangeDisplaySettingsExW, DS_HK_OFF(real_ChangeDisplaySettingsExW), 0, DS_HK_MOD_U32 },
-    { "GetSystemMetrics",     (void *)(uintptr_t)hook_GetSystemMetrics,     DS_HK_OFF(real_GetSystemMetrics),     0, DS_HK_MOD_U32 },
-    { "CreateWindowExA",      (void *)(uintptr_t)hook_CreateWindowExA,      DS_HK_OFF(real_CreateWindowExA),      0, DS_HK_MOD_U32 },
-    { "CreateWindowExW",      (void *)(uintptr_t)hook_CreateWindowExW,      DS_HK_OFF(real_CreateWindowExW),      0, DS_HK_MOD_U32 },
-    { "ShowWindow",           (void *)(uintptr_t)hook_ShowWindow,           DS_HK_OFF(real_ShowWindow),           0, DS_HK_MOD_U32 },
-    { "ShowWindowAsync",      (void *)(uintptr_t)hook_ShowWindowAsync,      DS_HK_OFF(real_ShowWindowAsync),      0, DS_HK_MOD_U32 },
-    { "SetWindowPlacement",   (void *)(uintptr_t)hook_SetWindowPlacement,   DS_HK_OFF(real_SetWindowPlacement),   0, DS_HK_MOD_U32 },
-    { "SetWindowPos",         (void *)(uintptr_t)hook_SetWindowPos,         DS_HK_OFF(real_SetWindowPos),         0, DS_HK_MOD_U32 },
-    { "MoveWindow",           (void *)(uintptr_t)hook_MoveWindow,           DS_HK_OFF(real_MoveWindow),           0, DS_HK_MOD_U32 },
-    { "GetWindowLongA",       (void *)(uintptr_t)hook_GetWindowLongA,       DS_HK_OFF(real_GetWindowLongA),       0, DS_HK_MOD_U32 },
-    { "GetWindowLongW",       (void *)(uintptr_t)hook_GetWindowLongW,       DS_HK_OFF(real_GetWindowLongW),       0, DS_HK_MOD_U32 },
-    { "SetWindowLongA",       (void *)(uintptr_t)hook_SetWindowLongA,       DS_HK_OFF(real_SetWindowLongA),       0, DS_HK_MOD_U32 },
-    { "SetWindowLongW",       (void *)(uintptr_t)hook_SetWindowLongW,       DS_HK_OFF(real_SetWindowLongW),       0, DS_HK_MOD_U32 },
 #if defined(_WIN64)
-    { "GetWindowLongPtrA",    (void *)(uintptr_t)hook_GetWindowLongPtrA,    DS_HK_OFF(real_GetWindowLongPtrA),    0, DS_HK_MOD_U32 },
-    { "GetWindowLongPtrW",    (void *)(uintptr_t)hook_GetWindowLongPtrW,    DS_HK_OFF(real_GetWindowLongPtrW),    0, DS_HK_MOD_U32 },
-    { "SetWindowLongPtrA",    (void *)(uintptr_t)hook_SetWindowLongPtrA,    DS_HK_OFF(real_SetWindowLongPtrA),    0, DS_HK_MOD_U32 },
-    { "SetWindowLongPtrW",    (void *)(uintptr_t)hook_SetWindowLongPtrW,    DS_HK_OFF(real_SetWindowLongPtrW),    0, DS_HK_MOD_U32 },
+#define DS_HOOK_WIN64_ITEMS(X) \
+    X("GetWindowLongPtrA",    hook_GetWindowLongPtrA,    real_GetWindowLongPtrA,    0, DS_HK_MOD_U32) \
+    X("GetWindowLongPtrW",    hook_GetWindowLongPtrW,    real_GetWindowLongPtrW,    0, DS_HK_MOD_U32) \
+    X("SetWindowLongPtrA",    hook_SetWindowLongPtrA,    real_SetWindowLongPtrA,    0, DS_HK_MOD_U32) \
+    X("SetWindowLongPtrW",    hook_SetWindowLongPtrW,    real_SetWindowLongPtrW,    0, DS_HK_MOD_U32)
+#else
+#define DS_HOOK_WIN64_ITEMS(X)
 #endif
-    { "GetClientRect",        (void *)(uintptr_t)hook_GetClientRect,        DS_HK_OFF(real_GetClientRect),        0, DS_HK_MOD_U32 },
-    { "GetWindowRect",        (void *)(uintptr_t)hook_GetWindowRect,        DS_HK_OFF(real_GetWindowRect),        0, DS_HK_MOD_U32 },
-    { "GetMonitorInfoA",      (void *)(uintptr_t)hook_GetMonitorInfoA,      DS_HK_OFF(real_GetMonitorInfoA),      0, DS_HK_MOD_U32 },
-    { "GetMonitorInfoW",      (void *)(uintptr_t)hook_GetMonitorInfoW,      DS_HK_OFF(real_GetMonitorInfoW),      0, DS_HK_MOD_U32 },
-    { "AdjustWindowRect",     NULL,                                         DS_HK_OFF(real_AdjustWindowRect),     0, DS_HK_MOD_U32 },
-    { "AdjustWindowRectEx",   NULL,                                         DS_HK_OFF(real_AdjustWindowRectEx),   0, DS_HK_MOD_U32 },
-    { "GetCursorPos",         (void *)(uintptr_t)hook_GetCursorPos,         DS_HK_OFF(real_GetCursorPos),         0, DS_HK_MOD_U32 },
-    { "SetCursorPos",         (void *)(uintptr_t)hook_SetCursorPos,         DS_HK_OFF(real_SetCursorPos),         0, DS_HK_MOD_U32 },
-    { "ClipCursor",           (void *)(uintptr_t)hook_ClipCursor,           DS_HK_OFF(real_ClipCursor),           0, DS_HK_MOD_U32 },
-    { "GetClipCursor",        (void *)(uintptr_t)hook_GetClipCursor,        DS_HK_OFF(real_GetClipCursor),        0, DS_HK_MOD_U32 },
-    { "GetMessagePos",        (void *)(uintptr_t)hook_GetMessagePos,        DS_HK_OFF(real_GetMessagePos),        0, DS_HK_MOD_U32 },
-    { "GetRawInputData",      (void *)(uintptr_t)hook_GetRawInputData,      DS_HK_OFF(real_GetRawInputData),      0, DS_HK_MOD_U32 },
-    { "GetRawInputBuffer",    (void *)(uintptr_t)hook_GetRawInputBuffer,    DS_HK_OFF(real_GetRawInputBuffer),    0, DS_HK_MOD_U32 },
-    { "RegisterRawInputDevices", (void *)(uintptr_t)hook_RegisterRawInputDevices, DS_HK_OFF(real_RegisterRawInputDevices), 0, DS_HK_MOD_U32 },
-    { "ScreenToClient",       (void *)(uintptr_t)hook_ScreenToClient,       DS_HK_OFF(real_ScreenToClient),       0, DS_HK_MOD_U32 },
-    { "ClientToScreen",       (void *)(uintptr_t)hook_ClientToScreen,       DS_HK_OFF(real_ClientToScreen),       0, DS_HK_MOD_U32 },
-    { "MapWindowPoints",      (void *)(uintptr_t)hook_MapWindowPoints,      DS_HK_OFF(real_MapWindowPoints),      0, DS_HK_MOD_U32 },
-    { "WindowFromPoint",      (void *)(uintptr_t)hook_WindowFromPoint,      DS_HK_OFF(real_WindowFromPoint),      0, DS_HK_MOD_U32 },
-    { "ReleaseDC",            (void *)(uintptr_t)hook_ReleaseDC,            DS_HK_OFF(real_ReleaseDC),            DS_HK_WINED3D_GPA, DS_HK_MOD_U32 },
-    { "SetThreadDpiAwarenessContext",  NULL,                                DS_HK_OFF(p_SetThreadDpiAwarenessContext),  0, DS_HK_MOD_U32 },
-    { "GetWindowDpiAwarenessContext",  NULL,                                DS_HK_OFF(p_GetWindowDpiAwarenessContext),  0, DS_HK_MOD_U32 },
-    { "SetProcessDpiAwarenessContext", NULL,                                DS_HK_OFF(p_SetProcessDpiAwarenessContext), 0, DS_HK_MOD_U32 },
-    { "GetDeviceCaps",        (void *)(uintptr_t)hook_GetDeviceCaps,        DS_HK_OFF(real_GetDeviceCaps),        0, DS_HK_MOD_G32 },
-    { "DeleteDC",             (void *)(uintptr_t)hook_DeleteDC,             DS_HK_OFF(real_DeleteDC),             DS_HK_WINED3D_GPA, DS_HK_MOD_G32 },
-    { "ChoosePixelFormat",    (void *)(uintptr_t)hook_ChoosePixelFormat,    DS_HK_OFF(real_ChoosePixelFormat),    DS_HK_WINED3D_GPA, DS_HK_MOD_G32 },
-    { "DescribePixelFormat",  (void *)(uintptr_t)hook_DescribePixelFormat,  DS_HK_OFF(real_DescribePixelFormat),  DS_HK_WINED3D_GPA, DS_HK_MOD_G32 },
-    { "GetPixelFormat",       (void *)(uintptr_t)hook_GetPixelFormat,       DS_HK_OFF(real_GetPixelFormat),       DS_HK_WINED3D_GPA, DS_HK_MOD_G32 },
-    { "SetPixelFormat",       (void *)(uintptr_t)hook_SetPixelFormat,       DS_HK_OFF(real_SetPixelFormat),       DS_HK_WINED3D_GPA, DS_HK_MOD_G32 },
-    { "BitBlt",               (void *)(uintptr_t)hook_BitBlt,               DS_HK_OFF(real_BitBlt),               0, DS_HK_MOD_G32 },
-    { "StretchBlt",           (void *)(uintptr_t)hook_StretchBlt,           DS_HK_OFF(real_StretchBlt),           0, DS_HK_MOD_G32 },
-    { "SetDIBitsToDevice",    (void *)(uintptr_t)hook_SetDIBitsToDevice,    DS_HK_OFF(real_SetDIBitsToDevice),    0, DS_HK_MOD_G32 },
-    { "StretchDIBits",        (void *)(uintptr_t)hook_StretchDIBits,        DS_HK_OFF(real_StretchDIBits),        0, DS_HK_MOD_G32 },
-    { "SwapBuffers",          (void *)(uintptr_t)hook_SwapBuffers,          DS_HK_OFF(real_SwapBuffers),          DS_HK_WINED3D_GPA, DS_HK_MOD_G32 },
-    { "D3DKMTEscape",         (void *)(uintptr_t)hook_D3DKMTEscape,         DS_HK_OFF(real_D3DKMTEscape),         DS_HK_WINE | DS_HK_WINED3D_GPA, 0 },
-    { "NtGdiDdDDIEscape",     (void *)(uintptr_t)hook_D3DKMTEscape,         DS_HK_OFF(real_NtGdiDdDDIEscape),     DS_HK_WINE | DS_HK_WINED3D_GPA, 0 },
-    { "wglCreateContext",       (void *)(uintptr_t)hook_wglCreateContext,       DS_HK_OFF(real_wglCreateContext),       DS_HK_WINED3D_GPA, DS_HK_MOD_GL32 },
-    { "wglCreateLayerContext",  (void *)(uintptr_t)hook_wglCreateLayerContext,  DS_HK_OFF(real_wglCreateLayerContext),  DS_HK_WINED3D_GPA, DS_HK_MOD_GL32 },
-    { "wglGetCurrentDC",        (void *)(uintptr_t)hook_wglGetCurrentDC,        DS_HK_OFF(real_wglGetCurrentDC),        DS_HK_WINED3D_GPA, DS_HK_MOD_GL32 },
-    { "wglChoosePixelFormat",   (void *)(uintptr_t)hook_wglChoosePixelFormat,   DS_HK_OFF(real_wglChoosePixelFormat),   0, DS_HK_MOD_GL32 },
-    { "wglDescribePixelFormat", (void *)(uintptr_t)hook_wglDescribePixelFormat, DS_HK_OFF(real_wglDescribePixelFormat), 0, DS_HK_MOD_GL32 },
-    { "wglGetPixelFormat",      (void *)(uintptr_t)hook_wglGetPixelFormat,      DS_HK_OFF(real_wglGetPixelFormat),      0, DS_HK_MOD_GL32 },
-    { "wglSetPixelFormat",      (void *)(uintptr_t)hook_wglSetPixelFormat,      DS_HK_OFF(real_wglSetPixelFormat),      0, DS_HK_MOD_GL32 },
-    { "wglMakeCurrent",         (void *)(uintptr_t)hook_wglMakeCurrent,         DS_HK_OFF(real_wglMakeCurrent),         DS_HK_WINED3D_GPA, DS_HK_MOD_GL32 },
-    { "wglDeleteContext",       (void *)(uintptr_t)hook_wglDeleteContext,       DS_HK_OFF(real_wglDeleteContext),       DS_HK_WINED3D_GPA, DS_HK_MOD_GL32 },
-    { "wglSwapBuffers",         (void *)(uintptr_t)hook_wglSwapBuffers,         DS_HK_OFF(real_wglSwapBuffers),         DS_HK_WINED3D_GPA, DS_HK_MOD_GL32 },
-    { "wglGetProcAddress",      (void *)(uintptr_t)hook_wglGetProcAddress,      DS_HK_OFF(real_wglGetProcAddress),      DS_HK_WINED3D_GPA, DS_HK_MOD_GL32 },
-    { "glDrawBuffer",           (void *)(uintptr_t)hook_glDrawBuffer,           DS_HK_OFF(real_glDrawBuffer),           0, DS_HK_MOD_GL32 },
-    { "glReadBuffer",           (void *)(uintptr_t)hook_glReadBuffer,           DS_HK_OFF(real_glReadBuffer),           0, DS_HK_MOD_GL32 },
-    { "glGetIntegerv",          (void *)(uintptr_t)hook_glGetIntegerv,          DS_HK_OFF(real_glGetIntegerv),          0, DS_HK_MOD_GL32 },
-};
+
+#define DS_HOOK_TABLE_ITEMS(X) \
+    X("LoadLibraryA",         hook_LoadLibraryA,         real_LoadLibraryA,         DS_HK_LOADER, 0) \
+    X("LoadLibraryW",         hook_LoadLibraryW,         real_LoadLibraryW,         DS_HK_LOADER, 0) \
+    X("LoadLibraryExA",       hook_LoadLibraryExA,       real_LoadLibraryExA,       DS_HK_LOADER, 0) \
+    X("LoadLibraryExW",       hook_LoadLibraryExW,       real_LoadLibraryExW,       DS_HK_LOADER, 0) \
+    X("CreateProcessA",       hook_CreateProcessA,       real_CreateProcessA,       DS_HK_LOADER, 0) \
+    X("CreateProcessW",       hook_CreateProcessW,       real_CreateProcessW,       DS_HK_LOADER, 0) \
+    X("ShellExecuteA",        hook_ShellExecuteA,        real_ShellExecuteA,        DS_HK_LOADER | DS_HK_SHELL, 0) \
+    X("ShellExecuteW",        hook_ShellExecuteW,        real_ShellExecuteW,        DS_HK_LOADER | DS_HK_SHELL, 0) \
+    X("ShellExecuteExA",      hook_ShellExecuteExA,      real_ShellExecuteExA,      DS_HK_LOADER | DS_HK_SHELL, 0) \
+    X("ShellExecuteExW",      hook_ShellExecuteExW,      real_ShellExecuteExW,      DS_HK_LOADER | DS_HK_SHELL, 0) \
+    X("GetProcAddress",       hook_GetProcAddress,       real_GetProcAddress,       0, 0) \
+    X("EnumDisplaySettingsA",   hook_EnumDisplaySettingsA,   real_EnumDisplaySettingsA,   0, DS_HK_MOD_U32) \
+    X("EnumDisplaySettingsW",   hook_EnumDisplaySettingsW,   real_EnumDisplaySettingsW,   0, DS_HK_MOD_U32) \
+    X("EnumDisplaySettingsExA", hook_EnumDisplaySettingsExA, real_EnumDisplaySettingsExA, 0, DS_HK_MOD_U32) \
+    X("EnumDisplaySettingsExW", hook_EnumDisplaySettingsExW, real_EnumDisplaySettingsExW, 0, DS_HK_MOD_U32) \
+    X("ChangeDisplaySettingsA",   hook_ChangeDisplaySettingsA,   real_ChangeDisplaySettingsA,   0, DS_HK_MOD_U32) \
+    X("ChangeDisplaySettingsW",   hook_ChangeDisplaySettingsW,   real_ChangeDisplaySettingsW,   0, DS_HK_MOD_U32) \
+    X("ChangeDisplaySettingsExA", hook_ChangeDisplaySettingsExA, real_ChangeDisplaySettingsExA, 0, DS_HK_MOD_U32) \
+    X("ChangeDisplaySettingsExW", hook_ChangeDisplaySettingsExW, real_ChangeDisplaySettingsExW, 0, DS_HK_MOD_U32) \
+    X("GetSystemMetrics",     hook_GetSystemMetrics,     real_GetSystemMetrics,     0, DS_HK_MOD_U32) \
+    X("CreateWindowExA",      hook_CreateWindowExA,      real_CreateWindowExA,      0, DS_HK_MOD_U32) \
+    X("CreateWindowExW",      hook_CreateWindowExW,      real_CreateWindowExW,      0, DS_HK_MOD_U32) \
+    X("ShowWindow",           hook_ShowWindow,           real_ShowWindow,           0, DS_HK_MOD_U32) \
+    X("ShowWindowAsync",      hook_ShowWindowAsync,      real_ShowWindowAsync,      0, DS_HK_MOD_U32) \
+    X("SetWindowPlacement",   hook_SetWindowPlacement,   real_SetWindowPlacement,   0, DS_HK_MOD_U32) \
+    X("SetWindowPos",         hook_SetWindowPos,         real_SetWindowPos,         0, DS_HK_MOD_U32) \
+    X("MoveWindow",           hook_MoveWindow,           real_MoveWindow,           0, DS_HK_MOD_U32) \
+    X("GetWindowLongA",       hook_GetWindowLongA,       real_GetWindowLongA,       0, DS_HK_MOD_U32) \
+    X("GetWindowLongW",       hook_GetWindowLongW,       real_GetWindowLongW,       0, DS_HK_MOD_U32) \
+    X("SetWindowLongA",       hook_SetWindowLongA,       real_SetWindowLongA,       0, DS_HK_MOD_U32) \
+    X("SetWindowLongW",       hook_SetWindowLongW,       real_SetWindowLongW,       0, DS_HK_MOD_U32) \
+    DS_HOOK_WIN64_ITEMS(X) \
+    X("GetClientRect",        hook_GetClientRect,        real_GetClientRect,        0, DS_HK_MOD_U32) \
+    X("GetWindowRect",        hook_GetWindowRect,        real_GetWindowRect,        0, DS_HK_MOD_U32) \
+    X("GetMonitorInfoA",      hook_GetMonitorInfoA,      real_GetMonitorInfoA,      0, DS_HK_MOD_U32) \
+    X("GetMonitorInfoW",      hook_GetMonitorInfoW,      real_GetMonitorInfoW,      0, DS_HK_MOD_U32) \
+    X("AdjustWindowRect",     NULL,                      real_AdjustWindowRect,     0, DS_HK_MOD_U32) \
+    X("AdjustWindowRectEx",   NULL,                      real_AdjustWindowRectEx,   0, DS_HK_MOD_U32) \
+    X("GetCursorPos",         hook_GetCursorPos,         real_GetCursorPos,         0, DS_HK_MOD_U32) \
+    X("SetCursorPos",         hook_SetCursorPos,         real_SetCursorPos,         0, DS_HK_MOD_U32) \
+    X("ClipCursor",           hook_ClipCursor,           real_ClipCursor,           0, DS_HK_MOD_U32) \
+    X("GetClipCursor",        hook_GetClipCursor,        real_GetClipCursor,        0, DS_HK_MOD_U32) \
+    X("GetMessagePos",        hook_GetMessagePos,        real_GetMessagePos,        0, DS_HK_MOD_U32) \
+    X("GetRawInputData",      hook_GetRawInputData,      real_GetRawInputData,      0, DS_HK_MOD_U32) \
+    X("GetRawInputBuffer",    hook_GetRawInputBuffer,    real_GetRawInputBuffer,    0, DS_HK_MOD_U32) \
+    X("RegisterRawInputDevices", hook_RegisterRawInputDevices, real_RegisterRawInputDevices, 0, DS_HK_MOD_U32) \
+    X("ScreenToClient",       hook_ScreenToClient,       real_ScreenToClient,       0, DS_HK_MOD_U32) \
+    X("ClientToScreen",       hook_ClientToScreen,       real_ClientToScreen,       0, DS_HK_MOD_U32) \
+    X("MapWindowPoints",      hook_MapWindowPoints,      real_MapWindowPoints,      0, DS_HK_MOD_U32) \
+    X("WindowFromPoint",      hook_WindowFromPoint,      real_WindowFromPoint,      0, DS_HK_MOD_U32) \
+    X("ReleaseDC",            hook_ReleaseDC,            real_ReleaseDC,            DS_HK_WINED3D_GPA, DS_HK_MOD_U32) \
+    X("SetThreadDpiAwarenessContext",  NULL,             p_SetThreadDpiAwarenessContext,  0, DS_HK_MOD_U32) \
+    X("GetWindowDpiAwarenessContext",  NULL,             p_GetWindowDpiAwarenessContext,  0, DS_HK_MOD_U32) \
+    X("SetProcessDpiAwarenessContext", NULL,             p_SetProcessDpiAwarenessContext, 0, DS_HK_MOD_U32) \
+    X("GetDeviceCaps",        hook_GetDeviceCaps,        real_GetDeviceCaps,        0, DS_HK_MOD_G32) \
+    X("DeleteDC",             hook_DeleteDC,             real_DeleteDC,             DS_HK_WINED3D_GPA, DS_HK_MOD_G32) \
+    X("ChoosePixelFormat",    hook_ChoosePixelFormat,    real_ChoosePixelFormat,    DS_HK_WINED3D_GPA, DS_HK_MOD_G32) \
+    X("DescribePixelFormat",  hook_DescribePixelFormat,  real_DescribePixelFormat,  DS_HK_WINED3D_GPA, DS_HK_MOD_G32) \
+    X("GetPixelFormat",       hook_GetPixelFormat,       real_GetPixelFormat,       DS_HK_WINED3D_GPA, DS_HK_MOD_G32) \
+    X("SetPixelFormat",       hook_SetPixelFormat,       real_SetPixelFormat,       DS_HK_WINED3D_GPA, DS_HK_MOD_G32) \
+    X("BitBlt",               hook_BitBlt,               real_BitBlt,               0, DS_HK_MOD_G32) \
+    X("StretchBlt",           hook_StretchBlt,           real_StretchBlt,           0, DS_HK_MOD_G32) \
+    X("SetDIBitsToDevice",    hook_SetDIBitsToDevice,    real_SetDIBitsToDevice,    0, DS_HK_MOD_G32) \
+    X("StretchDIBits",        hook_StretchDIBits,        real_StretchDIBits,        0, DS_HK_MOD_G32) \
+    X("SwapBuffers",          hook_SwapBuffers,          real_SwapBuffers,          DS_HK_WINED3D_GPA, DS_HK_MOD_G32) \
+    X("D3DKMTEscape",         hook_D3DKMTEscape,         real_D3DKMTEscape,         DS_HK_WINE | DS_HK_WINED3D_GPA, 0) \
+    X("NtGdiDdDDIEscape",     hook_D3DKMTEscape,         real_NtGdiDdDDIEscape,     DS_HK_WINE | DS_HK_WINED3D_GPA, 0) \
+    X("wglCreateContext",       hook_wglCreateContext,       real_wglCreateContext,       DS_HK_WINED3D_GPA, DS_HK_MOD_GL32) \
+    X("wglCreateLayerContext",  hook_wglCreateLayerContext,  real_wglCreateLayerContext,  DS_HK_WINED3D_GPA, DS_HK_MOD_GL32) \
+    X("wglGetCurrentDC",        hook_wglGetCurrentDC,        real_wglGetCurrentDC,        DS_HK_WINED3D_GPA, DS_HK_MOD_GL32) \
+    X("wglChoosePixelFormat",   hook_wglChoosePixelFormat,   real_wglChoosePixelFormat,   0, DS_HK_MOD_GL32) \
+    X("wglDescribePixelFormat", hook_wglDescribePixelFormat, real_wglDescribePixelFormat, 0, DS_HK_MOD_GL32) \
+    X("wglGetPixelFormat",      hook_wglGetPixelFormat,      real_wglGetPixelFormat,      0, DS_HK_MOD_GL32) \
+    X("wglSetPixelFormat",      hook_wglSetPixelFormat,      real_wglSetPixelFormat,      0, DS_HK_MOD_GL32) \
+    X("wglMakeCurrent",         hook_wglMakeCurrent,         real_wglMakeCurrent,         DS_HK_WINED3D_GPA, DS_HK_MOD_GL32) \
+    X("wglDeleteContext",       hook_wglDeleteContext,       real_wglDeleteContext,       DS_HK_WINED3D_GPA, DS_HK_MOD_GL32) \
+    X("wglSwapBuffers",         hook_wglSwapBuffers,         real_wglSwapBuffers,         DS_HK_WINED3D_GPA, DS_HK_MOD_GL32) \
+    X("wglGetProcAddress",      hook_wglGetProcAddress,      real_wglGetProcAddress,      DS_HK_WINED3D_GPA, DS_HK_MOD_GL32) \
+    X("glDrawBuffer",           hook_glDrawBuffer,           real_glDrawBuffer,           0, DS_HK_MOD_GL32) \
+    X("glReadBuffer",           hook_glReadBuffer,           real_glReadBuffer,           0, DS_HK_MOD_GL32) \
+    X("glGetIntegerv",          hook_glGetIntegerv,          real_glGetIntegerv,          0, DS_HK_MOD_GL32)
+
+#define DS_HK_NAME_ITEM(nm, hk, fld, fl, mid) nm "\0"
+#define DS_HK_ENTRY_ITEM(nm, hk, fld, fl, mid) { (void *)(uintptr_t)(hk), DS_HK_OFF(fld), (fl), (mid) },
+
+static const char k_ds_hook_names_msz[] = DS_HOOK_TABLE_ITEMS(DS_HK_NAME_ITEM);
+static const ds_hook_entry_t k_ds_hook_table[] = { DS_HOOK_TABLE_ITEMS(DS_HK_ENTRY_ITEM) };
 
 static void *ds_lookup_hook_by_name_flags(const char *func_name, uint8_t req_mask, bool allow_loader_hooks, bool allow_shell)
 {
     if (!func_name || ((uintptr_t)func_name >> 16) == 0) {
         return NULL;
     }
-    for (size_t i = 0; i < sizeof(k_ds_hook_table) / sizeof(k_ds_hook_table[0]); i++) {
+    const char *nm = k_ds_hook_names_msz;
+    for (size_t i = 0; i < sizeof(k_ds_hook_table) / sizeof(k_ds_hook_table[0]); i++, nm += strlen(nm) + 1) {
         const ds_hook_entry_t *e = &k_ds_hook_table[i];
         if (!e->hook_fn) continue;
         if (req_mask && (e->flags & req_mask) == 0) continue;
         if ((e->flags & DS_HK_LOADER) && !allow_loader_hooks && !(allow_shell && (e->flags & DS_HK_SHELL))) continue;
         if ((e->flags & DS_HK_WINE) && !g_ds.is_wine) continue;
-        if (strcmp(func_name, e->name) == 0) return e->hook_fn;
+        if (strcmp(func_name, nm) == 0) return e->hook_fn;
     }
     return NULL;
 }
@@ -3206,14 +3273,17 @@ static void *ds_lookup_ibn_hook(
     bool           is_wine_gfx_mod
 )
 {
-    if (ibn_rva < sizeof(IMAGE_DOS_HEADER) || ibn_rva + 4 > size_of_image) return NULL;
-    const char *fn_name = (const char *)(img + ibn_rva + offsetof(IMAGE_IMPORT_BY_NAME, Name));
-    size_t max_name = size_of_image - (ibn_rva + offsetof(IMAGE_IMPORT_BY_NAME, Name));
+    if (ibn_rva < sizeof(IMAGE_DOS_HEADER) || ibn_rva >= size_of_image || size_of_image - ibn_rva < 4u) return NULL;
+    size_t name_off = ibn_rva + offsetof(IMAGE_IMPORT_BY_NAME, Name);
+    if (name_off >= size_of_image) return NULL;
+    const char *fn_name = (const char *)(img + name_off);
+    size_t max_name = size_of_image - name_off;
     if (max_name > 256) max_name = 256;
     if (!ds_is_nul_terminated_within(fn_name, max_name)) return NULL;
     if (is_com_loader_only_mod) {
-        for (size_t i = 0; i < 4; i++) {
-            if (strcmp(fn_name, k_ds_hook_table[i].name) == 0) return k_ds_hook_table[i].hook_fn;
+        const char *nm = k_ds_hook_names_msz;
+        for (size_t i = 0; i < 4; i++, nm += strlen(nm) + 1) {
+            if (strcmp(fn_name, nm) == 0) return k_ds_hook_table[i].hook_fn;
         }
         return NULL;
     }
@@ -3227,7 +3297,61 @@ static size_t ds_resolve_delay_rva(DWORD attrs, uintptr_t raw, uintptr_t img_bas
     return (raw >= img_base) ? (size_t)(raw - img_base) : 0;
 }
 
-static void ds_patch_single_module_iat(HMODULE hmod)
+static void ds_patch_iat_thunks(
+    uint8_t *img,
+    size_t   size_of_image,
+    size_t   iat_off,
+    size_t   orig_off,
+    bool     has_int,
+    bool     is_delay,
+    DWORD    delay_attrs,
+    bool     is_com_only,
+    bool     is_wine_gfx
+)
+{
+    uintptr_t img_base = (uintptr_t)img;
+    for (; iat_off <= size_of_image - sizeof(IMAGE_THUNK_DATA);
+         iat_off += sizeof(IMAGE_THUNK_DATA), orig_off += sizeof(IMAGE_THUNK_DATA)) {
+        IMAGE_THUNK_DATA *iat_thunk = (IMAGE_THUNK_DATA *)(img + iat_off);
+        if (iat_thunk->u1.Function == 0) break;
+        const void *cur_fn = (const void *)(uintptr_t)iat_thunk->u1.Function;
+        void *replacement = NULL;
+
+        if (!is_delay && has_int && orig_off <= size_of_image - sizeof(IMAGE_THUNK_DATA)) {
+            IMAGE_THUNK_DATA *orig_thunk = (IMAGE_THUNK_DATA *)(img + orig_off);
+            if (orig_thunk->u1.AddressOfData == 0) break;
+            if (!IMAGE_SNAP_BY_ORDINAL(orig_thunk->u1.Ordinal)) {
+                replacement = ds_lookup_ibn_hook(img, size_of_image, (size_t)orig_thunk->u1.AddressOfData, is_com_only, is_wine_gfx);
+            }
+        }
+        if (!replacement) {
+            if (is_com_only) {
+                for (size_t i = 0; i < 4; i++) {
+                    void *real_fn = *ds_hk_real_slot(&k_ds_hook_table[i]);
+                    if (real_fn && real_fn == cur_fn) {
+                        replacement = k_ds_hook_table[i].hook_fn;
+                        break;
+                    }
+                }
+            } else {
+                replacement = ds_lookup_hook_by_real_ptr(cur_fn, !is_wine_gfx);
+            }
+        }
+        if (!replacement && is_delay && has_int && orig_off <= size_of_image - sizeof(IMAGE_THUNK_DATA) &&
+            ((uintptr_t)cur_fn < img_base || (uintptr_t)cur_fn >= img_base + size_of_image)) {
+            IMAGE_THUNK_DATA *orig_thunk = (IMAGE_THUNK_DATA *)(img + orig_off);
+            if (orig_thunk->u1.AddressOfData != 0 && !IMAGE_SNAP_BY_ORDINAL(orig_thunk->u1.Ordinal)) {
+                size_t ibn_rva = ds_resolve_delay_rva(delay_attrs, (uintptr_t)orig_thunk->u1.AddressOfData, img_base);
+                replacement = ds_lookup_ibn_hook(img, size_of_image, ibn_rva, false, is_wine_gfx);
+            }
+        }
+        if (replacement) {
+            ds_patch_iat_slot_atomic(&iat_thunk->u1.Function, replacement);
+        }
+    }
+}
+
+static void ds_patch_single_module_iat(HMODULE hmod, uint32_t patch_gen)
 {
     if (!hmod || hmod == g_ds.self_hmod) return;
 
@@ -3236,59 +3360,29 @@ static void ds_patch_single_module_iat(HMODULE hmod)
     const WCHAR *base = ds_basename_w(mod_path);
 
     uint32_t mflags = ds_compute_mod_flags_by_base(base);
-    bool mod_state_changed = false;
-    bool dxvk_d3d9_hint = false;
-    if ((mflags & DS_MODF_D3D9) != 0) {
-        /* Positive DXVK d3d9.dll check outside g_ds.lock */
-        dxvk_d3d9_hint = (
-            GetModuleHandleW(L"wined3d.dll") == NULL &&
-            (GetModuleHandleW(L"vulkan-1.dll") != NULL || GetModuleHandleW(L"winevulkan.dll") != NULL)
-        );
-    }
+    ds_mod_cache_store(hmod, mflags, patch_gen);
+    bool dxvk_d3d9_hint = ((mflags & DS_MODF_D3D9) != 0) &&
+        GetModuleHandleW(L"wined3d.dll") == NULL &&
+        (GetModuleHandleW(L"vulkan-1.dll") != NULL || GetModuleHandleW(L"winevulkan.dll") != NULL);
     bool tier_changed = false;
     bool now_modern = false;
     if ((mflags & (DS_MODF_DDRAW | DS_MODF_D3D8 | DS_MODF_D3D9 | DS_MODF_MODERN_DX | DS_MODF_VULKAN)) != 0) {
         if (g_ds.lock_initialized) ds_lock();
-        if ((mflags & DS_MODF_DDRAW) != 0) {
-            if (!g_ds.ddraw_loaded || !g_ds.legacy_d3d_loaded) {
-                g_ds.ddraw_loaded = true;
-                g_ds.legacy_d3d_loaded = true;
-                mod_state_changed = true;
-            }
-        } else if ((mflags & DS_MODF_D3D8) != 0) {
-            if (!g_ds.d3d8_or_9_loaded || !g_ds.legacy_d3d_loaded) {
-                g_ds.d3d8_or_9_loaded = true;
-                g_ds.legacy_d3d_loaded = true;
-                mod_state_changed = true;
-            }
-        } else if ((mflags & DS_MODF_D3D9) != 0) {
-            if (!g_ds.d3d8_or_9_loaded || !g_ds.d3d9_loaded || !g_ds.legacy_d3d_loaded) {
-                g_ds.d3d8_or_9_loaded = true;
-                g_ds.d3d9_loaded = true;
-                g_ds.legacy_d3d_loaded = true;
-                mod_state_changed = true;
-            }
-            if (dxvk_d3d9_hint && !g_ds.wined3d_uses_vulkan && !g_ds.wined3d_uses_gl) {
-                g_ds.wined3d_uses_vulkan = true;
-                mod_state_changed = true;
-            }
-        } else if ((mflags & DS_MODF_MODERN_DX) != 0) {
-            if (!g_ds.dxgi_or_d3d10_plus_loaded || !g_ds.modern_gfx_loaded) {
-                g_ds.dxgi_or_d3d10_plus_loaded = true;
-                g_ds.modern_gfx_loaded = true;
-                mod_state_changed = true;
-            }
-        } else if ((mflags & DS_MODF_VULKAN) != 0) {
-            if (!g_ds.vulkan_loaded) {
-                g_ds.vulkan_loaded = true;
-                mod_state_changed = true;
-            }
-            if (!g_ds.wined3d_uses_gl && !g_ds.wined3d_uses_vulkan) {
-                g_ds.wined3d_uses_vulkan = true;
-                mod_state_changed = true;
-            }
+        bool ch = false;
+        #define DS_SET_FLAG(f) do { if (!(f)) { (f) = true; ch = true; } } while (0)
+        if (mflags & DS_MODF_DDRAW) { DS_SET_FLAG(g_ds.ddraw_loaded); DS_SET_FLAG(g_ds.legacy_d3d_loaded); }
+        if (mflags & (DS_MODF_D3D8 | DS_MODF_D3D9)) { DS_SET_FLAG(g_ds.d3d8_or_9_loaded); DS_SET_FLAG(g_ds.legacy_d3d_loaded); }
+        if (mflags & DS_MODF_D3D9) {
+            DS_SET_FLAG(g_ds.d3d9_loaded);
+            if (dxvk_d3d9_hint && !g_ds.wined3d_uses_gl) DS_SET_FLAG(g_ds.wined3d_uses_vulkan);
         }
-        if (mod_state_changed && g_ds.lock_initialized) {
+        if (mflags & DS_MODF_MODERN_DX) { DS_SET_FLAG(g_ds.dxgi_or_d3d10_plus_loaded); DS_SET_FLAG(g_ds.modern_gfx_loaded); }
+        if (mflags & DS_MODF_VULKAN) {
+            DS_SET_FLAG(g_ds.vulkan_loaded);
+            if (!g_ds.wined3d_uses_gl) DS_SET_FLAG(g_ds.wined3d_uses_vulkan);
+        }
+        #undef DS_SET_FLAG
+        if (ch && g_ds.lock_initialized) {
             tier_changed = ds_update_presenter_tier_locked();
             now_modern = ds_is_modern_tier_locked();
         }
@@ -3296,85 +3390,49 @@ static void ds_patch_single_module_iat(HMODULE hmod)
     }
 
     if (tier_changed) {
-        if (now_modern) {
-            ds_request_restore_passthrough();
-        } else {
-            ds_request_apply_presentation();
-        }
+        if (now_modern) ds_request_restore_passthrough();
+        else ds_request_apply_presentation();
         ds_write_status_file();
     }
 
     if ((mflags & DS_MODF_SKIP_IAT) != 0) return;
 
-    bool is_com_loader_only_mod = (
-        ds_wcs_ieq_ascii(base, "ole32.dll") ||
-        ds_wcs_ieq_ascii(base, "combase.dll")
-    );
+    bool is_com_loader_only_mod = (ds_wcs_ieq_ascii(base, "ole32.dll") || ds_wcs_ieq_ascii(base, "combase.dll"));
     bool is_wine_gfx_mod = ((mflags & (DS_MODF_WINED3D | DS_MODF_DDRAW | DS_MODF_D3D8 | DS_MODF_D3D9)) != 0);
 
     uint8_t *img = (uint8_t *)hmod;
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)img;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000) return;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < (LONG)sizeof(IMAGE_DOS_HEADER) || dos->e_lfanew > 0x100000) return;
 
-    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(img + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(img + (size_t)dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) return;
 
     size_t size_of_image = (size_t)nt->OptionalHeader.SizeOfImage;
-    if (size_of_image < 512 || (size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS) > size_of_image) return;
+    if (size_of_image < 512u || (size_t)dos->e_lfanew > size_of_image || size_of_image - (size_t)dos->e_lfanew < sizeof(IMAGE_NT_HEADERS)) return;
 
-    IMAGE_DATA_DIRECTORY imp_dir = { 0, 0 };
     if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
-        imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    }
-    if (imp_dir.VirtualAddress != 0 && imp_dir.Size != 0 &&
-        (size_t)imp_dir.VirtualAddress < size_of_image &&
-        (size_t)imp_dir.VirtualAddress + sizeof(IMAGE_IMPORT_DESCRIPTOR) <= size_of_image) {
-        size_t desc_off = (size_t)imp_dir.VirtualAddress;
-        for (; desc_off + sizeof(IMAGE_IMPORT_DESCRIPTOR) <= size_of_image; desc_off += sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
-            IMAGE_IMPORT_DESCRIPTOR *desc = (IMAGE_IMPORT_DESCRIPTOR *)(img + desc_off);
-            if (desc->Name == 0 && desc->FirstThunk == 0) break;
-            if (desc->Name == 0 || (size_t)desc->Name >= size_of_image) continue;
-            if (desc->FirstThunk == 0 || (size_t)desc->FirstThunk + sizeof(IMAGE_THUNK_DATA) > size_of_image) continue;
+        IMAGE_DATA_DIRECTORY imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (imp_dir.VirtualAddress != 0 && imp_dir.Size != 0 &&
+            (size_t)imp_dir.VirtualAddress < size_of_image &&
+            size_of_image - (size_t)imp_dir.VirtualAddress >= sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+            for (size_t desc_off = (size_t)imp_dir.VirtualAddress;
+                 desc_off <= size_of_image - sizeof(IMAGE_IMPORT_DESCRIPTOR);
+                 desc_off += sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+                IMAGE_IMPORT_DESCRIPTOR *desc = (IMAGE_IMPORT_DESCRIPTOR *)(img + desc_off);
+                if (desc->Name == 0 && desc->FirstThunk == 0) break;
+                if (desc->Name == 0 || (size_t)desc->Name >= size_of_image) continue;
+                if (desc->FirstThunk == 0 || (size_t)desc->FirstThunk >= size_of_image ||
+                    size_of_image - (size_t)desc->FirstThunk < sizeof(IMAGE_THUNK_DATA)) continue;
 
-            bool has_distinct_int = (
-                desc->OriginalFirstThunk != 0 &&
-                desc->OriginalFirstThunk != desc->FirstThunk &&
-                (size_t)desc->OriginalFirstThunk + sizeof(IMAGE_THUNK_DATA) <= size_of_image
-            );
-
-            size_t iat_off = (size_t)desc->FirstThunk;
-            size_t orig_off = has_distinct_int ? (size_t)desc->OriginalFirstThunk : 0;
-
-            for (; iat_off + sizeof(IMAGE_THUNK_DATA) <= size_of_image;
-                 iat_off += sizeof(IMAGE_THUNK_DATA), orig_off += sizeof(IMAGE_THUNK_DATA)) {
-                IMAGE_THUNK_DATA *iat_thunk = (IMAGE_THUNK_DATA *)(img + iat_off);
-                if (iat_thunk->u1.Function == 0) break;
-
-                void *replacement = NULL;
-                if (has_distinct_int && orig_off + sizeof(IMAGE_THUNK_DATA) <= size_of_image) {
-                    IMAGE_THUNK_DATA *orig_thunk = (IMAGE_THUNK_DATA *)(img + orig_off);
-                    if (orig_thunk->u1.AddressOfData == 0) break;
-                    if (!IMAGE_SNAP_BY_ORDINAL(orig_thunk->u1.Ordinal)) {
-                        replacement = ds_lookup_ibn_hook(img, size_of_image, (size_t)orig_thunk->u1.AddressOfData, is_com_loader_only_mod, is_wine_gfx_mod);
-                    }
-                }
-
-                if (!replacement) {
-                    const void *cur_fn = (const void *)(uintptr_t)iat_thunk->u1.Function;
-                    if (is_com_loader_only_mod) {
-                        for (size_t i = 0; i < 4; i++) {
-                            void *real_fn = *ds_hk_real_slot(&k_ds_hook_table[i]);
-                            if (real_fn && real_fn == cur_fn) {
-                                replacement = k_ds_hook_table[i].hook_fn;
-                                break;
-                            }
-                        }
-                    } else {
-                        replacement = ds_lookup_hook_by_real_ptr(cur_fn, !is_wine_gfx_mod);
-                    }
-                }
-                if (!replacement) continue;
-                ds_patch_iat_slot_atomic(&iat_thunk->u1.Function, replacement);
+                bool has_distinct_int = (
+                    desc->OriginalFirstThunk != 0 &&
+                    desc->OriginalFirstThunk != desc->FirstThunk &&
+                    (size_t)desc->OriginalFirstThunk < size_of_image &&
+                    size_of_image - (size_t)desc->OriginalFirstThunk >= sizeof(IMAGE_THUNK_DATA)
+                );
+                ds_patch_iat_thunks(img, size_of_image, (size_t)desc->FirstThunk,
+                                    has_distinct_int ? (size_t)desc->OriginalFirstThunk : 0u,
+                                    has_distinct_int, false, 0u, is_com_loader_only_mod, is_wine_gfx_mod);
             }
         }
     }
@@ -3383,58 +3441,40 @@ static void ds_patch_single_module_iat(HMODULE hmod)
     if (!is_com_loader_only_mod && nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT) {
         IMAGE_DATA_DIRECTORY delay_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
         if (delay_dir.VirtualAddress != 0 && delay_dir.Size >= 32u &&
-            (size_t)delay_dir.VirtualAddress + 32u <= size_of_image) {
+            (size_t)delay_dir.VirtualAddress < size_of_image &&
+            size_of_image - (size_t)delay_dir.VirtualAddress >= 32u) {
             typedef struct ds_delay_desc_s {
-                DWORD grAttrs;
-                DWORD rvaDLLName;
-                DWORD rvaHmod;
-                DWORD rvaIAT;
-                DWORD rvaINT;
-                DWORD rvaBoundIAT;
-                DWORD rvaUnloadIAT;
-                DWORD dwTimeStamp;
+                DWORD grAttrs, rvaDLLName, rvaHmod, rvaIAT, rvaINT, rvaBoundIAT, rvaUnloadIAT, dwTimeStamp;
             } ds_delay_desc_t;
             uintptr_t img_base = (uintptr_t)img;
             size_t d_off = (size_t)delay_dir.VirtualAddress;
-            for (int di = 0; di < 64 && d_off + sizeof(ds_delay_desc_t) <= size_of_image; di++, d_off += sizeof(ds_delay_desc_t)) {
+            for (int di = 0; di < 64 && d_off <= size_of_image - sizeof(ds_delay_desc_t); di++, d_off += sizeof(ds_delay_desc_t)) {
                 const ds_delay_desc_t *dd = (const ds_delay_desc_t *)(img + d_off);
                 if (dd->rvaDLLName == 0 && dd->rvaIAT == 0 && dd->rvaINT == 0) break;
                 if (dd->rvaIAT == 0) continue;
                 size_t iat_rva = ds_resolve_delay_rva(dd->grAttrs, (uintptr_t)dd->rvaIAT, img_base);
                 size_t int_rva = ds_resolve_delay_rva(dd->grAttrs, (uintptr_t)dd->rvaINT, img_base);
-                if (iat_rva == 0 || iat_rva + sizeof(IMAGE_THUNK_DATA) > size_of_image) continue;
-                bool has_int = (int_rva != 0 && int_rva != iat_rva && int_rva + sizeof(IMAGE_THUNK_DATA) <= size_of_image);
-                for (size_t io = iat_rva, no = int_rva;
-                     io + sizeof(IMAGE_THUNK_DATA) <= size_of_image;
-                     io += sizeof(IMAGE_THUNK_DATA), no += sizeof(IMAGE_THUNK_DATA)) {
-                    IMAGE_THUNK_DATA *iat_thunk = (IMAGE_THUNK_DATA *)(img + io);
-                    if (iat_thunk->u1.Function == 0) break;
-                    /* Only patch delay-load slots already resolved outside our image (pointing to real Win32 fn) */
-                    const void *cur_fn = (const void *)(uintptr_t)iat_thunk->u1.Function;
-                    void *replacement = ds_lookup_hook_by_real_ptr(cur_fn, !is_wine_gfx_mod);
-                    if (!replacement && has_int && no + sizeof(IMAGE_THUNK_DATA) <= size_of_image &&
-                        ((uintptr_t)cur_fn < img_base || (uintptr_t)cur_fn >= img_base + size_of_image)) {
-                        IMAGE_THUNK_DATA *orig_thunk = (IMAGE_THUNK_DATA *)(img + no);
-                        if (orig_thunk->u1.AddressOfData != 0 && !IMAGE_SNAP_BY_ORDINAL(orig_thunk->u1.Ordinal)) {
-                            size_t ibn_rva = ds_resolve_delay_rva(dd->grAttrs, (uintptr_t)orig_thunk->u1.AddressOfData, img_base);
-                            replacement = ds_lookup_ibn_hook(img, size_of_image, ibn_rva, false, is_wine_gfx_mod);
-                        }
-                    }
-                    if (replacement) {
-                        ds_patch_iat_slot_atomic(&iat_thunk->u1.Function, replacement);
-                    }
-                }
+                if (iat_rva == 0 || iat_rva >= size_of_image || size_of_image - iat_rva < sizeof(IMAGE_THUNK_DATA)) continue;
+                bool has_int = (int_rva != 0 && int_rva != iat_rva && int_rva < size_of_image && size_of_image - int_rva >= sizeof(IMAGE_THUNK_DATA));
+                ds_patch_iat_thunks(img, size_of_image, iat_rva, int_rva, has_int, true, dd->grAttrs, false, is_wine_gfx_mod);
             }
         }
     }
 }
 
-void ds_patch_loaded_modules(void)
+static void ds_patch_loaded_modules_gen(bool force_rescan)
 {
-    ds_invalidate_mod_cache();
+    uint32_t gen = force_rescan
+        ? (uint32_t)InterlockedIncrement(&s_iat_patch_gen)
+        : (uint32_t)InterlockedCompareExchange(&s_iat_patch_gen, 0, 0);
+    if (gen == 0u) gen = (uint32_t)InterlockedIncrement(&s_iat_patch_gen);
+
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) {
-        ds_patch_single_module_iat(GetModuleHandleW(NULL));
+        HMODULE main_mod = GetModuleHandleW(NULL);
+        if (force_rescan || !ds_mod_is_patched_at_gen(main_mod, gen)) {
+            ds_patch_single_module_iat(main_mod, gen);
+        }
         return;
     }
 
@@ -3443,10 +3483,18 @@ void ds_patch_loaded_modules(void)
     me.dwSize = sizeof(me);
     if (Module32FirstW(snap, &me)) {
         do {
-            ds_patch_single_module_iat(me.hModule);
+            if (!force_rescan && ds_mod_is_patched_at_gen(me.hModule, gen)) {
+                continue;
+            }
+            ds_patch_single_module_iat(me.hModule, gen);
         } while (Module32NextW(snap, &me));
     }
     CloseHandle(snap);
+}
+
+void ds_patch_loaded_modules(void)
+{
+    ds_patch_loaded_modules_gen(true);
 }
 
 static FARPROC WINAPI hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
@@ -3491,8 +3539,14 @@ static FARPROC WINAPI hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
 static HMODULE ds_on_module_loaded(HMODULE h, DWORD dwFlags)
 {
     if (h && !ds_is_internal_call() && (dwFlags & (LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE)) == 0) {
-        ds_resolve_loaded_system_apis();
-        ds_patch_loaded_modules();
+        uint32_t gen = (uint32_t)InterlockedCompareExchange(&s_iat_patch_gen, 0, 0);
+        if (gen == 0u) gen = (uint32_t)InterlockedIncrement(&s_iat_patch_gen);
+        if (!ds_mod_is_patched_at_gen(h, gen)) {
+            ds_resolve_loaded_system_apis();
+            ds_patch_single_module_iat(h, gen);
+            /* Patch any brand-new transitive dependencies pulled in by h, skipping already-patched modules */
+            ds_patch_loaded_modules_gen(false);
+        }
     }
     return h;
 }
@@ -3544,23 +3598,10 @@ static void ds_read_env_utf8(const char *name, char *out_buf, size_t max_bytes)
 static bool ds_read_ini_file_raw(const WCHAR *path, ds_control_state_t *out_ctl)
 {
     if (!path || !path[0] || !out_ctl) return false;
-    HANDLE hf = CreateFileW(
-        path,
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
-    if (hf == INVALID_HANDLE_VALUE) return false;
-    char buf[1024];
-    DWORD bytes_read = 0;
-    BOOL ok = ReadFile(hf, buf, (DWORD)(sizeof(buf) - 1), &bytes_read, NULL);
-    CloseHandle(hf);
-    if (!ok || bytes_read == 0) return false;
-    buf[bytes_read] = '\0';
-    return ds_parse_control_ini(buf, (size_t)bytes_read, out_ctl);
+    char buf[DS_INI_BUF_BYTES];
+    size_t bytes_read = 0;
+    if (!ds_read_ini_file_utf8(path, buf, sizeof(buf), &bytes_read)) return false;
+    return ds_parse_control_ini(buf, bytes_read, out_ctl);
 }
 
 DS_ALWAYS_INLINE void ds_fill_sibling_path_if_empty(WCHAR *dst, size_t dst_cch, const WCHAR *dir, const WCHAR *filename)
@@ -3813,7 +3854,10 @@ void ds_refresh_host_display_metrics_for_hwnd(HWND hwnd)
 
 void ds_refresh_host_display_metrics(void)
 {
-    HWND target = g_ds.hwnd_game;
+    HWND target = NULL;
+    if (g_ds.lock_initialized) ds_lock();
+    target = g_ds.hwnd_game;
+    if (g_ds.lock_initialized) ds_unlock();
     ds_refresh_host_display_metrics_for_hwnd(target);
 }
 
@@ -3827,30 +3871,30 @@ static void ds_resolve_loaded_system_apis(void)
     mods[DS_HK_MOD_G32]  = GetModuleHandleW(L"gdi32.dll");
     mods[DS_HK_MOD_GL32] = GetModuleHandleW(L"opengl32.dll");
 
-    for (size_t i = 0; i < sizeof(k_ds_hook_table) / sizeof(k_ds_hook_table[0]); i++) {
+    const char *nm = k_ds_hook_names_msz;
+    for (size_t i = 0; i < sizeof(k_ds_hook_table) / sizeof(k_ds_hook_table[0]); i++, nm += strlen(nm) + 1) {
         const ds_hook_entry_t *e = &k_ds_hook_table[i];
         void **slot = ds_hk_real_slot(e);
-        if (e->mod_id == 0 || *slot != NULL) continue;
+        if (e->mod_id == 0 || InterlockedCompareExchangePointer((PVOID volatile *)slot, NULL, NULL) != NULL) continue;
         HMODULE hm = mods[e->mod_id];
-        if (hm) {
-            *slot = (void *)(uintptr_t)g_ds.real_GetProcAddress(hm, e->name);
+        void *fn = hm ? (void *)(uintptr_t)g_ds.real_GetProcAddress(hm, nm) : NULL;
+        if (!fn && e->mod_id == DS_HK_MOD_GL32 && mods[DS_HK_MOD_G32]) {
+            fn = (void *)(uintptr_t)g_ds.real_GetProcAddress(mods[DS_HK_MOD_G32], nm);
         }
-        if (*slot == NULL && e->mod_id == DS_HK_MOD_GL32 && mods[DS_HK_MOD_G32]) {
-            *slot = (void *)(uintptr_t)g_ds.real_GetProcAddress(mods[DS_HK_MOD_G32], e->name);
+        if (fn) {
+            InterlockedCompareExchangePointer((PVOID volatile *)slot, fn, NULL);
         }
     }
 
-    if (g_ds.is_wine && !g_ds.real_D3DKMTEscape) {
+    if (g_ds.is_wine && InterlockedCompareExchangePointer((PVOID volatile *)&g_ds.real_D3DKMTEscape, NULL, NULL) == NULL) {
         HMODULE w32u = GetModuleHandleW(L"win32u.dll");
-        if (w32u && !g_ds.real_NtGdiDdDDIEscape) {
-            g_ds.real_NtGdiDdDDIEscape = (pfn_D3DKMTEscape_t)(uintptr_t)g_ds.real_GetProcAddress(w32u, "NtGdiDdDDIEscape");
+        if (w32u && InterlockedCompareExchangePointer((PVOID volatile *)&g_ds.real_NtGdiDdDDIEscape, NULL, NULL) == NULL) {
+            void *fn = (void *)(uintptr_t)g_ds.real_GetProcAddress(w32u, "NtGdiDdDDIEscape");
+            if (fn) InterlockedCompareExchangePointer((PVOID volatile *)&g_ds.real_NtGdiDdDDIEscape, fn, NULL);
         }
-        if (mods[DS_HK_MOD_G32] && !g_ds.real_D3DKMTEscape) {
-            g_ds.real_D3DKMTEscape = (pfn_D3DKMTEscape_t)(uintptr_t)g_ds.real_GetProcAddress(mods[DS_HK_MOD_G32], "D3DKMTEscape");
-        }
-        if (!g_ds.real_D3DKMTEscape) {
-            g_ds.real_D3DKMTEscape = g_ds.real_NtGdiDdDDIEscape;
-        }
+        void *esc = mods[DS_HK_MOD_G32] ? (void *)(uintptr_t)g_ds.real_GetProcAddress(mods[DS_HK_MOD_G32], "D3DKMTEscape") : NULL;
+        if (!esc) esc = (void *)(uintptr_t)g_ds.real_NtGdiDdDDIEscape;
+        if (esc) InterlockedCompareExchangePointer((PVOID volatile *)&g_ds.real_D3DKMTEscape, esc, NULL);
     }
 
     ds_ensure_shell32_loaded(false);
@@ -3945,20 +3989,21 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
     ds_read_env_utf8("ONE_LAUNCHER_SAFE_INSET_TOP", ev, sizeof(ev));
     g_ds.safe_inset_top = ev[0] ? (int32_t)atoi(ev) : 0;
 
-    for (size_t i = 0; i < sizeof(k_ds_path_envs) / sizeof(k_ds_path_envs[0]); i++) {
-        ds_read_env_w(k_ds_path_envs[i].key, ds_path_env_field(i), MAX_PATH);
+    const char *ek = k_ds_path_env_keys_msz;
+    for (size_t i = 0; i < sizeof(k_ds_path_env_offs) / sizeof(k_ds_path_env_offs[0]); i++, ek += strlen(ek) + 1) {
+        ds_read_env_w(ek, ds_path_env_field(i), MAX_PATH);
     }
 
     if (g_ds.self_dir[0]) {
-        static const char k_sib_names[4][30] = {
-            "one_display_scaler_x86.dll",
-            "one_display_scaler_x64.dll",
-            "one_display_launcher_x86.exe",
-            "one_display_launcher_x64.exe"
-        };
-        for (size_t i = 0; i < 4; i++) {
+        static const char k_sib_names_msz[] =
+            "one_display_scaler_x86.dll\0"
+            "one_display_scaler_x64.dll\0"
+            "one_display_launcher_x86.exe\0"
+            "one_display_launcher_x64.exe\0";
+        const char *sn = k_sib_names_msz;
+        for (size_t i = 0; i < 4; i++, sn += strlen(sn) + 1) {
             WCHAR leaf[32];
-            ds_ascii_to_w(k_sib_names[i], leaf, 32);
+            ds_ascii_to_w(sn, leaf, 32);
             ds_fill_sibling_path_if_empty(ds_path_env_field(i), MAX_PATH, g_ds.self_dir, leaf);
         }
     }
@@ -4022,12 +4067,23 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
     g_ds.real_GetProcAddress = k32 ? (pfn_GetProcAddress_t)(uintptr_t)GetProcAddress(k32, "GetProcAddress") : NULL;
     if (!g_ds.real_GetProcAddress) return;
 
-    for (size_t i = 0; i < 6; i++) {
-        *ds_hk_real_slot(&k_ds_hook_table[i]) = (void *)(uintptr_t)g_ds.real_GetProcAddress(k32, k_ds_hook_table[i].name);
+    const char *k32_nm = k_ds_hook_names_msz;
+    for (size_t i = 0; i < 6; i++, k32_nm += strlen(k32_nm) + 1) {
+        *ds_hk_real_slot(&k_ds_hook_table[i]) = (void *)(uintptr_t)g_ds.real_GetProcAddress(k32, k32_nm);
     }
 
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     g_ds.is_wine = (ntdll != NULL && g_ds.real_GetProcAddress(ntdll, "wine_get_version") != NULL);
+#if !defined(_WIN64)
+    {
+        typedef BOOL (WINAPI *pfn_IsWow64Process_t)(HANDLE, PBOOL);
+        pfn_IsWow64Process_t pIsWow64 = (pfn_IsWow64Process_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "IsWow64Process");
+        BOOL wow64 = FALSE;
+        if (pIsWow64 && pIsWow64(GetCurrentProcess(), &wow64)) {
+            g_ds.is_wow64 = (wow64 != FALSE);
+        }
+    }
+#endif
 
     if (!is_chaining_wrapper) {
         char aff_env[16] = { 0 };

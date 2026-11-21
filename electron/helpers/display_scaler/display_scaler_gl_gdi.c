@@ -56,34 +56,27 @@ typedef const char *(WINAPI *pfn_wglQueryRendererStringWINE_t)(HDC, GLint, GLenu
 #define GL_COLOR_CLEAR_VALUE 0x0C22
 #endif
 
-#define DS_MAX_GL_DC_MAP 16
-
-typedef struct ds_gl_dc_entry_s {
-    HDC  game_hdc;
-    HDC  host_hdc;
-    HWND host_hwnd;
-} ds_gl_dc_entry_t;
-
 typedef struct ds_gl_state_s {
-    bool                          procs_queried;
     bool                          fbo_supported;
     HGLRC                         game_hglrc;
     HGLRC                         fbo_ctx;
-    GLuint                        fbo_id;
-    GLuint                        color_tex;
-    GLuint                        depth_rb;
-    int32_t                       fbo_w;
-    int32_t                       fbo_h;
+    union {
+        ds_gl_game_fbo_t          gfbo;
+        struct {
+            GLuint                fbo_id;
+            GLuint                color_tex;
+            GLuint                depth_rb;
+            int32_t               fbo_w;
+            int32_t               fbo_h;
+            GLuint                game_draw_fbo;
+            GLuint                game_read_fbo;
+        };
+    };
     bool                          fbo_redirect_active;
-    GLuint                        game_draw_fbo;
-    GLuint                        game_read_fbo;
 
     /* WineD3D OpenGL presentation tracking & shader-blitter upscale FBO */
     HGLRC                         w3d_hglrc;
-    GLuint                        w3d_fbo_id;
-    GLuint                        w3d_color_tex;
-    int32_t                       w3d_w;
-    int32_t                       w3d_h;
+    ds_gl_color_fbo_t             wfbo;
     bool                          w3d_scaled_in_blit;
     bool                          last_present_was_gl;
     GLint                         last_w3d_vp[4];
@@ -91,15 +84,16 @@ typedef struct ds_gl_state_s {
 
     /* Two-pass zero-shader FBO Sharp-Bilinear intermediate surface */
     HGLRC                         sharp_ctx;
-    GLuint                        sharp_fbo;
-    GLuint                        sharp_tex;
-    int32_t                       sharp_w;
-    int32_t                       sharp_h;
+    ds_gl_color_fbo_t             sfbo;
 
-    /* Bijective game_hdc <-> host_hdc map for OneLauncherGLHostChild */
+    /* Bijective LRU game_hdc <-> host_hdc map for OneLauncherGLHostChild */
     ds_gl_dc_entry_t              dc_map[DS_MAX_GL_DC_MAP];
+    uint32_t                      dc_map_gen;
     /* Per-HGLRC isolation map (native game context vs WineD3D probe/renderer context) */
     ds_gl_ctx_entry_t             ctx_map[DS_MAX_GL_CTX_MAP];
+    /* Per-HGLRC FBO/texture/RB ownership table (reused across context switches, freed on delete) */
+    ds_gl_ctx_fbo_slot_t          fbo_slots[DS_MAX_GL_CTX_MAP];
+    uint32_t                      fbo_slot_gen;
     int                           last_host_pf;
     PIXELFORMATDESCRIPTOR         last_host_pfd;
     bool                          has_last_host_pfd;
@@ -173,45 +167,49 @@ static void *ds_gl_proc_or_ext(HMODULE h_gl, const char *core_name, const char *
 #define DS_GLP_STATE   4u
 
 typedef struct ds_gl_proc_def_s {
-    const char *core;
-    const char *ext;
-    uint16_t    slot_off;
-    uint8_t     flags;
+    uint16_t slot_off;
+    uint8_t  flags;
 } ds_gl_proc_def_t;
 
 #define DS_GL_OFF(field) ((uint16_t)offsetof(ds_gl_state_t, field))
 
-static const ds_gl_proc_def_t k_gl_proc_defs[] = {
-    { "glGenTextures",             NULL,                        DS_GL_OFF(p_glGenTextures),             DS_GLP_REQ_FBO },
-    { "glDeleteTextures",          NULL,                        DS_GL_OFF(p_glDeleteTextures),          DS_GLP_REQ_FBO },
-    { "glBindTexture",             NULL,                        DS_GL_OFF(p_glBindTexture),             DS_GLP_REQ_FBO },
-    { "glTexImage2D",              NULL,                        DS_GL_OFF(p_glTexImage2D),              DS_GLP_REQ_FBO },
-    { "glTexParameteri",           NULL,                        DS_GL_OFF(p_glTexParameteri),           DS_GLP_REQ_FBO },
-    { "glIsEnabled",               NULL,                        DS_GL_OFF(p_glIsEnabled),               DS_GLP_STATE },
-    { "glEnable",                  NULL,                        DS_GL_OFF(p_glEnable),                  DS_GLP_STATE },
-    { "glDisable",                 NULL,                        DS_GL_OFF(p_glDisable),                 DS_GLP_STATE },
-    { "glGetBooleanv",             NULL,                        DS_GL_OFF(p_glGetBooleanv),             DS_GLP_STATE },
-    { "glGetIntegerv",             NULL,                        DS_GL_OFF(p_glGetIntegerv),             DS_GLP_STATE },
-    { "glGetFloatv",               NULL,                        DS_GL_OFF(p_glGetFloatv),               DS_GLP_STATE },
-    { "glColorMask",               NULL,                        DS_GL_OFF(p_glColorMask),               DS_GLP_STATE },
-    { "glViewport",                NULL,                        DS_GL_OFF(p_glViewport),                DS_GLP_STATE },
-    { "wglGetCurrentDC",           NULL,                        DS_GL_OFF(p_wglGetCurrentDC),           DS_GLP_STATE },
-    { "glGenFramebuffers",         "glGenFramebuffersEXT",      DS_GL_OFF(p_glGenFramebuffers),         DS_GLP_EXT | DS_GLP_REQ_FBO },
-    { "glDeleteFramebuffers",      "glDeleteFramebuffersEXT",   DS_GL_OFF(p_glDeleteFramebuffers),      DS_GLP_EXT | DS_GLP_REQ_FBO },
-    { "glBindFramebuffer",         "glBindFramebufferEXT",      DS_GL_OFF(p_glBindFramebuffer),         DS_GLP_EXT | DS_GLP_REQ_FBO | DS_GLP_STATE },
-    { "glFramebufferTexture2D",    "glFramebufferTexture2DEXT", DS_GL_OFF(p_glFramebufferTexture2D),    DS_GLP_EXT | DS_GLP_REQ_FBO },
-    { "glGenRenderbuffers",        "glGenRenderbuffersEXT",     DS_GL_OFF(p_glGenRenderbuffers),        DS_GLP_EXT | DS_GLP_REQ_FBO },
-    { "glDeleteRenderbuffers",     "glDeleteRenderbuffersEXT",  DS_GL_OFF(p_glDeleteRenderbuffers),     DS_GLP_EXT | DS_GLP_REQ_FBO },
-    { "glBindRenderbuffer",        "glBindRenderbufferEXT",     DS_GL_OFF(p_glBindRenderbuffer),        DS_GLP_EXT | DS_GLP_REQ_FBO },
-    { "glRenderbufferStorage",     "glRenderbufferStorageEXT",  DS_GL_OFF(p_glRenderbufferStorage),     DS_GLP_EXT | DS_GLP_REQ_FBO },
-    { "glFramebufferRenderbuffer", "glFramebufferRenderbufferEXT", DS_GL_OFF(p_glFramebufferRenderbuffer), DS_GLP_EXT | DS_GLP_REQ_FBO },
-    { "glCheckFramebufferStatus",  "glCheckFramebufferStatusEXT",  DS_GL_OFF(p_glCheckFramebufferStatus),  DS_GLP_EXT | DS_GLP_REQ_FBO },
-    { "glBlitFramebuffer",         "glBlitFramebufferEXT",      DS_GL_OFF(p_glBlitFramebuffer),         DS_GLP_EXT | DS_GLP_REQ_FBO },
-    { "glBindBuffer",              "glBindBufferARB",           DS_GL_OFF(p_glBindBuffer),              DS_GLP_EXT },
-    { "glClearColor",              NULL,                        DS_GL_OFF(p_glClearColor),              DS_GLP_EXT | DS_GLP_STATE },
-    { "glClear",                   NULL,                        DS_GL_OFF(p_glClear),                   DS_GLP_EXT | DS_GLP_STATE },
-    { "glScissor",                 NULL,                        DS_GL_OFF(p_glScissor),                 DS_GLP_EXT | DS_GLP_STATE },
-};
+#define DS_GL_PROC_LIST(X) \
+    X("glGenTextures",             "",                           p_glGenTextures,             DS_GLP_REQ_FBO) \
+    X("glDeleteTextures",          "",                           p_glDeleteTextures,          DS_GLP_REQ_FBO) \
+    X("glBindTexture",             "",                           p_glBindTexture,             DS_GLP_REQ_FBO) \
+    X("glTexImage2D",              "",                           p_glTexImage2D,              DS_GLP_REQ_FBO) \
+    X("glTexParameteri",           "",                           p_glTexParameteri,           DS_GLP_REQ_FBO) \
+    X("glIsEnabled",               "",                           p_glIsEnabled,               DS_GLP_STATE) \
+    X("glEnable",                  "",                           p_glEnable,                  DS_GLP_STATE) \
+    X("glDisable",                 "",                           p_glDisable,                 DS_GLP_STATE) \
+    X("glGetBooleanv",             "",                           p_glGetBooleanv,             DS_GLP_STATE) \
+    X("glGetIntegerv",             "",                           p_glGetIntegerv,             DS_GLP_STATE) \
+    X("glGetFloatv",               "",                           p_glGetFloatv,               DS_GLP_STATE) \
+    X("glColorMask",               "",                           p_glColorMask,               DS_GLP_STATE) \
+    X("glViewport",                "",                           p_glViewport,                DS_GLP_STATE) \
+    X("wglGetCurrentContext",      "",                           p_wglGetCurrentContext,      DS_GLP_STATE | DS_GLP_REQ_FBO) \
+    X("wglGetCurrentDC",           "",                           p_wglGetCurrentDC,           DS_GLP_STATE) \
+    X("glGenFramebuffers",         "glGenFramebuffersEXT",       p_glGenFramebuffers,         DS_GLP_EXT | DS_GLP_REQ_FBO) \
+    X("glDeleteFramebuffers",      "glDeleteFramebuffersEXT",    p_glDeleteFramebuffers,      DS_GLP_EXT | DS_GLP_REQ_FBO) \
+    X("glBindFramebuffer",         "glBindFramebufferEXT",       p_glBindFramebuffer,         DS_GLP_EXT | DS_GLP_REQ_FBO | DS_GLP_STATE) \
+    X("glFramebufferTexture2D",    "glFramebufferTexture2DEXT",  p_glFramebufferTexture2D,    DS_GLP_EXT | DS_GLP_REQ_FBO) \
+    X("glGenRenderbuffers",        "glGenRenderbuffersEXT",      p_glGenRenderbuffers,        DS_GLP_EXT | DS_GLP_REQ_FBO) \
+    X("glDeleteRenderbuffers",     "glDeleteRenderbuffersEXT",   p_glDeleteRenderbuffers,     DS_GLP_EXT | DS_GLP_REQ_FBO) \
+    X("glBindRenderbuffer",        "glBindRenderbufferEXT",      p_glBindRenderbuffer,        DS_GLP_EXT | DS_GLP_REQ_FBO) \
+    X("glRenderbufferStorage",     "glRenderbufferStorageEXT",   p_glRenderbufferStorage,     DS_GLP_EXT | DS_GLP_REQ_FBO) \
+    X("glFramebufferRenderbuffer", "glFramebufferRenderbufferEXT", p_glFramebufferRenderbuffer, DS_GLP_EXT | DS_GLP_REQ_FBO) \
+    X("glCheckFramebufferStatus",  "glCheckFramebufferStatusEXT", p_glCheckFramebufferStatus, DS_GLP_EXT | DS_GLP_REQ_FBO) \
+    X("glBlitFramebuffer",         "glBlitFramebufferEXT",       p_glBlitFramebuffer,         DS_GLP_EXT | DS_GLP_REQ_FBO) \
+    X("glBindBuffer",              "glBindBufferARB",            p_glBindBuffer,              DS_GLP_EXT) \
+    X("glClearColor",              "",                           p_glClearColor,              DS_GLP_EXT | DS_GLP_STATE) \
+    X("glClear",                   "",                           p_glClear,                   DS_GLP_EXT | DS_GLP_STATE) \
+    X("glScissor",                 "",                           p_glScissor,                 DS_GLP_EXT | DS_GLP_STATE)
+
+#define DS_GL_PROC_STR_ITEM(core, ext, field, fl) core "\0" ext "\0"
+#define DS_GL_PROC_DEF_ITEM(core, ext, field, fl) { DS_GL_OFF(field), (fl) },
+
+static const char k_gl_proc_names_msz[] = DS_GL_PROC_LIST(DS_GL_PROC_STR_ITEM);
+static const ds_gl_proc_def_t k_gl_proc_defs[] = { DS_GL_PROC_LIST(DS_GL_PROC_DEF_ITEM) };
 
 DS_ALWAYS_INLINE void **ds_gl_slot_ptr(uint16_t off)
 {
@@ -220,52 +218,65 @@ DS_ALWAYS_INLINE void **ds_gl_slot_ptr(uint16_t off)
 
 static void ds_gl_resolve_table_procs(HMODULE h_gl, bool state_only)
 {
+    const char *p = k_gl_proc_names_msz;
     for (size_t i = 0; i < sizeof(k_gl_proc_defs) / sizeof(k_gl_proc_defs[0]); i++) {
+        const char *core = p;
+        p += strlen(p) + 1;
+        const char *ext = p;
+        p += strlen(p) + 1;
         const ds_gl_proc_def_t *d = &k_gl_proc_defs[i];
         if (state_only && (d->flags & DS_GLP_STATE) == 0) continue;
         void **slot = ds_gl_slot_ptr(d->slot_off);
-        if (*slot != NULL) continue;
-        *slot = (d->flags & DS_GLP_EXT)
-            ? ds_gl_proc_or_ext(h_gl, d->core, d->ext)
-            : (void *)(uintptr_t)g_ds.real_GetProcAddress(h_gl, d->core);
+        if (InterlockedCompareExchangePointer((PVOID volatile *)slot, NULL, NULL) != NULL) continue;
+        void *fn = (d->flags & DS_GLP_EXT)
+            ? ds_gl_proc_or_ext(h_gl, core, ext[0] ? ext : NULL)
+            : (void *)(uintptr_t)g_ds.real_GetProcAddress(h_gl, core);
+        if (fn) {
+            InterlockedCompareExchangePointer((PVOID volatile *)slot, fn, NULL);
+        }
     }
     if (!g_ds.real_glGetIntegerv && g_gl.p_glGetIntegerv) {
-        g_ds.real_glGetIntegerv = g_gl.p_glGetIntegerv;
+        InterlockedCompareExchangePointer((PVOID volatile *)&g_ds.real_glGetIntegerv, (PVOID)(uintptr_t)g_gl.p_glGetIntegerv, NULL);
     }
 }
 
-static bool ds_gl_init_procs_once(void)
-{
-    if (g_gl.procs_queried) {
-        return g_gl.fbo_supported;
-    }
+static INIT_ONCE s_gl_procs_once = INIT_ONCE_STATIC_INIT;
 
+static BOOL CALLBACK ds_gl_init_procs_once_cb(PINIT_ONCE init_once, PVOID param, PVOID *ctx)
+{
+    (void)init_once;
+    (void)param;
+    (void)ctx;
     HMODULE h_gl = GetModuleHandleW(L"opengl32.dll");
     if (!h_gl || !g_ds.real_GetProcAddress) {
-        return false;
+        return FALSE;
     }
 
-    if (!g_gl.p_wglGetCurrentContext) {
-        g_gl.p_wglGetCurrentContext = (pfn_wglGetCurrentContext_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "wglGetCurrentContext");
+    pfn_wglGetCurrentContext_t p_cur_ctx = g_gl.p_wglGetCurrentContext;
+    if (!p_cur_ctx) {
+        p_cur_ctx = (pfn_wglGetCurrentContext_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "wglGetCurrentContext");
+        if (p_cur_ctx) {
+            InterlockedCompareExchangePointer((PVOID volatile *)&g_gl.p_wglGetCurrentContext, (PVOID)(uintptr_t)p_cur_ctx, NULL);
+        }
     }
-    if (!g_gl.p_wglGetCurrentDC) {
-        g_gl.p_wglGetCurrentDC = (pfn_wglGetCurrentDC_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "wglGetCurrentDC");
-    }
-    if (!g_gl.p_wglGetCurrentContext || g_gl.p_wglGetCurrentContext() == NULL) {
+    if (!p_cur_ctx || p_cur_ctx() == NULL) {
         /* Wait until a WGL context is current so wglGetProcAddress resolves FBO entrypoints */
-        return false;
+        return FALSE;
     }
 
-    g_gl.procs_queried = true;
+    ds_enter_internal();
     ds_gl_resolve_table_procs(h_gl, false);
     if (!g_ds.real_glDrawBuffer) {
-        g_ds.real_glDrawBuffer = (pfn_glDrawBuffer_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glDrawBuffer");
+        void *fn = (void *)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glDrawBuffer");
+        if (fn) InterlockedCompareExchangePointer((PVOID volatile *)&g_ds.real_glDrawBuffer, fn, NULL);
     }
     if (!g_ds.real_glReadBuffer) {
-        g_ds.real_glReadBuffer = (pfn_glReadBuffer_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glReadBuffer");
+        void *fn = (void *)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glReadBuffer");
+        if (fn) InterlockedCompareExchangePointer((PVOID volatile *)&g_ds.real_glReadBuffer, fn, NULL);
     }
+    ds_leave_internal();
 
-    bool ok = (g_gl.p_wglGetCurrentContext != NULL);
+    bool ok = true;
     for (size_t i = 0; i < sizeof(k_gl_proc_defs) / sizeof(k_gl_proc_defs[0]); i++) {
         if ((k_gl_proc_defs[i].flags & DS_GLP_REQ_FBO) && *ds_gl_slot_ptr(k_gl_proc_defs[i].slot_off) == NULL) {
             ok = false;
@@ -275,7 +286,83 @@ static bool ds_gl_init_procs_once(void)
     g_gl.fbo_supported = ok;
     ds_tracef("gl_init: ok=%d %p %p %p",
               (int)g_gl.fbo_supported, g_gl.p_glGenFramebuffers, g_gl.p_glBlitFramebuffer, g_gl.p_glBindFramebuffer);
+    return TRUE;
+}
+
+static bool ds_gl_init_procs_once(void)
+{
+    if (!InitOnceExecuteOnce(&s_gl_procs_once, ds_gl_init_procs_once_cb, NULL, NULL)) {
+        return false;
+    }
     return g_gl.fbo_supported;
+}
+
+static void ds_gl_save_active_fbo_slots_locked(void)
+{
+    if (g_gl.fbo_ctx != NULL) {
+        ds_gl_ctx_fbo_slot_t *s = ds_gl_ctx_fbo_acquire(
+            g_gl.fbo_slots, DS_MAX_GL_CTX_MAP, (uintptr_t)g_gl.fbo_ctx, true, &g_gl.fbo_slot_gen, NULL
+        );
+        if (s) s->game = g_gl.gfbo;
+    }
+    if (g_gl.sharp_ctx != NULL) {
+        ds_gl_ctx_fbo_slot_t *s = ds_gl_ctx_fbo_acquire(
+            g_gl.fbo_slots, DS_MAX_GL_CTX_MAP, (uintptr_t)g_gl.sharp_ctx, true, &g_gl.fbo_slot_gen, NULL
+        );
+        if (s) s->sharp = g_gl.sfbo;
+    }
+    if (g_gl.w3d_hglrc != NULL) {
+        ds_gl_ctx_fbo_slot_t *s = ds_gl_ctx_fbo_acquire(
+            g_gl.fbo_slots, DS_MAX_GL_CTX_MAP, (uintptr_t)g_gl.w3d_hglrc, true, &g_gl.fbo_slot_gen, NULL
+        );
+        if (s) s->w3d = g_gl.wfbo;
+    }
+}
+
+/* kind: 0 = game FBO, 1 = sharp FBO, 2 = WineD3D FBO */
+static void ds_gl_switch_fbo_ctx(HGLRC next_ctx, int kind)
+{
+    ds_lock();
+    ds_gl_save_active_fbo_slots_locked();
+    ds_gl_ctx_fbo_slot_t *s = next_ctx
+        ? ds_gl_ctx_fbo_acquire(g_gl.fbo_slots, DS_MAX_GL_CTX_MAP, (uintptr_t)next_ctx, false, &g_gl.fbo_slot_gen, NULL)
+        : NULL;
+    if (kind == 0) {
+        g_gl.fbo_ctx = next_ctx;
+        if (s) g_gl.gfbo = s->game;
+        else memset(&g_gl.gfbo, 0, sizeof(g_gl.gfbo));
+        g_gl.fbo_redirect_active = false;
+    } else if (kind == 1) {
+        g_gl.sharp_ctx = next_ctx;
+        if (s) g_gl.sfbo = s->sharp;
+        else memset(&g_gl.sfbo, 0, sizeof(g_gl.sfbo));
+    } else {
+        g_gl.w3d_hglrc = next_ctx;
+        if (s) g_gl.wfbo = s->w3d;
+        else memset(&g_gl.wfbo, 0, sizeof(g_gl.wfbo));
+    }
+    ds_unlock();
+}
+
+static void ds_gl_delete_fbo_slot_objects_current_ctx(const ds_gl_ctx_fbo_slot_t *s)
+{
+    if (!s || !g_gl.fbo_supported) return;
+    if (s->game.depth_rb && g_gl.p_glDeleteRenderbuffers) {
+        GLuint rb = s->game.depth_rb;
+        g_gl.p_glDeleteRenderbuffers(1, &rb);
+    }
+    GLuint texs[3] = { s->game.color_tex, s->sharp.tex_id, s->w3d.tex_id };
+    GLuint fbos[3] = { s->game.fbo_id, s->sharp.fbo_id, s->w3d.fbo_id };
+    for (int i = 0; i < 3; i++) {
+        if (texs[i] && g_gl.p_glDeleteTextures) g_gl.p_glDeleteTextures(1, &texs[i]);
+        if (fbos[i] && g_gl.p_glDeleteFramebuffers) g_gl.p_glDeleteFramebuffers(1, &fbos[i]);
+    }
+}
+
+static void ds_gl_restore_back_buffers(void)
+{
+    if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_BACK);
+    if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_BACK);
 }
 
 DS_ALWAYS_INLINE void ds_gl_destroy_fbo_current_ctx(void)
@@ -283,36 +370,64 @@ DS_ALWAYS_INLINE void ds_gl_destroy_fbo_current_ctx(void)
     if (!g_gl.fbo_supported) return;
     if (g_gl.fbo_redirect_active && g_gl.p_glBindFramebuffer) {
         g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_BACK);
-        if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_BACK);
+        ds_gl_restore_back_buffers();
     }
-    if (g_gl.depth_rb) {
-        g_gl.p_glDeleteRenderbuffers(1, &g_gl.depth_rb);
-        g_gl.depth_rb = 0;
-    }
-    if (g_gl.color_tex) {
-        g_gl.p_glDeleteTextures(1, &g_gl.color_tex);
-        g_gl.color_tex = 0;
-    }
-    if (g_gl.fbo_id) {
-        g_gl.p_glDeleteFramebuffers(1, &g_gl.fbo_id);
-        g_gl.fbo_id = 0;
-    }
+    ds_gl_ctx_fbo_slot_t tmp = { 0 };
+    tmp.game = g_gl.gfbo;
     if (g_gl.sharp_ctx == g_gl.fbo_ctx) {
-        if (g_gl.sharp_tex) {
-            g_gl.p_glDeleteTextures(1, &g_gl.sharp_tex);
-            g_gl.sharp_tex = 0;
-        }
-        if (g_gl.sharp_fbo) {
-            g_gl.p_glDeleteFramebuffers(1, &g_gl.sharp_fbo);
-            g_gl.sharp_fbo = 0;
-        }
-        g_gl.sharp_w = 0;
-        g_gl.sharp_h = 0;
+        tmp.sharp = g_gl.sfbo;
+        memset(&g_gl.sfbo, 0, sizeof(g_gl.sfbo));
     }
-    g_gl.fbo_w = 0;
-    g_gl.fbo_h = 0;
+    ds_gl_delete_fbo_slot_objects_current_ctx(&tmp);
+    memset(&g_gl.gfbo, 0, sizeof(g_gl.gfbo));
     g_gl.fbo_redirect_active = false;
+}
+
+static bool ds_gl_setup_fbo(GLuint *io_fbo, GLuint *io_tex, GLuint *opt_depth_rb, int32_t w, int32_t h)
+{
+    GLint prev_tex = 0, prev_rb = 0, prev_unpack = 0;
+    if (g_gl.p_glGetIntegerv) {
+        g_gl.p_glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+        if (opt_depth_rb) g_gl.p_glGetIntegerv(GL_RENDERBUFFER_BINDING, &prev_rb);
+        if (g_gl.p_glBindBuffer) {
+            g_gl.p_glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prev_unpack);
+            if (prev_unpack != 0) g_gl.p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        }
+    }
+    if (*io_fbo == 0) {
+        g_gl.p_glGenFramebuffers(1, io_fbo);
+        g_gl.p_glGenTextures(1, io_tex);
+        if (opt_depth_rb) g_gl.p_glGenRenderbuffers(1, opt_depth_rb);
+    }
+    g_gl.p_glBindTexture(GL_TEXTURE_2D, *io_tex);
+    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g_gl.p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    g_gl.p_glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    if (prev_unpack != 0 && g_gl.p_glBindBuffer) {
+        g_gl.p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)prev_unpack);
+    }
+    if (opt_depth_rb) {
+        g_gl.p_glBindRenderbuffer(GL_RENDERBUFFER, *opt_depth_rb);
+        g_gl.p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+        g_gl.p_glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)prev_rb);
+    }
+    g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, *io_fbo);
+    g_gl.p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *io_tex, 0);
+    if (opt_depth_rb) {
+        g_gl.p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, *opt_depth_rb);
+    }
+    if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_COLOR_ATTACHMENT0);
+    if (g_gl.p_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        if (opt_depth_rb && *opt_depth_rb) { g_gl.p_glDeleteRenderbuffers(1, opt_depth_rb); *opt_depth_rb = 0; }
+        if (*io_tex) { g_gl.p_glDeleteTextures(1, io_tex); *io_tex = 0; }
+        if (*io_fbo) { g_gl.p_glDeleteFramebuffers(1, io_fbo); *io_fbo = 0; }
+        return false;
+    }
+    return true;
 }
 
 static bool ds_gl_sync_fbo_for_current_ctx(int32_t virt_w, int32_t virt_h, int32_t dst_w, int32_t dst_h, bool want_fbo)
@@ -325,75 +440,21 @@ static bool ds_gl_sync_fbo_for_current_ctx(int32_t virt_w, int32_t virt_h, int32
         return false;
     }
     if (g_gl.fbo_ctx != cur_ctx) {
-        g_gl.fbo_ctx = cur_ctx;
-        g_gl.fbo_id = 0;
-        g_gl.color_tex = 0;
-        g_gl.depth_rb = 0;
-        g_gl.fbo_w = 0;
-        g_gl.fbo_h = 0;
-        g_gl.fbo_redirect_active = false;
-        g_gl.game_draw_fbo = 0;
-        g_gl.game_read_fbo = 0;
+        ds_gl_switch_fbo_ctx(cur_ctx, 0);
     }
     if (!want_fbo || virt_w <= 0 || virt_h <= 0 || dst_w <= 0 || dst_h <= 0 ||
         (virt_w == dst_w && virt_h == dst_h)) {
         if (g_gl.fbo_redirect_active) {
             g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_BACK);
-            if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_BACK);
+            ds_gl_restore_back_buffers();
             g_gl.fbo_redirect_active = false;
         }
         return false;
     }
 
     if (g_gl.fbo_id == 0 || g_gl.fbo_w != virt_w || g_gl.fbo_h != virt_h) {
-        GLint prev_tex = 0;
-        GLint prev_rb = 0;
-        GLint prev_unpack_pbo = 0;
-        if (g_gl.p_glGetIntegerv) {
-            g_gl.p_glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
-            g_gl.p_glGetIntegerv(GL_RENDERBUFFER_BINDING, &prev_rb);
-            if (g_gl.p_glBindBuffer) {
-                g_gl.p_glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prev_unpack_pbo);
-                if (prev_unpack_pbo != 0) {
-                    g_gl.p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-                }
-            }
-        }
-        if (g_gl.fbo_id == 0) {
-            g_gl.p_glGenFramebuffers(1, &g_gl.fbo_id);
-            g_gl.p_glGenTextures(1, &g_gl.color_tex);
-            g_gl.p_glGenRenderbuffers(1, &g_gl.depth_rb);
-        }
-
-        g_gl.p_glBindTexture(GL_TEXTURE_2D, g_gl.color_tex);
-        g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        g_gl.p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, virt_w, virt_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        g_gl.p_glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
-        if (prev_unpack_pbo != 0 && g_gl.p_glBindBuffer) {
-            g_gl.p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)prev_unpack_pbo);
-        }
-
-        g_gl.p_glBindRenderbuffer(GL_RENDERBUFFER, g_gl.depth_rb);
-        g_gl.p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, virt_w, virt_h);
-        g_gl.p_glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)prev_rb);
-
-        g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, g_gl.fbo_id);
-        g_gl.p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_gl.color_tex, 0);
-        g_gl.p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g_gl.depth_rb);
-        if (g_ds.real_glDrawBuffer) {
-            g_ds.real_glDrawBuffer(GL_COLOR_ATTACHMENT0);
-        }
-        if (g_ds.real_glReadBuffer) {
-            g_ds.real_glReadBuffer(GL_COLOR_ATTACHMENT0);
-        }
-
-        GLenum status = g_gl.p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (status != GL_FRAMEBUFFER_COMPLETE) {
-            ds_tracef("gl_fbo: status=0x%x FAIL", (unsigned int)status);
+        if (!ds_gl_setup_fbo(&g_gl.fbo_id, &g_gl.color_tex, &g_gl.depth_rb, virt_w, virt_h)) {
+            ds_tracef("gl_fbo: FAIL");
             ds_gl_destroy_fbo_current_ctx();
             return false;
         }
@@ -402,16 +463,16 @@ static bool ds_gl_sync_fbo_for_current_ctx(int32_t virt_w, int32_t virt_h, int32
     }
 
     g_gl.fbo_redirect_active = true;
-    GLuint target_draw = g_gl.game_draw_fbo ? g_gl.game_draw_fbo : g_gl.fbo_id;
-    GLuint target_read = g_gl.game_read_fbo ? g_gl.game_read_fbo : g_gl.fbo_id;
+    GLuint target_draw = g_gl.gfbo.game_draw_fbo ? g_gl.gfbo.game_draw_fbo : g_gl.gfbo.fbo_id;
+    GLuint target_read = g_gl.gfbo.game_read_fbo ? g_gl.gfbo.game_read_fbo : g_gl.gfbo.fbo_id;
     g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target_draw);
     g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, target_read);
     static int32_t s_last_vw = 0, s_last_vh = 0, s_last_dw = 0, s_last_dh = 0;
     static GLuint s_last_fbo = 0;
-    if (s_last_vw != virt_w || s_last_vh != virt_h || s_last_dw != dst_w || s_last_dh != dst_h || s_last_fbo != g_gl.fbo_id) {
-        s_last_vw = virt_w; s_last_vh = virt_h; s_last_dw = dst_w; s_last_dh = dst_h; s_last_fbo = g_gl.fbo_id;
+    if (s_last_vw != virt_w || s_last_vh != virt_h || s_last_dw != dst_w || s_last_dh != dst_h || s_last_fbo != g_gl.gfbo.fbo_id) {
+        s_last_vw = virt_w; s_last_vh = virt_h; s_last_dw = dst_w; s_last_dh = dst_h; s_last_fbo = g_gl.gfbo.fbo_id;
         ds_tracef("fbo: %dx%d->%dx%d w=%d id=%u r=%d",
-                  virt_w, virt_h, dst_w, dst_h, (int)want_fbo, g_gl.fbo_id, (int)g_gl.fbo_redirect_active);
+                  virt_w, virt_h, dst_w, dst_h, (int)want_fbo, g_gl.gfbo.fbo_id, (int)g_gl.fbo_redirect_active);
     }
     return true;
 }
@@ -423,23 +484,13 @@ static void APIENTRY hook_glBindFramebuffer(GLenum target, GLuint framebuffer)
         g_gl.p_glBindFramebuffer(target, framebuffer);
         return;
     }
-    if (g_gl.fbo_redirect_active && g_gl.fbo_id != 0 &&
+    if (g_gl.fbo_redirect_active && g_gl.gfbo.fbo_id != 0 &&
         g_gl.p_wglGetCurrentContext && g_gl.p_wglGetCurrentContext() == g_gl.game_hglrc) {
-        GLuint virt_fb = (framebuffer == g_gl.fbo_id) ? 0u : framebuffer;
-        if (target == GL_FRAMEBUFFER) {
-            g_gl.game_draw_fbo = virt_fb;
-            g_gl.game_read_fbo = virt_fb;
-            g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, virt_fb == 0 ? g_gl.fbo_id : virt_fb);
-            return;
-        }
-        if (target == GL_DRAW_FRAMEBUFFER) {
-            g_gl.game_draw_fbo = virt_fb;
-            g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, virt_fb == 0 ? g_gl.fbo_id : virt_fb);
-            return;
-        }
-        if (target == GL_READ_FRAMEBUFFER) {
-            g_gl.game_read_fbo = virt_fb;
-            g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, virt_fb == 0 ? g_gl.fbo_id : virt_fb);
+        GLuint virt_fb = (framebuffer == g_gl.gfbo.fbo_id) ? 0u : framebuffer;
+        if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER) {
+            if (target != GL_READ_FRAMEBUFFER) g_gl.gfbo.game_draw_fbo = virt_fb;
+            if (target != GL_DRAW_FRAMEBUFFER) g_gl.gfbo.game_read_fbo = virt_fb;
+            g_gl.p_glBindFramebuffer(target, virt_fb == 0 ? g_gl.gfbo.fbo_id : virt_fb);
             return;
         }
     }
@@ -455,31 +506,22 @@ static void APIENTRY hook_glDeleteFramebuffers(GLsizei n, const GLuint *framebuf
         bool rebound = false;
         for (GLsizei i = 0; i < n; i++) {
             GLuint fb = framebuffers[i];
-            if (fb != 0 && (fb == g_gl.fbo_id || fb == g_gl.sharp_fbo)) {
+            if (fb != 0 && (fb == g_gl.gfbo.fbo_id || fb == g_gl.sfbo.fbo_id)) {
                 has_protected = true;
                 break;
             }
         }
-        if (has_protected) {
-            for (GLsizei i = 0; i < n; i++) {
-                GLuint fb = framebuffers[i];
-                if (fb == 0 || fb == g_gl.fbo_id || fb == g_gl.sharp_fbo) continue;
-                if (fb == g_gl.game_draw_fbo) { g_gl.game_draw_fbo = 0; rebound = true; }
-                if (fb == g_gl.game_read_fbo) { g_gl.game_read_fbo = 0; rebound = true; }
-                g_gl.p_glDeleteFramebuffers(1, &fb);
-            }
-        } else {
-            for (GLsizei i = 0; i < n; i++) {
-                GLuint fb = framebuffers[i];
-                if (fb == 0) continue;
-                if (fb == g_gl.game_draw_fbo) { g_gl.game_draw_fbo = 0; rebound = true; }
-                if (fb == g_gl.game_read_fbo) { g_gl.game_read_fbo = 0; rebound = true; }
-            }
-            g_gl.p_glDeleteFramebuffers(n, framebuffers);
+        for (GLsizei i = 0; i < n; i++) {
+            GLuint fb = framebuffers[i];
+            if (fb == 0 || fb == g_gl.gfbo.fbo_id || fb == g_gl.sfbo.fbo_id) continue;
+            if (fb == g_gl.gfbo.game_draw_fbo) { g_gl.gfbo.game_draw_fbo = 0; rebound = true; }
+            if (fb == g_gl.gfbo.game_read_fbo) { g_gl.gfbo.game_read_fbo = 0; rebound = true; }
+            if (has_protected) g_gl.p_glDeleteFramebuffers(1, &fb);
         }
-        if (rebound && g_gl.fbo_redirect_active && g_gl.fbo_id != 0 && g_gl.p_glBindFramebuffer) {
-            g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_gl.game_draw_fbo ? g_gl.game_draw_fbo : g_gl.fbo_id);
-            g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gl.game_read_fbo ? g_gl.game_read_fbo : g_gl.fbo_id);
+        if (!has_protected) g_gl.p_glDeleteFramebuffers(n, framebuffers);
+        if (rebound && g_gl.fbo_redirect_active && g_gl.gfbo.fbo_id != 0 && g_gl.p_glBindFramebuffer) {
+            g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_gl.gfbo.game_draw_fbo ? g_gl.gfbo.game_draw_fbo : g_gl.gfbo.fbo_id);
+            g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gl.gfbo.game_read_fbo ? g_gl.gfbo.game_read_fbo : g_gl.gfbo.fbo_id);
         }
         return;
     }
@@ -493,9 +535,9 @@ void APIENTRY hook_glGetIntegerv(GLenum pname, GLint *data)
     fn(pname, data);
     if (!data || ds_is_internal_call()) return;
     if ((pname == GL_FRAMEBUFFER_BINDING || pname == GL_READ_FRAMEBUFFER_BINDING) &&
-        g_gl.fbo_redirect_active && g_gl.fbo_id != 0 &&
+        g_gl.fbo_redirect_active && g_gl.gfbo.fbo_id != 0 &&
         g_gl.p_wglGetCurrentContext && g_gl.p_wglGetCurrentContext() == g_gl.game_hglrc) {
-        if ((GLuint)(*data) == g_gl.fbo_id) {
+        if ((GLuint)(*data) == g_gl.gfbo.fbo_id) {
             *data = 0;
         }
     }
@@ -505,7 +547,7 @@ static void ds_gl_draw_or_read_buf(GLenum mode, bool is_draw)
 {
     pfn_glDrawBuffer_t fn = is_draw ? g_ds.real_glDrawBuffer : g_ds.real_glReadBuffer;
     if (!fn) return;
-    GLuint cur_fbo = is_draw ? g_gl.game_draw_fbo : g_gl.game_read_fbo;
+    GLuint cur_fbo = is_draw ? g_gl.gfbo.game_draw_fbo : g_gl.gfbo.game_read_fbo;
     if (g_gl.fbo_redirect_active && cur_fbo == 0 &&
         !ds_is_internal_call() &&
         g_gl.p_wglGetCurrentContext && g_gl.p_wglGetCurrentContext() == g_gl.game_hglrc) {
@@ -542,9 +584,99 @@ static void ds_gl_ensure_state_procs(void)
     ds_gl_resolve_table_procs(h_gl, true);
 }
 
+static void ds_gl_save_fbo_pair(GLint *out_draw, GLint *out_read)
+{
+    *out_draw = 0;
+    *out_read = 0;
+    if (g_gl.p_glGetIntegerv) {
+        g_gl.p_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, out_draw);
+        g_gl.p_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, out_read);
+    }
+}
+
+static void ds_gl_bind_fbo_pair(GLuint draw_fbo, GLuint read_fbo)
+{
+    if (g_gl.p_glBindFramebuffer) {
+        g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_fbo);
+        g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
+    }
+}
+
+typedef struct ds_gl_present_snap_s {
+    bool              is_target_win;
+    bool              is_fs;
+    bool              want_scale;
+    int32_t           win_scale;
+    int32_t           vw;
+    int32_t           vh;
+    int32_t           real_w;
+    int32_t           real_h;
+    int32_t           phys_w;
+    int32_t           phys_h;
+    int32_t           safe_inset_top;
+    int32_t           dst_x;
+    int32_t           dst_y;
+    int32_t           dw;
+    int32_t           dh;
+    ds_aspect_mode_t  aspect;
+    ds_scale_filter_t filter;
+} ds_gl_present_snap_t;
+
+static bool ds_is_target_gl_win_locked(HWND win, bool allow_null);
+
+static void ds_gl_snapshot_present(HWND win, bool allow_null, bool mark_w3d_gl, bool mark_last_present, ds_gl_present_snap_t *s)
+{
+    EnterCriticalSection(&g_ds.lock);
+    if (mark_w3d_gl) {
+        if (!g_ds.game_gl_active) {
+            g_ds.wined3d_uses_gl = true;
+            g_ds.wined3d_uses_vulkan = false;
+        }
+        ds_notify_gl_context_active_locked();
+    }
+    s->is_target_win = ds_is_target_gl_win_locked(win, allow_null);
+    if (mark_last_present && s->is_target_win) {
+        g_gl.last_present_was_gl = true;
+    }
+    s->is_fs = g_ds.fullscreen_active;
+    s->win_scale = ds_get_windowed_scale_locked();
+    s->vw = g_ds.virt_w;
+    s->vh = g_ds.virt_h;
+    s->real_w = g_ds.real_screen_w;
+    s->real_h = g_ds.real_screen_h;
+    s->phys_w = g_ds.phys_screen_w;
+    s->phys_h = g_ds.phys_screen_h;
+    s->safe_inset_top = g_ds.safe_inset_top;
+    s->dst_x = s->is_fs ? g_ds.vp.dst_x : 0;
+    s->dst_y = s->is_fs ? g_ds.vp.dst_y : 0;
+    s->dw = s->is_fs ? g_ds.vp.dst_w : (s->vw * s->win_scale);
+    s->dh = s->is_fs ? g_ds.vp.dst_h : (s->vh * s->win_scale);
+    s->aspect = s->is_fs ? g_ds.aspect_mode : DS_ASPECT_PRESERVE;
+    s->filter = g_ds.scale_filter;
+    s->want_scale = (s->is_fs || s->win_scale > 1) && !ds_is_modern_tier_locked();
+    LeaveCriticalSection(&g_ds.lock);
+}
+
+static void ds_gl_try_adopt_win(HWND win, bool allow_retarget, bool ensure_bounds)
+{
+    if (!win) return;
+    ds_lock();
+    HWND game_w = g_ds.hwnd_game;
+    HWND host_w = g_ds.hwnd_gl_host;
+    ds_unlock();
+    if (win != host_w && (game_w == NULL || (allow_retarget && game_w != win)) &&
+        ds_is_candidate_game_window(win, NULL, NULL)) {
+        ds_attach_and_apply_game_window(win, 0, 0);
+    } else if (ensure_bounds && win == game_w) {
+        ds_ensure_game_window_bounds(win);
+    }
+}
+
 static bool ds_gl_compute_phys_viewport(
     int32_t          backing_w,
     int32_t          backing_h,
+    int32_t          safe_inset_top,
+    int32_t          real_screen_h,
     int32_t          vw,
     int32_t          vh,
     ds_aspect_mode_t aspect,
@@ -555,8 +687,8 @@ static bool ds_gl_compute_phys_viewport(
         return false;
     }
     int32_t phys_inset_top = 0;
-    if (g_ds.safe_inset_top > 0 && g_ds.real_screen_h > 0) {
-        phys_inset_top = (int32_t)(((int64_t)g_ds.safe_inset_top * backing_h + g_ds.real_screen_h / 2) / g_ds.real_screen_h);
+    if (safe_inset_top > 0 && real_screen_h > 0) {
+        phys_inset_top = (int32_t)(((int64_t)safe_inset_top * backing_h + real_screen_h / 2) / real_screen_h);
     }
     return ds_compute_viewport(backing_w, backing_h, phys_inset_top, vw, vh, aspect, out_vp);
 }
@@ -631,83 +763,41 @@ static void ds_gl_clear_pillarbox_margins(
     }
 }
 
-static bool ds_gl_setup_color_fbo(GLuint *io_fbo, GLuint *io_tex, int32_t w, int32_t h)
-{
-    GLint prev_tex = 0;
-    GLint prev_unpack = 0;
-    if (g_gl.p_glGetIntegerv) {
-        g_gl.p_glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
-        if (g_gl.p_glBindBuffer) {
-            g_gl.p_glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prev_unpack);
-            if (prev_unpack != 0) {
-                g_gl.p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-            }
-        }
-    }
-    if (*io_fbo == 0) {
-        g_gl.p_glGenFramebuffers(1, io_fbo);
-        g_gl.p_glGenTextures(1, io_tex);
-    }
-    g_gl.p_glBindTexture(GL_TEXTURE_2D, *io_tex);
-    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    g_gl.p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    g_gl.p_glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
-    if (prev_unpack != 0 && g_gl.p_glBindBuffer) {
-        g_gl.p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)prev_unpack);
-    }
-    g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, *io_fbo);
-    g_gl.p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *io_tex, 0);
-    if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_COLOR_ATTACHMENT0);
-    if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_COLOR_ATTACHMENT0);
-    return (g_gl.p_glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
-}
-
 DS_ALWAYS_INLINE bool ds_gl_ensure_sharp_fbo(HGLRC cur_ctx, int32_t inter_w, int32_t inter_h)
 {
     if (!cur_ctx || inter_w <= 0 || inter_h <= 0 || !ds_gl_init_procs_once()) {
         return false;
     }
     if (g_gl.sharp_ctx != cur_ctx) {
-        g_gl.sharp_ctx = cur_ctx;
-        g_gl.sharp_fbo = 0;
-        g_gl.sharp_tex = 0;
-        g_gl.sharp_w = 0;
-        g_gl.sharp_h = 0;
+        ds_gl_switch_fbo_ctx(cur_ctx, 1);
     }
-    if (g_gl.sharp_fbo != 0 && g_gl.sharp_w == inter_w && g_gl.sharp_h == inter_h) {
+    if (g_gl.sfbo.fbo_id != 0 && g_gl.sfbo.w == inter_w && g_gl.sfbo.h == inter_h) {
         return true;
     }
 
-    GLint prev_draw = 0;
-    GLint prev_read = 0;
-    if (g_gl.p_glGetIntegerv) {
-        g_gl.p_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
-        g_gl.p_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
-    }
+    GLint prev_draw = 0, prev_read = 0;
+    ds_gl_save_fbo_pair(&prev_draw, &prev_read);
 
-    bool complete = ds_gl_setup_color_fbo(&g_gl.sharp_fbo, &g_gl.sharp_tex, inter_w, inter_h);
-    g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw);
-    g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+    bool complete = ds_gl_setup_fbo(&g_gl.sfbo.fbo_id, &g_gl.sfbo.tex_id, NULL, inter_w, inter_h);
+    ds_gl_bind_fbo_pair((GLuint)prev_draw, (GLuint)prev_read);
 
     if (!complete) {
-        if (g_gl.sharp_tex) {
-            g_gl.p_glDeleteTextures(1, &g_gl.sharp_tex);
-            g_gl.sharp_tex = 0;
-        }
-        if (g_gl.sharp_fbo) {
-            g_gl.p_glDeleteFramebuffers(1, &g_gl.sharp_fbo);
-            g_gl.sharp_fbo = 0;
-        }
-        g_gl.sharp_w = 0;
-        g_gl.sharp_h = 0;
+        g_gl.sfbo.w = 0;
+        g_gl.sfbo.h = 0;
         return false;
     }
-    g_gl.sharp_w = inter_w;
-    g_gl.sharp_h = inter_h;
+    g_gl.sfbo.w = inter_w;
+    g_gl.sfbo.h = inter_h;
     return true;
+}
+
+static int32_t ds_sharp_axis_factor(int32_t fbo_cap, int32_t src_dim, int32_t dst_dim)
+{
+    int32_t max_k = fbo_cap / src_dim;
+    int32_t ceil_k = (dst_dim + src_dim - 1) / src_dim;
+    if (max_k < 1) max_k = 1;
+    if (ceil_k < 1) ceil_k = 1;
+    return (ceil_k < max_k) ? ceil_k : max_k;
 }
 
 static void ds_gl_present_blit_to_backbuffer(
@@ -760,29 +850,18 @@ static void ds_gl_present_blit_to_backbuffer(
                     if (fbo_cap > 16384) fbo_cap = 16384;
                     g_ds.gl_max_texture_size = fbo_cap;
                 }
-                int32_t max_kx = fbo_cap / src_w;
-                if (max_kx < 1) max_kx = 1;
-                int32_t ceil_kx = (dst_w + src_w - 1) / src_w;
-                if (ceil_kx < 1) ceil_kx = 1;
-                int32_t kx = (ceil_kx < max_kx) ? ceil_kx : max_kx;
-
-                int32_t max_ky = fbo_cap / src_h;
-                if (max_ky < 1) max_ky = 1;
-                int32_t ceil_ky = (dst_h + src_h - 1) / src_h;
-                if (ceil_ky < 1) ceil_ky = 1;
-                int32_t ky = (ceil_ky < max_ky) ? ceil_ky : max_ky;
+                int32_t kx = ds_sharp_axis_factor(fbo_cap, src_w, dst_w);
+                int32_t ky = ds_sharp_axis_factor(fbo_cap, src_h, dst_h);
 
                 int32_t inter_w = src_w * kx;
                 int32_t inter_h = src_h * ky;
                 if (inter_w == dst_w && inter_h == dst_h) {
                     filter = GL_NEAREST;
                 } else if ((kx > 1 || ky > 1) && ds_gl_ensure_sharp_fbo(cur_ctx, inter_w, inter_h)) {
-                    g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, src_read_fbo);
-                    g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_gl.sharp_fbo);
+                    ds_gl_bind_fbo_pair(g_gl.sfbo.fbo_id, src_read_fbo);
                     g_gl.p_glBlitFramebuffer(sx0, sy0, sx1, sy1, 0, 0, inter_w, inter_h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-                    g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gl.sharp_fbo);
-                    g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+                    ds_gl_bind_fbo_pair(0, g_gl.sfbo.fbo_id);
                     if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_BACK);
                     g_gl.p_glBlitFramebuffer(0, 0, inter_w, inter_h, dx0, dy0, dx1, dy1, GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
@@ -850,92 +929,60 @@ static void APIENTRY hook_glBlitFramebuffer(
             HDC cur_hdc = g_gl.p_wglGetCurrentDC ? g_gl.p_wglGetCurrentDC() : NULL;
             HWND cur_win = cur_hdc ? WindowFromDC(cur_hdc) : NULL;
 
-            EnterCriticalSection(&g_ds.lock);
-            if (!g_ds.game_gl_active) {
-                g_ds.wined3d_uses_gl = true;
-                g_ds.wined3d_uses_vulkan = false;
-            }
-            ds_notify_gl_context_active_locked();
-            bool is_target_win = ds_is_target_gl_win_locked(cur_win, true);
-            bool is_fs = g_ds.fullscreen_active;
-            int32_t win_scale = ds_get_windowed_scale_locked();
-            int32_t vw = g_ds.virt_w;
-            int32_t vh = g_ds.virt_h;
-            int32_t real_w = g_ds.real_screen_w;
-            int32_t real_h = g_ds.real_screen_h;
-            int32_t phys_w = g_ds.phys_screen_w;
-            int32_t phys_h = g_ds.phys_screen_h;
-            int32_t dw = is_fs ? g_ds.vp.dst_w : (vw * win_scale);
-            int32_t dh = is_fs ? g_ds.vp.dst_h : (vh * win_scale);
-            int32_t dst_x = is_fs ? g_ds.vp.dst_x : 0;
-            int32_t dst_y = is_fs ? g_ds.vp.dst_y : 0;
+            ds_gl_present_snap_t sn;
+            ds_gl_snapshot_present(cur_win, true, true, false, &sn);
             bool should_scale = (
-                !ds_is_modern_tier_locked() &&
-                is_target_win &&
-                (is_fs || win_scale > 1) &&
-                vw > 0 &&
-                vh > 0 &&
-                dw > 0 &&
-                dh > 0 &&
-                (vw != dw || vh != dh)
+                sn.want_scale &&
+                sn.is_target_win &&
+                sn.vw > 0 && sn.vh > 0 &&
+                sn.dw > 0 && sn.dh > 0 &&
+                (sn.vw != sn.dw || sn.vh != sn.dh)
             );
-            ds_aspect_mode_t aspect = is_fs ? g_ds.aspect_mode : DS_ASPECT_PRESERVE;
-            ds_scale_filter_t sfilter = g_ds.scale_filter;
-            LeaveCriticalSection(&g_ds.lock);
 
             if (should_scale) {
-                int32_t backing_w = is_fs ? phys_w : dw;
-                int32_t backing_h = is_fs ? phys_h : dh;
-                if (is_fs && cur_win != NULL && g_ds.real_GetClientRect != NULL) {
+                int32_t backing_w = sn.is_fs ? sn.phys_w : sn.dw;
+                int32_t backing_h = sn.is_fs ? sn.phys_h : sn.dh;
+                if (sn.is_fs && cur_win != NULL) {
                     RECT live_rc = { 0, 0, 0, 0 };
-                    HANDLE prev_dpi = ds_dpi_guard_enter_for_hwnd(cur_win);
-                    ds_enter_internal();
-                    BOOL has_live = g_ds.real_GetClientRect(cur_win, &live_rc);
-                    ds_leave_internal();
-                    ds_dpi_guard_leave(prev_dpi);
-                    if (has_live) {
+                    if (ds_get_rect_dpi(cur_win, &live_rc, true)) {
                         ds_clamp_live_backing_dims(
                             live_rc.right - live_rc.left,
                             live_rc.bottom - live_rc.top,
-                            vw,
-                            vh,
-                            real_w,
-                            real_h,
-                            phys_w,
-                            phys_h,
-                            &backing_w,
-                            &backing_h
+                            sn.vw, sn.vh,
+                            sn.real_w, sn.real_h,
+                            sn.phys_w, sn.phys_h,
+                            &backing_w, &backing_h
                         );
                     }
                 }
-                if (is_fs && backing_w > 0 && backing_h > 0) {
+                if (sn.is_fs && backing_w > 0 && backing_h > 0) {
                     ds_viewport_t phys_vp;
-                    if (ds_gl_compute_phys_viewport(backing_w, backing_h, vw, vh, aspect, &phys_vp)) {
-                        dst_x = phys_vp.dst_x;
-                        dst_y = phys_vp.dst_y;
-                        dw = phys_vp.dst_w;
-                        dh = phys_vp.dst_h;
+                    if (ds_gl_compute_phys_viewport(backing_w, backing_h, sn.safe_inset_top, sn.real_h, sn.vw, sn.vh, sn.aspect, &phys_vp)) {
+                        sn.dst_x = phys_vp.dst_x;
+                        sn.dst_y = phys_vp.dst_y;
+                        sn.dw = phys_vp.dst_w;
+                        sn.dh = phys_vp.dst_h;
                     }
                 }
-                int32_t gl_dst_y = backing_h - (dst_y + dh);
-                GLint nx0 = ds_scale_gl_coord(dstX0, dw, vw, dst_x);
-                GLint nx1 = ds_scale_gl_coord(dstX1, dw, vw, dst_x);
-                GLint ny0 = ds_scale_gl_coord(dstY0, dh, vh, gl_dst_y);
-                GLint ny1 = ds_scale_gl_coord(dstY1, dh, vh, gl_dst_y);
+                int32_t gl_dst_y = backing_h - (sn.dst_y + sn.dh);
+                GLint nx0 = ds_scale_gl_coord(dstX0, sn.dw, sn.vw, sn.dst_x);
+                GLint nx1 = ds_scale_gl_coord(dstX1, sn.dw, sn.vw, sn.dst_x);
+                GLint ny0 = ds_scale_gl_coord(dstY0, sn.dh, sn.vh, gl_dst_y);
+                GLint ny1 = ds_scale_gl_coord(dstY1, sn.dh, sn.vh, gl_dst_y);
                 if (mask == GL_COLOR_BUFFER_BIT) {
                     if (g_gl.p_glGetIntegerv && g_gl.p_glViewport && backing_w > 0 && backing_h > 0 &&
-                        (vw != backing_w || vh != backing_h)) {
+                        (sn.vw != backing_w || sn.vh != backing_h)) {
                         GLint cur_vp[4] = { 0, 0, 0, 0 };
                         GLint cur_sc[4] = { 0, 0, 0, 0 };
                         g_gl.p_glGetIntegerv(GL_VIEWPORT, cur_vp);
                         g_gl.p_glGetIntegerv(GL_SCISSOR_BOX, cur_sc);
                         if (cur_vp[0] == 0 && cur_vp[1] == 0 && cur_vp[2] == backing_w && cur_vp[3] == backing_h) {
                             GLint rv[4];
-                            ds_gl_pick_w3d_rect(g_gl.last_w3d_vp, vw, vh, rv);
+                            ds_gl_pick_w3d_rect(g_gl.last_w3d_vp, sn.vw, sn.vh, rv);
                             g_gl.p_glViewport(rv[0], rv[1], rv[2], rv[3]);
                             if (g_gl.p_glScissor && cur_sc[0] == 0 && cur_sc[1] == 0 &&
                                 cur_sc[2] == backing_w && cur_sc[3] == backing_h) {
-                                ds_gl_pick_w3d_rect(g_gl.last_w3d_sc, vw, vh, rv);
+                                ds_gl_pick_w3d_rect(g_gl.last_w3d_sc, sn.vw, sn.vh, rv);
                                 g_gl.p_glScissor(rv[0], rv[1], rv[2], rv[3]);
                             }
                         } else if (cur_vp[2] > 0 && cur_vp[3] > 0) {
@@ -948,7 +995,7 @@ static void APIENTRY hook_glBlitFramebuffer(
                     if (read_fbo != 0 && cur_hdc != NULL) {
                         ds_gl_rebind_drawable_if_pending(cur_hdc);
                     }
-                    ds_gl_clear_pillarbox_margins(dst_x, gl_dst_y, dst_x + dw, gl_dst_y + dh, backing_w, backing_h);
+                    ds_gl_clear_pillarbox_margins(sn.dst_x, gl_dst_y, sn.dst_x + sn.dw, gl_dst_y + sn.dh, backing_w, backing_h);
                 }
                 GLboolean was_scissor = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_SCISSOR_TEST) : GL_FALSE;
                 if (was_scissor && g_gl.p_glDisable) {
@@ -959,25 +1006,18 @@ static void APIENTRY hook_glBlitFramebuffer(
                 ds_gl_present_blit_to_backbuffer(
                     cur_ctx,
                     (GLuint)read_fbo,
-                    srcX0,
-                    srcY0,
-                    srcX1,
-                    srcY1,
-                    nx0,
-                    ny0,
-                    nx1,
-                    ny1,
-                    mask,
-                    filter,
-                    aspect,
-                    sfilter
+                    srcX0, srcY0, srcX1, srcY1,
+                    nx0, ny0, nx1, ny1,
+                    mask, filter, sn.aspect, sn.filter
                 );
                 ds_leave_internal();
                 if (was_scissor && g_gl.p_glEnable) {
                     g_gl.p_glEnable(GL_SCISSOR_TEST);
                 }
                 g_gl.w3d_scaled_in_blit = true;
+                ds_lock();
                 g_gl.last_present_was_gl = true;
+                ds_unlock();
                 InterlockedIncrement(&g_ds.gdi_margin_gen);
                 return;
             }
@@ -1002,73 +1042,59 @@ static void ds_gl_pop_blit_caps(GLboolean was_scissor, GLboolean was_srgb)
 }
 
 static void ds_gl_upscale_wined3d_backbuffer(
-    HDC               target_hdc,
-    HGLRC             cur_ctx,
-    int32_t           vw,
-    int32_t           vh,
-    int32_t           dst_x,
-    int32_t           gl_dst_y,
-    int32_t           dw,
-    int32_t           dh,
-    ds_aspect_mode_t  aspect,
-    ds_scale_filter_t scale_filter
+    HDC                         target_hdc,
+    HGLRC                       cur_ctx,
+    const ds_gl_present_snap_t *sn
 )
 {
+    int32_t vw = sn->vw, vh = sn->vh, dw = sn->dw, dh = sn->dh;
+    int32_t dst_x = sn->dst_x;
+    int32_t real_h = sn->is_fs ? sn->real_h : dh;
+    int32_t gl_dst_y = real_h - (sn->dst_y + dh);
     if (vw <= 0 || vh <= 0 || dw <= 0 || dh <= 0) {
         return;
     }
 
     ds_enter_internal();
 
-    GLint prev_draw_fbo = 0;
-    GLint prev_read_fbo = 0;
-    if (g_gl.p_glGetIntegerv) {
-        g_gl.p_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
-        g_gl.p_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
-    }
+    GLint prev_draw_fbo = 0, prev_read_fbo = 0;
+    ds_gl_save_fbo_pair(&prev_draw_fbo, &prev_read_fbo);
 
     if (g_gl.w3d_hglrc != cur_ctx) {
-        g_gl.w3d_hglrc = cur_ctx;
-        g_gl.w3d_fbo_id = 0;
-        g_gl.w3d_color_tex = 0;
-        g_gl.w3d_w = 0;
-        g_gl.w3d_h = 0;
+        ds_gl_switch_fbo_ctx(cur_ctx, 2);
     }
 
-    if (g_gl.w3d_fbo_id == 0 || g_gl.w3d_w != vw || g_gl.w3d_h != vh) {
-        if (!ds_gl_setup_color_fbo(&g_gl.w3d_fbo_id, &g_gl.w3d_color_tex, vw, vh)) {
-            g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw_fbo);
-            g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+    if (g_gl.wfbo.fbo_id == 0 || g_gl.wfbo.w != vw || g_gl.wfbo.h != vh) {
+        if (!ds_gl_setup_fbo(&g_gl.wfbo.fbo_id, &g_gl.wfbo.tex_id, NULL, vw, vh)) {
+            g_gl.wfbo.w = 0;
+            g_gl.wfbo.h = 0;
+            ds_gl_bind_fbo_pair((GLuint)prev_draw_fbo, (GLuint)prev_read_fbo);
             ds_leave_internal();
             return;
         }
-        g_gl.w3d_w = vw;
-        g_gl.w3d_h = vh;
+        g_gl.wfbo.w = vw;
+        g_gl.wfbo.h = vh;
     }
 
     GLboolean was_scissor = GL_FALSE, was_srgb = GL_FALSE;
     ds_gl_push_blit_caps(&was_scissor, &was_srgb);
 
-    g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_gl.w3d_fbo_id);
+    ds_gl_bind_fbo_pair(g_gl.wfbo.fbo_id, 0);
     if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_BACK);
     g_gl.p_glBlitFramebuffer(0, 0, vw, vh, 0, 0, vw, vh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-    /* Rebind Cocoa drawable now that Frame 1 is safely preserved in `w3d_fbo_id` */
+    /* Rebind Cocoa drawable now that Frame 1 is safely preserved in `wfbo.fbo_id` */
     ds_gl_rebind_drawable_if_pending(target_hdc);
 
-    g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gl.w3d_fbo_id);
-    g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    ds_gl_bind_fbo_pair(0, g_gl.wfbo.fbo_id);
     if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_BACK);
 
-    int32_t backing_w = g_ds.fullscreen_active ? g_ds.phys_screen_w : dw;
-    int32_t backing_h = g_ds.fullscreen_active ? g_ds.phys_screen_h : dh;
-
-    int32_t dst_w = dw;
-    int32_t dst_h = dh;
-    if (g_ds.fullscreen_active && backing_w > 0 && backing_h > 0) {
+    int32_t backing_w = sn->is_fs ? sn->phys_w : dw;
+    int32_t backing_h = sn->is_fs ? sn->phys_h : dh;
+    int32_t dst_w = dw, dst_h = dh;
+    if (sn->is_fs && backing_w > 0 && backing_h > 0) {
         ds_viewport_t phys_vp;
-        if (ds_gl_compute_phys_viewport(backing_w, backing_h, vw, vh, aspect, &phys_vp)) {
+        if (ds_gl_compute_phys_viewport(backing_w, backing_h, sn->safe_inset_top, sn->real_h, vw, vh, sn->aspect, &phys_vp)) {
             dst_x = phys_vp.dst_x;
             dst_w = phys_vp.dst_w;
             dst_h = phys_vp.dst_h;
@@ -1079,24 +1105,15 @@ static void ds_gl_upscale_wined3d_backbuffer(
     ds_gl_clear_pillarbox_margins(dst_x, gl_dst_y, dst_x + dst_w, gl_dst_y + dst_h, backing_w, backing_h);
 
     ds_gl_present_blit_to_backbuffer(
-        cur_ctx,
-        g_gl.w3d_fbo_id,
-        0,
-        0,
-        vw,
-        vh,
-        dst_x,
-        gl_dst_y,
-        dst_x + dst_w,
-        gl_dst_y + dst_h,
+        cur_ctx, g_gl.wfbo.fbo_id,
+        0, 0, vw, vh,
+        dst_x, gl_dst_y, dst_x + dst_w, gl_dst_y + dst_h,
         GL_COLOR_BUFFER_BIT,
-        (aspect == DS_ASPECT_INTEGER) ? GL_NEAREST : GL_LINEAR,
-        aspect,
-        scale_filter
+        (sn->aspect == DS_ASPECT_INTEGER) ? GL_NEAREST : GL_LINEAR,
+        sn->aspect, sn->filter
     );
 
-    g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw_fbo);
-    g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+    ds_gl_bind_fbo_pair((GLuint)prev_draw_fbo, (GLuint)prev_read_fbo);
     if (prev_draw_fbo == 0 && g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_BACK);
     if (prev_read_fbo == 0 && g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_BACK);
 
@@ -1124,15 +1141,25 @@ static void ds_gl_upscale_wined3d_backbuffer(
  *      and recreating a clean hidden child ready for the next 3D session.
  * ------------------------------------------------------------------------- */
 
+static void ds_release_dc_raw(HWND hwnd, HDC hdc)
+{
+    if (!hwnd || !hdc) return;
+    if (g_ds.real_ReleaseDC) {
+        g_ds.real_ReleaseDC(hwnd, hdc);
+    } else {
+        ReleaseDC(hwnd, hdc);
+    }
+}
+
 void ds_gl_release_all_host_dcs_for_hwnd(HWND host_hwnd)
 {
     ds_gl_dc_entry_t to_free[DS_MAX_GL_DC_MAP];
-    int count = 0;
+    size_t count = 0;
 
     ds_lock();
-    for (int i = 0; i < DS_MAX_GL_DC_MAP; i++) {
-        if (g_gl.dc_map[i].host_hdc != NULL &&
-            (host_hwnd == NULL || g_gl.dc_map[i].host_hwnd == host_hwnd)) {
+    for (size_t i = 0; i < DS_MAX_GL_DC_MAP; i++) {
+        if (g_gl.dc_map[i].host_hdc != 0u &&
+            (host_hwnd == NULL || g_gl.dc_map[i].host_hwnd == (uintptr_t)host_hwnd)) {
             to_free[count++] = g_gl.dc_map[i];
             memset(&g_gl.dc_map[i], 0, sizeof(g_gl.dc_map[i]));
         }
@@ -1141,13 +1168,11 @@ void ds_gl_release_all_host_dcs_for_hwnd(HWND host_hwnd)
 
     if (count > 0) {
         ds_enter_internal();
-        for (int i = 0; i < count; i++) {
-            if (to_free[i].host_hwnd && to_free[i].host_hdc && IsWindow(to_free[i].host_hwnd)) {
-                if (g_ds.real_ReleaseDC) {
-                    g_ds.real_ReleaseDC(to_free[i].host_hwnd, to_free[i].host_hdc);
-                } else {
-                    ReleaseDC(to_free[i].host_hwnd, to_free[i].host_hdc);
-                }
+        for (size_t i = 0; i < count; i++) {
+            HWND hw = (HWND)to_free[i].host_hwnd;
+            HDC hd = (HDC)to_free[i].host_hdc;
+            if (hw && hd && IsWindow(hw)) {
+                ds_release_dc_raw(hw, hd);
             }
         }
         ds_leave_internal();
@@ -1161,8 +1186,8 @@ void ds_gl_on_release_dc(HWND hwnd, HDC hdc)
 
     ds_gl_dc_entry_t victim = { 0 };
     ds_lock();
-    for (int i = 0; i < DS_MAX_GL_DC_MAP; i++) {
-        if (g_gl.dc_map[i].game_hdc == hdc) {
+    for (size_t i = 0; i < DS_MAX_GL_DC_MAP; i++) {
+        if (g_gl.dc_map[i].game_hdc == (uintptr_t)hdc) {
             victim = g_gl.dc_map[i];
             memset(&g_gl.dc_map[i], 0, sizeof(g_gl.dc_map[i]));
             break;
@@ -1170,13 +1195,11 @@ void ds_gl_on_release_dc(HWND hwnd, HDC hdc)
     }
     ds_unlock();
 
-    if (victim.host_hdc && victim.host_hwnd && IsWindow(victim.host_hwnd)) {
+    HWND vh = (HWND)victim.host_hwnd;
+    HDC vd = (HDC)victim.host_hdc;
+    if (vd && vh && IsWindow(vh)) {
         ds_enter_internal();
-        if (g_ds.real_ReleaseDC) {
-            g_ds.real_ReleaseDC(victim.host_hwnd, victim.host_hdc);
-        } else {
-            ReleaseDC(victim.host_hwnd, victim.host_hdc);
-        }
+        ds_release_dc_raw(vh, vd);
         ds_leave_internal();
     }
 }
@@ -1196,18 +1219,20 @@ static HDC ds_gl_map_hdc_for_wgl(HDC hdc)
         ds_unlock();
         return hdc;
     }
-    for (int i = 0; i < DS_MAX_GL_DC_MAP; i++) {
-        if (g_gl.dc_map[i].host_hdc == hdc) {
+    for (size_t i = 0; i < DS_MAX_GL_DC_MAP; i++) {
+        if (g_gl.dc_map[i].host_hdc == (uintptr_t)hdc) {
+            g_gl.dc_map[i].last_used_gen = ++g_gl.dc_map_gen;
             ds_unlock();
             return hdc;
         }
-        if (g_gl.dc_map[i].game_hdc == hdc &&
-            g_gl.dc_map[i].host_hdc != NULL &&
-            g_gl.dc_map[i].host_hwnd == g_ds.hwnd_gl_host &&
+        if (g_gl.dc_map[i].game_hdc == (uintptr_t)hdc &&
+            g_gl.dc_map[i].host_hdc != 0u &&
+            g_gl.dc_map[i].host_hwnd == (uintptr_t)g_ds.hwnd_gl_host &&
             g_ds.hwnd_gl_host != NULL) {
+            g_gl.dc_map[i].last_used_gen = ++g_gl.dc_map_gen;
             cached_game = g_ds.hwnd_game;
-            cached_host = g_gl.dc_map[i].host_hwnd;
-            cached_host_hdc = g_gl.dc_map[i].host_hdc;
+            cached_host = (HWND)g_gl.dc_map[i].host_hwnd;
+            cached_host_hdc = (HDC)g_gl.dc_map[i].host_hdc;
             break;
         }
     }
@@ -1225,9 +1250,7 @@ static HDC ds_gl_map_hdc_for_wgl(HDC hdc)
         return hdc;
     }
 
-    if (win != g_ds.hwnd_gl_host && g_ds.hwnd_game == NULL && ds_is_candidate_game_window(win, NULL, NULL)) {
-        ds_attach_and_apply_game_window(win, 0, 0);
-    }
+    ds_gl_try_adopt_win(win, false, false);
 
     ds_lock();
     HWND game_hwnd = g_ds.hwnd_game;
@@ -1255,6 +1278,7 @@ static HDC ds_gl_map_hdc_for_wgl(HDC hdc)
 
     ds_enter_internal();
     HDC host_hdc = GetDCEx(host_hwnd, NULL, DCX_CACHE | DCX_CLIPSIBLINGS);
+    HDC active_gl_dc = g_gl.p_wglGetCurrentDC ? g_gl.p_wglGetCurrentDC() : NULL;
     ds_leave_internal();
     if (!host_hdc) {
         return hdc;
@@ -1262,34 +1286,38 @@ static HDC ds_gl_map_hdc_for_wgl(HDC hdc)
 
     ds_gl_dc_entry_t evicted = { 0 };
     ds_lock();
-    int free_slot = -1;
-    for (int i = 0; i < DS_MAX_GL_DC_MAP; i++) {
-        if (g_gl.dc_map[i].game_hdc == hdc && g_gl.dc_map[i].host_hwnd == host_hwnd && g_gl.dc_map[i].host_hdc != NULL) {
-            HDC winner = g_gl.dc_map[i].host_hdc;
-            ds_unlock();
-            ds_enter_internal();
-            if (g_ds.real_ReleaseDC) g_ds.real_ReleaseDC(host_hwnd, host_hdc);
-            else ReleaseDC(host_hwnd, host_hdc);
-            ds_leave_internal();
-            return winner;
-        }
-        if (free_slot < 0 && g_gl.dc_map[i].host_hdc == NULL) {
-            free_slot = i;
-        }
+    size_t slot = ds_gl_dc_map_select_slot(
+        g_gl.dc_map,
+        DS_MAX_GL_DC_MAP,
+        (uintptr_t)hdc,
+        (uintptr_t)host_hwnd,
+        (uintptr_t)active_gl_dc
+    );
+    if (g_gl.dc_map[slot].game_hdc == (uintptr_t)hdc &&
+        g_gl.dc_map[slot].host_hwnd == (uintptr_t)host_hwnd &&
+        g_gl.dc_map[slot].host_hdc != 0u) {
+        g_gl.dc_map[slot].last_used_gen = ++g_gl.dc_map_gen;
+        HDC winner = (HDC)g_gl.dc_map[slot].host_hdc;
+        ds_unlock();
+        ds_enter_internal();
+        ds_release_dc_raw(host_hwnd, host_hdc);
+        ds_leave_internal();
+        return winner;
     }
-    if (free_slot < 0) {
-        free_slot = 0;
-        evicted = g_gl.dc_map[0];
+    if (g_gl.dc_map[slot].host_hdc != 0u) {
+        evicted = g_gl.dc_map[slot];
     }
-    g_gl.dc_map[free_slot].game_hdc  = hdc;
-    g_gl.dc_map[free_slot].host_hdc  = host_hdc;
-    g_gl.dc_map[free_slot].host_hwnd = host_hwnd;
+    g_gl.dc_map[slot].game_hdc      = (uintptr_t)hdc;
+    g_gl.dc_map[slot].host_hdc      = (uintptr_t)host_hdc;
+    g_gl.dc_map[slot].host_hwnd     = (uintptr_t)host_hwnd;
+    g_gl.dc_map[slot].last_used_gen = ++g_gl.dc_map_gen;
     ds_unlock();
 
-    if (evicted.host_hdc && evicted.host_hwnd && IsWindow(evicted.host_hwnd)) {
+    HWND ev_hw = (HWND)evicted.host_hwnd;
+    HDC ev_dc = (HDC)evicted.host_hdc;
+    if (ev_dc && ev_hw && IsWindow(ev_hw)) {
         ds_enter_internal();
-        if (g_ds.real_ReleaseDC) g_ds.real_ReleaseDC(evicted.host_hwnd, evicted.host_hdc);
-        else ReleaseDC(evicted.host_hwnd, evicted.host_hdc);
+        ds_release_dc_raw(ev_hw, ev_dc);
         ds_leave_internal();
     }
 
@@ -1310,9 +1338,10 @@ static HDC ds_gl_unmap_host_hdc(HDC hdc)
     }
     HDC mapped = hdc;
     ds_lock();
-    for (int i = 0; i < DS_MAX_GL_DC_MAP; i++) {
-        if (g_gl.dc_map[i].host_hdc == hdc && g_gl.dc_map[i].game_hdc != NULL) {
-            mapped = g_gl.dc_map[i].game_hdc;
+    for (size_t i = 0; i < DS_MAX_GL_DC_MAP; i++) {
+        if (g_gl.dc_map[i].host_hdc == (uintptr_t)hdc && g_gl.dc_map[i].game_hdc != 0u) {
+            g_gl.dc_map[i].last_used_gen = ++g_gl.dc_map_gen;
+            mapped = (HDC)g_gl.dc_map[i].game_hdc;
             break;
         }
     }
@@ -1549,8 +1578,6 @@ static const char *WINAPI hook_wglQueryRendererStringWINE(HDC dc, GLint renderer
 #define DS_GLH_IN_GDS    2u
 
 typedef struct ds_gl_hook_def_s {
-    const char *name;
-    const char *alt;
     void       *hook;
     uint16_t    slot_off;
     uint8_t     flags;
@@ -1558,36 +1585,46 @@ typedef struct ds_gl_hook_def_s {
 
 #define DS_GDS_OFF(field) ((uint16_t)offsetof(ds_runtime_t, field))
 
-static const ds_gl_hook_def_t k_gl_hook_defs[] = {
-    { "glBlitFramebuffer",          "glBlitFramebufferEXT",          (void *)(uintptr_t)hook_glBlitFramebuffer,          DS_GL_OFF(p_glBlitFramebuffer),          0 },
-    { "wglSetPixelFormatWINE",      NULL,                            (void *)(uintptr_t)hook_wglSetPixelFormatWINE,      DS_GL_OFF(p_wglSetPixelFormatWINE),      0 },
-    { "wglChoosePixelFormatARB",    "wglChoosePixelFormatEXT",       (void *)(uintptr_t)hook_wglChoosePixelFormatARB,    DS_GL_OFF(p_wglChoosePixelFormatARB),    0 },
-    { "wglGetPixelFormatAttribivARB", "wglGetPixelFormatAttribivEXT", (void *)(uintptr_t)hook_wglGetPixelFormatAttribivARB, DS_GL_OFF(p_wglGetPixelFormatAttribivARB), 0 },
-    { "wglGetPixelFormatAttribfvARB", "wglGetPixelFormatAttribfvEXT", (void *)(uintptr_t)hook_wglGetPixelFormatAttribfvARB, DS_GL_OFF(p_wglGetPixelFormatAttribfvARB), 0 },
-    { "wglCreateContextAttribsARB", NULL,                            (void *)(uintptr_t)hook_wglCreateContextAttribsARB, DS_GL_OFF(p_wglCreateContextAttribsARB), 0 },
-    { "wglGetExtensionsStringARB",  NULL,                            (void *)(uintptr_t)hook_wglGetExtensionsStringARB,  DS_GL_OFF(p_wglGetExtensionsStringARB),  0 },
-    { "wglMakeContextCurrentARB",   "wglMakeContextCurrentEXT",      (void *)(uintptr_t)hook_wglMakeContextCurrentARB,   DS_GL_OFF(p_wglMakeContextCurrentARB),   0 },
-    { "wglGetCurrentReadDCARB",     "wglGetCurrentReadDCEXT",        (void *)(uintptr_t)hook_wglGetCurrentReadDCARB,     DS_GL_OFF(p_wglGetCurrentReadDCARB),     0 },
-    { "wglQueryRendererIntegerWINE", NULL,                           (void *)(uintptr_t)hook_wglQueryRendererIntegerWINE, DS_GL_OFF(p_wglQueryRendererIntegerWINE), 0 },
-    { "wglQueryRendererStringWINE", NULL,                            (void *)(uintptr_t)hook_wglQueryRendererStringWINE, DS_GL_OFF(p_wglQueryRendererStringWINE), 0 },
-    { "wglGetPixelFormat",          NULL,                            (void *)(uintptr_t)hook_wglGetPixelFormat,          DS_GDS_OFF(real_wglGetPixelFormat),      DS_GLH_IN_GDS },
-    { "wglSetPixelFormat",          NULL,                            (void *)(uintptr_t)hook_wglSetPixelFormat,          DS_GDS_OFF(real_wglSetPixelFormat),      DS_GLH_IN_GDS },
-    { "wglChoosePixelFormat",       NULL,                            (void *)(uintptr_t)hook_wglChoosePixelFormat,       DS_GDS_OFF(real_wglChoosePixelFormat),   DS_GLH_IN_GDS },
-    { "wglDescribePixelFormat",     NULL,                            (void *)(uintptr_t)hook_wglDescribePixelFormat,     DS_GDS_OFF(real_wglDescribePixelFormat), DS_GLH_IN_GDS },
-    { "glBindFramebuffer",          "glBindFramebufferEXT",          (void *)(uintptr_t)hook_glBindFramebuffer,          DS_GL_OFF(p_glBindFramebuffer),          DS_GLH_GAME_ONLY },
-    { "glDeleteFramebuffers",       "glDeleteFramebuffersEXT",       (void *)(uintptr_t)hook_glDeleteFramebuffers,       DS_GL_OFF(p_glDeleteFramebuffers),       DS_GLH_GAME_ONLY },
-    { "glGetIntegerv",              NULL,                            (void *)(uintptr_t)hook_glGetIntegerv,              DS_GDS_OFF(real_glGetIntegerv),          DS_GLH_GAME_ONLY | DS_GLH_IN_GDS },
-    { "glDrawBuffer",               NULL,                            (void *)(uintptr_t)hook_glDrawBuffer,               DS_GDS_OFF(real_glDrawBuffer),           DS_GLH_GAME_ONLY | DS_GLH_IN_GDS },
-    { "glReadBuffer",               NULL,                            (void *)(uintptr_t)hook_glReadBuffer,               DS_GDS_OFF(real_glReadBuffer),           DS_GLH_GAME_ONLY | DS_GLH_IN_GDS },
-};
+#define DS_GL_HOOK_LIST(X) \
+    X("glBlitFramebuffer",          "glBlitFramebufferEXT",          hook_glBlitFramebuffer,          DS_GL_OFF(p_glBlitFramebuffer),          0) \
+    X("wglSetPixelFormatWINE",      "",                              hook_wglSetPixelFormatWINE,      DS_GL_OFF(p_wglSetPixelFormatWINE),      0) \
+    X("wglChoosePixelFormatARB",    "wglChoosePixelFormatEXT",       hook_wglChoosePixelFormatARB,    DS_GL_OFF(p_wglChoosePixelFormatARB),    0) \
+    X("wglGetPixelFormatAttribivARB", "wglGetPixelFormatAttribivEXT", hook_wglGetPixelFormatAttribivARB, DS_GL_OFF(p_wglGetPixelFormatAttribivARB), 0) \
+    X("wglGetPixelFormatAttribfvARB", "wglGetPixelFormatAttribfvEXT", hook_wglGetPixelFormatAttribfvARB, DS_GL_OFF(p_wglGetPixelFormatAttribfvARB), 0) \
+    X("wglCreateContextAttribsARB", "",                              hook_wglCreateContextAttribsARB, DS_GL_OFF(p_wglCreateContextAttribsARB), 0) \
+    X("wglGetExtensionsStringARB",  "",                              hook_wglGetExtensionsStringARB,  DS_GL_OFF(p_wglGetExtensionsStringARB),  0) \
+    X("wglMakeContextCurrentARB",   "wglMakeContextCurrentEXT",      hook_wglMakeContextCurrentARB,   DS_GL_OFF(p_wglMakeContextCurrentARB),   0) \
+    X("wglGetCurrentReadDCARB",     "wglGetCurrentReadDCEXT",        hook_wglGetCurrentReadDCARB,     DS_GL_OFF(p_wglGetCurrentReadDCARB),     0) \
+    X("wglQueryRendererIntegerWINE", "",                             hook_wglQueryRendererIntegerWINE, DS_GL_OFF(p_wglQueryRendererIntegerWINE), 0) \
+    X("wglQueryRendererStringWINE", "",                              hook_wglQueryRendererStringWINE, DS_GL_OFF(p_wglQueryRendererStringWINE), 0) \
+    X("wglGetPixelFormat",          "",                              hook_wglGetPixelFormat,          DS_GDS_OFF(real_wglGetPixelFormat),      DS_GLH_IN_GDS) \
+    X("wglSetPixelFormat",          "",                              hook_wglSetPixelFormat,          DS_GDS_OFF(real_wglSetPixelFormat),      DS_GLH_IN_GDS) \
+    X("wglChoosePixelFormat",       "",                              hook_wglChoosePixelFormat,       DS_GDS_OFF(real_wglChoosePixelFormat),   DS_GLH_IN_GDS) \
+    X("wglDescribePixelFormat",     "",                              hook_wglDescribePixelFormat,     DS_GDS_OFF(real_wglDescribePixelFormat), DS_GLH_IN_GDS) \
+    X("glBindFramebuffer",          "glBindFramebufferEXT",          hook_glBindFramebuffer,          DS_GL_OFF(p_glBindFramebuffer),          DS_GLH_GAME_ONLY) \
+    X("glDeleteFramebuffers",       "glDeleteFramebuffersEXT",       hook_glDeleteFramebuffers,       DS_GL_OFF(p_glDeleteFramebuffers),       DS_GLH_GAME_ONLY) \
+    X("glGetIntegerv",              "",                              hook_glGetIntegerv,              DS_GDS_OFF(real_glGetIntegerv),          DS_GLH_GAME_ONLY | DS_GLH_IN_GDS) \
+    X("glDrawBuffer",               "",                              hook_glDrawBuffer,               DS_GDS_OFF(real_glDrawBuffer),           DS_GLH_GAME_ONLY | DS_GLH_IN_GDS) \
+    X("glReadBuffer",               "",                              hook_glReadBuffer,               DS_GDS_OFF(real_glReadBuffer),           DS_GLH_GAME_ONLY | DS_GLH_IN_GDS)
+
+#define DS_GL_HOOK_STR_ITEM(nm, alt, hk, off, fl) nm "\0" alt "\0"
+#define DS_GL_HOOK_DEF_ITEM(nm, alt, hk, off, fl) { (void *)(uintptr_t)(hk), (off), (fl) },
+
+static const char k_gl_hook_names_msz[] = DS_GL_HOOK_LIST(DS_GL_HOOK_STR_ITEM);
+static const ds_gl_hook_def_t k_gl_hook_defs[] = { DS_GL_HOOK_LIST(DS_GL_HOOK_DEF_ITEM) };
 
 static void *ds_resolve_gl_proc_common(const char *name, void *real_fn, bool include_game_only)
 {
     if (!name || !real_fn) return real_fn;
+    const char *p = k_gl_hook_names_msz;
     for (size_t i = 0; i < sizeof(k_gl_hook_defs) / sizeof(k_gl_hook_defs[0]); i++) {
+        const char *nm = p;
+        p += strlen(p) + 1;
+        const char *alt = p;
+        p += strlen(p) + 1;
         const ds_gl_hook_def_t *d = &k_gl_hook_defs[i];
         if ((d->flags & DS_GLH_GAME_ONLY) && !include_game_only) continue;
-        if (strcmp(name, d->name) == 0 || (d->alt && strcmp(name, d->alt) == 0)) {
+        if (strcmp(name, nm) == 0 || (alt[0] != '\0' && strcmp(name, alt) == 0)) {
             void **slot = (d->flags & DS_GLH_IN_GDS)
                 ? (void **)(void *)((uint8_t *)&g_ds + d->slot_off)
                 : ds_gl_slot_ptr(d->slot_off);
@@ -1627,43 +1664,28 @@ PROC WINAPI hook_wglGetProcAddress(LPCSTR lpszProc)
 
 static void ds_gl_ensure_wgl_query_procs(void)
 {
-    if (g_gl.p_wglGetCurrentContext && g_gl.p_wglGetCurrentDC && g_gl.p_wglSetPixelFormatWINE) {
+    ds_gl_ensure_state_procs();
+    if (g_gl.p_wglSetPixelFormatWINE) {
         return;
     }
     HMODULE h_gl = GetModuleHandleW(L"opengl32.dll");
     if (!h_gl || !g_ds.real_GetProcAddress) {
         return;
     }
-    if (!g_gl.p_wglGetCurrentContext) {
-        g_gl.p_wglGetCurrentContext = (pfn_wglGetCurrentContext_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "wglGetCurrentContext");
+    FARPROC wpf = g_ds.real_GetProcAddress(h_gl, "wglSetPixelFormatWINE");
+    if (!wpf && g_ds.real_wglGetProcAddress) {
+        ds_enter_internal();
+        wpf = (FARPROC)g_ds.real_wglGetProcAddress("wglSetPixelFormatWINE");
+        ds_leave_internal();
     }
-    if (!g_gl.p_wglGetCurrentDC) {
-        g_gl.p_wglGetCurrentDC = (pfn_wglGetCurrentDC_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "wglGetCurrentDC");
-    }
-    if (!g_gl.p_wglSetPixelFormatWINE) {
-        FARPROC wpf = g_ds.real_GetProcAddress(h_gl, "wglSetPixelFormatWINE");
-        if (!wpf && g_ds.real_wglGetProcAddress) {
-            ds_enter_internal();
-            wpf = (FARPROC)g_ds.real_wglGetProcAddress("wglSetPixelFormatWINE");
-            ds_leave_internal();
-        }
-        if (wpf) {
-            g_gl.p_wglSetPixelFormatWINE = (pfn_wglSetPixelFormatWINE_t)(uintptr_t)wpf;
-        }
+    if (wpf) {
+        InterlockedCompareExchangePointer((PVOID volatile *)&g_gl.p_wglSetPixelFormatWINE, (PVOID)(uintptr_t)wpf, NULL);
     }
 }
 
 static void ds_gl_reset_fbo_state(HGLRC next_ctx)
 {
-    g_gl.fbo_ctx = next_ctx;
-    g_gl.fbo_id = 0;
-    g_gl.color_tex = 0;
-    g_gl.depth_rb = 0;
-    g_gl.fbo_w = 0;
-    g_gl.fbo_h = 0;
-    g_gl.fbo_redirect_active = false;
-    g_gl.game_draw_fbo = 0;
-    g_gl.game_read_fbo = 0;
+    ds_gl_switch_fbo_ctx(next_ctx, 0);
 }
 
 BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
@@ -1696,9 +1718,7 @@ BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
         ds_unlock();
     }
 
-    if (win && win != g_ds.hwnd_gl_host && g_ds.hwnd_game == NULL && ds_is_candidate_game_window(win, NULL, NULL)) {
-        ds_attach_and_apply_game_window(win, 0, 0);
-    }
+    ds_gl_try_adopt_win(win, false, false);
 
     HDC target_hdc = hdc ? ds_gl_map_hdc_for_wgl(hdc) : NULL;
     if (target_hdc && target_hdc != hdc && hglrc != NULL) {
@@ -1746,57 +1766,56 @@ BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
         return ok;
     }
 
-    if (win && win != g_ds.hwnd_gl_host && (g_ds.hwnd_game == NULL || g_ds.hwnd_game != win) && ds_is_candidate_game_window(win, NULL, NULL)) {
-        ds_attach_and_apply_game_window(win, 0, 0);
-    }
+    ds_gl_try_adopt_win(win, true, false);
 
-    ds_lock();
-    bool is_game_win = (
-        win != NULL &&
-        (win == g_ds.hwnd_game || win == g_ds.hwnd_gl_host || (g_ds.hwnd_game != NULL && IsChild(g_ds.hwnd_game, win)))
-    );
-    bool fs_active = g_ds.fullscreen_active;
-    int32_t win_scale = ds_get_windowed_scale_locked();
-    int32_t vw = g_ds.virt_w;
-    int32_t vh = g_ds.virt_h;
-    int32_t dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
-    int32_t dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
-    bool want_fbo = (fs_active || (win_scale > 1)) && !ds_is_modern_tier_locked();
-    ds_unlock();
+    ds_gl_present_snap_t sn;
+    ds_gl_snapshot_present(win, false, false, false, &sn);
 
-    if (is_game_win) {
+    if (sn.is_target_win) {
         if (g_gl.fbo_ctx != hglrc) {
             ds_gl_reset_fbo_state(hglrc);
         }
         g_gl.game_hglrc = hglrc;
-        ds_gl_sync_fbo_for_current_ctx(vw, vh, dw, dh, want_fbo);
+        ds_gl_sync_fbo_for_current_ctx(sn.vw, sn.vh, sn.dw, sn.dh, sn.want_scale);
     }
     return ok;
 }
 
 BOOL WINAPI hook_wglDeleteContext(HGLRC hglrc)
 {
-    if (hglrc && (hglrc == g_gl.game_hglrc || hglrc == g_gl.fbo_ctx)) {
-        g_gl.game_hglrc = NULL;
-        ds_gl_reset_fbo_state(NULL);
+    ds_gl_ctx_fbo_slot_t removed = { 0 };
+    bool had_slot = false;
+    if (hglrc) {
+        ds_lock();
+        ds_gl_save_active_fbo_slots_locked();
+        had_slot = ds_gl_ctx_fbo_remove(g_gl.fbo_slots, DS_MAX_GL_CTX_MAP, (uintptr_t)hglrc, &removed);
+        if (hglrc == g_gl.game_hglrc || hglrc == g_gl.fbo_ctx) {
+            g_gl.game_hglrc = NULL;
+            g_gl.fbo_ctx = NULL;
+            memset(&g_gl.gfbo, 0, sizeof(g_gl.gfbo));
+            g_gl.fbo_redirect_active = false;
+        }
+        if (hglrc == g_gl.w3d_hglrc) {
+            g_gl.w3d_hglrc = NULL;
+            memset(&g_gl.wfbo, 0, sizeof(g_gl.wfbo));
+        }
+        if (hglrc == g_gl.sharp_ctx) {
+            g_gl.sharp_ctx = NULL;
+            memset(&g_gl.sfbo, 0, sizeof(g_gl.sfbo));
+        }
+        memset(g_gl.last_w3d_vp, 0, sizeof(g_gl.last_w3d_vp));
+        memset(g_gl.last_w3d_sc, 0, sizeof(g_gl.last_w3d_sc));
+        ds_unlock();
+
+        if (had_slot && g_gl.fbo_supported && g_gl.p_wglGetCurrentContext &&
+            g_gl.p_wglGetCurrentContext() == hglrc) {
+            ds_enter_internal();
+            if (g_gl.p_glBindFramebuffer) g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            ds_gl_delete_fbo_slot_objects_current_ctx(&removed);
+            ds_leave_internal();
+        }
+        ds_gl_ctx_track(hglrc, -1);
     }
-    if (hglrc && hglrc == g_gl.w3d_hglrc) {
-        g_gl.w3d_hglrc = NULL;
-        g_gl.w3d_fbo_id = 0;
-        g_gl.w3d_color_tex = 0;
-        g_gl.w3d_w = 0;
-        g_gl.w3d_h = 0;
-    }
-    if (hglrc && hglrc == g_gl.sharp_ctx) {
-        g_gl.sharp_ctx = NULL;
-        g_gl.sharp_fbo = 0;
-        g_gl.sharp_tex = 0;
-        g_gl.sharp_w = 0;
-        g_gl.sharp_h = 0;
-    }
-    memset(g_gl.last_w3d_vp, 0, sizeof(g_gl.last_w3d_vp));
-    memset(g_gl.last_w3d_sc, 0, sizeof(g_gl.last_w3d_sc));
-    ds_gl_ctx_track(hglrc, -1);
     return g_ds.real_wglDeleteContext ? g_ds.real_wglDeleteContext(hglrc) : FALSE;
 }
 
@@ -1915,43 +1934,22 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
         ds_notify_gl_context_active_locked();
         ds_unlock();
 
-        if (win && win != g_ds.hwnd_gl_host && g_ds.hwnd_game == NULL && ds_is_candidate_game_window(win, NULL, NULL)) {
-            ds_attach_and_apply_game_window(win, 0, 0);
-        } else if (win && win == g_ds.hwnd_game) {
-            ds_ensure_game_window_bounds(win);
-        }
+        ds_gl_try_adopt_win(win, false, true);
 
         HDC target_hdc = ds_gl_map_hdc_for_wgl(hdc);
 
-        ds_lock();
-        bool is_game_win = ds_is_target_gl_win_locked(win, false);
-        if (is_game_win) {
-            g_gl.last_present_was_gl = true;
-        }
-        bool fs_active = g_ds.fullscreen_active;
-        int32_t win_scale = ds_get_windowed_scale_locked();
-        ds_aspect_mode_t aspect = fs_active ? g_ds.aspect_mode : DS_ASPECT_PRESERVE;
-        ds_scale_filter_t w3d_filter = g_ds.scale_filter;
-        int32_t vw = g_ds.virt_w;
-        int32_t vh = g_ds.virt_h;
-        int32_t dst_x = fs_active ? g_ds.vp.dst_x : 0;
-        int32_t dst_y = fs_active ? g_ds.vp.dst_y : 0;
-        int32_t dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
-        int32_t dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
-        int32_t real_h = fs_active ? g_ds.real_screen_h : dh;
-        bool want_scale = (fs_active || (win_scale > 1)) && !ds_is_modern_tier_locked();
-        ds_unlock();
+        ds_gl_present_snap_t sn;
+        ds_gl_snapshot_present(win, false, false, true, &sn);
 
-        if (is_game_win) {
+        if (sn.is_target_win) {
             InterlockedIncrement(&g_ds.gdi_margin_gen);
             ds_set_gl_host_visible(true);
             ds_gl_ensure_wgl_query_procs();
-            if (!g_gl.w3d_scaled_in_blit && want_scale && vw > 0 && vh > 0 && dw > 0 && dh > 0 &&
-                (vw != dw || vh != dh) && ds_gl_init_procs_once()) {
+            if (!g_gl.w3d_scaled_in_blit && sn.want_scale && sn.vw > 0 && sn.vh > 0 && sn.dw > 0 && sn.dh > 0 &&
+                (sn.vw != sn.dw || sn.vh != sn.dh) && ds_gl_init_procs_once()) {
                 HGLRC cur_ctx = g_gl.p_wglGetCurrentContext ? g_gl.p_wglGetCurrentContext() : NULL;
                 if (cur_ctx != NULL) {
-                    int32_t gl_dst_y = real_h - (dst_y + dh);
-                    ds_gl_upscale_wined3d_backbuffer(target_hdc, cur_ctx, vw, vh, dst_x, gl_dst_y, dw, dh, aspect, w3d_filter);
+                    ds_gl_upscale_wined3d_backbuffer(target_hdc, cur_ctx, &sn);
                 }
             }
         }
@@ -1961,7 +1959,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
         BOOL w3d_swapped = ds_call_real_swap(target_hdc, use_wgl_swap);
         ds_leave_internal();
 
-        if (is_game_win) {
+        if (sn.is_target_win) {
             ds_gl_rebind_drawable_if_pending(target_hdc);
         }
         return w3d_swapped;
@@ -1979,48 +1977,31 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
         ds_notify_gl_context_active_locked();
         ds_unlock();
     }
-    if (win && win != g_ds.hwnd_gl_host && (g_ds.hwnd_game == NULL || g_ds.hwnd_game != win) && ds_is_candidate_game_window(win, NULL, NULL)) {
-        ds_attach_and_apply_game_window(win, 0, 0);
-    } else if (win && win == g_ds.hwnd_game) {
-        ds_ensure_game_window_bounds(win);
-    }
+    ds_gl_try_adopt_win(win, true, true);
 
     HDC target_hdc = ds_gl_map_hdc_for_wgl(hdc);
 
-    ds_lock();
-    bool is_game_win = ds_is_target_gl_win_locked(win, false);
-    bool fs_active = g_ds.fullscreen_active;
-    int32_t win_scale = ds_get_windowed_scale_locked();
-    ds_aspect_mode_t aspect = fs_active ? g_ds.aspect_mode : DS_ASPECT_PRESERVE;
-    ds_scale_filter_t filter_mode = g_ds.scale_filter;
-    int32_t vw = g_ds.virt_w;
-    int32_t vh = g_ds.virt_h;
-    int32_t dst_x = fs_active ? g_ds.vp.dst_x : 0;
-    int32_t dst_y = fs_active ? g_ds.vp.dst_y : 0;
-    int32_t dst_w = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
-    int32_t dst_h = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
-    int32_t dw = dst_w;
-    int32_t dh = dst_h;
-    int32_t backing_w = fs_active ? g_ds.phys_screen_w : (vw * win_scale);
-    int32_t backing_h = fs_active ? g_ds.phys_screen_h : (vh * win_scale);
-    bool want_fbo = (fs_active || (win_scale > 1)) && !ds_is_modern_tier_locked();
-    if (fs_active) {
+    ds_gl_present_snap_t sn;
+    ds_gl_snapshot_present(win, false, false, false, &sn);
+    int32_t dst_x = sn.dst_x, dst_y = sn.dst_y, dst_w = sn.dw, dst_h = sn.dh;
+    int32_t backing_w = sn.is_fs ? sn.phys_w : sn.dw;
+    int32_t backing_h = sn.is_fs ? sn.phys_h : sn.dh;
+    if (sn.is_fs) {
         ds_viewport_t phys_vp;
-        if (ds_gl_compute_phys_viewport(backing_w, backing_h, vw, vh, aspect, &phys_vp)) {
+        if (ds_gl_compute_phys_viewport(backing_w, backing_h, sn.safe_inset_top, sn.real_h, sn.vw, sn.vh, sn.aspect, &phys_vp)) {
             dst_x = phys_vp.dst_x;
             dst_y = phys_vp.dst_y;
             dst_w = phys_vp.dst_w;
             dst_h = phys_vp.dst_h;
         }
     }
-    ds_unlock();
 
-    if (is_game_win && ds_gl_init_procs_once()) {
+    if (sn.is_target_win && ds_gl_init_procs_once()) {
         HGLRC cur_ctx = g_gl.p_wglGetCurrentContext ? g_gl.p_wglGetCurrentContext() : NULL;
         if (cur_ctx != NULL) {
             if (g_gl.game_hglrc != cur_ctx || g_gl.fbo_ctx != cur_ctx) {
                 g_gl.game_hglrc = cur_ctx;
-                ds_gl_sync_fbo_for_current_ctx(vw, vh, dw, dh, want_fbo);
+                ds_gl_sync_fbo_for_current_ctx(sn.vw, sn.vh, sn.dw, sn.dh, sn.want_scale);
             }
             if (cur_ctx == g_gl.game_hglrc) {
                 ds_lock();
@@ -2028,8 +2009,8 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                 ds_unlock();
                 InterlockedIncrement(&g_ds.gdi_margin_gen);
                 ds_set_gl_host_visible(true);
-                if (g_gl.fbo_redirect_active && g_gl.fbo_id != 0 && want_fbo && dw > 0 && dh > 0) {
-                    /* Rebind Cocoa drawable BEFORE blitting to FBO 0 while Frame 1 lives safely in `g_gl.fbo_id` */
+                if (g_gl.fbo_redirect_active && g_gl.gfbo.fbo_id != 0 && sn.want_scale && sn.dw > 0 && sn.dh > 0) {
+                    /* Rebind Cocoa drawable BEFORE blitting to FBO 0 while Frame 1 lives safely in `g_gl.gfbo.fbo_id` */
                     ds_gl_rebind_drawable_if_pending(target_hdc);
                     GLint dx0 = dst_x;
                     GLint dy0 = backing_h - (dst_y + dst_h);
@@ -2051,20 +2032,12 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
 
                     ds_gl_clear_pillarbox_margins(dx0, dy0, dx1, dy1, backing_w, backing_h);
                     ds_gl_present_blit_to_backbuffer(
-                        cur_ctx,
-                        g_gl.fbo_id,
-                        0,
-                        0,
-                        g_gl.fbo_w,
-                        g_gl.fbo_h,
-                        dx0,
-                        dy0,
-                        dx1,
-                        dy1,
+                        cur_ctx, g_gl.gfbo.fbo_id,
+                        0, 0, g_gl.gfbo.w, g_gl.gfbo.h,
+                        dx0, dy0, dx1, dy1,
                         GL_COLOR_BUFFER_BIT,
-                        (aspect == DS_ASPECT_INTEGER) ? GL_NEAREST : GL_LINEAR,
-                        aspect,
-                        filter_mode
+                        (sn.aspect == DS_ASPECT_INTEGER) ? GL_NEAREST : GL_LINEAR,
+                        sn.aspect, sn.filter
                     );
 
                     ds_gl_pop_blit_caps(was_scissor, was_srgb);
@@ -2077,16 +2050,8 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                 ds_gl_rebind_drawable_if_pending(target_hdc);
 
                 /* Prepare FBO (or unbind to 0 if unscaled windowed) for next frame */
-                ds_lock();
-                fs_active = g_ds.fullscreen_active;
-                win_scale = ds_get_windowed_scale_locked();
-                vw = g_ds.virt_w;
-                vh = g_ds.virt_h;
-                dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
-                dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
-                want_fbo = (fs_active || (win_scale > 1)) && !ds_is_modern_tier_locked();
-                ds_unlock();
-                ds_gl_sync_fbo_for_current_ctx(vw, vh, dw, dh, want_fbo);
+                ds_gl_snapshot_present(win, false, false, false, &sn);
+                ds_gl_sync_fbo_for_current_ctx(sn.vw, sn.vh, sn.dw, sn.dh, sn.want_scale);
                 return swapped;
             }
         }
@@ -2112,16 +2077,9 @@ void ds_gl_notify_mode_changed(void)
         return;
     }
     if (g_gl.p_wglGetCurrentContext() == g_gl.game_hglrc) {
-        ds_lock();
-        bool fs_active = g_ds.fullscreen_active;
-        int32_t win_scale = ds_get_windowed_scale_locked();
-        int32_t vw = g_ds.virt_w;
-        int32_t vh = g_ds.virt_h;
-        int32_t dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
-        int32_t dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
-        bool want_fbo = (fs_active || (win_scale > 1)) && !ds_is_modern_tier_locked();
-        ds_unlock();
-        ds_gl_sync_fbo_for_current_ctx(vw, vh, dw, dh, want_fbo);
+        ds_gl_present_snap_t sn;
+        ds_gl_snapshot_present(NULL, true, false, false, &sn);
+        ds_gl_sync_fbo_for_current_ctx(sn.vw, sn.vh, sn.dw, sn.dh, sn.want_scale);
     }
 }
 
@@ -2359,7 +2317,9 @@ static void WINAPI hook_vkCmdBlitImage(
 
     int32_t sc_w = 0, sc_h = 0;
     bool should_scale = false;
+    bool status_dirty = false;
     ds_aspect_mode_t aspect = DS_ASPECT_PRESERVE;
+    ds_scale_filter_t sfilter = DS_FILTER_AUTO;
     ds_viewport_t vp;
     memset(&vp, 0, sizeof(vp));
 
@@ -2373,6 +2333,7 @@ static void WINAPI hook_vkCmdBlitImage(
     if (s && sw > 0 && sh > 0 && s->ext_w > 0 && s->ext_h > 0) {
         sc_w = s->ext_w;
         sc_h = s->ext_h;
+        sfilter = g_ds.scale_filter;
         bool active = (
             ds_is_vulkan_d3d9_locked() &&
             !ds_is_passthrough_locked() &&
@@ -2386,6 +2347,7 @@ static void WINAPI hook_vkCmdBlitImage(
                 g_ds.virt_h = g_ds.real_screen_h;
                 ds_refresh_viewport_locked();
                 ds_cursor_warp_reset(&g_ds.warp);
+                status_dirty = true;
             }
         } else if (active && (sw < sc_w || sh < sc_h)) {
             if (g_ds.fullscreen_active && (g_ds.virt_w != sw || g_ds.virt_h != sh || !g_ds.mode_virtualized)) {
@@ -2393,14 +2355,19 @@ static void WINAPI hook_vkCmdBlitImage(
                 g_ds.virt_h = sh;
                 g_ds.mode_virtualized = true;
                 ds_refresh_viewport_locked();
+                status_dirty = true;
             }
             aspect = g_ds.fullscreen_active ? g_ds.aspect_mode : DS_ASPECT_STRETCH;
             should_scale = g_ds.fullscreen_active
-                ? ds_gl_compute_phys_viewport(sc_w, sc_h, sw, sh, aspect, &vp)
+                ? ds_gl_compute_phys_viewport(sc_w, sc_h, g_ds.safe_inset_top, g_ds.real_screen_h, sw, sh, aspect, &vp)
                 : ds_compute_viewport(sc_w, sc_h, 0, sw, sh, aspect, &vp);
         }
     }
     ds_unlock();
+
+    if (status_dirty) {
+        ds_write_status_file();
+    }
 
     if (!should_scale || vp.dst_w <= 0 || vp.dst_h <= 0) {
         g_vk.p_vkCmdBlitImage(cmd, src_img, src_layout, dst_img, dst_layout, region_count, regions, filter);
@@ -2442,7 +2409,7 @@ static void WINAPI hook_vkCmdBlitImage(
     patched.dstOffsets[1].x = flip_x ? vp.dst_x : (vp.dst_x + vp.dst_w);
     patched.dstOffsets[0].y = flip_y ? (vp.dst_y + vp.dst_h) : vp.dst_y;
     patched.dstOffsets[1].y = flip_y ? vp.dst_y : (vp.dst_y + vp.dst_h);
-    uint32_t out_filter = (aspect == DS_ASPECT_INTEGER) ? DS_VK_FILTER_NEAREST : DS_VK_FILTER_LINEAR;
+    uint32_t out_filter = ds_vk_choose_blit_filter(aspect, sfilter);
     g_vk.p_vkCmdBlitImage(cmd, src_img, src_layout, dst_img, dst_layout, 1u, &patched, out_filter);
 }
 
@@ -2520,11 +2487,15 @@ void *ds_resolve_wined3d_vk_proc(const char *name, void *real_fn)
 
 void ds_gl_shutdown(void)
 {
+    if (g_ds.lock_initialized) ds_lock();
     g_gl.game_hglrc = NULL;
+    g_gl.fbo_ctx = NULL;
     g_gl.w3d_hglrc = NULL;
     g_gl.sharp_ctx = NULL;
     g_gl.fbo_redirect_active = false;
     g_gl.last_present_was_gl = false;
+    memset(g_gl.fbo_slots, 0, sizeof(g_gl.fbo_slots));
+    if (g_ds.lock_initialized) ds_unlock();
     ds_gl_release_all_host_dcs_for_hwnd(NULL);
 }
 
@@ -2538,26 +2509,27 @@ static void ds_clear_gdi_margins(HDC hdcDst, int32_t dx, int32_t dy, int32_t dw,
     static LONG    s_last_gen = -1;
     static int32_t s_last_dx = -1, s_last_dy = -1, s_last_dw = -1, s_last_dh = -1;
 
-    if (!g_ds.fullscreen_active) {
-        return;
-    }
-
     HWND win = WindowFromDC(hdcDst);
-    LONG cur_gen = g_ds.gdi_margin_gen;
-    if (!force_clear && win == s_last_win && cur_gen == s_last_gen &&
-        dx == s_last_dx && dy == s_last_dy && dw == s_last_dw && dh == s_last_dh) {
-        return;
+    int32_t sw = 0, sh = 0;
+    bool need_clear = false;
+    ds_lock();
+    if (g_ds.fullscreen_active) {
+        LONG cur_gen = g_ds.gdi_margin_gen;
+        if (force_clear || win != s_last_win || cur_gen != s_last_gen ||
+            dx != s_last_dx || dy != s_last_dy || dw != s_last_dw || dh != s_last_dh) {
+            s_last_win = win;
+            s_last_gen = cur_gen;
+            s_last_dx = dx;
+            s_last_dy = dy;
+            s_last_dw = dw;
+            s_last_dh = dh;
+            sw = g_ds.real_screen_w;
+            sh = g_ds.real_screen_h;
+            need_clear = (sw > 0 && sh > 0);
+        }
     }
-    s_last_win = win;
-    s_last_gen = cur_gen;
-    s_last_dx = dx;
-    s_last_dy = dy;
-    s_last_dw = dw;
-    s_last_dh = dh;
-
-    int32_t sw = g_ds.real_screen_w;
-    int32_t sh = g_ds.real_screen_h;
-    if (sw <= 0 || sh <= 0) return;
+    ds_unlock();
+    if (!need_clear) return;
 
     ds_enter_internal();
     /*
@@ -2582,11 +2554,7 @@ static void ds_clear_gdi_margins(HDC hdcDst, int32_t dx, int32_t dy, int32_t dw,
         PatBlt(target_dc, dx, dy + dh, dw, sh - (dy + dh), BLACKNESS);
     }
     if (clear_dc) {
-        if (g_ds.real_ReleaseDC) {
-            g_ds.real_ReleaseDC(win, clear_dc);
-        } else {
-            ReleaseDC(win, clear_dc);
-        }
+        ds_release_dc_raw(win, clear_dc);
     }
     ds_leave_internal();
 }
@@ -2601,17 +2569,20 @@ static bool ds_should_scale_gdi_dc(HDC hdcDst, const void *caller_ret, int32_t *
         return false;
     }
     HWND win = WindowFromDC(hdcDst);
-    if (!win || win == g_ds.hwnd_gl_host) {
+    if (!win) {
         return false;
     }
     ds_ensure_runtime_started();
 
     bool need_reset_gl_host = false;
+    int32_t snap_vw = 0, snap_vh = 0;
     ds_lock();
-    if (ds_is_modern_tier_locked()) {
+    if (win == g_ds.hwnd_gl_host || ds_is_modern_tier_locked()) {
         ds_unlock();
         return false;
     }
+    snap_vw = g_ds.virt_w;
+    snap_vh = g_ds.virt_h;
     int32_t win_scale = ds_get_windowed_scale_locked();
     bool is_game_gdi_target = (
         win == g_ds.hwnd_game ||
@@ -2622,29 +2593,29 @@ static bool ds_should_scale_gdi_dc(HDC hdcDst, const void *caller_ret, int32_t *
     if (g_ds.fullscreen_active) {
         match = (
             is_game_gdi_target &&
-            g_ds.virt_w > 0 &&
-            g_ds.virt_h > 0 &&
+            snap_vw > 0 &&
+            snap_vh > 0 &&
             g_ds.vp.dst_w > 0 &&
             g_ds.vp.dst_h > 0 &&
-            (g_ds.vp.dst_w != g_ds.virt_w || g_ds.vp.dst_h != g_ds.virt_h)
+            (g_ds.vp.dst_w != snap_vw || g_ds.vp.dst_h != snap_vh)
         );
         if (match) {
-            *out_vw = g_ds.virt_w;
-            *out_vh = g_ds.virt_h;
+            *out_vw = snap_vw;
+            *out_vh = snap_vh;
             *out_dx = g_ds.vp.dst_x;
             *out_dy = g_ds.vp.dst_y;
             *out_dw = g_ds.vp.dst_w;
             *out_dh = g_ds.vp.dst_h;
         }
-    } else if (win_scale > 1 && g_ds.virt_w > 0 && g_ds.virt_h > 0 &&
+    } else if (win_scale > 1 && snap_vw > 0 && snap_vh > 0 &&
                (win == g_ds.hwnd_game || (g_ds.hwnd_game != NULL && IsChild(g_ds.hwnd_game, win)))) {
         match = true;
-        *out_vw = g_ds.virt_w;
-        *out_vh = g_ds.virt_h;
+        *out_vw = snap_vw;
+        *out_vh = snap_vh;
         *out_dx = 0;
         *out_dy = 0;
-        *out_dw = g_ds.virt_w * win_scale;
-        *out_dh = g_ds.virt_h * win_scale;
+        *out_dw = snap_vw * win_scale;
+        *out_dh = snap_vh * win_scale;
     }
     if (is_game_gdi_target && match) {
         g_ds.ddraw_gdi_active = true;
@@ -2660,7 +2631,7 @@ static bool ds_should_scale_gdi_dc(HDC hdcDst, const void *caller_ret, int32_t *
     }
     if (g_ds.trace_file[0] != L'\0' && is_game_gdi_target && InterlockedDecrement(&g_gl.mode_trace_budget) >= 0) {
         ds_tracef("gdi: win=%p m=%d rst=%d %dx%d",
-                  win, (int)match, (int)need_reset_gl_host, (int)g_ds.virt_w, (int)g_ds.virt_h);
+                  win, (int)match, (int)need_reset_gl_host, (int)snap_vw, (int)snap_vh);
     }
     return match;
 }
@@ -2672,6 +2643,7 @@ int WINAPI hook_GetDeviceCaps(HDC hdc, int index)
         if (hdc == NULL || GetObjectType(hdc) == OBJ_DC) {
             ds_lock();
             bool passthrough = ds_is_modern_tier_locked();
+            bool pref_16 = ds_prefer_16bpp_ddraw();
             bool active = !passthrough && g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0;
             int32_t vw = g_ds.virt_w;
             int32_t vh = g_ds.virt_h;
@@ -2684,7 +2656,7 @@ int WINAPI hook_GetDeviceCaps(HDC hdc, int index)
                     if (index == HORZRES || index == DESKTOPHORZRES) return vw;
                     if (index == VERTRES || index == DESKTOPVERTRES) return vh;
                     if (index == BITSPIXEL) {
-                        if (ds_prefer_16bpp_ddraw() && vbpp > 16) return 16;
+                        if (pref_16 && vbpp > 16) return 16;
                         if (vbpp >= 8) return vbpp;
                     }
                     if (index == PLANES) return 1;
@@ -2692,7 +2664,7 @@ int WINAPI hook_GetDeviceCaps(HDC hdc, int index)
                 }
                 int real_val = g_ds.real_GetDeviceCaps ? g_ds.real_GetDeviceCaps(hdc, index) : 0;
                 if (index == BITSPIXEL) {
-                    if (ds_prefer_16bpp_ddraw()) return 16;
+                    if (pref_16) return 16;
                     if (real_val < 8) return (vbpp >= 8) ? vbpp : 32;
                 }
                 if (index == PLANES && real_val < 1) return 1;
@@ -2808,7 +2780,7 @@ int WINAPI hook_SetDIBitsToDevice(HDC hdc, int xDest, int yDest, DWORD w, DWORD 
                             } else if (bh->biClrUsed > 0 && bh->biClrUsed <= 256) {
                                 pal_bytes = (size_t)bh->biClrUsed * ((ColorUse == DIB_PAL_COLORS) ? sizeof(WORD) : sizeof(RGBQUAD));
                             }
-                            if ((size_t)hdr_sz + pal_bytes <= sizeof(bmi_storage)) {
+                            if (cLines <= 0x7fffffffu && (size_t)hdr_sz + pal_bytes <= sizeof(bmi_storage)) {
                                 memcpy(bmi_storage, lpbmi, (size_t)hdr_sz + pal_bytes);
                                 BITMAPINFO *patched = (BITMAPINFO *)(void *)bmi_storage;
                                 patched->bmiHeader.biHeight = (dib_h < 0) ? -(LONG)cLines : (LONG)cLines;

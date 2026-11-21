@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "display_scaler.h"
+#include "common_process_denylist.h"
 
 #define ASSERT_TRUE(cond)                                                                        \
     do {                                                                                         \
@@ -900,6 +901,457 @@ static void test_round4_live_backing_clamp(void)
     ASSERT_TRUE(bw == 3024 && bh == 1964);
 }
 
+static void write_u16_le(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+
+static void write_u32_le(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static uint8_t *build_synthetic_pe_export_image(
+    bool        is_pe64,
+    const char *exp_name,
+    uint32_t    exp_fn_rva,
+    bool        omit_name_nul,
+    size_t     *out_size
+)
+{
+    /* Layout:
+     *   0x000..0x07F : DOS header (`e_lfanew = 0x80`)
+     *   0x080..0x097 : PE sig + COFF header (`nsec = 1`, `opt_sz = 0xE0` PE32 or `0xF0` PE32+)
+     *   0x098..      : Optional header (export dir at RVA 0x2000, size 0x100)
+     *   sec_off      : 1 section `.edata` (VA=0x2000, VS=0x200, RawOff=0x200, RawSize=exact)
+     *   0x200..      : IMAGE_EXPORT_DIRECTORY (40 B) + funcs[1] (4 B) + names[1] (4 B) + ords[1] (2 B) + name bytes
+     */
+    const size_t pe_off = 0x80u;
+    const uint16_t opt_sz = is_pe64 ? 0xF0u : 0xE0u;
+    const size_t opt_off = pe_off + 24u;
+    const size_t sec_off = opt_off + (size_t)opt_sz;
+    const size_t raw_off = 0x200u;
+    const size_t name_rel = 40u + 4u + 4u + 2u; /* 50 B */
+    const size_t name_len = strlen(exp_name);
+    const size_t name_bytes = omit_name_nul ? name_len : (name_len + 1u);
+    const size_t raw_sz = name_rel + name_bytes;
+    const size_t total_sz = raw_off + raw_sz;
+
+    uint8_t *buf = (uint8_t *)calloc(1u, total_sz);
+    ASSERT_TRUE(buf != NULL);
+
+    buf[0] = 'M';
+    buf[1] = 'Z';
+    write_u32_le(buf + 0x3cu, (uint32_t)pe_off);
+
+    memcpy(buf + pe_off, "PE\0\0", 4u);
+    write_u16_le(buf + pe_off + 6u, 1u); /* NumberOfSections */
+    write_u16_le(buf + pe_off + 20u, opt_sz); /* SizeOfOptionalHeader */
+
+    write_u16_le(buf + opt_off, is_pe64 ? 0x020bu : 0x010bu);
+    const size_t num_rva_rel = is_pe64 ? 108u : 92u;
+    const size_t dd_rel = is_pe64 ? 112u : 96u;
+    write_u32_le(buf + opt_off + num_rva_rel, 16u); /* NumberOfRvaAndSizes */
+    write_u32_le(buf + opt_off + dd_rel, 0x2000u);  /* Export RVA */
+    write_u32_le(buf + opt_off + dd_rel + 4u, (uint32_t)raw_sz); /* Export Size */
+
+    /* Section `.edata` */
+    memcpy(buf + sec_off, ".edata\0\0", 8u);
+    write_u32_le(buf + sec_off + 8u, (uint32_t)raw_sz);  /* VirtualSize */
+    write_u32_le(buf + sec_off + 12u, 0x2000u);          /* VirtualAddress */
+    write_u32_le(buf + sec_off + 16u, (uint32_t)raw_sz); /* SizeOfRawData */
+    write_u32_le(buf + sec_off + 20u, (uint32_t)raw_off);/* PointerToRawData */
+
+    /* IMAGE_EXPORT_DIRECTORY at raw_off (RVA 0x2000) */
+    write_u32_le(buf + raw_off + 20u, 1u);               /* NumberOfFunctions */
+    write_u32_le(buf + raw_off + 24u, 1u);               /* NumberOfNames */
+    write_u32_le(buf + raw_off + 28u, 0x2000u + 40u);    /* AddressOfFunctions */
+    write_u32_le(buf + raw_off + 32u, 0x2000u + 44u);    /* AddressOfNames */
+    write_u32_le(buf + raw_off + 36u, 0x2000u + 48u);    /* AddressOfNameOrdinals */
+
+    write_u32_le(buf + raw_off + 40u, exp_fn_rva);
+    write_u32_le(buf + raw_off + 44u, 0x2000u + (uint32_t)name_rel);
+    write_u16_le(buf + raw_off + 48u, 0u);
+    memcpy(buf + raw_off + name_rel, exp_name, name_len);
+    if (!omit_name_nul) {
+        buf[raw_off + name_rel + name_len] = '\0';
+    }
+
+    *out_size = total_sz;
+    return buf;
+}
+
+static void test_r4_pe_export_bounds_and_fuzz(void)
+{
+    /* DS-06: Overflow-safe PE32 / PE32+ export lookup + adversarial OOB / wraparound rejection */
+    const char *k_trigger = "OneLauncherDisplayScalerTriggerScan";
+
+    /* 1. Valid PE32 (0x010b) and PE32+ (0x020b) exact-sized heap images */
+    size_t sz32 = 0u;
+    uint8_t *pe32 = build_synthetic_pe_export_image(false, k_trigger, 0x1234u, false, &sz32);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(pe32, sz32, k_trigger) == 0x1234u);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(pe32, sz32, "MissingExport") == 0u);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(pe32, sz32, "") == 0u);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(pe32, sz32, NULL) == 0u);
+
+    size_t sz64 = 0u;
+    uint8_t *pe64 = build_synthetic_pe_export_image(true, k_trigger, 0x2468u, false, &sz64);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(pe64, sz64, k_trigger) == 0x2468u);
+
+    /* 2. Truncated buffers (< 64 B and every byte-length prefix up to sz32 - 1) must NEVER read OOB */
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(NULL, 1024u, k_trigger) == 0u);
+    for (size_t trunc = 0u; trunc < sz32; trunc++) {
+        uint8_t *sub = (trunc > 0u) ? (uint8_t *)malloc(trunc) : NULL;
+        if (trunc > 0u) {
+            ASSERT_TRUE(sub != NULL);
+            memcpy(sub, pe32, trunc);
+        }
+        /* Truncated image must either return 0 (incomplete) or never fault under ASan */
+        ASSERT_TRUE(ds_find_pe_export_rva_in_buf(sub, trunc, k_trigger) == 0u);
+        free(sub);
+    }
+
+    /* 3. Non-NUL-terminated export name at exact end of heap buffer (guards 1-byte over-read!) */
+    size_t sz_nonul = 0u;
+    uint8_t *pe_nonul = build_synthetic_pe_export_image(false, k_trigger, 0x1234u, true, &sz_nonul);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(pe_nonul, sz_nonul, k_trigger) == 0u);
+    free(pe_nonul);
+
+    /* 4. Forwarded export (fn_rva points inside [exp_rva, exp_rva + exp_sz)) must be rejected */
+    size_t sz_fwd = 0u;
+    uint8_t *pe_fwd = build_synthetic_pe_export_image(true, k_trigger, 0x2010u, false, &sz_fwd);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(pe_fwd, sz_fwd, k_trigger) == 0u);
+    free(pe_fwd);
+
+    /* 5. Corrupt e_lfanew wraparound (0xFFFFFFF0u) & sub-DOS offset (32) */
+    uint8_t *corrupt = (uint8_t *)malloc(sz32);
+    ASSERT_TRUE(corrupt != NULL);
+    memcpy(corrupt, pe32, sz32);
+    write_u32_le(corrupt + 0x3cu, 0xFFFFFFF0u);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(corrupt, sz32, k_trigger) == 0u);
+    write_u32_le(corrupt + 0x3cu, 32u);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(corrupt, sz32, k_trigger) == 0u);
+
+    /* 6. Bad optional magic, NumberOfRvaAndSizes = 0, and nsec = 0xFFFFu overflow */
+    memcpy(corrupt, pe32, sz32);
+    write_u16_le(corrupt + 0x98u, 0x0107u);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(corrupt, sz32, k_trigger) == 0u);
+
+    memcpy(corrupt, pe32, sz32);
+    write_u32_le(corrupt + 0x98u + 92u, 0u);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(corrupt, sz32, k_trigger) == 0u);
+
+    memcpy(corrupt, pe32, sz32);
+    write_u16_le(corrupt + 0x80u + 6u, 0xFFFFu);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(corrupt, sz32, k_trigger) == 0u);
+
+    /* 7. Section PointerToRawData + SizeOfRawData uint32 wraparound */
+    memcpy(corrupt, pe32, sz32);
+    write_u32_le(corrupt + 0x80u + 24u + 0xE0u + 16u, 0x00000100u);
+    write_u32_le(corrupt + 0x80u + 24u + 0xE0u + 20u, 0xFFFFFFF0u);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(corrupt, sz32, k_trigger) == 0u);
+
+    /* 8. NumberOfNames = 0x40000001u (* 4 overflow) and OOB ordinal index >= NumberOfFunctions */
+    memcpy(corrupt, pe32, sz32);
+    write_u32_le(corrupt + 0x200u + 24u, 0x40000001u);
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(corrupt, sz32, k_trigger) == 0u);
+
+    memcpy(corrupt, pe32, sz32);
+    write_u16_le(corrupt + 0x200u + 48u, 99u); /* ord_idx = 99 >= num_funcs (1) */
+    ASSERT_TRUE(ds_find_pe_export_rva_in_buf(corrupt, sz32, k_trigger) == 0u);
+
+    free(corrupt);
+    free(pe32);
+    free(pe64);
+}
+
+static void test_r4_lru_dc_map_eviction(void)
+{
+    /* DS-03: LRU dc_map slot selection + active bound GL DC eviction protection */
+    ds_gl_dc_entry_t slots[DS_MAX_GL_DC_MAP];
+    memset(slots, 0, sizeof(slots));
+
+    const uintptr_t host_a = 0xAA01u;
+    const uintptr_t host_stale = 0xBB02u;
+
+    /* NULL / empty guards */
+    ASSERT_TRUE(ds_gl_dc_map_select_slot(NULL, DS_MAX_GL_DC_MAP, 0x1u, host_a, 0u) == 0u);
+    ASSERT_TRUE(ds_gl_dc_map_select_slot(slots, 0u, 0x1u, host_a, 0u) == 0u);
+    ASSERT_TRUE(ds_gl_dc_map_select_slot(slots, DS_MAX_GL_DC_MAP, 0x100u, host_a, 0u) == 0u);
+
+    /* Partial table selects first empty slot */
+    slots[0].game_hdc = 0x100u;
+    slots[0].host_hdc = 0x200u;
+    slots[0].host_hwnd = host_a;
+    slots[0].last_used_gen = 1u;
+    ASSERT_TRUE(ds_gl_dc_map_select_slot(slots, DS_MAX_GL_DC_MAP, 0x101u, host_a, 0x200u) == 1u);
+    /* Exact existing match returns its existing slot */
+    ASSERT_TRUE(ds_gl_dc_map_select_slot(slots, DS_MAX_GL_DC_MAP, 0x100u, host_a, 0x200u) == 0u);
+
+    /* Fill all 16 slots with ascending last_used_gen = 1..16; protect slot 0 (oldest!) */
+    for (size_t i = 0u; i < DS_MAX_GL_DC_MAP; i++) {
+        slots[i].game_hdc = (uintptr_t)(0x1000u + i);
+        slots[i].host_hdc = (uintptr_t)(0x2000u + i);
+        slots[i].host_hwnd = host_a;
+        slots[i].last_used_gen = (uint32_t)(i + 1u);
+    }
+    /* Slot 0 is protected (bound GL DC) -> MUST evict slot 1 (next-oldest unprotected), NEVER slot 0 */
+    ASSERT_TRUE(ds_gl_dc_map_select_slot(slots, DS_MAX_GL_DC_MAP, 0x9999u, host_a, 0x2000u) == 1u);
+
+    /* Bump slot 1's generation above all others -> slot 2 becomes oldest unprotected */
+    slots[1].last_used_gen = 100u;
+    ASSERT_TRUE(ds_gl_dc_map_select_slot(slots, DS_MAX_GL_DC_MAP, 0x9999u, host_a, 0x2000u) == 2u);
+
+    /* Stale host_hwnd entry (slot 7, even with newest gen=999) is evicted BEFORE any live entry */
+    slots[7].host_hwnd = host_stale;
+    slots[7].last_used_gen = 999u;
+    ASSERT_TRUE(ds_gl_dc_map_select_slot(slots, DS_MAX_GL_DC_MAP, 0x9999u, host_a, 0x2000u) == 7u);
+
+    /* Unless stale slot 7 is itself the protected bound GL DC -> falls back to oldest unprotected (slot 0) */
+    ASSERT_TRUE(ds_gl_dc_map_select_slot(slots, DS_MAX_GL_DC_MAP, 0x9999u, host_a, slots[7].host_hdc) == 0u);
+
+    /* Degenerate fallback: all entries share protected_host_hdc -> picks lru_any safely in bounds */
+    for (size_t i = 0u; i < DS_MAX_GL_DC_MAP; i++) {
+        slots[i].host_hdc = 0x7777u;
+        slots[i].host_hwnd = host_a;
+        slots[i].last_used_gen = (uint32_t)(50u - i);
+    }
+    ASSERT_TRUE(ds_gl_dc_map_select_slot(slots, DS_MAX_GL_DC_MAP, 0x9999u, host_a, 0x7777u) == DS_MAX_GL_DC_MAP - 1u);
+}
+
+static void test_r4_ini_2048_deep_paths(void)
+{
+    /* DS-05: 2048 B INI buffer preserves trailing keys after deep macOS Wine prefix paths */
+    ASSERT_TRUE(DS_INI_BUF_BYTES == 2048u);
+
+    char deep_ctl[440];
+    char deep_status[440];
+    memset(deep_ctl, 0, sizeof(deep_ctl));
+    memset(deep_status, 0, sizeof(deep_status));
+    const char *prefix = "Z:\\Users\\testuser\\Library\\Application Support\\OneLauncher\\bottles\\deep_nested_prefix\\drive_c\\users\\Public\\OneLauncher\\";
+    snprintf(deep_ctl, sizeof(deep_ctl), "%s", prefix);
+    snprintf(deep_status, sizeof(deep_status), "%s", prefix);
+    while (strlen(deep_ctl) < 395u) {
+        strncat(deep_ctl, "sub_segment_dir\\", sizeof(deep_ctl) - strlen(deep_ctl) - 1u);
+    }
+    strncat(deep_ctl, "display_control.ini", sizeof(deep_ctl) - strlen(deep_ctl) - 1u);
+    while (strlen(deep_status) < 395u) {
+        strncat(deep_status, "sub_segment_dir\\", sizeof(deep_status) - strlen(deep_status) - 1u);
+    }
+    strncat(deep_status, "display_status.json", sizeof(deep_status) - strlen(deep_status) - 1u);
+
+    char payload[DS_INI_BUF_BYTES];
+    memset(payload, 0, sizeof(payload));
+    int pos = 0;
+    for (int i = 0; i < 12; i++) {
+        int n = snprintf(payload + pos, sizeof(payload) - (size_t)pos,
+                         "# round4 padded header comment line %02d for 2048 byte INI boundary test\r\n", i);
+        ASSERT_TRUE(n > 0 && (size_t)(pos + n) < sizeof(payload));
+        pos += n;
+    }
+    int tail = snprintf(
+        payload + pos,
+        sizeof(payload) - (size_t)pos,
+        "control_file=%s\r\n"
+        "status_file=%s\r\n"
+        "seq=99\r\n"
+        "fullscreen=1\r\n"
+        "aspect=integer\r\n"
+        "filter=nearest\r\n"
+        "mode=force_fullscreen\r\n"
+        "safe_inset_top=74\r\n"
+        "hotkey=1\r\n"
+        "user_override=1\r\n"
+        "updated_unix_ms=1763000000123\r\n",
+        deep_ctl,
+        deep_status
+    );
+    ASSERT_TRUE(tail > 0);
+    size_t total_len = (size_t)(pos + tail);
+    /* Must exceed previous 1024/1536 B limits and stay strictly inside DS_INI_BUF_BYTES */
+    ASSERT_TRUE(total_len > 1600u && total_len < DS_INI_BUF_BYTES);
+
+    /* Exact heap-sized non-NUL-terminated copy so ASan detects any 1-byte over-read */
+    char *exact_buf = (char *)malloc(total_len);
+    ASSERT_TRUE(exact_buf != NULL);
+    memcpy(exact_buf, payload, total_len);
+
+    ds_control_state_t st;
+    ASSERT_TRUE(ds_parse_control_ini(exact_buf, total_len, &st));
+    ASSERT_TRUE(st.has_control_file && strcmp(st.control_file, deep_ctl) == 0);
+    ASSERT_TRUE(st.has_status_file && strcmp(st.status_file, deep_status) == 0);
+    ASSERT_TRUE(st.has_seq && st.seq == 99ULL);
+    ASSERT_TRUE(st.has_fullscreen && st.fullscreen == true);
+    ASSERT_TRUE(st.has_aspect && st.aspect == DS_ASPECT_INTEGER);
+    ASSERT_TRUE(st.has_filter && st.filter == DS_FILTER_NEAREST);
+    ASSERT_TRUE(st.has_scaling_mode && st.scaling_mode == DS_MODE_FORCE_FULLSCREEN);
+    ASSERT_TRUE(st.has_safe_inset_top && st.safe_inset_top == 74);
+    ASSERT_TRUE(st.has_hotkey && st.hotkey == true);
+    ASSERT_TRUE(st.has_user_override && st.user_override == true);
+    ASSERT_TRUE(st.has_updated_unix_ms && st.updated_unix_ms == 1763000000123ULL);
+    free(exact_buf);
+
+    /* Overlong path (>= 520 B) must be safely rejected without buffer overflow */
+    char overlong[600];
+    memcpy(overlong, "control_file=", 13u);
+    memset(overlong + 13u, 'A', 540u);
+    memcpy(overlong + 553u, "\nseq=3\n", 7u);
+    ASSERT_TRUE(ds_parse_control_ini(overlong, 560u, &st));
+    ASSERT_TRUE(!st.has_control_file);
+    ASSERT_TRUE(st.has_seq && st.seq == 3ULL);
+}
+
+static void test_r4_wow64_rawinput_alignment(void)
+{
+    /* DS-07: WoW64 vs native x86 vs x64 RAWINPUT header offset & QWORD stride validation */
+    ds_rawinput_step_t step;
+
+    /* 1. Native 32-bit (DWORD 4-byte aligned, 16-byte header) */
+    ASSERT_TRUE(ds_rawinput_validate_block(36u, 16u, 64u, false, false, &step));
+    ASSERT_TRUE(step.mouse_offset == 16u && step.next_step == 36u);
+    ASSERT_TRUE(ds_rawinput_validate_block(34u, 0u, 64u, false, false, &step));
+    ASSERT_TRUE(step.mouse_offset == 16u && step.next_step == 36u);
+
+    /* 2. 32-bit under 64-bit Wine/WoW64 (QWORD 8-byte aligned!) */
+    ASSERT_TRUE(ds_rawinput_validate_block(36u, 16u, 64u, true, false, &step));
+    ASSERT_TRUE(step.mouse_offset == 16u && step.next_step == 40u);
+    ASSERT_TRUE(ds_rawinput_validate_block(40u, 16u, 64u, true, false, &step));
+    ASSERT_TRUE(step.mouse_offset == 16u && step.next_step == 40u);
+    ASSERT_TRUE(ds_rawinput_validate_block(48u, 24u, 64u, true, false, &step));
+    ASSERT_TRUE(step.mouse_offset == 24u && step.next_step == 48u);
+
+    /* 3. Native 64-bit (QWORD 8-byte aligned, 24-byte header default) */
+    ASSERT_TRUE(ds_rawinput_validate_block(48u, 24u, 96u, false, true, &step));
+    ASSERT_TRUE(step.mouse_offset == 24u && step.next_step == 48u);
+    ASSERT_TRUE(ds_rawinput_validate_block(44u, 0u, 96u, false, true, &step));
+    ASSERT_TRUE(step.mouse_offset == 24u && step.next_step == 48u);
+
+    /* 4. Multi-packet WoW64 buffer walk (two 36 B packets spaced at 40 B QWORD boundaries) */
+    size_t offset = 0u;
+    const size_t buf_bytes = 80u;
+    int packets = 0;
+    while (offset < buf_bytes) {
+        ASSERT_TRUE(ds_rawinput_validate_block(36u, 16u, buf_bytes - offset, true, false, &step));
+        ASSERT_TRUE(step.mouse_offset == 16u && step.next_step == 40u);
+        offset += step.next_step;
+        packets++;
+    }
+    ASSERT_TRUE(packets == 2 && offset == 80u);
+
+    /* 5. Malformed header sizes, truncated packets, and zero/huge dwSize rejected cleanly */
+    ASSERT_TRUE(!ds_rawinput_validate_block(36u, 12u, 64u, true, false, &step));
+    ASSERT_TRUE(!ds_rawinput_validate_block(36u, 20u, 64u, true, false, &step));
+    ASSERT_TRUE(!ds_rawinput_validate_block(36u, 32u, 64u, false, true, &step));
+    ASSERT_TRUE(!ds_rawinput_validate_block(15u, 16u, 64u, true, false, &step));
+    ASSERT_TRUE(!ds_rawinput_validate_block(23u, 24u, 64u, false, true, &step));
+    ASSERT_TRUE(!ds_rawinput_validate_block(48u, 24u, 47u, false, true, &step));
+    ASSERT_TRUE(!ds_rawinput_validate_block(0u, 16u, 64u, false, false, &step));
+    ASSERT_TRUE(!ds_rawinput_validate_block(0xFFFFFFFFu, 16u, 4096u, true, false, &step));
+}
+
+static void test_r4_per_hglrc_fbo_lifecycle(void)
+{
+    /* DS-01: Per-HGLRC FBO/texture/RB ownership, switch preservation, delete & LRU eviction */
+    ds_gl_ctx_fbo_slot_t slots[DS_MAX_GL_CTX_MAP];
+    memset(slots, 0, sizeof(slots));
+    uint32_t gen = 0u;
+    ds_gl_ctx_fbo_slot_t evicted, removed;
+
+    /* NULL / zero guards */
+    ASSERT_TRUE(ds_gl_ctx_fbo_acquire(NULL, DS_MAX_GL_CTX_MAP, 0xA001u, true, &gen, &evicted) == NULL);
+    ASSERT_TRUE(ds_gl_ctx_fbo_acquire(slots, 0u, 0xA001u, true, &gen, &evicted) == NULL);
+    ASSERT_TRUE(ds_gl_ctx_fbo_acquire(slots, DS_MAX_GL_CTX_MAP, 0u, true, &gen, &evicted) == NULL);
+    ASSERT_TRUE(!ds_gl_ctx_fbo_remove(slots, DS_MAX_GL_CTX_MAP, 0xA001u, &removed));
+
+    /* Create ctx1 & ctx2 with distinct GL objects */
+    ds_gl_ctx_fbo_slot_t *s1 = ds_gl_ctx_fbo_acquire(slots, DS_MAX_GL_CTX_MAP, 0xA001u, true, &gen, &evicted);
+    ASSERT_TRUE(s1 != NULL && evicted.ctx_key == 0u);
+    s1->game.fbo_id = 11u;
+    s1->game.color_tex = 12u;
+    s1->game.depth_rb = 13u;
+    s1->game.w = 640;
+    s1->game.h = 480;
+    s1->sharp.fbo_id = 14u;
+    s1->sharp.tex_id = 15u;
+    s1->w3d.fbo_id = 16u;
+    s1->w3d.tex_id = 17u;
+
+    ds_gl_ctx_fbo_slot_t *s2 = ds_gl_ctx_fbo_acquire(slots, DS_MAX_GL_CTX_MAP, 0xA002u, true, &gen, &evicted);
+    ASSERT_TRUE(s2 != NULL && s2 != s1 && evicted.ctx_key == 0u);
+    s2->game.fbo_id = 21u;
+    s2->game.color_tex = 22u;
+    s2->game.depth_rb = 23u;
+    uint32_t s2_gen = s2->last_used_gen;
+
+    /* Context switch back to ctx1 preserves exact FBO handles & advances LRU generation */
+    ds_gl_ctx_fbo_slot_t *s1_again = ds_gl_ctx_fbo_acquire(slots, DS_MAX_GL_CTX_MAP, 0xA001u, false, &gen, &evicted);
+    ASSERT_TRUE(s1_again == s1);
+    ASSERT_TRUE(s1_again->game.fbo_id == 11u && s1_again->game.color_tex == 12u && s1_again->game.depth_rb == 13u);
+    ASSERT_TRUE(s1_again->sharp.fbo_id == 14u && s1_again->w3d.fbo_id == 16u);
+    ASSERT_TRUE(s1_again->last_used_gen > s2_gen);
+    ASSERT_TRUE(ds_gl_ctx_fbo_acquire(slots, DS_MAX_GL_CTX_MAP, 0xA099u, false, &gen, NULL) == NULL);
+
+    /* Delete ctx1 -> returns exact handles for glDeleteFramebuffers/Textures/Renderbuffers & clears slot */
+    ASSERT_TRUE(ds_gl_ctx_fbo_remove(slots, DS_MAX_GL_CTX_MAP, 0xA001u, &removed));
+    ASSERT_TRUE(removed.ctx_key == 0xA001u && removed.game.fbo_id == 11u && removed.sharp.fbo_id == 14u && removed.w3d.fbo_id == 16u);
+    ASSERT_TRUE(!ds_gl_ctx_fbo_remove(slots, DS_MAX_GL_CTX_MAP, 0xA001u, &removed));
+    ASSERT_TRUE(ds_gl_ctx_fbo_acquire(slots, DS_MAX_GL_CTX_MAP, 0xA001u, false, &gen, NULL) == NULL);
+
+    /* Saturate all 16 slots, touch slot 0 (0xB000), insert 17th -> LRU slot 1 (0xB001) is evicted, NOT slot 0 */
+    memset(slots, 0, sizeof(slots));
+    gen = 0u;
+    for (size_t i = 0u; i < DS_MAX_GL_CTX_MAP; i++) {
+        ds_gl_ctx_fbo_slot_t *s = ds_gl_ctx_fbo_acquire(slots, DS_MAX_GL_CTX_MAP, (uintptr_t)(0xB000u + i), true, &gen, &evicted);
+        ASSERT_TRUE(s != NULL && evicted.ctx_key == 0u);
+        s->game.fbo_id = (uint32_t)(100u + i);
+    }
+    ASSERT_TRUE(ds_gl_ctx_fbo_acquire(slots, DS_MAX_GL_CTX_MAP, 0xB000u, false, &gen, NULL) != NULL);
+
+    ds_gl_ctx_fbo_slot_t *s17 = ds_gl_ctx_fbo_acquire(slots, DS_MAX_GL_CTX_MAP, 0xB010u, true, &gen, &evicted);
+    ASSERT_TRUE(s17 != NULL && s17->ctx_key == 0xB010u && s17->game.fbo_id == 0u);
+    ASSERT_TRUE(evicted.ctx_key == 0xB001u && evicted.game.fbo_id == 101u);
+    ASSERT_TRUE(ds_gl_ctx_fbo_acquire(slots, DS_MAX_GL_CTX_MAP, 0xB000u, false, &gen, NULL) != NULL);
+    ASSERT_TRUE(ds_gl_ctx_fbo_acquire(slots, DS_MAX_GL_CTX_MAP, 0xB001u, false, &gen, NULL) == NULL);
+}
+
+static void test_r4_vulkan_filter_and_shared_denylist(void)
+{
+    /* DS-10: Vulkan VkFilter parity (`DS_FILTER_NEAREST` and `DS_ASPECT_INTEGER` -> VK_FILTER_NEAREST = 0) */
+    ASSERT_TRUE(ds_vk_choose_blit_filter(DS_ASPECT_INTEGER, DS_FILTER_AUTO) == 0u);
+    ASSERT_TRUE(ds_vk_choose_blit_filter(DS_ASPECT_INTEGER, DS_FILTER_LINEAR) == 0u);
+    ASSERT_TRUE(ds_vk_choose_blit_filter(DS_ASPECT_PRESERVE, DS_FILTER_NEAREST) == 0u);
+    ASSERT_TRUE(ds_vk_choose_blit_filter(DS_ASPECT_STRETCH, DS_FILTER_NEAREST) == 0u);
+    ASSERT_TRUE(ds_vk_choose_blit_filter(DS_ASPECT_PRESERVE, DS_FILTER_AUTO) == 1u);
+    ASSERT_TRUE(ds_vk_choose_blit_filter(DS_ASPECT_PRESERVE, DS_FILTER_SHARP) == 1u);
+    ASSERT_TRUE(ds_vk_choose_blit_filter(DS_ASPECT_PRESERVE, DS_FILTER_LINEAR) == 1u);
+    ASSERT_TRUE(ds_vk_choose_blit_filter(DS_ASPECT_STRETCH, DS_FILTER_LINEAR) == 1u);
+
+    /* Shared common_process_denylist.h ASCII multi-sz matching (case-insensitive exact match) */
+    ASSERT_TRUE(one_denylist_match_ascii_msz("WineDevice.EXE", ONE_DENYLIST_WINE_SYSTEM_MSZ));
+    ASSERT_TRUE(one_denylist_match_ascii_msz("EXPLORER.EXE", ONE_DENYLIST_WINE_SYSTEM_MSZ));
+    ASSERT_TRUE(one_denylist_match_ascii_msz("rpcss.exe", ONE_DENYLIST_WINE_SYSTEM_MSZ));
+    ASSERT_TRUE(one_denylist_match_ascii_msz("one_display_launcher_x86.exe", ONE_DENYLIST_WINE_SYSTEM_MSZ));
+    ASSERT_TRUE(one_denylist_match_ascii_msz("SteamWebHelper.exe", ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ));
+    ASSERT_TRUE(one_denylist_match_ascii_msz("UnityCrashHandler64.exe", ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ));
+    ASSERT_TRUE(one_denylist_match_ascii_msz("GalaxyClient.exe", ONE_DENYLIST_GALAXY_CHAIN_MSZ));
+    ASSERT_TRUE(one_denylist_match_ascii_msz("Steam.exe", ONE_DENYLIST_STOREFRONT_CLIENTS_MSZ));
+    ASSERT_TRUE(one_denylist_match_ascii_msz("EasyAntiCheat_EOS_Setup.exe", ONE_DENYLIST_INSTALLERS_MSZ));
+    ASSERT_TRUE(one_denylist_match_ascii_msz("wineserver", ONE_DENYLIST_UNIX_WINE_MSZ));
+
+    /* Negative cases: normal games & partial/empty/NULL strings must never false-positive */
+    ASSERT_TRUE(!one_denylist_match_ascii_msz("game.exe", ONE_DENYLIST_WINE_SYSTEM_MSZ));
+    ASSERT_TRUE(!one_denylist_match_ascii_msz("engine64.exe", ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ));
+    ASSERT_TRUE(!one_denylist_match_ascii_msz("explorer.exe.bak", ONE_DENYLIST_WINE_SYSTEM_MSZ));
+    ASSERT_TRUE(!one_denylist_match_ascii_msz("steam", ONE_DENYLIST_STOREFRONT_CLIENTS_MSZ));
+    ASSERT_TRUE(!one_denylist_match_ascii_msz("", ONE_DENYLIST_WINE_SYSTEM_MSZ));
+    ASSERT_TRUE(!one_denylist_match_ascii_msz(NULL, ONE_DENYLIST_WINE_SYSTEM_MSZ));
+    ASSERT_TRUE(!one_denylist_match_ascii_msz("explorer.exe", NULL));
+}
+
 int main(void)
 {
     test_viewport_and_notch_geometry();
@@ -914,6 +1366,12 @@ int main(void)
     test_round4_gl_ctx_isolation_map();
     test_round4_subnative_exclusive_fullscreen_predicate();
     test_round4_live_backing_clamp();
-    printf("[DS-ASAN-PASS] All display_scaler C11 geometry, mode-table, zero-drift mouselook & INI tests passed.\n");
+    test_r4_pe_export_bounds_and_fuzz();
+    test_r4_lru_dc_map_eviction();
+    test_r4_ini_2048_deep_paths();
+    test_r4_wow64_rawinput_alignment();
+    test_r4_per_hglrc_fbo_lifecycle();
+    test_r4_vulkan_filter_and_shared_denylist();
+    printf("[DS-ASAN-PASS] All display_scaler C11 geometry, mode-table, zero-drift mouselook, PE/LRU/WoW64/FBO & INI tests passed.\n");
     return 0;
 }

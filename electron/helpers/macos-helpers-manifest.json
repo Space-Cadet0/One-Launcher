@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "usage": "build-and-ci-verification-only",
+  "note": "Never verify this pre-signed manifest at runtime against packaged .app dylibs because build/afterPack.cjs re-signs bundled dylibs.",
+  "sources": {
+    "electron/helpers/common_process_denylist.h": "ddd821b310fe49c191a48943c0b9d95f089c181fa08db17e0f9d7d7f919953e7",
+    "electron/helpers/one_metal_preload.c": "2db37fbaa2da3d05eb766b619d09f22f05da9a609447872568043b2dfde2feee",
+    "electron/helpers/one_coop_activate.c": "0175322f280bbc7ebbbb27a9241a18334eb65b50d1e66a65c08227bb214ac447",
+    "scripts/build-macos-helpers.cjs": "114403a1acc6a8c0f1a56a0b5035191f98c742ff2f809d654dc6300d97c05ab6"
+  },
+  "outputs": {
+    "libone_metal_preload.dylib": {
+      "sha256": "b65729ab0c87b4d84fa6e4317055a1028f4b09fd349105a159493b372346373f",
+      "sizeBytes": 135136,
+      "archs": [
+        "arm64",
+        "x86_64"
+      ],
+      "adhocWithoutHardenedRuntime": true,
+      "forbiddenStaticLinks": [
+        "Metal.framework",
+        "CoreFoundation.framework",
+        "CoreAudio.framework"
+      ]
+    },
+    "libone_coop_activate.dylib": {
+      "sha256": "11839808be20fbaea4ae3d563ae65c16bcb4d3a878c8b46e67aff79b1f7d220f",
+      "sizeBytes": 138016,
+      "archs": [
+        "arm64",
+        "x86_64"
+      ],
+      "adhocWithoutHardenedRuntime": true
+    }
+  }
+}

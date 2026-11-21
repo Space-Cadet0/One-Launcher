@@ -236,85 +236,14 @@ function invokeNativeWarpDrift(iterations, screenW, screenH, safeInsetTop, virtW
   return JSON.parse(res.stdout.trim());
 }
 
+const { computeOracleViewport } = require('../../../scripts/verify-display-output.cjs');
+
 /**
- * Authoritative mathematical reference for viewport calculation.
+ * Authoritative mathematical reference for viewport calculation (unified SSOT with
+ * scripts/verify-display-output.cjs & C11 ds_compute_viewport).
  */
 function oracleComputeViewport(screenW, screenH, safeInsetTop, virtW, virtH, aspectMode) {
-  if (screenW <= 0 || screenH <= 0 || virtW <= 0 || virtH <= 0) {
-    return null;
-  }
-
-  const safeTop = Math.max(0, Math.min(Math.floor(safeInsetTop), Math.floor(screenH / 4) - 1));
-  const usableX = 0;
-  const usableY = safeTop;
-  const usableW = screenW;
-  const usableH = screenH - safeTop;
-
-  let dstW = 0;
-  let dstH = 0;
-  let integerScale = 0;
-
-  if (aspectMode === 'stretch') {
-    dstW = usableW;
-    dstH = usableH;
-  } else if (aspectMode === 'integer') {
-    const scaleX = Math.floor(usableW / virtW);
-    const scaleY = Math.floor(usableH / virtH);
-    const k = Math.min(scaleX, scaleY);
-    if (k >= 1) {
-      integerScale = k;
-      dstW = virtW * k;
-      dstH = virtH * k;
-    } else {
-      integerScale = 0;
-      const lhs = usableW * virtH;
-      const rhs = usableH * virtW;
-      if (lhs > rhs) {
-        dstH = usableH;
-        const fitByH = Math.floor((rhs + Math.floor(virtH / 2)) / virtH);
-        dstW = Math.min(usableW, (rhs % virtH === 0) ? Math.floor(rhs / virtH) : ((fitByH + 1) & ~1));
-      } else if (lhs < rhs) {
-        dstW = usableW;
-        let fitH = Math.min(usableH, Math.floor((lhs + Math.floor(virtW / 2)) / virtW));
-        if (fitH >= 2) fitH &= ~1;
-        dstH = Math.max(1, fitH);
-      } else {
-        dstW = usableW;
-        dstH = usableH;
-      }
-    }
-  } else {
-    const lhs = usableW * virtH;
-    const rhs = usableH * virtW;
-    if (lhs > rhs) {
-      dstH = usableH;
-      const fitByH = Math.floor((rhs + Math.floor(virtH / 2)) / virtH);
-      dstW = Math.min(usableW, (rhs % virtH === 0) ? Math.floor(rhs / virtH) : ((fitByH + 1) & ~1));
-    } else if (lhs < rhs) {
-      dstW = usableW;
-      let fitH = Math.min(usableH, Math.floor((lhs + Math.floor(virtW / 2)) / virtW));
-      if (fitH >= 2) fitH &= ~1;
-      dstH = Math.max(1, fitH);
-    } else {
-      dstW = usableW;
-      dstH = usableH;
-    }
-  }
-
-  const dstX = usableX + Math.floor((usableW - dstW) / 2);
-  const dstY = usableY + Math.floor((usableH - dstH) / 2);
-
-  return {
-    usableX,
-    usableY,
-    usableW,
-    usableH,
-    dstX,
-    dstY,
-    dstW,
-    dstH,
-    integerScale,
-  };
+  return computeOracleViewport(screenW, screenH, safeInsetTop, virtW, virtH, aspectMode);
 }
 
 /**

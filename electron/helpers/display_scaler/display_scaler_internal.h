@@ -254,6 +254,7 @@ typedef struct ds_runtime_s {
     bool                user_forced_windowed;
     bool                user_forced_fullscreen;
     bool                is_wine;
+    bool                is_wow64;
     bool                wined3d_uses_gl;
     bool                wined3d_uses_vulkan;
     bool                gl_upscale_active;
@@ -300,6 +301,8 @@ typedef struct ds_runtime_s {
     bool                visible_resync_done;
     volatile LONG       gl_drawable_rebind_pending;
     DWORD               first_visible_tick;
+    DWORD               last_hit_probe_tick;
+    int                 consec_resync_attempts;
     UINT                msg_apply_presentation;
     UINT                msg_gl_host_ctl;
     INIT_ONCE           watcher_once;
@@ -428,6 +431,7 @@ bool ds_is_vulkan_d3d9_subnative_locked(void);
 bool ds_is_modern_tier_locked(void);
 bool ds_is_modern_borderless_locked(void);
 bool ds_is_passthrough_locked(void);
+bool ds_is_passthrough_safe(void);
 
 /* Internal recursion guard & caller module classifier (`display_scaler_dll.c`) */
 bool ds_wcs_ieq_ascii(const WCHAR *w, const char *a);
@@ -442,6 +446,8 @@ HANDLE ds_dpi_guard_enter(HANDLE target_ctx);
 HANDLE ds_dpi_guard_enter_for_hwnd(HWND hwnd);
 void ds_dpi_guard_leave(HANDLE prev_ctx);
 BOOL ds_set_window_pos_dpi(HWND hwnd, HWND after, int x, int y, int w, int h, UINT flags, bool clear_present);
+BOOL ds_get_rect_dpi(HWND hwnd, RECT *out_rc, bool client_rect);
+bool ds_read_ini_file_utf8(const WCHAR *path, char *out_buf, size_t cap, size_t *out_len);
 bool ds_is_system_renderer_caller(const void *ret_addr);
 bool ds_is_wined3d_caller(const void *ret_addr);
 bool ds_should_virtualize_rect_for_caller(const void *ret_addr);

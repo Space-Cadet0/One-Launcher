@@ -25,6 +25,7 @@
 #include <wchar.h>
 
 #include "display_scaler.h"
+#include "../common_process_denylist.h"
 
 #ifndef JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO
 #define JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO 4
@@ -148,28 +149,20 @@ static const WCHAR *basename_w(const WCHAR *path)
 static bool is_excluded_helper_exe(const WCHAR *full_path)
 {
     const WCHAR *base = basename_w(full_path);
-    static const WCHAR *const k_skip[] = {
-        L"explorer.exe", L"services.exe", L"winedevice.exe", L"plugplay.exe",
-        L"svchost.exe", L"rpcss.exe", L"conhost.exe", L"cmd.exe", L"reg.exe",
-        L"regedit.exe", L"winecfg.exe", L"winedbg.exe", L"msiexec.exe",
-        L"rundll32.exe", L"wineboot.exe", L"winemenubuilder.exe",
-        L"dxsetup.exe", L"vcredist_x86.exe", L"vcredist_x64.exe",
-        L"vc_redist.x86.exe", L"vc_redist.x64.exe",
-        L"steam.exe", L"steamwebhelper.exe", L"steamservice.exe",
-        L"steamerrorreporter.exe", L"steamerrorreporter64.exe", L"gameoverlayui.exe",
-        L"galaxyclient.exe", L"galaxyclienthelper.exe", L"galaxycommunication.exe",
-        L"goglauncher.exe", L"eadesktop.exe", L"ubisoftconnect.exe", L"upc.exe",
-        L"epicgameslauncher.exe", L"epicwebhelper.exe",
-        L"crashreportclient.exe", L"crashhandler.exe", L"crashhandler64.exe",
-        L"unitycrashhandler32.exe", L"unitycrashhandler64.exe",
-        L"easyanticheat_eos_setup.exe", L"battleye_launcher.exe",
-        L"one_display_launcher_x86.exe", L"one_display_launcher_x64.exe",
-        L"one_xgr_win_launcher.exe", L"one_xgr_win_launcher_x86.exe"
-    };
-    for (size_t i = 0; i < sizeof(k_skip) / sizeof(k_skip[0]); i++) {
-        if (_wcsicmp(base, k_skip[i]) == 0) return true;
-    }
-    return false;
+    /*
+     * Shared process denylist (`common_process_denylist.h`): Wine daemons
+     * (winedevice.exe, explorer.exe, rpcss.exe), storefront helpers, crash handlers
+     * (crashhandler64.exe, unitycrashhandler64.exe), and anti-cheat installers
+     * (easyanticheat_eos_setup.exe, battleye_launcher.exe).
+     */
+    static const char k_skip_msz[] =
+        ONE_DENYLIST_WINE_SYSTEM_MSZ
+        ONE_DENYLIST_SHELL_MSZ
+        ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ
+        ONE_DENYLIST_GALAXY_CHAIN_MSZ
+        ONE_DENYLIST_STOREFRONT_CLIENTS_MSZ
+        ONE_DENYLIST_INSTALLERS_MSZ;
+    return one_denylist_match_wcs_msz(base, k_skip_msz);
 }
 
 static uint16_t read_pe_machine_w(const WCHAR *exe_path)
@@ -196,7 +189,8 @@ static uint16_t read_pe_machine_w(const WCHAR *exe_path)
     if (ReadFile(hf, dos, sizeof(dos), &nr, NULL) && nr == sizeof(dos) && dos[0] == 'M' && dos[1] == 'Z') {
         uint32_t lfanew = 0;
         memcpy(&lfanew, dos + 0x3c, sizeof(uint32_t));
-        if (SetFilePointer(hf, (LONG)lfanew, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER) {
+        if (lfanew >= 64u && lfanew <= 0x1000000u &&
+            SetFilePointer(hf, (LONG)lfanew, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER) {
             uint8_t pe[6];
             if (ReadFile(hf, pe, sizeof(pe), &nr, NULL) && nr == sizeof(pe) &&
                 pe[0] == 'P' && pe[1] == 'E' && pe[2] == 0 && pe[3] == 0) {
@@ -231,73 +225,8 @@ static uint32_t find_pe_export_rva_w(const WCHAR *dll_path, const char *export_n
 
     DWORD nr = 0;
     uint32_t found_rva = 0;
-    if (ReadFile(hf, buf, fsize, &nr, NULL) && nr == fsize && buf[0] == 'M' && buf[1] == 'Z') {
-        uint32_t pe_off = 0;
-        memcpy(&pe_off, buf + 0x3c, 4);
-        if (pe_off + 24 < fsize && memcmp(buf + pe_off, "PE\0\0", 4) == 0) {
-            uint16_t nsec = 0, opt_sz = 0, magic = 0;
-            memcpy(&nsec, buf + pe_off + 6, 2);
-            memcpy(&opt_sz, buf + pe_off + 20, 2);
-            uint32_t opt_off = pe_off + 24;
-            if (opt_off + opt_sz <= fsize && opt_sz >= 96) {
-                memcpy(&magic, buf + opt_off, 2);
-                uint32_t dd_off = (magic == 0x010bu) ? (opt_off + 96u) : ((magic == 0x020bu) ? (opt_off + 112u) : 0u);
-                uint32_t sec_off = opt_off + opt_sz;
-                if (dd_off != 0 && dd_off + 8 <= fsize && sec_off + (uint32_t)nsec * 40u <= fsize) {
-                    uint32_t exp_rva = 0;
-                    memcpy(&exp_rva, buf + dd_off, 4);
-                    /* Convert RVA helper via section table */
-                    #define DS_RVA_TO_OFF(rva_val, out_off) do { \
-                        (out_off) = 0; \
-                        for (uint16_t _si = 0; _si < nsec; _si++) { \
-                            uint32_t _sh = sec_off + (uint32_t)_si * 40u; \
-                            uint32_t _vs = 0, _va = 0, _rs = 0, _ro = 0; \
-                            memcpy(&_vs, buf + _sh + 8, 4); \
-                            memcpy(&_va, buf + _sh + 12, 4); \
-                            memcpy(&_rs, buf + _sh + 16, 4); \
-                            memcpy(&_ro, buf + _sh + 20, 4); \
-                            uint32_t _sp = (_vs > _rs) ? _vs : _rs; \
-                            if ((rva_val) >= _va && (rva_val) < _va + _sp && ((rva_val) - _va) < _rs) { \
-                                (out_off) = _ro + ((rva_val) - _va); \
-                                break; \
-                            } \
-                        } \
-                    } while (0)
-
-                    uint32_t exp_off = 0;
-                    DS_RVA_TO_OFF(exp_rva, exp_off);
-                    if (exp_off != 0 && exp_off + 40 <= fsize) {
-                        uint32_t num_names = 0, funcs_rva = 0, names_rva = 0, ords_rva = 0;
-                        memcpy(&num_names, buf + exp_off + 24, 4);
-                        memcpy(&funcs_rva, buf + exp_off + 28, 4);
-                        memcpy(&names_rva, buf + exp_off + 32, 4);
-                        memcpy(&ords_rva,  buf + exp_off + 36, 4);
-                        uint32_t funcs_off = 0, names_off = 0, ords_off = 0;
-                        DS_RVA_TO_OFF(funcs_rva, funcs_off);
-                        DS_RVA_TO_OFF(names_rva, names_off);
-                        DS_RVA_TO_OFF(ords_rva, ords_off);
-                        if (funcs_off && names_off && ords_off &&
-                            names_off + num_names * 4 <= fsize &&
-                            ords_off + num_names * 2 <= fsize) {
-                            for (uint32_t ni = 0; ni < num_names; ni++) {
-                                uint32_t nm_rva = 0, nm_off = 0;
-                                memcpy(&nm_rva, buf + names_off + ni * 4, 4);
-                                DS_RVA_TO_OFF(nm_rva, nm_off);
-                                if (nm_off && nm_off < fsize && strcmp((const char *)(buf + nm_off), export_name) == 0) {
-                                    uint16_t ord_idx = 0;
-                                    memcpy(&ord_idx, buf + ords_off + ni * 2, 2);
-                                    if (funcs_off + ((uint32_t)ord_idx + 1u) * 4u <= fsize) {
-                                        memcpy(&found_rva, buf + funcs_off + (uint32_t)ord_idx * 4u, 4);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    #undef DS_RVA_TO_OFF
-                }
-            }
-        }
+    if (ReadFile(hf, buf, fsize, &nr, NULL) && nr == fsize) {
+        found_rva = ds_find_pe_export_rva_in_buf(buf, (size_t)fsize, export_name);
     }
 
     HeapFree(GetProcessHeap(), 0, buf);
@@ -498,8 +427,12 @@ static bool inject_pid_dispatch(DWORD pid, const WCHAR *explicit_dll, const WCHA
     }
 
     WCHAR cmd[MAX_PATH * 3];
-    _snwprintf(cmd, (sizeof(cmd) / sizeof(WCHAR)) - 1, L"\"%ls\" --inject-pid %lu --dll \"%ls\"", sib_exe, (unsigned long)pid, chosen_dll);
-    cmd[(sizeof(cmd) / sizeof(WCHAR)) - 1] = L'\0';
+    size_t cmd_cap = sizeof(cmd) / sizeof(WCHAR);
+    int cn = _snwprintf(cmd, cmd_cap, L"\"%ls\" --inject-pid %lu --dll \"%ls\"", sib_exe, (unsigned long)pid, chosen_dll);
+    if (cn <= 0 || (size_t)cn >= cmd_cap) {
+        return false;
+    }
+    cmd[cmd_cap - 1] = L'\0';
 
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -566,13 +499,14 @@ static bool watch_active_session_is_off(void)
     if (!last_sep) return false;
     *last_sep = L'\0';
     WCHAR ini_path[MAX_PATH] = { 0 };
-    _snwprintf(ini_path, MAX_PATH - 1, L"%ls\\active_session.ini", self_path);
+    int pn = _snwprintf(ini_path, MAX_PATH, L"%ls\\active_session.ini", self_path);
+    if (pn <= 0 || pn >= MAX_PATH) return false;
     HANDLE hf = CreateFileW(
         ini_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
     );
     if (hf == INVALID_HANDLE_VALUE) return false;
-    char buf[512];
+    char buf[DS_INI_BUF_BYTES];
     DWORD nr = 0;
     BOOL ok = ReadFile(hf, buf, (DWORD)(sizeof(buf) - 1), &nr, NULL);
     CloseHandle(hf);
@@ -992,16 +926,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     ExitProcess(DS_LAUNCH_ERR_APC_INJECT);
                 }
                 WCHAR cmd[MAX_PATH * 3];
-                _snwprintf(
+                size_t cmd_cap = sizeof(cmd) / sizeof(WCHAR);
+                int an = _snwprintf(
                     cmd,
-                    (sizeof(cmd) / sizeof(WCHAR)) - 1,
+                    cmd_cap,
                     L"\"%ls\" --inject-pid %lu --tid %lu --dll \"%ls\"",
                     sib_exe,
                     (unsigned long)pid,
                     (unsigned long)tid,
                     chosen_dll
                 );
-                cmd[(sizeof(cmd) / sizeof(WCHAR)) - 1] = L'\0';
+                if (an <= 0 || (size_t)an >= cmd_cap) {
+                    ExitProcess(DS_LAUNCH_ERR_APC_INJECT);
+                }
+                cmd[cmd_cap - 1] = L'\0';
                 STARTUPINFOW si_apc;
                 PROCESS_INFORMATION pi_apc;
                 memset(&si_apc, 0, sizeof(si_apc));

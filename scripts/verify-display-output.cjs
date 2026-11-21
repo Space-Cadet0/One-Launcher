@@ -20,6 +20,7 @@
  *  - Comprehensive CLI interface and programmatic CommonJS exports.
  */
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -146,7 +147,7 @@ function decodePng(buffer) {
   }
 
   const compressed = Buffer.concat(idatChunks);
-  const decompressed = zlib.inflateSync(compressed);
+  const decompressed = zlib.inflateSync(compressed, { maxOutputLength: 128 * 1024 * 1024 });
 
   const bpp = colorType === 6 ? 4 : 3;
   const rowBytes = width * bpp;
@@ -306,7 +307,29 @@ function encodePng(width, height, rgbaBuffer) {
 // -----------------------------------------------------------------------------
 
 /**
- * Deterministic C11 oracle for viewport geometry, implementing ds_compute_viewport.
+ * Exact bit-for-bit parity with C11 `ds_round_aspect_dim_even_or_exact` in
+ * `electron/helpers/display_scaler/display_scaler_math.c`.
+ */
+function roundAspectDimEvenOrExact(num, den, maxBound) {
+  if (den <= 0 || maxBound <= 0) return 1;
+  let val;
+  if (num % den === 0) {
+    val = Math.floor(num / den);
+  } else {
+    val = Math.floor((num + Math.floor(den / 2)) / den);
+    if ((val & 1) !== 0) {
+      if (val + 1 <= maxBound) val += 1;
+      else if (val > 1) val -= 1;
+    }
+  }
+  if (val < 1) val = 1;
+  if (val > maxBound) val = maxBound;
+  return val;
+}
+
+/**
+ * Deterministic C11 oracle for viewport geometry, implementing ds_compute_viewport
+ * (single canonical JS oracle shared with tests/e2e_fullscreen/harness/native_oracle.cjs).
  *
  * @param {number} screenW
  * @param {number} screenH
@@ -321,20 +344,35 @@ function computeOracleViewport(screenW, screenH, safeInsetTop = 0, virtW = 640, 
     return null;
   }
 
-  const safeTop = Math.max(0, Math.min(Math.floor(safeInsetTop), Math.floor(screenH / 4) - 1));
+  const quarter = Math.floor(screenH / 4);
+  const maxInset = quarter > 0 ? quarter - 1 : 0;
+  const safeTop = (screenH <= 4 || safeInsetTop <= 0)
+    ? 0
+    : Math.min(Math.floor(safeInsetTop), maxInset);
   const usableX = 0;
   const usableY = safeTop;
   const usableW = screenW;
-  const usableH = screenH - safeTop;
+  const usableH = Math.max(1, screenH - safeTop);
 
-  let dstW = 0;
-  let dstH = 0;
+  let dstW = usableW;
+  let dstH = usableH;
   let integerScale = 0;
 
   if (aspectMode === 'stretch') {
-    dstW = usableW;
-    dstH = usableH;
-  } else if (aspectMode === 'integer') {
+    return {
+      usableX,
+      usableY,
+      usableW,
+      usableH,
+      dstX: usableX,
+      dstY: usableY,
+      dstW: usableW,
+      dstH: usableH,
+      integerScale: 0,
+    };
+  }
+
+  if (aspectMode === 'integer') {
     const scaleX = Math.floor(usableW / virtW);
     const scaleY = Math.floor(usableH / virtH);
     const k = Math.min(scaleX, scaleY);
@@ -342,54 +380,34 @@ function computeOracleViewport(screenW, screenH, safeInsetTop = 0, virtW = 640, 
       integerScale = k;
       dstW = virtW * k;
       dstH = virtH * k;
-    } else {
-      // Fallback to aspect preserve
-      integerScale = 0;
-      const lhs = usableW * virtH;
-      const rhs = usableH * virtW;
-      if (lhs > rhs) {
-        dstH = usableH;
-        const fitByH = Math.floor((rhs + Math.floor(virtH / 2)) / virtH);
-        let val = (rhs % virtH === 0) ? Math.floor(rhs / virtH) : fitByH;
-        if ((rhs % virtH !== 0) && (val & 1) !== 0) {
-          if (val + 1 <= usableW) val += 1;
-          else if (val > 1) val -= 1;
-        }
-        dstW = Math.min(usableW, val);
-      } else if (lhs < rhs) {
-        dstW = usableW;
-        let fitH = Math.min(usableH, Math.floor((lhs + Math.floor(virtW / 2)) / virtW));
-        if (fitH >= 2) fitH &= ~1;
-        dstH = Math.max(1, fitH);
-      } else {
-        dstW = usableW;
-        dstH = usableH;
-      }
+      return {
+        usableX,
+        usableY,
+        usableW,
+        usableH,
+        dstX: usableX + Math.floor((usableW - dstW) / 2),
+        dstY: usableY + Math.floor((usableH - dstH) / 2),
+        dstW,
+        dstH,
+        integerScale,
+      };
     }
-  } else {
-    // DS_ASPECT_PRESERVE
-    const lhs = usableW * virtH;
-    const rhs = usableH * virtW;
-    if (lhs > rhs) {
-      // Pillarbox: screen wider than virtual aspect
-      dstH = usableH;
-      const fitByH = Math.floor((rhs + Math.floor(virtH / 2)) / virtH);
-      let val = (rhs % virtH === 0) ? Math.floor(rhs / virtH) : fitByH;
-      if ((rhs % virtH !== 0) && (val & 1) !== 0) {
-        if (val + 1 <= usableW) val += 1;
-        else if (val > 1) val -= 1;
-      }
-      dstW = Math.min(usableW, val);
-    } else if (lhs < rhs) {
-      // Letterbox: screen taller than virtual aspect
-      dstW = usableW;
-      let fitH = Math.min(usableH, Math.floor((lhs + Math.floor(virtW / 2)) / virtW));
-      if (fitH >= 2) fitH &= ~1;
-      dstH = Math.max(1, fitH);
-    } else {
-      dstW = usableW;
-      dstH = usableH;
-    }
+    // k < 1: fall through cleanly to DS_ASPECT_PRESERVE
+  }
+
+  // DS_ASPECT_PRESERVE
+  const lhs = usableW * virtH;
+  const rhs = usableH * virtW;
+  if (lhs > rhs) {
+    // Pillarbox: screen wider than virtual aspect
+    dstH = usableH;
+    dstW = roundAspectDimEvenOrExact(rhs, virtH, usableW);
+  } else if (lhs < rhs) {
+    // Letterbox: screen taller than virtual aspect (always even height when >= 2)
+    dstW = usableW;
+    let fitH = Math.min(usableH, Math.floor((lhs + Math.floor(virtW / 2)) / virtW));
+    if (fitH >= 2) fitH &= ~1;
+    dstH = Math.max(1, fitH);
   }
 
   const dstX = usableX + Math.floor((usableW - dstW) / 2);
@@ -409,16 +427,84 @@ function computeOracleViewport(screenW, screenH, safeInsetTop = 0, virtW = 640, 
 }
 
 // -----------------------------------------------------------------------------
+// Native macOS CoreGraphics Helper (Zero-Spawn Screen Lock & Crash Display Restore)
+// -----------------------------------------------------------------------------
+
+let cachedMacNativeAddon = undefined;
+
+function loadMacNativeDisplayAddon() {
+  if (cachedMacNativeAddon !== undefined) {
+    return cachedMacNativeAddon;
+  }
+  if (process.platform !== 'darwin') {
+    cachedMacNativeAddon = null;
+    return null;
+  }
+  const dylibPath = path.resolve(__dirname, '../electron/helpers/libone_coop_activate.dylib');
+  try {
+    if (fs.existsSync(dylibPath)) {
+      const mod = { exports: {} };
+      process.dlopen(mod, dylibPath);
+      cachedMacNativeAddon = mod.exports;
+      return cachedMacNativeAddon;
+    }
+  } catch {
+    // Fall back gracefully when native addon cannot be opened
+  }
+  cachedMacNativeAddon = null;
+  return null;
+}
+
+/**
+ * MH-06 / SUP-05: Restores permanent host CoreGraphics display modes and ColorSync
+ * gamma transfer tables after abnormal / SIGKILL game exits on macOS.
+ *
+ * @param {{ platform?: string }} [options]
+ * @returns {{ restored: boolean, skipped?: boolean, method?: string, reason?: string, error?: string }}
+ */
+function restoreHostDisplayConfiguration(options = {}) {
+  const platform = options.platform || process.platform;
+  if (platform !== 'darwin') {
+    return { restored: false, skipped: true, reason: `non-darwin platform (${platform})` };
+  }
+  const addon = loadMacNativeDisplayAddon();
+  if (addon && typeof addon.restoreHostDisplayConfiguration === 'function') {
+    try {
+      const ok = Boolean(addon.restoreHostDisplayConfiguration());
+      return { restored: ok, method: 'coregraphics-napi' };
+    } catch (err) {
+      return { restored: false, method: 'coregraphics-napi', error: err.message };
+    }
+  }
+  return {
+    restored: false,
+    method: 'unavailable',
+    error: 'libone_coop_activate.dylib restoreHostDisplayConfiguration export unavailable',
+  };
+}
+
+// -----------------------------------------------------------------------------
 // System Environment & Screen Lock Detection
 // -----------------------------------------------------------------------------
 
 /**
  * Detects whether the macOS display is locked or asleep via Quartz CGSessionCopyCurrentDictionary.
+ * Prefers the in-process CoreGraphics N-API binding (<1 ms) over spawning `swift -e`.
  * Returns { isLocked: boolean, available: boolean }
  */
 function detectScreenLockState() {
   if (process.platform !== 'darwin') {
     return { isLocked: false, available: true, platform: process.platform };
+  }
+
+  const addon = loadMacNativeDisplayAddon();
+  if (addon && typeof addon.isSessionScreenLocked === 'function') {
+    try {
+      const isLocked = Boolean(addon.isSessionScreenLocked());
+      return { isLocked, available: true, method: 'coregraphics-napi' };
+    } catch {
+      // Fall through to swift fallback
+    }
   }
 
   try {
@@ -429,7 +515,7 @@ function detectScreenLockState() {
       timeout: 3000,
     });
     const isLocked = parseInt(res.trim(), 10) === 1;
-    return { isLocked, available: true };
+    return { isLocked, available: true, method: 'swift-fallback' };
   } catch (err) {
     return { isLocked: false, available: false, error: err.message };
   }
@@ -475,7 +561,9 @@ function detectDisplayGeometry(options = {}) {
             }
           }
         }
+        const requestedIdx = Number(options.displayIndex);
         const primary =
+          (Number.isInteger(requestedIdx) && requestedIdx >= 1 && allDisplays[requestedIdx - 1]) ||
           allDisplays.find((d) => d.spdisplays_main === 'spdisplays_yes') ||
           allDisplays.find((d) => d.spdisplays_online === 'spdisplays_yes') ||
           allDisplays[0] ||
@@ -798,14 +886,14 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, optionsOrWidth = {},
   let coreMenuBarBleed = false;
   let dockBleed = false;
 
-  const recordMarginViolation = (x, y, px, region) => {
+  const recordMarginViolation = (x, y, r, g, b, region) => {
     if (isInControlCenterPrivacyDotBox(x, y)) {
-      privacyDotCandidates.push({ x, y, r: px.r, g: px.g, b: px.b, region });
+      privacyDotCandidates.push({ x, y, r, g, b, region });
       return;
     }
     coreMarginViolations++;
     if (violations.length < 100) {
-      violations.push({ x, y, r: px.r, g: px.g, b: px.b, region });
+      violations.push({ x, y, r, g, b, region });
     }
     if (y <= 44) coreMenuBarBleed = true;
     if (y >= height - 60) dockBleed = true;
@@ -814,61 +902,52 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, optionsOrWidth = {},
   // 1. Physical Resolution Check
   const resolutionOk = (width === targetDisplayW && height === targetDisplayH);
 
-  // 2. Exhaustive Margin Inspection (Pillarbox & Letterbox)
+  // 2. Exhaustive Margin Inspection (Pillarbox & Letterbox) — zero per-pixel object allocations
   const dstX = expectedViewport.dstX;
   const dstY = expectedViewport.dstY;
   const dstW = expectedViewport.dstW;
   const dstH = expectedViewport.dstH;
+  const imgData = decodedImg.data;
+  const isBuf = Buffer.isBuffer(imgData);
+  const rowStride = width * 4;
+
+  const inspectMarginRect = (x0, x1, y0, y1, region) => {
+    if (x1 <= x0 || y1 <= y0) return;
+    if (isBuf) {
+      for (let y = y0; y < y1; y++) {
+        let idx = y * rowStride + (x0 * 4);
+        for (let x = x0; x < x1; x++, idx += 4) {
+          const r = imgData[idx];
+          const g = imgData[idx + 1];
+          const b = imgData[idx + 2];
+          if (r > blackTolerance || g > blackTolerance || b > blackTolerance) {
+            recordMarginViolation(x, y, r, g, b, region);
+          }
+        }
+      }
+      return;
+    }
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const px = decodedImg.getPixel(x, y);
+        if (isNonBlackRgb(px.r, px.g, px.b)) {
+          recordMarginViolation(x, y, px.r, px.g, px.b, region);
+        }
+      }
+    }
+  };
 
   // Check Left Pillarbox Margin (x in [0 .. dstX - 1])
-  if (dstX > 0) {
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < dstX; x++) {
-        const px = decodedImg.getPixel(x, y);
-        if (isNonBlackRgb(px.r, px.g, px.b)) {
-          recordMarginViolation(x, y, px, 'left_pillarbox');
-        }
-      }
-    }
-  }
+  inspectMarginRect(0, dstX, 0, height, 'left_pillarbox');
 
   // Check Right Pillarbox Margin (x in [dstX + dstW .. width - 1])
-  const rightMarginStart = dstX + dstW;
-  if (rightMarginStart < width) {
-    for (let y = 0; y < height; y++) {
-      for (let x = rightMarginStart; x < width; x++) {
-        const px = decodedImg.getPixel(x, y);
-        if (isNonBlackRgb(px.r, px.g, px.b)) {
-          recordMarginViolation(x, y, px, 'right_pillarbox');
-        }
-      }
-    }
-  }
+  inspectMarginRect(dstX + dstW, width, 0, height, 'right_pillarbox');
 
   // Check Top Letterbox Margin (y in [0 .. dstY - 1])
-  if (dstY > 0) {
-    for (let y = 0; y < dstY; y++) {
-      for (let x = 0; x < width; x++) {
-        const px = decodedImg.getPixel(x, y);
-        if (isNonBlackRgb(px.r, px.g, px.b)) {
-          recordMarginViolation(x, y, px, 'top_letterbox');
-        }
-      }
-    }
-  }
+  inspectMarginRect(0, width, 0, dstY, 'top_letterbox');
 
   // Check Bottom Letterbox Margin (y in [dstY + dstH .. height - 1])
-  const bottomMarginStart = dstY + dstH;
-  if (bottomMarginStart < height) {
-    for (let y = bottomMarginStart; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const px = decodedImg.getPixel(x, y);
-        if (isNonBlackRgb(px.r, px.g, px.b)) {
-          recordMarginViolation(x, y, px, 'bottom_letterbox');
-        }
-      }
-    }
-  }
+  inspectMarginRect(0, width, dstY + dstH, height, 'bottom_letterbox');
 
   // Only treat isolated top-right pixels as macOS Control Center privacy dot when every
   // other margin pixel across the entire panel (including 0..width-65 of Menu Bar) is clean.
@@ -922,9 +1001,6 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, optionsOrWidth = {},
     }
   }
   if (sampleCols.length === 0) sampleCols.push(Math.floor(width / 2));
-
-  const imgData = decodedImg.data;
-  const isBuf = Buffer.isBuffer(imgData);
 
   const isActiveAt = (x, y, rowOffset) => {
     if (isInControlCenterPrivacyDotBox(x, y) && privacyIndicatorDotExcluded) {
@@ -1298,7 +1374,7 @@ function verifyDisplayOutput(options = {}) {
         displayW = displayW || 3024;
         displayH = displayH || 1964;
       } else {
-        const detected = detectDisplayGeometry();
+        const detected = detectDisplayGeometry({ displayIndex: options.displayIndex });
         displayW = displayW || (detected && detected.width) || 1920;
         displayH = displayH || (detected && detected.height) || 1080;
       }
@@ -1364,16 +1440,22 @@ function verifyDisplayOutput(options = {}) {
           };
         }
 
-        tempCapturePath = path.join(os.tmpdir(), `onelauncher-verify-display-${Date.now()}.png`);
-        captureWholeDisplay(tempCapturePath);
+        tempCapturePath = path.join(
+          os.tmpdir(),
+          `onelauncher-verify-display-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.png`
+        );
+        captureWholeDisplay(tempCapturePath, { displayIndex: options.displayIndex });
         pngBuffer = fs.readFileSync(tempCapturePath);
         usedLiveCapture = true;
       } else {
         // Default fallback: If on macOS and screen is unlocked, run live; otherwise run synthetic
         const lockCheck = detectScreenLockState();
         if (process.platform === 'darwin' && !lockCheck.isLocked) {
-          tempCapturePath = path.join(os.tmpdir(), `onelauncher-verify-display-${Date.now()}.png`);
-          captureWholeDisplay(tempCapturePath);
+          tempCapturePath = path.join(
+            os.tmpdir(),
+            `onelauncher-verify-display-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.png`
+          );
+          captureWholeDisplay(tempCapturePath, { displayIndex: options.displayIndex });
           pngBuffer = fs.readFileSync(tempCapturePath);
           usedLiveCapture = true;
         } else {
@@ -1509,6 +1591,7 @@ Options:
                         Virtual game resolution (default: 640x480)
   --display-res=<w>x<h>, --display=<w>x<h>
                         Expected display resolution (default: 3024x1964)
+  --display-index=<n>   Target macOS display index for screencapture -D (1-based)
   --aspect-mode=<mode>  preserve | integer | stretch (default: preserve)
   --defect=<type>       none | offset | margin_white | menubar_bleed | dock_bleed
   --verbose             Print detailed pixel sampling and boundary coordinates
@@ -1531,6 +1614,7 @@ function parseCliArgs(args) {
     virtualHeight: 480,
     displayWidth: null,
     displayHeight: null,
+    displayIndex: null,
     aspectMode: 'preserve',
     defect: 'none',
     strictBlack: false,
@@ -1593,6 +1677,12 @@ function parseCliArgs(args) {
       applyDimPair(arg.slice(eqIdx + 1), 'display');
     } else if (arg === '--display-res' || arg === '--display') {
       applyDimPair(nextVal(), 'display');
+    } else if (arg.startsWith('--display-index=')) {
+      const idx = parseInt(arg.slice('--display-index='.length), 10);
+      if (Number.isInteger(idx) && idx >= 1) options.displayIndex = idx;
+    } else if (arg === '--display-index') {
+      const idx = parseInt(nextVal(), 10);
+      if (Number.isInteger(idx) && idx >= 1) options.displayIndex = idx;
     } else if (arg.startsWith('--aspect-mode=')) {
       options.aspectMode = arg.slice('--aspect-mode='.length);
     } else if (arg === '--aspect-mode') {
@@ -1664,6 +1754,7 @@ module.exports = {
   computeViewportLuminance,
   detectScreenLockState,
   isScreenLocked: () => detectScreenLockState().isLocked,
+  restoreHostDisplayConfiguration,
   detectDisplayGeometry,
   captureWholeDisplay,
   generateSyntheticDisplayBuffer,
