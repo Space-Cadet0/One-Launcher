@@ -63,11 +63,53 @@ export interface UseCatalogOverrideSyncParams {
   setGames: Dispatch<SetStateAction<CanonicalGame[]>>;
   gamesRef?: MutableRefObject<CanonicalGame[]>;
   setGameRefreshKey: Dispatch<SetStateAction<number>>;
+  onCatalogPersisted?: (catalog: CanonicalGame[]) => void;
   showSyncNotice: (
     message: string | null,
     durationMs?: number | null,
     tone?: SyncNoticeTone
   ) => void;
+}
+
+interface LocalRehydrationPatch {
+  capsuleImage?: string;
+  headerImage?: string;
+  iconUrl?: string;
+  shortDescription?: string;
+  detailedDescription?: string;
+  developers?: string[];
+  publishers?: string[];
+  genres?: string[];
+  tags?: string[];
+  releaseDate?: string;
+}
+
+function applyLocalRehydrationToCatalog(
+  catalog: CanonicalGame[],
+  revertedId: string,
+  patch: LocalRehydrationPatch
+): { updated: CanonicalGame[]; changed: boolean } {
+  let changed = false;
+  const updated = catalog.map((g) => {
+    if (g.id !== revertedId) return g;
+    // Never overwrite if user just created a brand-new override in the meantime
+    if (getUserOverrideForGame(g)) return g;
+    changed = true;
+    return {
+      ...g,
+      capsuleImage: g.capsuleImage || patch.capsuleImage,
+      headerImage: g.headerImage || patch.headerImage || '',
+      iconUrl: g.iconUrl || patch.iconUrl,
+      shortDescription: g.shortDescription || patch.shortDescription || '',
+      detailedDescription: g.detailedDescription || patch.detailedDescription,
+      developers: g.developers?.length ? g.developers : (patch.developers ?? []),
+      publishers: g.publishers?.length ? g.publishers : (patch.publishers ?? []),
+      genres: g.genres?.length ? g.genres : (patch.genres ?? []),
+      tags: g.tags?.length ? g.tags : (patch.tags ?? []),
+      releaseDate: g.releaseDate || patch.releaseDate,
+    };
+  });
+  return { updated: changed ? updated : catalog, changed };
 }
 
 export interface UseCatalogOverrideSyncResult {
@@ -95,12 +137,21 @@ export function useCatalogOverrideSync({
   setGames,
   gamesRef,
   setGameRefreshKey,
+  onCatalogPersisted,
   showSyncNotice,
 }: UseCatalogOverrideSyncParams): UseCatalogOverrideSyncResult {
   const [isFixMatchModalOpen, setIsFixMatchModalOpen] = useState(false);
   const [fixMatchGame, setFixMatchGame] = useState<CanonicalGame | null>(null);
   const [isMatchManagerOpen, setIsMatchManagerOpen] = useState(false);
   const internalMutationDepthRef = useRef<number>(0);
+  const isMountedRef = useRef<boolean>(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
@@ -235,23 +286,37 @@ export function useCatalogOverrideSync({
             ?.isSplittingFromMerged
       );
 
-      let appliedNextGames: CanonicalGame[] | null = null;
-      setGames((prevGames) => {
-        const next = applyOverrideToCatalog(prevGames, overrideToSave, fixMatchGame, isSplitting);
-        appliedNextGames = next;
-        if (gamesRef) {
+      // Compute next catalog deterministically outside setGames so React 19 automatic
+      // batching never defers/skips catalog persistence.
+      if (gamesRef) {
+        const baseCatalog = gamesRef.current;
+        const nextCatalog = applyOverrideToCatalog(
+          baseCatalog,
+          overrideToSave,
+          fixMatchGame,
+          isSplitting
+        );
+        gamesRef.current = nextCatalog;
+        setGames((prevGames) => {
+          const next =
+            prevGames === baseCatalog
+              ? nextCatalog
+              : applyOverrideToCatalog(prevGames, overrideToSave, fixMatchGame, isSplitting);
           gamesRef.current = next;
-        }
-        return next;
-      });
+          return next;
+        });
 
-      if (appliedNextGames) {
         const dirtyIds = new Set<string>([overrideToSave.gameId]);
         if (matchedCatalogGame?.id) dirtyIds.add(matchedCatalogGame.id);
-        saveCurrentCatalog(appliedNextGames, {
+        saveCurrentCatalog(nextCatalog, {
           dirtyGameIds: dirtyIds,
           skipSanitize: true,
         });
+        onCatalogPersisted?.(nextCatalog);
+      } else {
+        setGames((prevGames) =>
+          applyOverrideToCatalog(prevGames, overrideToSave, fixMatchGame, isSplitting)
+        );
       }
 
       setGameRefreshKey((prev) => prev + 1);
@@ -262,7 +327,7 @@ export function useCatalogOverrideSync({
         5000
       );
     },
-    [fixMatchGame, gamesRef, setGames, setGameRefreshKey, showSyncNotice]
+    [fixMatchGame, gamesRef, onCatalogPersisted, setGames, setGameRefreshKey, showSyncNotice]
   );
 
   const handleResetOverride = useCallback(
@@ -333,27 +398,28 @@ export function useCatalogOverrideSync({
       }
 
       const effectiveRemovedOv = removedOverride ?? existingOv;
-      let revertedCatalogSnapshot: CanonicalGame[] | null = null;
+      // Compute next catalog deterministically outside setGames so React 19 automatic
+      // batching never leaves the persistence snapshot null.
+      const baseCatalog = gamesRef?.current;
+      const finalCatalog: CanonicalGame[] =
+        baseCatalog && baseCatalog.length > 0
+          ? revertRemovedOverrideInCatalog(baseCatalog, gameId, effectiveRemovedOv, targetGame)
+          : [];
+
+      if (gamesRef && baseCatalog) {
+        gamesRef.current = finalCatalog;
+      }
 
       setGames((prevGames) => {
-        const next = revertRemovedOverrideInCatalog(
-          prevGames,
-          gameId,
-          effectiveRemovedOv,
-          targetGame
-        );
-        revertedCatalogSnapshot = next;
+        const next =
+          baseCatalog && prevGames === baseCatalog
+            ? finalCatalog
+            : revertRemovedOverrideInCatalog(prevGames, gameId, effectiveRemovedOv, targetGame);
         if (gamesRef) {
           gamesRef.current = next;
         }
         return next;
       });
-
-      const finalCatalog: CanonicalGame[] =
-        revertedCatalogSnapshot ??
-        (liveCatalog.length > 0
-          ? revertRemovedOverrideInCatalog(liveCatalog, gameId, effectiveRemovedOv, targetGame)
-          : []);
 
       // Find the reverted game entry in finalCatalog for immediate persistence & local metadata re-hydration
       const revertedEntry = finalCatalog.find((g) => {
@@ -400,9 +466,11 @@ export function useCatalogOverrideSync({
         }
         saveCurrentCatalog(finalCatalog, {
           dirtyGameIds: dirtyIds,
+          removedGameIds: confirmedOrphanIds.length > 0 ? confirmedOrphanIds : undefined,
           skipSanitize: true,
           immediate: true,
         });
+        onCatalogPersisted?.(finalCatalog);
       }
 
       // Non-blocking local storefront metadata re-hydration when reverted game lacks clean default art/synopsis
@@ -430,6 +498,7 @@ export function useCatalogOverrideSync({
             packageFamilyName: xboxPlat?.packageFamilyName ?? null,
           })
           .then((res) => {
+            if (!isMountedRef.current) return;
             if (!res?.success || !res.metadata || typeof res.metadata !== 'object') return;
             const meta = res.metadata as Record<string, unknown>;
             const nextCapsule =
@@ -486,40 +555,47 @@ export function useCatalogOverrideSync({
               return;
             }
 
-            let hydratedCatalog: CanonicalGame[] | null = null;
-            let didHydrateTarget = false;
-            setGames((currGames) => {
-              const updated = currGames.map((g) => {
-                if (g.id !== revertedId) return g;
-                // Never overwrite if user just created a brand-new override in the meantime
-                if (getUserOverrideForGame(g)) return g;
-                didHydrateTarget = true;
-                return {
-                  ...g,
-                  capsuleImage: g.capsuleImage || nextCapsule,
-                  headerImage: g.headerImage || nextHeader || '',
-                  iconUrl: g.iconUrl || nextIcon,
-                  shortDescription: g.shortDescription || nextShort || '',
-                  detailedDescription: g.detailedDescription || nextDetailed,
-                  developers: g.developers?.length ? g.developers : (nextDevs ?? []),
-                  publishers: g.publishers?.length ? g.publishers : (nextPubs ?? []),
-                  genres: g.genres?.length ? g.genres : (nextGenres ?? []),
-                  tags: g.tags?.length ? g.tags : (nextTags ?? []),
-                  releaseDate: g.releaseDate || nextRelease,
-                };
-              });
-              if (!didHydrateTarget) return currGames;
-              hydratedCatalog = updated;
-              if (gamesRef) {
-                gamesRef.current = updated;
-              }
-              return updated;
-            });
+            const patch: LocalRehydrationPatch = {
+              capsuleImage: nextCapsule,
+              headerImage: nextHeader,
+              iconUrl: nextIcon,
+              shortDescription: nextShort,
+              detailedDescription: nextDetailed,
+              developers: nextDevs,
+              publishers: nextPubs,
+              genres: nextGenres,
+              tags: nextTags,
+              releaseDate: nextRelease,
+            };
 
-            if (didHydrateTarget && hydratedCatalog) {
+            if (gamesRef) {
+              const currBase = gamesRef.current;
+              const { updated: hydratedCatalog, changed: didHydrateTarget } =
+                applyLocalRehydrationToCatalog(currBase, revertedId, patch);
+              if (!didHydrateTarget) return;
+
+              gamesRef.current = hydratedCatalog;
+              setGames((currGames) => {
+                if (currGames === currBase) {
+                  gamesRef.current = hydratedCatalog;
+                  return hydratedCatalog;
+                }
+                const recomputed = applyLocalRehydrationToCatalog(currGames, revertedId, patch);
+                if (!recomputed.changed) return currGames;
+                gamesRef.current = recomputed.updated;
+                return recomputed.updated;
+              });
+
               saveCurrentCatalog(hydratedCatalog, {
                 dirtyGameIds: [revertedId],
                 skipSanitize: true,
+              });
+              onCatalogPersisted?.(hydratedCatalog);
+              setGameRefreshKey((prev) => prev + 1);
+            } else {
+              setGames((currGames) => {
+                const recomputed = applyLocalRehydrationToCatalog(currGames, revertedId, patch);
+                return recomputed.changed ? recomputed.updated : currGames;
               });
               setGameRefreshKey((prev) => prev + 1);
             }
@@ -530,7 +606,7 @@ export function useCatalogOverrideSync({
       setGameRefreshKey((prev) => prev + 1);
       showSyncNotice('Reverted game match & metadata to default store settings.', 5000);
     },
-    [gamesRef, selectedGame, setGames, setGameRefreshKey, showSyncNotice]
+    [gamesRef, onCatalogPersisted, selectedGame, setGames, setGameRefreshKey, showSyncNotice]
   );
 
   const handleHideGame = useCallback(

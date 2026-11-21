@@ -430,7 +430,7 @@ describe('Tasks 4, 5, 9 & 11: DXMT MetalFX Spatial UX, HostPlatformCapabilities 
         (setupBtn!.props.onClick as () => void)();
         const wizardEvent = dispatchSpy.mock.calls
           .map((c) => (c as unknown as [CustomEvent<{ initialStep: string }>])[0])
-          .find((ev) => ev?.type === 'antigravity:open-setup-wizard');
+          .find((ev) => ev?.type === 'antigravity:open-system-setup');
         expect(wizardEvent?.detail?.initialStep).toBe('prerequisites');
       } finally {
         settingsRenderer.unmount();
