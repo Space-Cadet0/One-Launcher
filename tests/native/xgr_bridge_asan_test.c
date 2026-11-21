@@ -242,23 +242,37 @@ static void test_production_strbuf_json_and_base64(void)
     }
 
     /* Tight-heap truncated \u / surrogate pair fuzzing */
-    const char *truncated_inputs[] = {
+    const char *unterminated_inputs[] = {
         "{\"gamertag\":\"abc\\",
         "{\"gamertag\":\"abc\\u",
         "{\"gamertag\":\"abc\\u1",
         "{\"gamertag\":\"abc\\u12",
         "{\"gamertag\":\"abc\\u123",
-        "{\"gamertag\":\"abc\\u12GZ\"",
         "{\"gamertag\":\"\\uD83C\\",
         "{\"gamertag\":\"\\uD83C\\u",
-        "{\"gamertag\":\"\\uD83C\\uDF",
-        "{\"gamertag\":\"\\uD83C\"",
-        "{\"gamertag\":\"\\uDC00\""
+        "{\"gamertag\":\"\\uD83C\\uDF"
     };
-    for (size_t i = 0; i < sizeof(truncated_inputs) / sizeof(truncated_inputs[0]); i++) {
-        char *tight = dup_tight(truncated_inputs[i]);
+    for (size_t i = 0; i < sizeof(unterminated_inputs) / sizeof(unterminated_inputs[0]); i++) {
+        char *tight = dup_tight(unterminated_inputs[i]);
+        char out[128];
+        ASSERT_TRUE(!xgr_json_extract_string(tight, "gamertag", out, sizeof(out)));
+        free(tight);
+    }
+
+    const char *terminated_edge_inputs[] = {
+        "{\"gamertag\":\"abc\\u12GZ\"}",
+        "{\"gamertag\":\"\\uD83C\"}",
+        "{\"gamertag\":\"\\uDC00\"}",
+        "{\"gamertag\":\"a\\u0000b\"}"
+    };
+    for (size_t i = 0; i < sizeof(terminated_edge_inputs) / sizeof(terminated_edge_inputs[0]); i++) {
+        char *tight = dup_tight(terminated_edge_inputs[i]);
         char out[128];
         ASSERT_TRUE(xgr_json_extract_string(tight, "gamertag", out, sizeof(out)));
+        if (i == 3) {
+            /* \u0000 must not truncate C string (replaced with U+FFFD) */
+            ASSERT_STREQ(out, "a\xEF\xBF\xBD" "b");
+        }
         free(tight);
     }
 
@@ -1236,6 +1250,304 @@ static void test_production_xasync_10000_cycles(void)
 }
 
 /* =========================================================================
+ * 8. Wave 4 (W1-D) Hardening Suite:
+ *    - Multi-container WGS v14 odd-offset UTF-16LE alignment (XGR-09)
+ *    - SCID / PFN / Container path-traversal rejection (XGR-09)
+ *    - External SRWLOCK config reset under concurrent snapshot readers (XGR-02)
+ *    - 68-byte k_fallback_png PNG signature, chunk layout & CRC-32 validation (XGR-13)
+ *    - Manual XTaskQueue close with un-dispatched tasks (0 leaks) (XGR-12)
+ *    - xgr_get_env_utf8 out_cap==1 guard & non-hex ONE_XGR_KEY rejection (XGR-13)
+ *    - Uncollected XGameSaveInitializeProviderAsync across UninitializeApiImpl (XGR-04)
+ * ========================================================================= */
+
+static uint32_t asan_crc32(const uint8_t *buf, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint32_t)buf[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 1u) ? ((crc >> 1) ^ 0xEDB88320u) : (crc >> 1);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static uint32_t asan_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+struct cfg_reader_args {
+    _Atomic int stop;
+    _Atomic int reads;
+};
+
+static void *cfg_snapshot_reader_worker(void *arg)
+{
+    struct cfg_reader_args *a = (struct cfg_reader_args *)arg;
+    while (!atomic_load_explicit(&a->stop, memory_order_relaxed)) {
+        struct xgr_runtime_config_snapshot snap;
+        xgr_copy_runtime_config_snapshot(&snap);
+        atomic_fetch_add_explicit(&a->reads, 1, memory_order_relaxed);
+    }
+    return NULL;
+}
+
+struct manual_task_ctx {
+    _Atomic int *canceled_counter;
+};
+
+static void CALLBACK manual_undispatched_task_cb(void *ctx, bool canceled)
+{
+    struct manual_task_ctx *m = (struct manual_task_ctx *)ctx;
+    if (m) {
+        if (canceled && m->canceled_counter) {
+            atomic_fetch_add_explicit(m->canceled_counter, 1, memory_order_relaxed);
+        }
+        free(m);
+    }
+}
+
+static void test_r4_w1d_hardening_invariants(void)
+{
+    /* 8a. Path-traversal validator (XGR-09) */
+    ASSERT_TRUE(xgr_is_safe_path_segment("Blobfish.Brotato_8wekyb3d8bbwe", 192));
+    ASSERT_TRUE(xgr_is_safe_path_segment("00000000-0000-0000-0000-000071b6a9d4", 64));
+    ASSERT_TRUE(xgr_is_safe_path_segment("slot_01", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment("", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment("..", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment("../escape", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment("a/b", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment("a\\b", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment("C:drive", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment("CON", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment("nul", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment("COM1", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment("trail.", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment(" lead", 64));
+    ASSERT_TRUE(!xgr_is_safe_path_segment("bad\x01" "ctrl", 64));
+
+    /* 8b. Multi-container WGS v14 odd-offset UTF-16LE write + reload + traversal rejection (XGR-09) */
+    void *gs_iface = NULL;
+    ASSERT_HR_EQ(QueryApiImpl(&CLSID_XGameSaveImpl, &IID_IXGameSaveImpl, &gs_iface), S_OK);
+    const void *const *gs_vtbl = *(const void *const **)gs_iface;
+    typedef HRESULT (WINAPI *fn_gs_init_sync_t)(void *, XUserHandle, const char *, BOOLEAN, XGameSaveProviderHandle *);
+    typedef void    (WINAPI *fn_gs_close_prov_t)(void *, XGameSaveProviderHandle);
+    typedef HRESULT (WINAPI *fn_gs_create_cont_t)(void *, XGameSaveProviderHandle, const char *, XGameSaveContainerHandle *);
+    typedef void    (WINAPI *fn_gs_close_cont_t)(void *, XGameSaveContainerHandle);
+    typedef HRESULT (WINAPI *fn_gs_create_upd_t)(void *, XGameSaveContainerHandle, const char *, XGameSaveUpdateHandle *);
+    typedef void    (WINAPI *fn_gs_close_upd_t)(void *, XGameSaveUpdateHandle);
+    typedef HRESULT (WINAPI *fn_gs_blob_write_t)(void *, XGameSaveUpdateHandle, const char *, const uint8_t *, SIZE_T);
+    typedef HRESULT (WINAPI *fn_gs_submit_upd_t)(void *, XGameSaveUpdateHandle);
+    typedef HRESULT (WINAPI *fn_gs_read_blobs_t)(void *, XGameSaveContainerHandle, const char **, uint32_t *, SIZE_T, XGameSaveBlob *);
+
+    fn_gs_init_sync_t  pInitSync  = (fn_gs_init_sync_t)gs_vtbl[3];
+    fn_gs_close_prov_t pCloseProv = (fn_gs_close_prov_t)gs_vtbl[6];
+    fn_gs_create_cont_t pCreateCont = (fn_gs_create_cont_t)gs_vtbl[16];
+    fn_gs_close_cont_t  pCloseCont  = (fn_gs_close_cont_t)gs_vtbl[17];
+    fn_gs_create_upd_t  pCreateUpd  = (fn_gs_create_upd_t)gs_vtbl[23];
+    fn_gs_close_upd_t   pCloseUpd   = (fn_gs_close_upd_t)gs_vtbl[24];
+    fn_gs_blob_write_t  pBlobWrite  = (fn_gs_blob_write_t)gs_vtbl[25];
+    fn_gs_submit_upd_t  pSubmitUpd  = (fn_gs_submit_upd_t)gs_vtbl[27];
+    fn_gs_read_blobs_t  pReadBlobs  = (fn_gs_read_blobs_t)gs_vtbl[20];
+
+    /* Traversal SCID rejected before touching filesystem */
+    XGameSaveProviderHandle bad_prov = NULL;
+    ASSERT_HR_EQ(pInitSync(gs_iface, NULL, "../../etc/passwd", FALSE, &bad_prov), E_INVALIDARG);
+    ASSERT_TRUE(bad_prov == NULL);
+    ASSERT_HR_EQ(pInitSync(gs_iface, NULL, "scid\\evil", FALSE, &bad_prov), E_INVALIDARG);
+    ASSERT_TRUE(bad_prov == NULL);
+
+    const char *multi_scid = "00000000-0000-0000-0000-000071b6a9d5";
+    XGameSaveProviderHandle prov = NULL;
+    ASSERT_HR_EQ(pInitSync(gs_iface, NULL, multi_scid, FALSE, &prov), S_OK);
+    ASSERT_TRUE(prov != NULL);
+
+    /* Traversal container names rejected */
+    XGameSaveContainerHandle bad_cont = NULL;
+    ASSERT_HR_EQ(pCreateCont(gs_iface, prov, "../escape", &bad_cont), E_GS_INVALID_CONTAINER_NAME);
+    ASSERT_HR_EQ(pCreateCont(gs_iface, prov, "dir/file", &bad_cont), E_GS_INVALID_CONTAINER_NAME);
+    ASSERT_HR_EQ(pCreateCont(gs_iface, prov, "NUL", &bad_cont), E_GS_INVALID_CONTAINER_NAME);
+    ASSERT_TRUE(bad_cont == NULL);
+
+    /* Write 4 distinct containers so containers #1..#3 land on odd byte offsets in WGS containers.index */
+    static const char *const k_cont_names[4] = { "alpha", "beta_slot", "gamma_odd", "delta_final" };
+    static const char *const k_payloads[4]   = { "PAY_A_1", "PAY_BB_22", "PAY_CCC_333", "PAY_DDDD_4444" };
+    for (int i = 0; i < 4; i++) {
+        XGameSaveContainerHandle c = NULL;
+        ASSERT_HR_EQ(pCreateCont(gs_iface, prov, k_cont_names[i], &c), S_OK);
+        XGameSaveUpdateHandle u = NULL;
+        ASSERT_HR_EQ(pCreateUpd(gs_iface, c, k_cont_names[i], &u), S_OK);
+        ASSERT_HR_EQ(pBlobWrite(gs_iface, u, "state.dat", (const uint8_t *)k_payloads[i], strlen(k_payloads[i])), S_OK);
+        ASSERT_HR_EQ(pSubmitUpd(gs_iface, u), S_OK);
+        pCloseUpd(gs_iface, u);
+        pCloseCont(gs_iface, c);
+    }
+    pCloseProv(gs_iface, prov);
+    prov = NULL;
+
+    /* Re-open fresh provider from disk: parses all 4 odd-offset UTF-16LE entries under UBSan! */
+    ASSERT_HR_EQ(pInitSync(gs_iface, NULL, multi_scid, FALSE, &prov), S_OK);
+    ASSERT_TRUE(prov != NULL);
+    for (int i = 0; i < 4; i++) {
+        XGameSaveContainerHandle c = NULL;
+        ASSERT_HR_EQ(pCreateCont(gs_iface, prov, k_cont_names[i], &c), S_OK);
+        _Alignas(XGameSaveBlob) uint8_t blob_buf[512];
+        memset(blob_buf, 0, sizeof(blob_buf));
+        uint32_t blob_cnt = 1;
+        const char *wanted[1] = { "state.dat" };
+        ASSERT_HR_EQ(pReadBlobs(gs_iface, c, wanted, &blob_cnt, sizeof(blob_buf), (XGameSaveBlob *)blob_buf), S_OK);
+        ASSERT_TRUE(blob_cnt == 1);
+        XGameSaveBlob *b = (XGameSaveBlob *)blob_buf;
+        ASSERT_TRUE(b->info.size == (uint32_t)strlen(k_payloads[i]));
+        ASSERT_TRUE(memcmp(b->data, k_payloads[i], b->info.size) == 0);
+        pCloseCont(gs_iface, c);
+    }
+    pCloseProv(gs_iface, prov);
+
+    /* 8c. External SRWLOCK-safe xgr_runtime_config_reset under concurrent readers (XGR-02) */
+    {
+        struct cfg_reader_args rargs;
+        atomic_init(&rargs.stop, 0);
+        atomic_init(&rargs.reads, 0);
+        pthread_t readers[4];
+        for (int t = 0; t < 4; t++) {
+            ASSERT_TRUE(pthread_create(&readers[t], NULL, cfg_snapshot_reader_worker, &rargs) == 0);
+        }
+        const char *reload_xml =
+            "<Game configVersion=\"1\">"
+            "  <Identity Name=\"Blobfish.Brotato\" Publisher=\"CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US\" Version=\"1.0.1.3\"/>"
+            "  <TitleId>71B6A9D4</TitleId>"
+            "  <ShellVisuals DefaultDisplayName=\"Brotato\"/>"
+            "</Game>";
+        struct xgr_initialize_options opts = { .gameConfig = reload_xml, .isInline = true };
+        for (int iter = 0; iter < 50; iter++) {
+            xgr_runtime_config_reset();
+            xgr_load_runtime_config(&opts);
+        }
+        atomic_store_explicit(&rargs.stop, 1, memory_order_relaxed);
+        for (int t = 0; t < 4; t++) {
+            ASSERT_TRUE(pthread_join(readers[t], NULL) == 0);
+        }
+        ASSERT_TRUE(atomic_load_explicit(&rargs.reads, memory_order_relaxed) > 0);
+        struct xgr_runtime_config_snapshot final_snap;
+        xgr_copy_runtime_config_snapshot(&final_snap);
+        ASSERT_TRUE(final_snap.titleId == 0x71B6A9D4u);
+    }
+
+    /* 8d. Valid 68-byte k_fallback_png signature, IHDR/IDAT/IEND chunks & CRC-32 (XGR-13) */
+    {
+        void *xu_iface = NULL;
+        ASSERT_HR_EQ(QueryApiImpl(&CLSID_XUserImpl, &IID_IXUserImpl, &xu_iface), S_OK);
+        const void *const *xu_vtbl = *(const void *const **)xu_iface;
+        typedef HRESULT (WINAPI *fn_xu_add_async_t)(void *, uint32_t, XAsyncBlock *);
+        typedef HRESULT (WINAPI *fn_xu_add_res_t)(void *, XAsyncBlock *, XUserHandle *);
+        typedef void    (WINAPI *fn_xu_close_t)(void *, XUserHandle);
+        typedef HRESULT (WINAPI *fn_xu_pic_async_t)(void *, XUserHandle, uint32_t, XAsyncBlock *);
+        typedef HRESULT (WINAPI *fn_xu_pic_res_sz_t)(void *, XAsyncBlock *, size_t *);
+        typedef HRESULT (WINAPI *fn_xu_pic_res_t)(void *, XAsyncBlock *, size_t, void *, size_t *);
+
+        fn_xu_add_async_t pAddAsync = (fn_xu_add_async_t)xu_vtbl[7];
+        fn_xu_add_res_t   pAddRes   = (fn_xu_add_res_t)xu_vtbl[8];
+        fn_xu_close_t     pCloseU   = (fn_xu_close_t)xu_vtbl[4];
+        fn_xu_pic_async_t pPicAsync = (fn_xu_pic_async_t)xu_vtbl[16];
+        fn_xu_pic_res_sz_t pPicSz   = (fn_xu_pic_res_sz_t)xu_vtbl[17];
+        fn_xu_pic_res_t   pPicRes   = (fn_xu_pic_res_t)xu_vtbl[18];
+
+        XAsyncBlock uab;
+        memset(&uab, 0, sizeof(uab));
+        ASSERT_HR_EQ(pAddAsync(xu_iface, 1u /* AddDefaultUserSilently */, &uab), S_OK);
+        ASSERT_HR_EQ(xgr_async_get_status(&uab, true), S_OK);
+        XUserHandle user = NULL;
+        ASSERT_HR_EQ(pAddRes(xu_iface, &uab, &user), S_OK);
+        ASSERT_TRUE(user != NULL);
+
+        XAsyncBlock pab;
+        memset(&pab, 0, sizeof(pab));
+        ASSERT_HR_EQ(pPicAsync(xu_iface, user, 0u, &pab), S_OK);
+        ASSERT_HR_EQ(xgr_async_get_status(&pab, true), S_OK);
+        size_t png_sz = 0;
+        ASSERT_HR_EQ(pPicSz(xu_iface, &pab, &png_sz), S_OK);
+        ASSERT_TRUE(png_sz == 68);
+        uint8_t png[68];
+        size_t png_used = 0;
+        ASSERT_HR_EQ(pPicRes(xu_iface, &pab, sizeof(png), png, &png_used), S_OK);
+        ASSERT_TRUE(png_used == 68);
+
+        /* Verify PNG 8-byte signature */
+        static const uint8_t k_png_sig[8] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+        ASSERT_TRUE(memcmp(png, k_png_sig, 8) == 0);
+        /* Verify IHDR chunk (offset 8, len 13, 1x1 8-bit RGBA, valid CRC-32) */
+        ASSERT_TRUE(asan_be32(png + 8) == 13);
+        ASSERT_TRUE(memcmp(png + 12, "IHDR", 4) == 0);
+        ASSERT_TRUE(asan_be32(png + 16) == 1 && asan_be32(png + 20) == 1);
+        ASSERT_TRUE(png[24] == 8 && png[25] == 6); /* 8-bit RGBA */
+        ASSERT_TRUE(asan_be32(png + 29) == asan_crc32(png + 12, 17));
+        /* Verify IDAT chunk (offset 33, len 11, valid CRC-32) */
+        ASSERT_TRUE(asan_be32(png + 33) == 11);
+        ASSERT_TRUE(memcmp(png + 37, "IDAT", 4) == 0);
+        ASSERT_TRUE(asan_be32(png + 52) == asan_crc32(png + 37, 15));
+        /* Verify IEND chunk (offset 56, len 0, valid CRC-32) */
+        ASSERT_TRUE(asan_be32(png + 56) == 0);
+        ASSERT_TRUE(memcmp(png + 60, "IEND", 4) == 0);
+        ASSERT_TRUE(asan_be32(png + 64) == asan_crc32(png + 60, 4));
+        ASSERT_TRUE(asan_be32(png + 64) == 0xAE426082u);
+
+        pCloseU(xu_iface, user);
+    }
+
+    /* 8e. Manual XTaskQueue closed with 16 un-dispatched tasks (0 leaks, all canceled!) (XGR-12) */
+    {
+        void *th_iface = NULL;
+        ASSERT_HR_EQ(QueryApiImpl(&CLSID_XThreadingImpl, &IID_IXThreadingImpl, &th_iface), S_OK);
+        const void *const *th_vtbl = *(const void *const **)th_iface;
+        fn_th_create_queue_t pCreateQueue = (fn_th_create_queue_t)th_vtbl[12];
+        fn_th_close_queue_t  pCloseQueue  = (fn_th_close_queue_t)th_vtbl[17];
+
+        XTaskQueueHandle manual_q = NULL;
+        ASSERT_HR_EQ(pCreateQueue(th_iface, XTaskQueueDispatchMode_Manual, XTaskQueueDispatchMode_Manual, &manual_q), S_OK);
+        _Atomic int canceled_count;
+        atomic_init(&canceled_count, 0);
+        for (int i = 0; i < 16; i++) {
+            struct manual_task_ctx *m = (struct manual_task_ctx *)malloc(sizeof(*m));
+            ASSERT_TRUE(m != NULL);
+            m->canceled_counter = &canceled_count;
+            ASSERT_HR_EQ(xgr_task_queue_submit_delayed(manual_q, XTaskQueuePort_Work, 0, m, manual_undispatched_task_cb), S_OK);
+        }
+        /* Closing without dispatching MUST drain & cancel all 16 tasks and release port/CS/event */
+        pCloseQueue(th_iface, manual_q);
+        ASSERT_TRUE(atomic_load_explicit(&canceled_count, memory_order_seq_cst) == 16);
+    }
+
+    /* 8f. xgr_get_env_utf8 out_cap==1 overflow guard & non-hex ONE_XGR_KEY rejection (XGR-13) */
+    {
+        char tiny1[1] = { 'X' };
+        ASSERT_TRUE(!xgr_get_env_utf8(L"ONE_XGR_APPDATA_DIR", tiny1, 1));
+        ASSERT_TRUE(tiny1[0] == '\0');
+
+        setenv("ONE_XGR_PORT", "12345", 1);
+        setenv("ONE_XGR_KEY", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", 1);
+        ASSERT_TRUE(!xgr_rpc_is_configured());
+        setenv("ONE_XGR_KEY", "\"injected_json_key_padding_0000000000000000000000000000000000000", 1);
+        ASSERT_TRUE(!xgr_rpc_is_configured());
+        unsetenv("ONE_XGR_PORT");
+        unsetenv("ONE_XGR_KEY");
+    }
+
+    /* 8g. Uncollected XGameSaveInitializeProviderAsync across UninitializeApiImpl (XGR-04: 0 double-free!) */
+    {
+        typedef HRESULT (WINAPI *fn_gs_init_async_t)(void *, XUserHandle, const char *, BOOLEAN, XAsyncBlock *);
+        fn_gs_init_async_t pInitAsync = (fn_gs_init_async_t)gs_vtbl[4];
+        XAsyncBlock *leaked_result_ab = (XAsyncBlock *)calloc(1, sizeof(*leaked_result_ab));
+        ASSERT_TRUE(leaked_result_ab != NULL);
+        ASSERT_HR_EQ(pInitAsync(gs_iface, NULL, multi_scid, FALSE, leaked_result_ab), S_OK);
+        ASSERT_HR_EQ(xgr_async_get_status(leaked_result_ab, true), S_OK);
+        /* Deliberately do NOT call XGameSaveInitializeProviderResult before UninitializeApiImpl! */
+        free(leaked_result_ab);
+    }
+}
+
+/* =========================================================================
  * Main Runner & Zero-Leak Verification Gate
  * ========================================================================= */
 
@@ -1262,12 +1574,13 @@ int main(void)
     ASSERT_HR_EQ(InitializeApiImplEx2(0, 0, 0, &init_opts), S_OK);
     ASSERT_HR_EQ(DllCanUnloadNow(), S_FALSE);
 
-    /* Suite 3..7 (production WGS binary v14, Mono GC shared provider, XUser, 25 COM vtables, AppNotify, 10k XAsync) */
+    /* Suite 3..8 (production WGS binary v14, Mono GC shared provider, XUser, 25 COM vtables, AppNotify, 10k XAsync, R4 W1-D hardening) */
     test_production_wgs_index_and_blob_lifecycle();
     test_mono_gc_shared_provider_and_edge_contracts();
     test_xuser_token_signature_and_manual_work_queue();
     test_com_vtables_legacy_iids_threading_and_appnotify();
     test_production_xasync_10000_cycles();
+    test_r4_w1d_hardening_invariants();
 
     /* Drain any detached pool workers and uninitialize entire production runtime */
     win32_drain_background_workers();

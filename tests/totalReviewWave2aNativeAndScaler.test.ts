@@ -60,6 +60,23 @@ describe('Total Project Review — Wave 2A: Native C11 Display Scaler, macOS Hel
       expect(verified.winXgrLauncher.subsystem).toBe(2);
       expect(verified.winXgrLauncherX86.machine).toBe('0x014c');
       expect(verified.winXgrLauncherX86.subsystem).toBe(2);
+
+      // XGR-08: Verify Win64 SEH .pdata unwind tables are restored on all 4 PE32+ binaries
+      // and DllCharacteristics security flags (DYNAMIC_BASE | NX_COMPAT | HIGH_ENTROPY_VA) are set
+      const SEC_X64 = 0x0020 | 0x0040 | 0x0100;
+      const SEC_X86 = 0x0040 | 0x0100;
+      expect(verified.pdataSize).toBeGreaterThan(400);
+      expect(verified.gameInputBridge.pdataSize).toBeGreaterThan(400);
+      expect(verified.winXgrLauncher.pdataSize).toBeGreaterThan(400);
+      // appnotify_bridge.c has 5 functions (+60 B over 300 B stripped CRT baseline = 360 B)
+      expect(verified.appNotifyBridge.pdataSize).toBeGreaterThanOrEqual(360);
+
+      for (const x64Art of [verified, verified.gameInputBridge, verified.appNotifyBridge, verified.winXgrLauncher]) {
+        expect(x64Art.dllCharacteristics & SEC_X64).toBe(SEC_X64);
+      }
+      for (const x86Art of [verified.xgrBridgeX86, verified.gameInputBridgeX86, verified.appNotifyBridgeX86, verified.winXgrLauncherX86]) {
+        expect(x86Art.dllCharacteristics & SEC_X86).toBe(SEC_X86);
+      }
     });
 
     it('verifies all 4 Display Scaler & Preloader Launcher PE32 & PE64 binaries (<120 KB, deterministic headers, exports, markers)', () => {
@@ -90,7 +107,7 @@ describe('Total Project Review — Wave 2A: Native C11 Display Scaler, macOS Hel
       expect(verified.launcherX64.sizeBytes).toBeLessThan(120 * 1024);
     });
 
-    it('enforces -mstackrealign on x86 targets and dead-section pruning (-ffunction-sections, -fdata-sections, -Wl,--gc-sections) across build scripts', () => {
+    it('enforces -mstackrealign + unwind stripping on x86 targets, Win64 SEH .pdata retention on x64 XGR targets, and dead-section pruning across build scripts', () => {
       const xboxBuildSrc = readRepoFile('scripts/build-xbox-bridge.cjs');
       const scalerBuildSrc = readRepoFile('scripts/build-display-scaler.cjs');
 
@@ -101,6 +118,14 @@ describe('Total Project Review — Wave 2A: Native C11 Display Scaler, macOS Hel
         expect(src).toContain('-ffunction-sections');
         expect(src).toContain('-fdata-sections');
         expect(src).toContain('-Wl,--gc-sections');
+      }
+
+      // XGR-08: Every x86_64-windows-gnu build block in build-xbox-bridge.cjs must NOT strip SEH .pdata unwind tables
+      const x64Blocks = xboxBuildSrc.match(/'x86_64-windows-gnu'[\s\S]*?'-Wall'/g) || [];
+      expect(x64Blocks.length).toBe(4);
+      for (const block of x64Blocks) {
+        expect(block).not.toContain('-fno-unwind-tables');
+        expect(block).not.toContain('-fno-asynchronous-unwind-tables');
       }
     });
 

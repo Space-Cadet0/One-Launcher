@@ -49,6 +49,9 @@ static inline HRESULT xgr_return_hr(HRESULT hr)
 #ifndef REGDB_E_CLASSNOTREG
 #define REGDB_E_CLASSNOTREG                 ((HRESULT)0x80040154L)
 #endif
+#ifndef E_HANDLE
+#define E_HANDLE                            ((HRESULT)0x80070006L)
+#endif
 #define E_GAMEUSER_NO_DEFAULT_USER          ((HRESULT)0x89245106L)
 #define E_GAMEUSER_USER_NOT_FOUND           ((HRESULT)0x89245105L)
 #define E_GAME_MISSING_GAME_CONFIG          ((HRESULT)0x87E5001FL)
@@ -420,9 +423,8 @@ struct xgr_dlc_package_entry {
     char mount_path_win[MAX_PATH];
 };
 
-/* Global Parsed Runtime Configuration */
+/* Global Parsed Runtime Configuration (synchronized externally via g_xgr_cfg_lock in xgr_xml_pfn.c) */
 struct xgr_runtime_config {
-    SRWLOCK lock;
     bool initialized;
     bool packaged;
     bool fullTrust;
@@ -471,9 +473,58 @@ struct xgr_runtime_config_snapshot {
     XVersion version;
 };
 
+/* Strict single-segment path validation for SCID / PFN / save identifiers.
+ * Rejects path traversal (".."), directory separators, drive colons,
+ * Windows invalid filename characters, ASCII control bytes, trailing dot/space,
+ * and Windows reserved DOS device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9). */
+static inline bool xgr_is_safe_path_segment(const char *s, size_t max_len)
+{
+    if (!s || !s[0] || max_len == 0) return false;
+    size_t len = 0;
+    for (; s[len] != '\0'; len++) {
+        if (len >= max_len) return false;
+        unsigned char c = (unsigned char)s[len];
+        if (c < 0x20u || c == 0x7Fu) return false;
+        if (c == '/' || c == '\\' || c == ':' || c == '*' ||
+            c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+            return false;
+        }
+        if (c == '.' && s[len + 1] == '.') return false;
+    }
+    if (len == 0) return false;
+    if (s[0] == '.' && len == 1) return false;
+    if (s[0] == ' ' || s[len - 1] == ' ' || s[len - 1] == '.') return false;
+
+    /* Check Windows reserved DOS device names (base before any '.') */
+    size_t base_len = 0;
+    while (base_len < len && s[base_len] != '.') base_len++;
+    if (base_len == 3) {
+        char b0 = (char)(s[0] >= 'a' && s[0] <= 'z' ? s[0] - 32 : s[0]);
+        char b1 = (char)(s[1] >= 'a' && s[1] <= 'z' ? s[1] - 32 : s[1]);
+        char b2 = (char)(s[2] >= 'a' && s[2] <= 'z' ? s[2] - 32 : s[2]);
+        if ((b0 == 'C' && b1 == 'O' && b2 == 'N') ||
+            (b0 == 'P' && b1 == 'R' && b2 == 'N') ||
+            (b0 == 'A' && b1 == 'U' && b2 == 'X') ||
+            (b0 == 'N' && b1 == 'U' && b2 == 'L')) {
+            return false;
+        }
+    } else if (base_len == 4) {
+        char b0 = (char)(s[0] >= 'a' && s[0] <= 'z' ? s[0] - 32 : s[0]);
+        char b1 = (char)(s[1] >= 'a' && s[1] <= 'z' ? s[1] - 32 : s[1]);
+        char b2 = (char)(s[2] >= 'a' && s[2] <= 'z' ? s[2] - 32 : s[2]);
+        char b3 = s[3];
+        if (b3 >= '1' && b3 <= '9') {
+            if ((b0 == 'C' && b1 == 'O' && b2 == 'M') ||
+                (b0 == 'L' && b1 == 'P' && b2 == 'T')) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 extern struct xgr_runtime_config g_xgr_cfg;
 extern const char g_one_launcher_xgr_bridge_marker[];
-HRESULT WINAPI xgr_not_impl_stub(void *iface);
 
 /* -------------------------------------------------------------------------
  * Verified CLSIDs & IIDs (Exact Match to Microsoft Retail xgameruntime.dll)
@@ -700,6 +751,7 @@ typedef struct XGR_PFGameSaveUICallbacks {
 typedef void *(WINAPI *xgr_playfab_proc_resolver_fn)(const char *proc_name);
 void *xgr_playfab_resolve_iat_replacement(const char *fn_name, void *orig_proc);
 void xgr_playfab_set_symbol_resolver_for_test(xgr_playfab_proc_resolver_fn resolver);
+void xgr_playfab_set_uninit_timeout_ms_for_test(uint32_t timeout_ms);
 void xgr_playfab_shim_reset(void);
 HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesInitialize(const XGR_PFGameSaveInitArgs *args);
 HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesSetUiCallbacks(const XGR_PFGameSaveUICallbacks *callbacks);

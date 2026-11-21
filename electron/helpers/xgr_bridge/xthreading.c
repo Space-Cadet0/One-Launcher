@@ -19,6 +19,8 @@ struct waiter_entry {
     XTaskQueuePort port;
     void *context;
     XTaskQueueCallback *callback;
+    volatile LONG closed;
+    volatile LONG callback_tid;
 };
 
 struct queued_task {
@@ -42,7 +44,7 @@ struct XTaskQueuePortObject {
     struct queued_task *head;
     struct queued_task *tail;
     volatile LONG queued_count;
-    bool terminating;
+    volatile LONG terminating;
     HANDLE terminated_event;
     HANDLE worker_thread;
     volatile LONG worker_tid;
@@ -80,9 +82,11 @@ struct xgr_async_state {
     const void *identity;
     XTaskQueueHandle effective_queue;
     HANDLE ready_event;
+    CRITICAL_SECTION state_cs;
     volatile HRESULT status;
     volatile LONG ref_count;
     volatile LONG cleanup_ran;
+    volatile LONG result_claimed;
     int32_t ring_slot;
     bool in_active_list;
     uint64_t cookie;
@@ -106,7 +110,7 @@ _Static_assert(sizeof(struct xgr_async_block_wire) <= sizeof(((XAsyncBlock *)0)-
 static INIT_ONCE g_async_ring_once = INIT_ONCE_STATIC_INIT;
 static volatile LONG g_async_ring_ready = 0;
 static CRITICAL_SECTION g_async_ring_cs;
-static volatile LONGLONG g_next_async_cookie = 1;
+_Alignas(8) static volatile LONGLONG g_next_async_cookie = 1;
 static struct xgr_async_state *g_active_head = NULL;
 static struct xgr_async_state *g_completed_ring[XGR_COMPLETED_RING_SIZE];
 
@@ -164,6 +168,22 @@ static void port_owner_addref(XTaskQueuePortHandle port)
     }
 }
 
+static inline bool port_is_terminating(XTaskQueuePortHandle port)
+{
+    return InterlockedCompareExchange(&port->terminating, 0, 0) != 0;
+}
+
+static void port_complete_one_task(XTaskQueuePortHandle port)
+{
+    EnterCriticalSection(&port->cs);
+    LONG rem = InterlockedDecrement(&port->queued_count);
+    if (rem == 0 && InterlockedCompareExchange(&port->terminating, 0, 0) != 0 && port->terminated_event) {
+        SetEvent(port->terminated_event);
+        WakeAllConditionVariable(&port->cv);
+    }
+    LeaveCriticalSection(&port->cs);
+}
+
 static DWORD WINAPI serialized_port_worker(LPVOID arg)
 {
     XTaskQueuePortHandle port = (XTaskQueuePortHandle)arg;
@@ -173,7 +193,7 @@ static DWORD WINAPI serialized_port_worker(LPVOID arg)
         bool is_canceled = false;
 
         EnterCriticalSection(&port->cs);
-        while (!port->terminating) {
+        while (!port_is_terminating(port)) {
             ULONGLONG now = GetTickCount64();
             struct queued_task *prev = NULL, *cur = port->head;
             DWORD min_wait = INFINITE;
@@ -198,14 +218,16 @@ static DWORD WINAPI serialized_port_worker(LPVOID arg)
             SleepConditionVariableCS(&port->cv, &port->cs, min_wait);
         }
 
-        if (!ready && port->terminating) {
+        if (!ready && port_is_terminating(port)) {
             if (port->head) {
                 ready = port->head;
                 port->head = ready->next;
                 if (!port->head) port->tail = NULL;
                 is_canceled = true;
             } else {
-                SetEvent(port->terminated_event);
+                if (InterlockedCompareExchange(&port->queued_count, 0, 0) == 0 && port->terminated_event) {
+                    SetEvent(port->terminated_event);
+                }
                 LeaveCriticalSection(&port->cs);
                 break;
             }
@@ -214,9 +236,7 @@ static DWORD WINAPI serialized_port_worker(LPVOID arg)
 
         if (ready) {
             if (ready->callback) ready->callback(ready->context, is_canceled);
-            if (InterlockedDecrement(&port->queued_count) == 0 && port->terminating) {
-                SetEvent(port->terminated_event);
-            }
+            port_complete_one_task(port);
             port_release(port);
             free(ready);
         }
@@ -232,14 +252,20 @@ static VOID CALLBACK tp_work_item_cb(PTP_CALLBACK_INSTANCE inst, PVOID ctx, PTP_
     struct queued_task *task = (struct queued_task *)ctx;
     XTaskQueuePortHandle port = task->port;
     ULONGLONG now = GetTickCount64();
-    if (task->due_tick > now && !port->terminating) {
-        Sleep((DWORD)(task->due_tick - now));
+    if (task->due_tick > now && !port_is_terminating(port)) {
+        EnterCriticalSection(&port->cs);
+        while (!port_is_terminating(port)) {
+            now = GetTickCount64();
+            if (now >= task->due_tick) break;
+            ULONGLONG diff = task->due_tick - now;
+            DWORD wait_ms = (diff > 0x7fffffffULL) ? 0x7fffffffU : (DWORD)diff;
+            SleepConditionVariableCS(&port->cv, &port->cs, wait_ms);
+        }
+        LeaveCriticalSection(&port->cs);
     }
-    bool canceled = port->terminating;
+    bool canceled = port_is_terminating(port);
     if (task->callback) task->callback(task->context, canceled);
-    if (InterlockedDecrement(&port->queued_count) == 0 && port->terminating) {
-        SetEvent(port->terminated_event);
-    }
+    port_complete_one_task(port);
     port_release(port);
     free(task);
     CloseThreadpoolWork(work);
@@ -312,13 +338,31 @@ static void port_owner_release(XTaskQueuePortHandle port)
 {
     if (!port) return;
     if (InterlockedDecrement(&port->owner_refs) == 0) {
+        struct queued_task *manual_drain = NULL;
         EnterCriticalSection(&port->cs);
-        port->terminating = true;
-        if (port->queued_count == 0 && port->terminated_event) {
+        InterlockedExchange(&port->terminating, 1);
+        if (port->mode == XTaskQueueDispatchMode_Manual && port->head) {
+            /* Drain all un-dispatched tasks on Manual port so neither tasks nor port leak! */
+            manual_drain = port->head;
+            port->head = NULL;
+            port->tail = NULL;
+        }
+        if (InterlockedCompareExchange(&port->queued_count, 0, 0) == 0 && port->terminated_event) {
             SetEvent(port->terminated_event);
         }
         WakeAllConditionVariable(&port->cv);
         LeaveCriticalSection(&port->cs);
+
+        while (manual_drain) {
+            struct queued_task *next = manual_drain->next;
+            if (manual_drain->callback) {
+                manual_drain->callback(manual_drain->context, true);
+            }
+            port_complete_one_task(port);
+            port_release(port);
+            free(manual_drain);
+            manual_drain = next;
+        }
 
         if (port->worker_thread) {
             DWORD cur_tid = GetCurrentThreadId();
@@ -340,9 +384,15 @@ void xgr_task_queue_close(XTaskQueueHandle queue)
         struct waiter_entry *w = queue->waiters;
         queue->waiters = NULL;
         LeaveCriticalSection(&queue->mon_cs);
+        DWORD cur_tid = GetCurrentThreadId();
         while (w) {
             struct waiter_entry *next = w->next;
-            if (w->wait_object) UnregisterWaitEx(w->wait_object, INVALID_HANDLE_VALUE);
+            InterlockedExchange(&w->closed, 1);
+            if (w->wait_object) {
+                DWORD cb_tid = (DWORD)InterlockedCompareExchange(&w->callback_tid, 0, 0);
+                HANDLE completion_ev = (cb_tid == cur_tid) ? NULL : INVALID_HANDLE_VALUE;
+                UnregisterWaitEx(w->wait_object, completion_ev);
+            }
             free(w);
             w = next;
         }
@@ -422,7 +472,7 @@ HRESULT xgr_task_queue_submit_delayed(XTaskQueueHandle queue, XTaskQueuePort por
     }
 
     EnterCriticalSection(&port->cs);
-    if (port->terminating) {
+    if (port_is_terminating(port)) {
         LeaveCriticalSection(&port->cs);
         if (temp_ref) xgr_task_queue_close(queue);
         return E_ABORT;
@@ -434,9 +484,7 @@ HRESULT xgr_task_queue_submit_delayed(XTaskQueueHandle queue, XTaskQueuePort por
     if (port->mode == XTaskQueueDispatchMode_Immediate && delayMs == 0) {
         notify_monitors(queue, port_type);
         cb(ctx, false);
-        if (InterlockedDecrement(&port->queued_count) == 0 && port->terminating) {
-            SetEvent(port->terminated_event);
-        }
+        port_complete_one_task(port);
         port_release(port);
         if (temp_ref) xgr_task_queue_close(queue);
         return S_OK;
@@ -444,7 +492,7 @@ HRESULT xgr_task_queue_submit_delayed(XTaskQueueHandle queue, XTaskQueuePort por
 
     struct queued_task *task = (struct queued_task *)calloc(1, sizeof(*task));
     if (!task) {
-        InterlockedDecrement(&port->queued_count);
+        port_complete_one_task(port);
         port_release(port);
         if (temp_ref) xgr_task_queue_close(queue);
         return E_OUTOFMEMORY;
@@ -461,7 +509,7 @@ HRESULT xgr_task_queue_submit_delayed(XTaskQueueHandle queue, XTaskQueuePort por
         PTP_WORK work = CreateThreadpoolWork(tp_work_item_cb, task, NULL);
         if (!work) {
             free(task);
-            InterlockedDecrement(&port->queued_count);
+            port_complete_one_task(port);
             port_release(port);
             if (temp_ref) xgr_task_queue_close(queue);
             return E_OUTOFMEMORY;
@@ -517,6 +565,7 @@ static void release_async_state(struct xgr_async_state *st)
             CloseHandle(st->ready_event);
             st->ready_event = NULL;
         }
+        DeleteCriticalSection(&st->state_cs);
         free(st);
     }
 }
@@ -524,12 +573,14 @@ static void release_async_state(struct xgr_async_state *st)
 static void cleanup_async_state_once(struct xgr_async_state *st)
 {
     if (!st) return;
+    EnterCriticalSection(&st->state_cs);
     if (InterlockedExchange(&st->cleanup_ran, 1) == 0) {
         if (st->provider) {
             st->provider(XAsyncOp_Cleanup, &st->data);
         }
         st->data.context = NULL;
     }
+    LeaveCriticalSection(&st->state_cs);
 }
 
 static void active_list_insert_locked(struct xgr_async_state *st)
@@ -686,9 +737,20 @@ static void retire_state_from_ring(struct xgr_async_state *st)
 
 void xgr_threading_shutdown(void)
 {
+    /* Close process queue first so queued async callbacks finish/cancel before draining active states */
+    AcquireSRWLockExclusive(&g_proc_queue_lock);
+    XTaskQueueHandle pq = g_proc_queue;
+    g_proc_queue = NULL;
+    g_proc_queue_created = false;
+    ReleaseSRWLockExclusive(&g_proc_queue_lock);
+    if (pq) {
+        xgr_task_queue_close(pq);
+    }
+
     if (InterlockedCompareExchange(&g_async_ring_ready, 0, 0) != 0) {
         struct xgr_async_state *to_free[XGR_COMPLETED_RING_SIZE];
         size_t n = 0;
+        struct xgr_async_state *active_drain = NULL;
 
         EnterCriticalSection(&g_async_ring_cs);
         for (int i = 0; i < XGR_COMPLETED_RING_SIZE; i++) {
@@ -698,21 +760,27 @@ void xgr_threading_shutdown(void)
                 g_completed_ring[i] = NULL;
             }
         }
+        while (g_active_head) {
+            struct xgr_async_state *st = g_active_head;
+            active_list_remove_locked(st);
+            st->active_next = active_drain;
+            active_drain = st;
+        }
         LeaveCriticalSection(&g_async_ring_cs);
 
         for (size_t i = 0; i < n; i++) {
             cleanup_async_state_once(to_free[i]);
             release_async_state(to_free[i]);
         }
-    }
-
-    AcquireSRWLockExclusive(&g_proc_queue_lock);
-    XTaskQueueHandle pq = g_proc_queue;
-    g_proc_queue = NULL;
-    g_proc_queue_created = false;
-    ReleaseSRWLockExclusive(&g_proc_queue_lock);
-    if (pq) {
-        xgr_task_queue_close(pq);
+        while (active_drain) {
+            struct xgr_async_state *next = active_drain->active_next;
+            active_drain->active_next = NULL;
+            active_drain->status = E_ABORT;
+            if (active_drain->ready_event) SetEvent(active_drain->ready_event);
+            cleanup_async_state_once(active_drain);
+            release_async_state(active_drain);
+            active_drain = next;
+        }
     }
     /* Keep g_time_sensitive_tls process-scoped; never reset g_tls_once or TlsFree mid-process */
 }
@@ -729,14 +797,18 @@ static void CALLBACK async_work_runner(void *ctx, bool canceled)
 {
     struct xgr_async_state *st = (struct xgr_async_state *)ctx;
     if (!st) return;
-    if (st->provider) {
-        st->provider(canceled ? XAsyncOp_Cancel : XAsyncOp_DoWork, &st->data);
-    }
     if (canceled) {
+        EnterCriticalSection(&st->state_cs);
+        if (st->provider && InterlockedCompareExchange(&st->cleanup_ran, 0, 0) == 0) {
+            st->provider(XAsyncOp_Cancel, &st->data);
+        }
         st->status = E_ABORT;
+        LeaveCriticalSection(&st->state_cs);
         park_completed_state(st);
         SetEvent(st->ready_event);
         cleanup_async_state_once(st);
+    } else if (st->provider) {
+        st->provider(XAsyncOp_DoWork, &st->data);
     }
     release_async_state(st);
 }
@@ -749,9 +821,13 @@ static void CALLBACK async_completion_runner(void *ctx, bool canceled)
     XAsyncBlock *ab = st->data.async;
     XAsyncCompletionRoutine *user_cb = (!canceled && ab) ? ab->callback : NULL;
 
-    if (canceled && st->provider) {
-        st->provider(XAsyncOp_Cancel, &st->data);
+    if (canceled) {
+        EnterCriticalSection(&st->state_cs);
+        if (st->provider && InterlockedCompareExchange(&st->cleanup_ran, 0, 0) == 0) {
+            st->provider(XAsyncOp_Cancel, &st->data);
+        }
         st->status = E_ABORT;
+        LeaveCriticalSection(&st->state_cs);
     }
 
     park_completed_state(st);
@@ -777,11 +853,13 @@ HRESULT xgr_async_begin(XAsyncBlock *async, void *context, const void *identity,
     struct xgr_async_state *st = (struct xgr_async_state *)calloc(1, sizeof(*st));
     if (!st) return xgr_return_hr(E_OUTOFMEMORY);
 
+    InitializeCriticalSection(&st->state_cs);
     st->status = E_PENDING;
     st->provider = provider;
     st->identity = identity;
     st->ref_count = 1; /* Owned by g_active_head until completion */
     st->cleanup_ran = 0;
+    st->result_claimed = 0;
     st->ring_slot = -1;
     st->in_active_list = false;
     st->cookie = (uint64_t)InterlockedIncrement64(&g_next_async_cookie);
@@ -792,6 +870,7 @@ HRESULT xgr_async_begin(XAsyncBlock *async, void *context, const void *identity,
     st->data.context = context;
     st->ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!st->ready_event) {
+        DeleteCriticalSection(&st->state_cs);
         free(st);
         return xgr_return_hr(E_OUTOFMEMORY);
     }
@@ -799,12 +878,14 @@ HRESULT xgr_async_begin(XAsyncBlock *async, void *context, const void *identity,
     if (async->queue) {
         if (FAILED(xgr_task_queue_duplicate(async->queue, &st->effective_queue))) {
             CloseHandle(st->ready_event);
+            DeleteCriticalSection(&st->state_cs);
             free(st);
             return xgr_return_hr(E_INVALIDARG);
         }
     } else {
         if (!xgr_task_queue_get_process(&st->effective_queue)) {
             CloseHandle(st->ready_event);
+            DeleteCriticalSection(&st->state_cs);
             free(st);
             return xgr_return_hr(E_INVALIDARG);
         }
@@ -949,7 +1030,6 @@ HRESULT xgr_async_get_result_size(XAsyncBlock *async, size_t *bufferSize)
 
 HRESULT xgr_async_get_result(XAsyncBlock *async, const void *identity, size_t bufferSize, void *buffer, size_t *bufferUsed)
 {
-    (void)identity;
     if (!async) return xgr_return_hr(E_INVALIDARG);
 
     bool is_retired = false;
@@ -964,9 +1044,19 @@ HRESULT xgr_async_get_result(XAsyncBlock *async, const void *identity, size_t bu
         if (st) release_async_state(st);
         return xgr_return_hr(E_INVALIDARG);
     }
+    if (st->identity && identity && st->identity != identity) {
+        release_async_state(st);
+        return xgr_return_hr(E_INVALIDARG);
+    }
     if (WaitForSingleObject(st->ready_event, 0) == WAIT_TIMEOUT) {
         release_async_state(st);
         return xgr_return_hr(E_PENDING);
+    }
+
+    if (InterlockedCompareExchange(&st->result_claimed, 1, 0) != 0) {
+        if (bufferUsed) *bufferUsed = 0;
+        release_async_state(st);
+        return xgr_return_hr(E_INVALIDARG);
     }
 
     HRESULT status = st->status;
@@ -979,23 +1069,31 @@ HRESULT xgr_async_get_result(XAsyncBlock *async, const void *identity, size_t bu
         return xgr_return_hr(status);
     }
 
-    if (bufferSize < st->data.bufferSize) {
+    size_t req_size = st->data.bufferSize;
+    if (bufferSize < req_size) {
+        InterlockedExchange(&st->result_claimed, 0);
         release_async_state(st);
         return xgr_return_hr(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
     }
 
-    st->data.buffer = buffer;
-    HRESULT hr = (st->data.bufferSize > 0 && st->provider)
-        ? st->provider(XAsyncOp_GetResult, &st->data)
+    /* Pass a thread-local XAsyncProviderData with caller's actual buffer/bufferSize under state_cs */
+    EnterCriticalSection(&st->state_cs);
+    XAsyncProviderData call_data = st->data;
+    call_data.buffer = buffer;
+    call_data.bufferSize = bufferSize;
+    HRESULT hr = (req_size > 0 && st->provider && InterlockedCompareExchange(&st->cleanup_ran, 0, 0) == 0)
+        ? st->provider(XAsyncOp_GetResult, &call_data)
         : S_OK;
+    LeaveCriticalSection(&st->state_cs);
 
     if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) || hr == E_GS_PROVIDED_BUFFER_TOO_SMALL) {
         if (bufferUsed) *bufferUsed = 0;
+        InterlockedExchange(&st->result_claimed, 0);
         release_async_state(st);
         return xgr_return_hr(hr);
     }
 
-    if (bufferUsed) *bufferUsed = SUCCEEDED(hr) ? st->data.bufferSize : 0;
+    if (bufferUsed) *bufferUsed = SUCCEEDED(hr) ? req_size : 0;
 
     write_wire_retired(async, hr);
     retire_state_from_ring(st);
@@ -1021,13 +1119,19 @@ static HRESULT CALLBACK generic_run_provider(XAsyncOp op, const XAsyncProviderDa
  * IXThreadingImpl Vtable Methods (Exact 31-Slot Layout)
  * ------------------------------------------------------------------------- */
 
+typedef struct IXThreadingImplVtbl IXThreadingImplVtbl;
+
 typedef struct IXThreadingImplObj {
-    const void *lpVtbl;
+    const IXThreadingImplVtbl *lpVtbl;
 } IXThreadingImplObj;
 
 static HRESULT WINAPI th_QueryInterface(void *iface, REFIID riid, void **ppv)
 {
     if (!ppv) return E_POINTER;
+    if (!riid) {
+        *ppv = NULL;
+        return E_INVALIDARG;
+    }
     if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IXThreadingImpl)) {
         *ppv = iface;
         return S_OK;
@@ -1056,7 +1160,11 @@ static void WINAPI th_XAsyncCancel(void *iface, XAsyncBlock *ab)
     (void)iface;
     struct xgr_async_state *st = acquire_async_state(ab, NULL, NULL);
     if (st) {
-        if (st->provider) st->provider(XAsyncOp_Cancel, &st->data);
+        EnterCriticalSection(&st->state_cs);
+        if (st->provider && InterlockedCompareExchange(&st->cleanup_ran, 0, 0) == 0) {
+            st->provider(XAsyncOp_Cancel, &st->data);
+        }
+        LeaveCriticalSection(&st->state_cs);
         release_async_state(st);
     }
     xgr_sync_teb_last_error();
@@ -1074,7 +1182,12 @@ static HRESULT WINAPI th_XAsyncBegin(void *iface, XAsyncBlock *ab, void *ctx, co
     return xgr_async_begin(ab, ctx, id, name, prov);
 }
 
-static HRESULT WINAPI th_PADDING_1(void *iface) { (void)iface; return E_NOTIMPL; }
+/* Slot 8: XAsyncBeginAlloc — exact 6-arg __stdcall arity (cleans 24 bytes on x86) */
+static HRESULT WINAPI th_XAsyncBeginAlloc(void *iface, XAsyncBlock *ab, const void *id, const char *name, XAsyncProvider *prov, size_t contextSize)
+{
+    (void)iface; (void)ab; (void)id; (void)name; (void)prov; (void)contextSize;
+    return xgr_return_hr(E_NOTIMPL);
+}
 
 static HRESULT WINAPI th_XAsyncSchedule(void *iface, XAsyncBlock *ab, UINT32 delayMs)
 {
@@ -1178,27 +1291,53 @@ static BOOLEAN WINAPI th_XTaskQueueDispatch(void *iface, XTaskQueueHandle q, XTa
         struct queued_task *ready = NULL;
         bool canceled = false;
         EnterCriticalSection(&port->cs);
-        ULONGLONG now = GetTickCount64();
-        struct queued_task *prev = NULL, *cur = port->head;
-        while (cur) {
-            if (port->terminating || cur->due_tick <= now) {
-                ready = cur;
-                canceled = port->terminating;
-                if (prev) prev->next = cur->next;
-                else port->head = cur->next;
-                if (port->tail == cur) port->tail = prev;
+        for (;;) {
+            ULONGLONG now = GetTickCount64();
+            bool term = port_is_terminating(port);
+            struct queued_task *prev = NULL, *cur = port->head;
+            DWORD min_wait = INFINITE;
+            while (cur) {
+                if (term || cur->due_tick <= now) {
+                    ready = cur;
+                    canceled = term;
+                    if (prev) prev->next = cur->next;
+                    else port->head = cur->next;
+                    if (port->tail == cur) port->tail = prev;
+                    break;
+                } else {
+                    ULONGLONG diff = cur->due_tick - now;
+                    DWORD dw = (diff > 0x7fffffffULL) ? 0x7fffffffU : (DWORD)diff;
+                    if (dw < min_wait) min_wait = dw;
+                }
+                prev = cur;
+                cur = cur->next;
+            }
+            if (ready) break;
+
+            if (port_type == XTaskQueuePort_Completion && q->term_cb &&
+                WaitForSingleObject(q->work->terminated_event, 0) == WAIT_OBJECT_0 &&
+                WaitForSingleObject(q->completion->terminated_event, 0) == WAIT_OBJECT_0) {
                 break;
             }
-            prev = cur;
-            cur = cur->next;
+
+            if (timeoutMs == 0) break;
+            DWORD wait_ms = min_wait;
+            if (timeoutMs != INFINITE) {
+                ULONGLONG elapsed = now - start;
+                if (elapsed >= (ULONGLONG)timeoutMs) break;
+                DWORD rem = (DWORD)((ULONGLONG)timeoutMs - elapsed);
+                if (rem < wait_ms) wait_ms = rem;
+            }
+            if (port_type == XTaskQueuePort_Completion && q->term_cb && wait_ms > 50U) {
+                wait_ms = 50U;
+            }
+            SleepConditionVariableCS(&port->cv, &port->cs, wait_ms);
         }
         LeaveCriticalSection(&port->cs);
 
         if (ready) {
             if (ready->callback) ready->callback(ready->context, canceled);
-            if (InterlockedDecrement(&port->queued_count) == 0 && port->terminating) {
-                SetEvent(port->terminated_event);
-            }
+            port_complete_one_task(port);
             port_release(port);
             free(ready);
             dispatched = TRUE;
@@ -1215,9 +1354,7 @@ static BOOLEAN WINAPI th_XTaskQueueDispatch(void *iface, XTaskQueueHandle q, XTa
                 break;
             }
         }
-
-        if (timeoutMs == 0 || (timeoutMs != INFINITE && (GetTickCount64() - start) >= timeoutMs)) break;
-        Sleep(1);
+        break;
     }
 
     if (temp_ref) xgr_task_queue_close(q);
@@ -1248,9 +1385,12 @@ static VOID CALLBACK win32_waiter_fired(PVOID param, BOOLEAN timerOrWaitFired)
 {
     (void)timerOrWaitFired;
     struct waiter_entry *w = (struct waiter_entry *)param;
-    if (w && w->callback) {
+    if (!w || InterlockedCompareExchange(&w->closed, 0, 0) != 0) return;
+    InterlockedExchange(&w->callback_tid, (LONG)GetCurrentThreadId());
+    if (w->callback && InterlockedCompareExchange(&w->closed, 0, 0) == 0) {
         xgr_task_queue_submit_delayed(w->queue, w->port, 0, w->context, w->callback);
     }
+    InterlockedExchange(&w->callback_tid, 0);
 }
 
 static HRESULT WINAPI th_XTaskQueueRegisterWaiter(void *iface, XTaskQueueHandle q, XTaskQueuePort port, HANDLE waitHandle, void *ctx, XTaskQueueCallback *cb, XTaskQueueRegistrationToken *token)
@@ -1316,7 +1456,13 @@ static void WINAPI th_XTaskQueueUnregisterWaiter(void *iface, XTaskQueueHandle q
     }
     LeaveCriticalSection(&q->mon_cs);
     if (found) {
-        if (found->wait_object) UnregisterWaitEx(found->wait_object, INVALID_HANDLE_VALUE);
+        InterlockedExchange(&found->closed, 1);
+        if (found->wait_object) {
+            DWORD cur_tid = GetCurrentThreadId();
+            DWORD cb_tid = (DWORD)InterlockedCompareExchange(&found->callback_tid, 0, 0);
+            HANDLE completion_ev = (cb_tid == cur_tid) ? NULL : INVALID_HANDLE_VALUE;
+            UnregisterWaitEx(found->wait_object, completion_ev);
+        }
         free(found);
     }
     if (release_extra) xgr_task_queue_close(q);
@@ -1333,14 +1479,14 @@ static HRESULT WINAPI th_XTaskQueueTerminate(void *iface, XTaskQueueHandle q, BO
 
     if (!q->composite) {
         EnterCriticalSection(&q->work->cs);
-        q->work->terminating = true;
-        if (q->work->queued_count == 0) SetEvent(q->work->terminated_event);
+        InterlockedExchange(&q->work->terminating, 1);
+        if (InterlockedCompareExchange(&q->work->queued_count, 0, 0) == 0) SetEvent(q->work->terminated_event);
         WakeAllConditionVariable(&q->work->cv);
         LeaveCriticalSection(&q->work->cs);
 
         EnterCriticalSection(&q->completion->cs);
-        q->completion->terminating = true;
-        if (q->completion->queued_count == 0) SetEvent(q->completion->terminated_event);
+        InterlockedExchange(&q->completion->terminating, 1);
+        if (InterlockedCompareExchange(&q->completion->queued_count, 0, 0) == 0) SetEvent(q->completion->terminated_event);
         WakeAllConditionVariable(&q->completion->cv);
         LeaveCriticalSection(&q->completion->cs);
 
@@ -1455,41 +1601,77 @@ static HRESULT WINAPI th_XThreadVerifyNotTimeSensitive(void *iface)
 
 static void WINAPI th_XThreadAssertNotTimeSensitive(void *iface) { (void)iface; }
 
-static const void *const g_xthreading_vtbl[31] = {
-    (const void *)th_QueryInterface,                        /* 0 */
-    (const void *)th_AddRef,                                /* 1 */
-    (const void *)th_Release,                               /* 2 */
-    (const void *)th_XAsyncGetStatus,                       /* 3 */
-    (const void *)th_XAsyncGetResultSize,                   /* 4 */
-    (const void *)th_XAsyncCancel,                          /* 5 */
-    (const void *)th_XAsyncRun,                             /* 6 */
-    (const void *)th_XAsyncBegin,                           /* 7 */
-    (const void *)th_PADDING_1,                             /* 8: __PADDING__ */
-    (const void *)th_XAsyncSchedule,                        /* 9 */
-    (const void *)th_XAsyncComplete,                        /* 10 */
-    (const void *)th_XAsyncGetResult,                       /* 11 */
-    (const void *)th_XTaskQueueCreate,                      /* 12 */
-    (const void *)th_XTaskQueueCreateComposite,             /* 13 */
-    (const void *)th_XTaskQueueGetPort,                     /* 14 */
-    (const void *)th_XTaskQueueDuplicateHandle,             /* 15 */
-    (const void *)th_XTaskQueueDispatch,                    /* 16 */
-    (const void *)th_XTaskQueueCloseHandle,                 /* 17 */
-    (const void *)th_XTaskQueueSubmitCallback,              /* 18 */
-    (const void *)th_XTaskQueueSubmitDelayedCallback,       /* 19 */
-    (const void *)th_XTaskQueueRegisterWaiter,              /* 20 */
-    (const void *)th_XTaskQueueUnregisterWaiter,            /* 21 */
-    (const void *)th_XTaskQueueTerminate,                   /* 22 */
-    (const void *)th_XTaskQueueRegisterMonitor,             /* 23 */
-    (const void *)th_XTaskQueueUnregisterMonitor,           /* 24 */
-    (const void *)th_XTaskQueueGetCurrentProcessTaskQueue,  /* 25 */
-    (const void *)th_XTaskQueueSetCurrentProcessTaskQueue,  /* 26 */
-    (const void *)th_XThreadSetTimeSensitive,               /* 27 */
-    (const void *)th_XThreadVerifyNotTimeSensitive,         /* 28 */
-    (const void *)th_XThreadAssertNotTimeSensitive,         /* 29 */
-    (const void *)th_XThreadIsTimeSensitive                 /* 30 */
+struct IXThreadingImplVtbl {
+    HRESULT (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);                                                 /* 0 */
+    ULONG   (WINAPI *AddRef)(void *iface);                                                                                  /* 1 */
+    ULONG   (WINAPI *Release)(void *iface);                                                                                 /* 2 */
+    HRESULT (WINAPI *XAsyncGetStatus)(void *iface, XAsyncBlock *ab, BOOLEAN wait);                                          /* 3 */
+    HRESULT (WINAPI *XAsyncGetResultSize)(void *iface, XAsyncBlock *ab, size_t *sz);                                        /* 4 */
+    void    (WINAPI *XAsyncCancel)(void *iface, XAsyncBlock *ab);                                                           /* 5 */
+    HRESULT (WINAPI *XAsyncRun)(void *iface, XAsyncBlock *ab, XAsyncWork *work);                                            /* 6 */
+    HRESULT (WINAPI *XAsyncBegin)(void *iface, XAsyncBlock *ab, void *ctx, const void *id, const char *name, XAsyncProvider *prov); /* 7 */
+    HRESULT (WINAPI *XAsyncBeginAlloc)(void *iface, XAsyncBlock *ab, const void *id, const char *name, XAsyncProvider *prov, size_t contextSize); /* 8 */
+    HRESULT (WINAPI *XAsyncSchedule)(void *iface, XAsyncBlock *ab, UINT32 delayMs);                                         /* 9 */
+    void    (WINAPI *XAsyncComplete)(void *iface, XAsyncBlock *ab, HRESULT result, size_t reqSize);                         /* 10 */
+    HRESULT (WINAPI *XAsyncGetResult)(void *iface, XAsyncBlock *ab, const void *id, size_t bufSize, void *buf, size_t *used); /* 11 */
+    HRESULT (WINAPI *XTaskQueueCreate)(void *iface, XTaskQueueDispatchMode wm, XTaskQueueDispatchMode cm, XTaskQueueHandle *q); /* 12 */
+    HRESULT (WINAPI *XTaskQueueCreateComposite)(void *iface, XTaskQueuePortHandle wp, XTaskQueuePortHandle cp, XTaskQueueHandle *out); /* 13 */
+    HRESULT (WINAPI *XTaskQueueGetPort)(void *iface, XTaskQueueHandle q, XTaskQueuePort port, XTaskQueuePortHandle *out);   /* 14 */
+    HRESULT (WINAPI *XTaskQueueDuplicateHandle)(void *iface, XTaskQueueHandle q, XTaskQueueHandle *dup);                    /* 15 */
+    BOOLEAN (WINAPI *XTaskQueueDispatch)(void *iface, XTaskQueueHandle q, XTaskQueuePort port_type, UINT32 timeoutMs);      /* 16 */
+    void    (WINAPI *XTaskQueueCloseHandle)(void *iface, XTaskQueueHandle q);                                               /* 17 */
+    HRESULT (WINAPI *XTaskQueueSubmitCallback)(void *iface, XTaskQueueHandle q, XTaskQueuePort port, void *ctx, XTaskQueueCallback *cb); /* 18 */
+    HRESULT (WINAPI *XTaskQueueSubmitDelayedCallback)(void *iface, XTaskQueueHandle q, XTaskQueuePort port, UINT32 delayMs, void *ctx, XTaskQueueCallback *cb); /* 19 */
+    HRESULT (WINAPI *XTaskQueueRegisterWaiter)(void *iface, XTaskQueueHandle q, XTaskQueuePort port, HANDLE waitHandle, void *ctx, XTaskQueueCallback *cb, XTaskQueueRegistrationToken *token); /* 20 */
+    void    (WINAPI *XTaskQueueUnregisterWaiter)(void *iface, XTaskQueueHandle q, XTaskQueueRegistrationToken token);       /* 21 */
+    HRESULT (WINAPI *XTaskQueueTerminate)(void *iface, XTaskQueueHandle q, BOOLEAN wait, void *ctx, XTaskQueueTerminatedCallback *cb); /* 22 */
+    HRESULT (WINAPI *XTaskQueueRegisterMonitor)(void *iface, XTaskQueueHandle q, void *ctx, XTaskQueueMonitorCallback *cb, XTaskQueueRegistrationToken *token); /* 23 */
+    void    (WINAPI *XTaskQueueUnregisterMonitor)(void *iface, XTaskQueueHandle q, XTaskQueueRegistrationToken token);      /* 24 */
+    BOOLEAN (WINAPI *XTaskQueueGetCurrentProcessTaskQueue)(void *iface, XTaskQueueHandle *q);                               /* 25 */
+    void    (WINAPI *XTaskQueueSetCurrentProcessTaskQueue)(void *iface, XTaskQueueHandle q);                                /* 26 */
+    HRESULT (WINAPI *XThreadSetTimeSensitive)(void *iface, BOOLEAN sensitive);                                              /* 27 */
+    HRESULT (WINAPI *XThreadVerifyNotTimeSensitive)(void *iface);                                                           /* 28 */
+    void    (WINAPI *XThreadAssertNotTimeSensitive)(void *iface);                                                           /* 29 */
+    BOOLEAN (WINAPI *XThreadIsTimeSensitive)(void *iface);                                                                  /* 30 */
 };
 
-static IXThreadingImplObj g_xthreading_singleton = { g_xthreading_vtbl };
+_Static_assert(sizeof(IXThreadingImplVtbl) == 31 * sizeof(void *), "IXThreadingImplVtbl must have exactly 31 slots");
+
+static const IXThreadingImplVtbl g_xthreading_vtbl = {
+    th_QueryInterface,
+    th_AddRef,
+    th_Release,
+    th_XAsyncGetStatus,
+    th_XAsyncGetResultSize,
+    th_XAsyncCancel,
+    th_XAsyncRun,
+    th_XAsyncBegin,
+    th_XAsyncBeginAlloc,
+    th_XAsyncSchedule,
+    th_XAsyncComplete,
+    th_XAsyncGetResult,
+    th_XTaskQueueCreate,
+    th_XTaskQueueCreateComposite,
+    th_XTaskQueueGetPort,
+    th_XTaskQueueDuplicateHandle,
+    th_XTaskQueueDispatch,
+    th_XTaskQueueCloseHandle,
+    th_XTaskQueueSubmitCallback,
+    th_XTaskQueueSubmitDelayedCallback,
+    th_XTaskQueueRegisterWaiter,
+    th_XTaskQueueUnregisterWaiter,
+    th_XTaskQueueTerminate,
+    th_XTaskQueueRegisterMonitor,
+    th_XTaskQueueUnregisterMonitor,
+    th_XTaskQueueGetCurrentProcessTaskQueue,
+    th_XTaskQueueSetCurrentProcessTaskQueue,
+    th_XThreadSetTimeSensitive,
+    th_XThreadVerifyNotTimeSensitive,
+    th_XThreadAssertNotTimeSensitive,
+    th_XThreadIsTimeSensitive
+};
+
+static IXThreadingImplObj g_xthreading_singleton = { &g_xthreading_vtbl };
 
 HRESULT xgr_query_threading(REFIID iid, void **ppv)
 {

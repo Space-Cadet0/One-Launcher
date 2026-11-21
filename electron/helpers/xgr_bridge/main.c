@@ -9,7 +9,7 @@
 /* Deterministic binary marker verified by build-xbox-bridge.cjs and runtime bottle staging */
 const char g_one_launcher_xgr_bridge_marker[] __attribute__((used)) = "OneLauncher.XGRBridge.v1";
 
-struct xgr_runtime_config g_xgr_cfg = { .lock = SRWLOCK_INIT };
+struct xgr_runtime_config g_xgr_cfg = { 0 };
 
 /* =========================================================================
  * Verified CLSIDs & IIDs (Exact Match to Microsoft Retail xgameruntime.dll)
@@ -148,12 +148,6 @@ XGR_GUID(IID_IXGameEventImpl,       0xbbfbdcc7, 0xbfe7, 0x409b, 0xa5, 0xca, 0xed
 static SRWLOCK g_runtime_lifecycle_lock = SRWLOCK_INIT;
 static volatile LONG g_init_ref_count = 0;
 
-HRESULT WINAPI xgr_not_impl_stub(void *iface)
-{
-    (void)iface;
-    return xgr_return_hr(E_NOTIMPL);
-}
-
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, void *reserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
@@ -161,7 +155,9 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, void *reserved)
         xgr_set_bridge_hmodule((HMODULE)hinst);
         DisableThreadLibraryCalls(hinst);
     } else if (reason == DLL_PROCESS_DETACH && reserved == NULL) {
-        xgr_uninstall_xcurl_shim();
+        /* Never call LdrUnregisterDllNotification or acquire locks that conflict with
+         * the PE loader lock inside DllMain; UninitializeApiImpl handles shim teardown.
+         * On process termination (reserved != NULL), do nothing at all. */
         xgr_threading_process_detach_cleanup();
     }
     return TRUE;
@@ -169,13 +165,10 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, void *reserved)
 
 HRESULT WINAPI DllCanUnloadNow(void)
 {
-    if (InterlockedCompareExchange(&g_init_ref_count, 0, 0) > 0) {
-        return S_FALSE;
-    }
-    if (xgr_is_xcurl_shim_active()) {
-        return S_FALSE;
-    }
-    return S_OK;
+    AcquireSRWLockShared(&g_runtime_lifecycle_lock);
+    bool busy = (InterlockedCompareExchange(&g_init_ref_count, 0, 0) > 0) || xgr_is_xcurl_shim_active();
+    ReleaseSRWLockShared(&g_runtime_lifecycle_lock);
+    return busy ? S_FALSE : S_OK;
 }
 
 HRESULT WINAPI InitializeApiImplEx2(ULONG gdkVer, ULONG gsVer, char mode, const struct xgr_initialize_options *options)
@@ -207,18 +200,20 @@ HRESULT WINAPI UninitializeApiImpl(void)
 {
     AcquireSRWLockExclusive(&g_runtime_lifecycle_lock);
     LONG prev = InterlockedCompareExchange(&g_init_ref_count, 0, 0);
-    if (prev > 0) {
-        LONG next = InterlockedDecrement(&g_init_ref_count);
-        if (next == 0) {
-            xgr_uninstall_xcurl_shim();
-            xgr_playfab_shim_reset();
-            xgr_invite_callbacks_reset();
-            xgr_gamesave_shutdown();
-            xgr_user_shutdown();
-            xgr_threading_shutdown();
-            xgr_rpc_shutdown();
-            xgr_runtime_config_reset();
-        }
+    if (prev > 1) {
+        InterlockedDecrement(&g_init_ref_count);
+    } else if (prev == 1) {
+        /* Perform full teardown BEFORE decrementing g_init_ref_count to 0 so
+         * DllCanUnloadNow() cannot return S_OK while shutdown is still running. */
+        xgr_uninstall_xcurl_shim();
+        xgr_playfab_shim_reset();
+        xgr_invite_callbacks_reset();
+        xgr_gamesave_shutdown();
+        xgr_user_shutdown();
+        xgr_threading_shutdown();
+        xgr_rpc_shutdown();
+        xgr_runtime_config_reset();
+        InterlockedDecrement(&g_init_ref_count);
     }
     ReleaseSRWLockExclusive(&g_runtime_lifecycle_lock);
     return xgr_return_hr(S_OK);
@@ -226,7 +221,9 @@ HRESULT WINAPI UninitializeApiImpl(void)
 
 BOOL WINAPI XErrorReport(HRESULT error, const char *message)
 {
+    AcquireSRWLockShared(&g_runtime_lifecycle_lock);
     xgr_ensure_xcurl_shim();
+    ReleaseSRWLockShared(&g_runtime_lifecycle_lock);
     return xgr_invoke_error_report(error, message);
 }
 
@@ -236,7 +233,9 @@ HRESULT WINAPI QueryApiImpl(REFCLSID clsid, REFIID iid, void **out)
     *out = NULL;
     if (!clsid || !iid) return E_INVALIDARG;
 
+    AcquireSRWLockShared(&g_runtime_lifecycle_lock);
     xgr_ensure_xcurl_shim();
+    ReleaseSRWLockShared(&g_runtime_lifecycle_lock);
 
     if (IsEqualGUID(clsid, &CLSID_XThreadingImpl))              return xgr_return_hr(xgr_query_threading(iid, out));
     if (IsEqualGUID(clsid, &CLSID_XUserImpl))                   return xgr_return_hr(xgr_query_user(iid, out));

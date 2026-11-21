@@ -1097,6 +1097,90 @@ static void test_wave2_remediation_invariants(void)
     pGsCloseProv(gs_iface, prov);
 }
 
+/* -------------------------------------------------------------------------
+ * Test 6: Wave 4 (W1-D) PlayFab UninitializeAsync XAsyncBlock Lifetime (XGR-05),
+ *         Bounded Watchdog Timeout, Late Upload Callback Safety & Handle Validation
+ * ------------------------------------------------------------------------- */
+static void test_playfab_uninit_async_and_timeout_lifecycle(void)
+{
+    xgr_playfab_shim_reset();
+    xgr_playfab_set_symbol_resolver_for_test(w2a_playfab_resolver);
+    xgr_playfab_set_uninit_timeout_ms_for_test(0);
+
+    XGR_PFGameSaveInitArgs init_args;
+    memset(&init_args, 0, sizeof(init_args));
+    init_args.saveFolder = "C:\\R4PlayFabTest";
+    ASSERT_HR_EQ(xgr_pf_shim_PFGameSaveFilesInitialize(&init_args), S_OK);
+
+    /* 6a. Async upload (35 ms): caller XAsyncBlock MUST be initialized immediately (never E_INVALIDARG!) */
+    XUserHandle fake_user = (XUserHandle)(uintptr_t)0xCAFE1234u;
+    XAsyncBlock add_ab;
+    memset(&add_ab, 0, sizeof(add_ab));
+    ASSERT_HR_EQ(xgr_pf_shim_PFGameSaveFilesAddUserWithUiAsync(fake_user, 0u, &add_ab), S_OK);
+
+    g_pf_upload_calls = 0;
+    g_pf_uninit_calls = 0;
+    g_pf_uninit_observed_upload_done = false;
+    g_pf_async_upload_delay_ms = 35u;
+    {
+        /* Stack-allocated XAsyncBlock goes out of scope immediately after XAsyncGetStatus(wait=true) */
+        XAsyncBlock stack_uninit_ab;
+        memset(&stack_uninit_ab, 0, sizeof(stack_uninit_ab));
+        ASSERT_HR_EQ(xgr_pf_shim_PFGameSaveFilesUninitializeAsync(&stack_uninit_ab), S_OK);
+        HRESULT st0 = xgr_async_get_status(&stack_uninit_ab, false);
+        ASSERT_TRUE(st0 == E_PENDING || st0 == S_OK);
+        ASSERT_HR_EQ(xgr_async_get_status(&stack_uninit_ab, true), S_OK);
+    }
+    ASSERT_TRUE(g_pf_upload_calls == 1);
+    ASSERT_TRUE(g_pf_uninit_calls == 1);
+    ASSERT_TRUE(g_pf_uninit_observed_upload_done);
+
+    /* 6b. Stalled upload (220 ms) > bounded watchdog timeout (80 ms):
+     *     UninitializeAsync must complete via watchdog before upload finishes, AND late upload
+     *     callback must NOT UAF or double-call real_uninit! */
+    ASSERT_HR_EQ(xgr_pf_shim_PFGameSaveFilesInitialize(&init_args), S_OK);
+    memset(&add_ab, 0, sizeof(add_ab));
+    ASSERT_HR_EQ(xgr_pf_shim_PFGameSaveFilesAddUserWithUiAsync(fake_user, 0u, &add_ab), S_OK);
+
+    g_pf_upload_calls = 0;
+    g_pf_uninit_calls = 0;
+    g_pf_uninit_observed_upload_done = true;
+    g_pf_async_upload_delay_ms = 220u;
+    xgr_playfab_set_uninit_timeout_ms_for_test(80u);
+    {
+        XAsyncBlock timeout_ab;
+        memset(&timeout_ab, 0, sizeof(timeout_ab));
+        ULONGLONG t0 = GetTickCount64();
+        ASSERT_HR_EQ(xgr_pf_shim_PFGameSaveFilesUninitializeAsync(&timeout_ab), S_OK);
+        ASSERT_HR_EQ(xgr_async_get_status(&timeout_ab, true), S_OK);
+        ULONGLONG elapsed = GetTickCount64() - t0;
+        ASSERT_TRUE(elapsed >= 50ULL && elapsed < 1500ULL);
+    }
+    ASSERT_TRUE(g_pf_upload_calls == 1);
+    ASSERT_TRUE(g_pf_uninit_calls == 1);
+    ASSERT_TRUE(!g_pf_uninit_observed_upload_done);
+
+    /* Wait for late 220 ms upload worker to fire pf_pre_uninit_upload_done_cb safely (0 UAF, 0 double-uninit, 0 leaks) */
+    win32_drain_background_workers();
+    ASSERT_TRUE(g_pf_uninit_calls == 1);
+    g_pf_async_upload_delay_ms = 0u;
+    xgr_playfab_set_uninit_timeout_ms_for_test(0u);
+
+    /* 6c. SetUiCallbacks(NULL) resets g_pf_default_ui_installed so headless callbacks reinstall on AddUser */
+    int prev_ui_calls = g_pf_set_ui_calls;
+    ASSERT_HR_EQ(xgr_pf_shim_PFGameSaveFilesSetUiCallbacks(NULL), S_OK);
+    memset(&add_ab, 0, sizeof(add_ab));
+    ASSERT_HR_EQ(xgr_pf_shim_PFGameSaveFilesAddUserWithUiAsync(fake_user, 0u, &add_ab), S_OK);
+    ASSERT_TRUE(g_pf_set_ui_calls > prev_ui_calls);
+    ASSERT_HR_EQ(xgr_pf_shim_PFGameSaveFilesUninitializeAsync(&add_ab), S_OK);
+    ASSERT_HR_EQ(xgr_async_get_status(&add_ab, true), S_OK);
+
+    /* 6d. xgr_user_duplicate rejects forged/closed handle with E_HANDLE */
+    XUserHandle dup = NULL;
+    ASSERT_HR_EQ(xgr_user_duplicate((XUserHandle)(uintptr_t)0xDEADBEEFu, &dup), E_HANDLE);
+    ASSERT_TRUE(dup == NULL);
+}
+
 int main(void)
 {
     char sandbox_template[] = "/tmp/ol-xgr-wave2a-asan-XXXXXX";
@@ -1112,6 +1196,7 @@ int main(void)
     test_xstore_license_token_and_prices();
     test_game_invite_and_protocol_dispatch();
     test_wave2_remediation_invariants();
+    test_playfab_uninit_async_and_timeout_lifecycle();
 
     xgr_playfab_set_symbol_resolver_for_test(NULL);
     xgr_playfab_shim_reset();
@@ -1187,10 +1272,11 @@ function compileAndRunTarget(clangBin, srcPath, binPath, label, env) {
   if (runRes.stderr) process.stderr.write(runRes.stderr);
 
   if (runRes.status !== 0) {
-    console.error(
+    const err = new Error(
       `[test-xbox-bridge-asan] Sanitizer binary (${label}) exited with status ${runRes.status} (signal: ${runRes.signal || 'none'})`
     );
-    process.exit(runRes.status || 1);
+    err.exitCode = runRes.status || 1;
+    throw err;
   }
 
   return { skipped: false, stdout: runRes.stdout || '' };
@@ -1263,7 +1349,12 @@ function runNativeAsanHarness() {
 }
 
 if (require.main === module) {
-  runNativeAsanHarness();
+  try {
+    runNativeAsanHarness();
+  } catch (err) {
+    console.error(err && err.message ? err.message : String(err));
+    process.exit((err && err.exitCode) || 1);
+  }
 }
 
 module.exports = {

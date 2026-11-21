@@ -7,6 +7,13 @@
 
 #include "xgr_internal.h"
 
+#ifndef ERROR_SHARING_VIOLATION
+#define ERROR_SHARING_VIOLATION 32u
+#endif
+#ifndef ERROR_ACCESS_DENIED
+#define ERROR_ACCESS_DENIED 5u
+#endif
+
 #define WGS_WINDOWS_EPOCH_DIFF_SEC 11644473600ULL
 
 _Static_assert(sizeof(GUID) == 16, "GUID must be 16 bytes");
@@ -248,14 +255,33 @@ static void ensure_dir_recursive_w(const wchar_t *dir_path)
     wcsncpy(tmp, dir_path, (sizeof(tmp) / sizeof(tmp[0])) - 1);
     tmp[(sizeof(tmp) / sizeof(tmp[0])) - 1] = L'\0';
 
-    for (wchar_t *p = tmp; *p; p++) {
-        if (*p == L'/') *p = L'\\';
+    size_t len = wcslen(tmp);
+    for (size_t i = 0; i < len; i++) {
+        if (tmp[i] == L'/') tmp[i] = L'\\';
     }
-    for (wchar_t *p = tmp + 3; *p; p++) {
-        if (*p == L'\\') {
-            *p = L'\0';
-            CreateDirectoryW(tmp, NULL);
-            *p = L'\\';
+
+    size_t start = 0;
+    if (len >= 3 &&
+        ((tmp[0] >= L'A' && tmp[0] <= L'Z') || (tmp[0] >= L'a' && tmp[0] <= L'z')) &&
+        tmp[1] == L':' && tmp[2] == L'\\') {
+        start = 3;
+    } else if (len >= 2 && tmp[0] == L'\\' && tmp[1] == L'\\') {
+        /* UNC path: skip \\server\share\ */
+        size_t i = 2;
+        while (i < len && tmp[i] != L'\\') i++;
+        if (i < len) i++;
+        while (i < len && tmp[i] != L'\\') i++;
+        if (i < len) i++;
+        start = i;
+    } else if (len >= 1 && tmp[0] == L'\\') {
+        start = 1;
+    }
+
+    for (size_t i = start; i < len; i++) {
+        if (tmp[i] == L'\\') {
+            tmp[i] = L'\0';
+            if (tmp[0] != L'\0') CreateDirectoryW(tmp, NULL);
+            tmp[i] = L'\\';
         }
     }
     CreateDirectoryW(tmp, NULL);
@@ -271,6 +297,10 @@ static bool resolve_system_appdata_dirs(
     size_t out_xgs_cch
 )
 {
+    if (!scid_lower || !xgr_is_safe_path_segment(scid_lower, 128)) return false;
+    const char *pfn = (pfn_utf8 && pfn_utf8[0]) ? pfn_utf8 : "OneLauncher.XboxGame_8wekyb3d8bbwe";
+    if (!xgr_is_safe_path_segment(pfn, 256)) return false;
+
     wchar_t base_local[MAX_PATH * 2] = { 0 };
     DWORD n = GetEnvironmentVariableW(L"ONE_XGR_APPDATA_DIR", base_local, MAX_PATH * 2 - 1);
     if (n == 0 || n >= MAX_PATH * 2 - 1) {
@@ -280,7 +310,6 @@ static bool resolve_system_appdata_dirs(
         wcscpy(base_local, L"C:\\users\\Public\\AppData\\Local");
     }
 
-    const char *pfn = (pfn_utf8 && pfn_utf8[0]) ? pfn_utf8 : "OneLauncher.XboxGame_8wekyb3d8bbwe";
     wchar_t pfn_w[256] = { 0 };
     MultiByteToWideChar(CP_UTF8, 0, pfn, -1, pfn_w, 255);
 
@@ -327,11 +356,15 @@ static uint8_t *read_whole_file_w(const wchar_t *path, size_t *out_len)
         CloseHandle(h);
         return NULL;
     }
-    DWORD got = 0;
-    if (len > 0 && (!ReadFile(h, buf, (DWORD)len, &got, NULL) || got != (DWORD)len)) {
-        free(buf);
-        CloseHandle(h);
-        return NULL;
+    size_t total = 0;
+    while (total < len) {
+        DWORD got = 0;
+        if (!ReadFile(h, buf + total, (DWORD)(len - total), &got, NULL) || got == 0) {
+            free(buf);
+            CloseHandle(h);
+            return NULL;
+        }
+        total += (size_t)got;
     }
     CloseHandle(h);
     if (out_len) *out_len = len;
@@ -345,19 +378,34 @@ static bool write_whole_file_atomic_w(const wchar_t *path, const uint8_t *data, 
 
     HANDLE h = CreateFileW(tmp_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return false;
-    DWORD written = 0;
-    BOOL ok = (len == 0) ? TRUE : WriteFile(h, data, (DWORD)len, &written, NULL);
-    FlushFileBuffers(h);
+    BOOL ok = TRUE;
+    size_t total = 0;
+    while (total < len) {
+        DWORD written = 0;
+        if (!WriteFile(h, data + total, (DWORD)(len - total), &written, NULL) || written == 0) {
+            ok = FALSE;
+            break;
+        }
+        total += (size_t)written;
+    }
+    if (ok) FlushFileBuffers(h);
     CloseHandle(h);
-    if (!ok || (len > 0 && written != (DWORD)len)) {
+    if (!ok || total != len) {
         DeleteFileW(tmp_path);
         return false;
     }
-    if (!MoveFileExW(tmp_path, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(tmp_path);
-        return false;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (MoveFileExW(tmp_path, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            return true;
+        }
+        DWORD err = GetLastError();
+        if (err != ERROR_SHARING_VIOLATION && err != ERROR_ACCESS_DENIED) {
+            break;
+        }
+        Sleep(10);
     }
-    return true;
+    DeleteFileW(tmp_path);
+    return false;
 }
 
 /* -------------------------------------------------------------------------
@@ -416,18 +464,29 @@ static bool bw_utf16_str(struct bin_writer *w, const char *utf8)
 
 static bool br_utf16_str(const uint8_t *buf, size_t len, size_t *off, char *out_utf8, size_t out_sz)
 {
-    if (*off + 4 > len) return false;
+    if (*off > len || len - *off < 4) return false;
     int32_t char_count = 0;
     memcpy(&char_count, buf + *off, 4);
     *off += 4;
-    if (char_count < 0 || char_count > 65536 || *off + (size_t)char_count * 2 > len) return false;
+    if (char_count < 0 || char_count > 65536) return false;
+    size_t byte_len = (size_t)char_count * 2u;
+    if (byte_len > len - *off) return false;
+
     if (out_utf8 && out_sz > 0) out_utf8[0] = '\0';
-    if (char_count > 0 && out_utf8 && out_sz > 0) {
-        const wchar_t *wptr = (const wchar_t *)(buf + *off);
-        int n = WideCharToMultiByte(CP_UTF8, 0, wptr, char_count, out_utf8, (int)(out_sz - 1), NULL, NULL);
+    if (char_count > 0 && out_utf8 && out_sz > 1) {
+        /* Copy UTF-16LE bytes into an aligned wchar_t buffer (containers.index has a 1-byte
+         * container_num field, so Container #1+ UTF-16LE strings begin at odd byte offsets!). */
+        wchar_t stack_w[256];
+        wchar_t *wbuf = ((size_t)char_count <= 256u)
+            ? stack_w
+            : (wchar_t *)malloc((size_t)char_count * sizeof(wchar_t));
+        if (!wbuf) return false;
+        memcpy(wbuf, buf + *off, byte_len);
+        int n = WideCharToMultiByte(CP_UTF8, 0, wbuf, char_count, out_utf8, (int)(out_sz - 1), NULL, NULL);
+        if (wbuf != stack_w) free(wbuf);
         if (n > 0) out_utf8[n] = '\0';
     }
-    *off += (size_t)char_count * 2;
+    *off += byte_len;
     return true;
 }
 
@@ -603,7 +662,7 @@ static bool load_container_blobs(
 
     int32_t bcount = 0;
     memcpy(&bcount, buf + 4, 4);
-    if (bcount <= 0 || 8 + (size_t)bcount * 160 > len) {
+    if (bcount <= 0 || bcount > 65536 || (size_t)bcount > (len - 8) / 160u) {
         free(buf);
         return true;
     }
@@ -654,7 +713,8 @@ static bool save_container_blobs(
     swprintf(folder_dir, sizeof(folder_dir) / sizeof(folder_dir[0]), L"%ls\\%ls", wgs_user_dir, folder_hex);
     ensure_dir_recursive_w(folder_dir);
 
-    size_t total = 8 + (size_t)count * 160;
+    if (count > 65536u || (size_t)count > (SIZE_MAX - 8u) / 160u) return false;
+    size_t total = 8u + (size_t)count * 160u;
     uint8_t *buf = (uint8_t *)calloc(1, total);
     if (!buf) return false;
 
@@ -757,15 +817,18 @@ static HRESULT create_provider_internal(XUserHandle user, const char *config_id,
         snap.packageFamilyName[0] ? snap.packageFamilyName : "OneLauncher.XboxGame_8wekyb3d8bbwe"
     );
 
-    resolve_system_appdata_dirs(
-        p->xuid,
-        p->scid,
-        p->pfn,
-        p->wgs_user_dir,
-        sizeof(p->wgs_user_dir) / sizeof(p->wgs_user_dir[0]),
-        p->xgs_user_dir,
-        sizeof(p->xgs_user_dir) / sizeof(p->xgs_user_dir[0])
-    );
+    if (!resolve_system_appdata_dirs(
+            p->xuid,
+            p->scid,
+            p->pfn,
+            p->wgs_user_dir,
+            sizeof(p->wgs_user_dir) / sizeof(p->wgs_user_dir[0]),
+            p->xgs_user_dir,
+            sizeof(p->xgs_user_dir) / sizeof(p->xgs_user_dir[0])
+        )) {
+        provider_release(p);
+        return E_INVALIDARG;
+    }
 
     notify_rpc_save_init(p);
 
@@ -867,16 +930,7 @@ void xgr_gamesave_shutdown(void)
 
 static bool is_valid_container_name(const char *name)
 {
-    if (!name || !name[0]) return false;
-    size_t len = strlen(name);
-    if (len > 255) return false;
-    for (size_t i = 0; i < len; i++) {
-        char c = name[i];
-        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
-            return false;
-        }
-    }
-    return true;
+    return xgr_is_safe_path_segment(name, 255);
 }
 
 static void delete_blob_guid_file_w(const wchar_t *folder_dir, const GUID *g)
@@ -961,12 +1015,15 @@ static HRESULT submit_update_sync(XGameSaveUpdateHandle upd)
         return E_GS_HANDLE_EXPIRED;
     }
 
+    const size_t max_update_bytes = 16u * 1024u * 1024u;
     size_t total_op_bytes = 0;
-    for (uint32_t i = 0; i < upd->count; i++) total_op_bytes += upd->ops[i].size;
-    if (total_op_bytes > 16 * 1024 * 1024) {
-        InterlockedExchange(&upd->submitted, 0);
-        ReleaseSRWLockExclusive(&upd->lock);
-        return E_GS_UPDATE_TOO_BIG;
+    for (uint32_t i = 0; i < upd->count; i++) {
+        if (upd->ops[i].size > max_update_bytes || total_op_bytes > max_update_bytes - upd->ops[i].size) {
+            InterlockedExchange(&upd->submitted, 0);
+            ReleaseSRWLockExclusive(&upd->lock);
+            return E_GS_UPDATE_TOO_BIG;
+        }
+        total_op_bytes += upd->ops[i].size;
     }
 
     XGameSaveProviderHandle prov = upd->container->provider;
@@ -1091,27 +1148,59 @@ static HRESULT submit_update_sync(XGameSaveUpdateHandle upd)
 
     if (SUCCEEDED(hr)) {
         uint64_t sum_bytes = 0;
-        for (uint32_t b = 0; b < bcnt; b++) sum_bytes += blobs[b].size;
-        ce->total_size = sum_bytes;
-        ce->modified_ft = now_filetime_u64();
-        ce->state_flags |= 0x01; /* Mark dirty so xboxTitleStorageSync uploads it */
-
-        uint8_t prev_num = ce->container_num;
-        uint8_t next_num = is_new_container ? 1 : (uint8_t)((prev_num % 250) + 1);
-        wchar_t prev_cfile[MAX_PATH * 2];
-        swprintf(prev_cfile, sizeof(prev_cfile) / sizeof(prev_cfile[0]), L"%ls\\container.%u", fdir, (unsigned)prev_num);
-        ce->container_num = next_num;
-
-        if (save_container_blobs(prov->wgs_user_dir, ce, blobs, bcnt) &&
-            save_wgs_index(prov->wgs_user_dir, &idx)) {
-            if (!is_new_container && prev_num != next_num) {
-                DeleteFileW(prev_cfile);
+        for (uint32_t b = 0; b < bcnt; b++) {
+            if ((uint64_t)blobs[b].size > UINT64_MAX - sum_bytes) {
+                sum_bytes = UINT64_MAX;
+                break;
             }
-            for (size_t s = 0; s < superseded_cnt; s++) {
-                delete_blob_guid_file_w(fdir, &superseded_guids[s]);
+            sum_bytes += (uint64_t)blobs[b].size;
+        }
+
+        /* Enforce provider quota across all containers before committing */
+        if (prov->quota_bytes > 0) {
+            uint64_t other_bytes = 0;
+            for (uint32_t ci = 0; idx.items != NULL && ci < idx.count; ci++) {
+                if (&idx.items[ci] == ce) continue;
+                if (idx.items[ci].total_size > UINT64_MAX - other_bytes) {
+                    other_bytes = UINT64_MAX;
+                    break;
+                }
+                other_bytes += idx.items[ci].total_size;
             }
-        } else {
-            hr = E_GS_OUT_OF_LOCAL_STORAGE;
+            if (sum_bytes > (uint64_t)prov->quota_bytes || other_bytes > (uint64_t)prov->quota_bytes - sum_bytes) {
+                hr = E_GS_QUOTA_EXCEEDED;
+            }
+        }
+
+        if (SUCCEEDED(hr)) {
+            ce->total_size = sum_bytes;
+            ce->modified_ft = now_filetime_u64();
+            ce->state_flags |= 0x01; /* Mark dirty so xboxTitleStorageSync uploads it */
+
+            uint8_t prev_num = ce->container_num;
+            uint8_t next_num = is_new_container ? 1 : (uint8_t)((prev_num % 250) + 1);
+            wchar_t prev_cfile[MAX_PATH * 2];
+            wchar_t next_cfile[MAX_PATH * 2];
+            swprintf(prev_cfile, sizeof(prev_cfile) / sizeof(prev_cfile[0]), L"%ls\\container.%u", fdir, (unsigned)prev_num);
+            swprintf(next_cfile, sizeof(next_cfile) / sizeof(next_cfile[0]), L"%ls\\container.%u", fdir, (unsigned)next_num);
+            ce->container_num = next_num;
+
+            if (!save_container_blobs(prov->wgs_user_dir, ce, blobs, bcnt)) {
+                hr = E_GS_OUT_OF_LOCAL_STORAGE;
+            } else if (!save_wgs_index(prov->wgs_user_dir, &idx)) {
+                /* Remove orphaned next container.<N> if index commit failed */
+                if (is_new_container || prev_num != next_num) {
+                    DeleteFileW(next_cfile);
+                }
+                hr = E_GS_OUT_OF_LOCAL_STORAGE;
+            } else {
+                if (!is_new_container && prev_num != next_num) {
+                    DeleteFileW(prev_cfile);
+                }
+                for (size_t s = 0; s < superseded_cnt; s++) {
+                    delete_blob_guid_file_w(fdir, &superseded_guids[s]);
+                }
+            }
         }
     }
 
@@ -1244,30 +1333,41 @@ static HRESULT prepare_blob_read(
     }
 
     if (SUCCEEDED(hr) && actual > 0) {
-        size_t total = (size_t)actual * sizeof(XGameSaveBlob);
-        for (uint32_t i = 0; i < actual; i++) {
-            total += strlen(matched_names[i]) + 1 + sizes[i];
-        }
-        uint8_t *packed = (uint8_t *)calloc(1, total);
-        if (!packed) {
+        if ((size_t)actual > SIZE_MAX / sizeof(XGameSaveBlob)) {
             hr = E_OUTOFMEMORY;
         } else {
-            XGameSaveBlob *hdrs = (XGameSaveBlob *)packed;
-            size_t cursor = (size_t)actual * sizeof(XGameSaveBlob);
+            size_t total = (size_t)actual * sizeof(XGameSaveBlob);
             for (uint32_t i = 0; i < actual; i++) {
                 size_t nlen = strlen(matched_names[i]) + 1;
-                memcpy(packed + cursor, matched_names[i], nlen);
-                hdrs[i].info.name = (const char *)(uintptr_t)cursor;
-                hdrs[i].info.size = (uint32_t)sizes[i];
-                cursor += nlen;
-
-                if (sizes[i] > 0) memcpy(packed + cursor, payloads[i], sizes[i]);
-                hdrs[i].data = (uint8_t *)(uintptr_t)cursor;
-                cursor += sizes[i];
+                if (nlen > SIZE_MAX - total || sizes[i] > SIZE_MAX - total - nlen) {
+                    hr = E_OUTOFMEMORY;
+                    break;
+                }
+                total += nlen + sizes[i];
             }
-            out->count = actual;
-            out->total_size = total;
-            out->packed = packed;
+            if (SUCCEEDED(hr)) {
+                uint8_t *packed = (uint8_t *)calloc(1, total);
+                if (!packed) {
+                    hr = E_OUTOFMEMORY;
+                } else {
+                    XGameSaveBlob *hdrs = (XGameSaveBlob *)packed;
+                    size_t cursor = (size_t)actual * sizeof(XGameSaveBlob);
+                    for (uint32_t i = 0; i < actual; i++) {
+                        size_t nlen = strlen(matched_names[i]) + 1;
+                        memcpy(packed + cursor, matched_names[i], nlen);
+                        hdrs[i].info.name = (const char *)(uintptr_t)cursor;
+                        hdrs[i].info.size = (uint32_t)sizes[i];
+                        cursor += nlen;
+
+                        if (sizes[i] > 0) memcpy(packed + cursor, payloads[i], sizes[i]);
+                        hdrs[i].data = (uint8_t *)(uintptr_t)cursor;
+                        cursor += sizes[i];
+                    }
+                    out->count = actual;
+                    out->total_size = total;
+                    out->packed = packed;
+                }
+            }
         }
     }
 
@@ -1309,21 +1409,26 @@ static HRESULT CALLBACK gs_init_provider(XAsyncOp op, const XAsyncProviderData *
         case XAsyncOp_Begin:
             return xgr_async_schedule(data->async, 0);
         case XAsyncOp_DoWork: {
-            HRESULT hr = create_provider_internal(ctx->user, ctx->scid, true, &ctx->provider);
+            /* Do NOT register into g_live_providers until GetResult hands ownership to caller
+             * (prevents double-free if xgr_gamesave_shutdown runs before Cleanup). */
+            HRESULT hr = create_provider_internal(ctx->user, ctx->scid, false, &ctx->provider);
             xgr_async_complete(data->async, hr, SUCCEEDED(hr) ? sizeof(XGameSaveProviderHandle) : 0);
             return S_OK;
         }
         case XAsyncOp_GetResult:
             if (!data->buffer || data->bufferSize < sizeof(XGameSaveProviderHandle)) return E_INVALIDARG;
+            if (!ctx->provider) return E_UNEXPECTED;
+            if (!gs_reg_insert(&g_live_providers, ctx->provider)) {
+                return E_OUTOFMEMORY;
+            }
             *(XGameSaveProviderHandle *)data->buffer = ctx->provider;
             ctx->provider = NULL;
             return S_OK;
         case XAsyncOp_Cleanup:
             if (ctx->provider) {
-                if (gs_reg_remove(&g_live_providers, ctx->provider)) {
-                    InterlockedExchange(&ctx->provider->api_closed, 1);
-                }
+                /* Uncollected provider was never inserted into g_live_providers; safe single release. */
                 provider_release(ctx->provider);
+                ctx->provider = NULL;
             }
             if (ctx->user) xgr_user_close(ctx->user);
             free(ctx);
@@ -1345,11 +1450,20 @@ static int64_t compute_remaining_quota(XGameSaveProviderHandle prov)
     struct wgs_index_state idx;
     load_wgs_index(prov->wgs_user_dir, &idx);
     uint64_t used = 0;
-    for (uint32_t i = 0; idx.items != NULL && i < idx.count; i++) used += idx.items[i].total_size;
+    for (uint32_t i = 0; idx.items != NULL && i < idx.count; i++) {
+        if (idx.items[i].total_size > UINT64_MAX - used) {
+            used = UINT64_MAX;
+            break;
+        }
+        used += idx.items[i].total_size;
+    }
     free_wgs_index(&idx);
-    int64_t rem = prov->quota_bytes - (int64_t)used;
+    int64_t rem = 0;
+    if (prov->quota_bytes > 0 && used < (uint64_t)prov->quota_bytes) {
+        rem = prov->quota_bytes - (int64_t)used;
+    }
     LeaveCriticalSection(&prov->cs);
-    return rem > 0 ? rem : 0;
+    return rem;
 }
 
 static HRESULT CALLBACK gs_quota_provider(XAsyncOp op, const XAsyncProviderData *data)
@@ -1403,7 +1517,7 @@ struct gs_read_async {
     uint32_t req_count;
     char **req_names;
     struct prepared_blob_read prep;
-    uint32_t *out_count_ptr;
+    volatile LONG prep_count;
 };
 
 static HRESULT CALLBACK gs_read_provider(XAsyncOp op, const XAsyncProviderData *data)
@@ -1413,6 +1527,7 @@ static HRESULT CALLBACK gs_read_provider(XAsyncOp op, const XAsyncProviderData *
         case XAsyncOp_Begin: return xgr_async_schedule(data->async, 0);
         case XAsyncOp_DoWork: {
             HRESULT hr = prepare_blob_read(ctx->container, (const char **)ctx->req_names, ctx->req_count, &ctx->prep);
+            InterlockedExchange(&ctx->prep_count, SUCCEEDED(hr) ? (LONG)ctx->prep.count : 0);
             xgr_async_complete(data->async, hr, SUCCEEDED(hr) ? ctx->prep.total_size : 0);
             return S_OK;
         }
@@ -1420,7 +1535,6 @@ static HRESULT CALLBACK gs_read_provider(XAsyncOp op, const XAsyncProviderData *
             if (data->bufferSize < ctx->prep.total_size) return E_GS_PROVIDED_BUFFER_TOO_SMALL;
             if (!data->buffer && ctx->prep.total_size > 0) return E_INVALIDARG;
             if (ctx->prep.total_size > 0) copy_relocated_blob_read(&ctx->prep, (XGameSaveBlob *)data->buffer);
-            if (ctx->out_count_ptr) *ctx->out_count_ptr = ctx->prep.count;
             return S_OK;
         case XAsyncOp_Cleanup:
             for (uint32_t i = 0; i < ctx->req_count; i++) free(ctx->req_names[i]);
@@ -1500,6 +1614,10 @@ static HRESULT CALLBACK gs_folder_provider(XAsyncOp op, const XAsyncProviderData
 static HRESULT WINAPI xgs_QueryInterface(void *iface, REFIID riid, void **ppv)
 {
     if (!ppv) return E_POINTER;
+    if (!riid) {
+        *ppv = NULL;
+        return E_INVALIDARG;
+    }
     if (IsEqualGUID(riid, &IID_IUnknown) ||
         IsEqualGUID(riid, &IID_IXGameSaveImpl) ||
         IsEqualGUID(riid, &IID_IXGameSaveImpl2) ||
@@ -1628,6 +1746,14 @@ static HRESULT WINAPI xgs_XGameSaveDeleteContainerResult(void *iface, XAsyncBloc
     return xgr_return_hr(xgr_async_get_result(async, (const void *)xgs_XGameSaveDeleteContainerAsync, 0, NULL, NULL));
 }
 
+struct gs_cont_enum_snap {
+    char name[256];
+    char display_name[256];
+    uint32_t blob_count;
+    uint64_t total_size;
+    int64_t last_modified;
+};
+
 static HRESULT enumerate_containers_internal(XGameSaveProviderHandle prov, const char *exact_or_prefix, bool exact, void *context, XGameSaveContainerInfoCallback *cb)
 {
     if (!prov || !cb) return E_INVALIDARG;
@@ -1636,35 +1762,56 @@ static HRESULT enumerate_containers_internal(XGameSaveProviderHandle prov, const
     load_wgs_index(prov->wgs_user_dir, &idx);
 
     size_t pfx_len = exact_or_prefix ? strlen(exact_or_prefix) : 0;
+    struct gs_cont_enum_snap *snaps = NULL;
+    uint32_t snap_cnt = 0;
 
-    for (uint32_t i = 0; idx.items != NULL && i < idx.count; i++) {
-        struct wgs_container_entry *ce = &idx.items[i];
-        if (exact) {
-            if (!exact_or_prefix || strcmp(ce->name, exact_or_prefix) != 0) continue;
-        } else if (exact_or_prefix && pfx_len > 0) {
-            if (strncmp(ce->name, exact_or_prefix, pfx_len) != 0) continue;
+    if (idx.items != NULL && idx.count > 0) {
+        snaps = (struct gs_cont_enum_snap *)calloc(idx.count, sizeof(*snaps));
+        if (!snaps) {
+            free_wgs_index(&idx);
+            LeaveCriticalSection(&prov->cs);
+            return E_OUTOFMEMORY;
         }
+        for (uint32_t i = 0; idx.items != NULL && i < idx.count; i++) {
+            struct wgs_container_entry *ce = &idx.items[i];
+            if (exact) {
+                if (!exact_or_prefix || strcmp(ce->name, exact_or_prefix) != 0) continue;
+            } else if (exact_or_prefix && pfx_len > 0) {
+                if (strncmp(ce->name, exact_or_prefix, pfx_len) != 0) continue;
+            }
 
-        struct wgs_blob_entry *blobs = NULL;
-        uint32_t bcnt = 0;
-        load_container_blobs(prov->wgs_user_dir, ce, &blobs, &bcnt);
-        free(blobs);
+            struct wgs_blob_entry *blobs = NULL;
+            uint32_t bcnt = 0;
+            load_container_blobs(prov->wgs_user_dir, ce, &blobs, &bcnt);
+            free(blobs);
 
-        XGameSaveContainerInfo info;
-        memset(&info, 0, sizeof(info));
-        info.name = ce->name;
-        info.displayName = ce->display_name[0] ? ce->display_name : ce->name;
-        info.blobCount = bcnt;
-        info.totalSize = ce->total_size;
-        info.lastModifiedTime = filetime_to_unix_sec(ce->modified_ft);
-        info.needsSync = false;
-
-        bool cont = cb(&info, context);
-        if (!cont || exact) break;
+            struct gs_cont_enum_snap *s = &snaps[snap_cnt++];
+            snprintf(s->name, sizeof(s->name), "%s", ce->name);
+            snprintf(s->display_name, sizeof(s->display_name), "%s", ce->display_name[0] ? ce->display_name : ce->name);
+            s->blob_count = bcnt;
+            s->total_size = ce->total_size;
+            s->last_modified = filetime_to_unix_sec(ce->modified_ft);
+            if (exact) break;
+        }
     }
 
     free_wgs_index(&idx);
     LeaveCriticalSection(&prov->cs);
+
+    /* Invoke user callbacks strictly outside prov->cs to avoid re-entrant deadlocks */
+    for (uint32_t i = 0; i < snap_cnt; i++) {
+        XGameSaveContainerInfo info;
+        memset(&info, 0, sizeof(info));
+        info.name = snaps[i].name;
+        info.displayName = snaps[i].display_name;
+        info.blobCount = snaps[i].blob_count;
+        info.totalSize = snaps[i].total_size;
+        info.lastModifiedTime = snaps[i].last_modified;
+        info.needsSync = false;
+        if (!cb(&info, context) || exact) break;
+    }
+
+    free(snaps);
     return S_OK;
 }
 
@@ -1751,10 +1898,17 @@ static HRESULT enumerate_blobs_internal(XGameSaveContainerHandle cont, const cha
         }
     }
 
+    struct wgs_blob_entry *blobs = NULL;
+    uint32_t bcnt = 0;
     if (ce) {
-        struct wgs_blob_entry *blobs = NULL;
-        uint32_t bcnt = 0;
         load_container_blobs(prov->wgs_user_dir, ce, &blobs, &bcnt);
+    }
+
+    free_wgs_index(&idx);
+    LeaveCriticalSection(&prov->cs);
+
+    /* Invoke user callbacks strictly outside prov->cs */
+    if (blobs) {
         size_t plen = prefix ? strlen(prefix) : 0;
         for (uint32_t b = 0; b < bcnt; b++) {
             if (prefix && plen > 0 && strncmp(blobs[b].name, prefix, plen) != 0) continue;
@@ -1765,9 +1919,6 @@ static HRESULT enumerate_blobs_internal(XGameSaveContainerHandle cont, const cha
         }
         free(blobs);
     }
-
-    free_wgs_index(&idx);
-    LeaveCriticalSection(&prov->cs);
     return S_OK;
 }
 
@@ -1833,7 +1984,14 @@ static HRESULT WINAPI xgs_XGameSaveReadBlobDataAsync(void *iface, XGameSaveConta
         for (uint32_t i = 0; i < countOfBlobs; i++) {
             size_t n = blobNames[i] ? strlen(blobNames[i]) + 1 : 1;
             ctx->req_names[i] = (char *)calloc(1, n);
-            if (ctx->req_names[i] && blobNames[i]) memcpy(ctx->req_names[i], blobNames[i], n);
+            if (!ctx->req_names[i]) {
+                for (uint32_t j = 0; j < i; j++) free(ctx->req_names[j]);
+                free(ctx->req_names);
+                container_release(cont);
+                free(ctx);
+                return xgr_return_hr(E_OUTOFMEMORY);
+            }
+            if (blobNames[i]) memcpy(ctx->req_names[i], blobNames[i], n);
         }
     }
 
@@ -1850,19 +2008,29 @@ static HRESULT WINAPI xgs_XGameSaveReadBlobDataAsync(void *iface, XGameSaveConta
 static HRESULT WINAPI xgs_XGameSaveReadBlobDataResult(void *iface, XAsyncBlock *async, SIZE_T blobsSize, XGameSaveBlob *blobData, uint32_t *countOfBlobs)
 {
     (void)iface;
-    if (!async || !countOfBlobs) return E_INVALIDARG;
+    if (!async || !countOfBlobs) return xgr_return_hr(E_INVALIDARG);
     *countOfBlobs = 0;
+
+    HRESULT status = xgr_async_get_status(async, false);
+    if (FAILED(status)) {
+        return xgr_return_hr(status);
+    }
+
+    uint32_t ready_count = 0;
     void *ctx_ptr = NULL;
     void *st_ref = xgr_async_try_acquire_state(async, &ctx_ptr);
     if (st_ref) {
         if (ctx_ptr) {
-            ((struct gs_read_async *)ctx_ptr)->out_count_ptr = countOfBlobs;
+            ready_count = (uint32_t)InterlockedCompareExchange(&((struct gs_read_async *)ctx_ptr)->prep_count, 0, 0);
         }
         xgr_async_release_state(st_ref);
     }
+
     HRESULT hr = xgr_async_get_result(async, (const void *)xgs_XGameSaveReadBlobDataAsync, blobsSize, blobData, NULL);
     if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
         hr = E_GS_PROVIDED_BUFFER_TOO_SMALL;
+    } else if (SUCCEEDED(hr)) {
+        *countOfBlobs = ready_count;
     }
     return xgr_return_hr(hr);
 }
@@ -1886,7 +2054,11 @@ static HRESULT WINAPI xgs_XGameSaveCreateUpdate(void *iface, XGameSaveContainerH
     if (displayName) {
         size_t n = strlen(displayName) + 1;
         u->display_name = (char *)malloc(n);
-        if (u->display_name) memcpy(u->display_name, displayName, n);
+        if (!u->display_name) {
+            update_release(u);
+            return xgr_return_hr(E_OUTOFMEMORY);
+        }
+        memcpy(u->display_name, displayName, n);
     }
     if (!gs_reg_insert(&g_live_updates, u)) {
         update_release(u);
@@ -2047,64 +2219,129 @@ static HRESULT WINAPI xgs_XGameSaveFilesGetRemainingQuota(void *iface, XUserHand
     return xgr_return_hr(S_OK);
 }
 
-static HRESULT WINAPI xgs_unknown_ext(void *iface) { (void)iface; return xgr_return_hr(E_NOTIMPL); }
+/* IXGameSaveImpl4 UI callback / extended slots (typed __stdcall signatures, zero void* casts) */
+static HRESULT WINAPI xgs_Ext_SetUiCallbacks(void *iface, const void *callbacks)
+{ (void)iface; (void)callbacks; return xgr_return_hr(E_NOTIMPL); }
+static HRESULT WINAPI xgs_Ext_SetUiResponse2(void *iface, XUserHandle user, uint32_t action)
+{ (void)iface; (void)user; (void)action; return xgr_return_hr(E_NOTIMPL); }
+static HRESULT WINAPI xgs_Ext_Reserved39(void *iface, XUserHandle user, const char *scid, XAsyncBlock *ab)
+{ (void)iface; (void)user; (void)scid; (void)ab; return xgr_return_hr(E_NOTIMPL); }
+static HRESULT WINAPI xgs_Ext_ReservedResult(void *iface, XAsyncBlock *ab)
+{ (void)iface; (void)ab; return xgr_return_hr(E_NOTIMPL); }
+static HRESULT WINAPI xgs_Ext_ReservedSize(void *iface, XAsyncBlock *ab, SIZE_T *outSize)
+{ (void)iface; (void)ab; if (outSize) *outSize = 0; return xgr_return_hr(E_NOTIMPL); }
+static HRESULT WINAPI xgs_Ext_ReservedBuf(void *iface, XAsyncBlock *ab, SIZE_T bufSize, void *buf)
+{ (void)iface; (void)ab; (void)bufSize; (void)buf; return xgr_return_hr(E_NOTIMPL); }
 
-static const void *const g_xgamesave4_vtbl[50] = {
-    (const void *)xgs_QueryInterface,                               /* 0 */
-    (const void *)xgs_AddRef,                                       /* 1 */
-    (const void *)xgs_Release,                                      /* 2 */
-    (const void *)xgs_XGameSaveInitializeProvider,                  /* 3 */
-    (const void *)xgs_XGameSaveInitializeProviderAsync,             /* 4 */
-    (const void *)xgs_XGameSaveInitializeProviderResult,            /* 5 */
-    (const void *)xgs_XGameSaveCloseProvider,                       /* 6 */
-    (const void *)xgs_XGameSaveGetRemainingQuota,                   /* 7 */
-    (const void *)xgs_XGameSaveGetRemainingQuotaAsync,              /* 8 */
-    (const void *)xgs_XGameSaveGetRemainingQuotaResult,             /* 9 */
-    (const void *)xgs_XGameSaveDeleteContainer,                     /* 10 */
-    (const void *)xgs_XGameSaveDeleteContainerAsync,                /* 11 */
-    (const void *)xgs_XGameSaveDeleteContainerResult,               /* 12 */
-    (const void *)xgs_XGameSaveGetContainerInfo,                    /* 13 */
-    (const void *)xgs_XGameSaveEnumerateContainerInfo,              /* 14 */
-    (const void *)xgs_XGameSaveEnumerateContainerInfoByName,        /* 15 */
-    (const void *)xgs_XGameSaveCreateContainer,                     /* 16 */
-    (const void *)xgs_XGameSaveCloseContainer,                      /* 17 */
-    (const void *)xgs_XGameSaveEnumerateBlobInfo,                   /* 18 */
-    (const void *)xgs_XGameSaveEnumerateBlobInfoByName,             /* 19 */
-    (const void *)xgs_XGameSaveReadBlobData,                        /* 20 */
-    (const void *)xgs_XGameSaveReadBlobDataAsync,                   /* 21 */
-    (const void *)xgs_XGameSaveReadBlobDataResult,                  /* 22 */
-    (const void *)xgs_XGameSaveCreateUpdate,                        /* 23 */
-    (const void *)xgs_XGameSaveCloseUpdate,                         /* 24 */
-    (const void *)xgs_XGameSaveSubmitBlobWrite,                     /* 25 */
-    (const void *)xgs_XGameSaveSubmitBlobDelete,                    /* 26 */
-    (const void *)xgs_XGameSaveSubmitUpdate,                        /* 27 */
-    (const void *)xgs_XGameSaveSubmitUpdateAsync,                   /* 28 */
-    (const void *)xgs_XGameSaveSubmitUpdateResult,                  /* 29 */
-    /* IXGameSaveImpl2 / Impl3 */
-    (const void *)xgs_XGameSaveFilesGetFolderWithUiAsync,           /* 30 */
-    (const void *)xgs_XGameSaveFilesGetFolderWithUiResult,          /* 31 */
-    (const void *)xgs_XGameSaveFilesGetRemainingQuota,              /* 32 */
-    /* IXGameSaveImpl4 trailing safety slots */
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext,
-    (const void *)xgs_unknown_ext
+typedef struct IXGameSaveImpl4Vtbl {
+    HRESULT (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);                                                                 /* 0 */
+    ULONG   (WINAPI *AddRef)(void *iface);                                                                                                  /* 1 */
+    ULONG   (WINAPI *Release)(void *iface);                                                                                                 /* 2 */
+    HRESULT (WINAPI *XGameSaveInitializeProvider)(void *iface, XUserHandle user, const char *configId, BOOLEAN syncOnDemand, XGameSaveProviderHandle *out); /* 3 */
+    HRESULT (WINAPI *XGameSaveInitializeProviderAsync)(void *iface, XUserHandle user, const char *configId, BOOLEAN syncOnDemand, XAsyncBlock *async);      /* 4 */
+    HRESULT (WINAPI *XGameSaveInitializeProviderResult)(void *iface, XAsyncBlock *async, XGameSaveProviderHandle *out);                     /* 5 */
+    void    (WINAPI *XGameSaveCloseProvider)(void *iface, XGameSaveProviderHandle prov);                                                    /* 6 */
+    HRESULT (WINAPI *XGameSaveGetRemainingQuota)(void *iface, XGameSaveProviderHandle prov, int64_t *rem);                                  /* 7 */
+    HRESULT (WINAPI *XGameSaveGetRemainingQuotaAsync)(void *iface, XGameSaveProviderHandle prov, XAsyncBlock *async);                       /* 8 */
+    HRESULT (WINAPI *XGameSaveGetRemainingQuotaResult)(void *iface, XAsyncBlock *async, int64_t *rem);                                      /* 9 */
+    HRESULT (WINAPI *XGameSaveDeleteContainer)(void *iface, XGameSaveProviderHandle prov, const char *cname);                               /* 10 */
+    HRESULT (WINAPI *XGameSaveDeleteContainerAsync)(void *iface, XGameSaveProviderHandle prov, const char *cname, XAsyncBlock *async);      /* 11 */
+    HRESULT (WINAPI *XGameSaveDeleteContainerResult)(void *iface, XAsyncBlock *async);                                                      /* 12 */
+    HRESULT (WINAPI *XGameSaveGetContainerInfo)(void *iface, XGameSaveProviderHandle prov, const char *cname, void *ctx, XGameSaveContainerInfoCallback *cb); /* 13 */
+    HRESULT (WINAPI *XGameSaveEnumerateContainerInfo)(void *iface, XGameSaveProviderHandle prov, void *ctx, XGameSaveContainerInfoCallback *cb); /* 14 */
+    HRESULT (WINAPI *XGameSaveEnumerateContainerInfoByName)(void *iface, XGameSaveProviderHandle prov, const char *prefix, void *ctx, XGameSaveContainerInfoCallback *cb); /* 15 */
+    HRESULT (WINAPI *XGameSaveCreateContainer)(void *iface, XGameSaveProviderHandle prov, const char *cname, XGameSaveContainerHandle *out); /* 16 */
+    void    (WINAPI *XGameSaveCloseContainer)(void *iface, XGameSaveContainerHandle cont);                                                  /* 17 */
+    HRESULT (WINAPI *XGameSaveEnumerateBlobInfo)(void *iface, XGameSaveContainerHandle cont, void *ctx, XGameSaveBlobInfoCallback *cb);     /* 18 */
+    HRESULT (WINAPI *XGameSaveEnumerateBlobInfoByName)(void *iface, XGameSaveContainerHandle cont, const char *prefix, void *ctx, XGameSaveBlobInfoCallback *cb); /* 19 */
+    HRESULT (WINAPI *XGameSaveReadBlobData)(void *iface, XGameSaveContainerHandle cont, const char **blobNames, uint32_t *countOfBlobs, SIZE_T blobsSize, XGameSaveBlob *blobData); /* 20 */
+    HRESULT (WINAPI *XGameSaveReadBlobDataAsync)(void *iface, XGameSaveContainerHandle cont, const char **blobNames, uint32_t countOfBlobs, XAsyncBlock *async); /* 21 */
+    HRESULT (WINAPI *XGameSaveReadBlobDataResult)(void *iface, XAsyncBlock *async, SIZE_T blobsSize, XGameSaveBlob *blobData, uint32_t *countOfBlobs); /* 22 */
+    HRESULT (WINAPI *XGameSaveCreateUpdate)(void *iface, XGameSaveContainerHandle cont, const char *displayName, XGameSaveUpdateHandle *out); /* 23 */
+    void    (WINAPI *XGameSaveCloseUpdate)(void *iface, XGameSaveUpdateHandle upd);                                                         /* 24 */
+    HRESULT (WINAPI *XGameSaveSubmitBlobWrite)(void *iface, XGameSaveUpdateHandle upd, const char *bname, uint8_t *data, SIZE_T byteCount); /* 25 */
+    HRESULT (WINAPI *XGameSaveSubmitBlobDelete)(void *iface, XGameSaveUpdateHandle upd, const char *bname);                                 /* 26 */
+    HRESULT (WINAPI *XGameSaveSubmitUpdate)(void *iface, XGameSaveUpdateHandle upd);                                                        /* 27 */
+    HRESULT (WINAPI *XGameSaveSubmitUpdateAsync)(void *iface, XGameSaveUpdateHandle upd, XAsyncBlock *async);                               /* 28 */
+    HRESULT (WINAPI *XGameSaveSubmitUpdateResult)(void *iface, XAsyncBlock *async);                                                         /* 29 */
+    HRESULT (WINAPI *XGameSaveFilesGetFolderWithUiAsync)(void *iface, XUserHandle user, const char *configId, XAsyncBlock *async);          /* 30 */
+    HRESULT (WINAPI *XGameSaveFilesGetFolderWithUiResult)(void *iface, XAsyncBlock *async, SIZE_T folderSize, char *folderResult);          /* 31 */
+    HRESULT (WINAPI *XGameSaveFilesGetRemainingQuota)(void *iface, XUserHandle user, const char *configId, int64_t *rem);                   /* 32 */
+    HRESULT (WINAPI *ExtSetUiCallbacks)(void *iface, const void *callbacks);                                                                /* 33 */
+    HRESULT (WINAPI *ExtSetUiProgressResponse)(void *iface, XUserHandle user, uint32_t action);                                             /* 34 */
+    HRESULT (WINAPI *ExtSetUiSyncFailedResponse)(void *iface, XUserHandle user, uint32_t action);                                           /* 35 */
+    HRESULT (WINAPI *ExtSetUiContentionResponse)(void *iface, XUserHandle user, uint32_t action);                                           /* 36 */
+    HRESULT (WINAPI *ExtSetUiConflictResponse)(void *iface, XUserHandle user, uint32_t action);                                             /* 37 */
+    HRESULT (WINAPI *ExtSetUiOutOfStorageResponse)(void *iface, XUserHandle user, uint32_t action);                                         /* 38 */
+    HRESULT (WINAPI *ExtReserved39)(void *iface, XUserHandle user, const char *scid, XAsyncBlock *ab);                                      /* 39 */
+    HRESULT (WINAPI *ExtReserved40)(void *iface, XAsyncBlock *ab);                                                                          /* 40 */
+    HRESULT (WINAPI *ExtReserved41)(void *iface, XAsyncBlock *ab, SIZE_T *outSize);                                                         /* 41 */
+    HRESULT (WINAPI *ExtReserved42)(void *iface, XAsyncBlock *ab, SIZE_T bufSize, void *buf);                                               /* 42 */
+    HRESULT (WINAPI *ExtReserved43)(void *iface, XUserHandle user, const char *scid, XAsyncBlock *ab);                                      /* 43 */
+    HRESULT (WINAPI *ExtReserved44)(void *iface, XAsyncBlock *ab);                                                                          /* 44 */
+    HRESULT (WINAPI *ExtReserved45)(void *iface, XAsyncBlock *ab, SIZE_T *outSize);                                                         /* 45 */
+    HRESULT (WINAPI *ExtReserved46)(void *iface, XAsyncBlock *ab, SIZE_T bufSize, void *buf);                                               /* 46 */
+    HRESULT (WINAPI *ExtReserved47)(void *iface, XUserHandle user, const char *scid, XAsyncBlock *ab);                                      /* 47 */
+    HRESULT (WINAPI *ExtReserved48)(void *iface, XAsyncBlock *ab);                                                                          /* 48 */
+    HRESULT (WINAPI *ExtReserved49)(void *iface, XAsyncBlock *ab, SIZE_T *outSize);                                                         /* 49 */
+} IXGameSaveImpl4Vtbl;
+
+_Static_assert(sizeof(IXGameSaveImpl4Vtbl) == 50 * sizeof(void *), "IXGameSaveImpl4Vtbl must have exactly 50 slots");
+
+static const IXGameSaveImpl4Vtbl g_xgamesave4_vtbl = {
+    xgs_QueryInterface,
+    xgs_AddRef,
+    xgs_Release,
+    xgs_XGameSaveInitializeProvider,
+    xgs_XGameSaveInitializeProviderAsync,
+    xgs_XGameSaveInitializeProviderResult,
+    xgs_XGameSaveCloseProvider,
+    xgs_XGameSaveGetRemainingQuota,
+    xgs_XGameSaveGetRemainingQuotaAsync,
+    xgs_XGameSaveGetRemainingQuotaResult,
+    xgs_XGameSaveDeleteContainer,
+    xgs_XGameSaveDeleteContainerAsync,
+    xgs_XGameSaveDeleteContainerResult,
+    xgs_XGameSaveGetContainerInfo,
+    xgs_XGameSaveEnumerateContainerInfo,
+    xgs_XGameSaveEnumerateContainerInfoByName,
+    xgs_XGameSaveCreateContainer,
+    xgs_XGameSaveCloseContainer,
+    xgs_XGameSaveEnumerateBlobInfo,
+    xgs_XGameSaveEnumerateBlobInfoByName,
+    xgs_XGameSaveReadBlobData,
+    xgs_XGameSaveReadBlobDataAsync,
+    xgs_XGameSaveReadBlobDataResult,
+    xgs_XGameSaveCreateUpdate,
+    xgs_XGameSaveCloseUpdate,
+    xgs_XGameSaveSubmitBlobWrite,
+    xgs_XGameSaveSubmitBlobDelete,
+    xgs_XGameSaveSubmitUpdate,
+    xgs_XGameSaveSubmitUpdateAsync,
+    xgs_XGameSaveSubmitUpdateResult,
+    xgs_XGameSaveFilesGetFolderWithUiAsync,
+    xgs_XGameSaveFilesGetFolderWithUiResult,
+    xgs_XGameSaveFilesGetRemainingQuota,
+    xgs_Ext_SetUiCallbacks,
+    xgs_Ext_SetUiResponse2,
+    xgs_Ext_SetUiResponse2,
+    xgs_Ext_SetUiResponse2,
+    xgs_Ext_SetUiResponse2,
+    xgs_Ext_SetUiResponse2,
+    xgs_Ext_Reserved39,
+    xgs_Ext_ReservedResult,
+    xgs_Ext_ReservedSize,
+    xgs_Ext_ReservedBuf,
+    xgs_Ext_Reserved39,
+    xgs_Ext_ReservedResult,
+    xgs_Ext_ReservedSize,
+    xgs_Ext_ReservedBuf,
+    xgs_Ext_Reserved39,
+    xgs_Ext_ReservedResult,
+    xgs_Ext_ReservedSize
 };
 
-static struct { const void *lpVtbl; } g_xgamesave_singleton = { g_xgamesave4_vtbl };
+static struct { const IXGameSaveImpl4Vtbl *lpVtbl; } g_xgamesave_singleton = { &g_xgamesave4_vtbl };
 
 HRESULT xgr_query_gamesave(REFIID iid, void **ppv)
 {

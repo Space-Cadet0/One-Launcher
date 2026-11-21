@@ -41,50 +41,89 @@ struct XStoreCanAcquireLicenseResultAbi {
     uint32_t status;
 };
 
-static uint64_t g_next_store_reg_token = 100;
+_Alignas(8) static volatile LONGLONG g_next_store_reg_token = 100;
 
 /* -------------------------------------------------------------------------
  * Helpers for parsing simple JSON object arrays from loopback server
  * ------------------------------------------------------------------------- */
 
-static const char *find_json_array(const char *json, const char *key)
+static const char *store_json_locate_key_value(const char *json, const char *key)
 {
     if (!json || !key) return NULL;
-    char pat[128];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(json, pat);
-    if (!p) return NULL;
-    p += strlen(pat);
+    size_t key_len = strlen(key);
+    const char *p = json;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-    if (*p != ':') return NULL;
-    p++;
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-    return (*p == '[') ? p : NULL;
+    if (*p != '{') return NULL;
+
+    int depth = 0;
+    bool expect_key = false;
+    while (*p) {
+        char ch = *p;
+        if (ch == '"') {
+            const char *str_start = ++p;
+            while (*p && *p != '"') {
+                if (*p == '\\') {
+                    p++;
+                    if (!*p) return NULL;
+                }
+                p++;
+            }
+            if (!*p) return NULL;
+            const char *str_end = p;
+            p++;
+            if (depth == 1 && expect_key) {
+                bool match = ((size_t)(str_end - str_start) == key_len) &&
+                             (key_len == 0 || memcmp(str_start, key, key_len) == 0);
+                const char *after = p;
+                while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') after++;
+                if (*after == ':') {
+                    after++;
+                    while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') after++;
+                    expect_key = false;
+                    if (match) return after;
+                    p = after;
+                    continue;
+                }
+            }
+            continue;
+        }
+        if (ch == '{') {
+            depth++;
+            if (depth == 1) expect_key = true;
+        } else if (ch == '}') {
+            depth--;
+            if (depth <= 0) break;
+        } else if (ch == '[') {
+            depth++;
+        } else if (ch == ']') {
+            depth--;
+            if (depth <= 0) break;
+        } else if (depth == 1) {
+            if (ch == ',') expect_key = true;
+            else if (ch == ':') expect_key = false;
+        }
+        p++;
+    }
+    return NULL;
+}
+
+static const char *find_json_array(const char *json, const char *key)
+{
+    const char *v = store_json_locate_key_value(json, key);
+    return (v && *v == '[') ? v : NULL;
 }
 
 static bool parse_json_float_field(const char *json, const char *key, float *out_val)
 {
     if (!json || !key || !out_val) return false;
-    char pat[128];
-    int plen = snprintf(pat, sizeof(pat), "\"%s\"", key);
-    if (plen <= 0 || (size_t)plen >= sizeof(pat)) return false;
-    const char *cursor = json;
-    const char *p = NULL;
-    while ((p = strstr(cursor, pat)) != NULL) {
-        cursor = p + (size_t)plen;
-        const char *v = cursor;
-        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
-        if (*v != ':') continue;
-        v++;
-        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
-        if (*v == '"') v++;
-        char *endp = NULL;
-        double val = strtod(v, &endp);
-        if (endp == v) continue;
-        *out_val = (float)val;
-        return true;
-    }
-    return false;
+    const char *v = store_json_locate_key_value(json, key);
+    if (!v) return false;
+    if (*v == '"') v++;
+    char *endp = NULL;
+    double val = strtod(v, &endp);
+    if (endp == v) return false;
+    *out_val = (float)val;
+    return true;
 }
 
 static const char *next_json_object_in_array(const char *cursor, char **out_obj_str)
@@ -129,26 +168,11 @@ static const char *next_json_object_in_array(const char *cursor, char **out_obj_
 
 static char *extract_json_subobject(const char *json, const char *key)
 {
-    if (!json || !key) return NULL;
-    char pat[128];
-    int plen = snprintf(pat, sizeof(pat), "\"%s\"", key);
-    if (plen <= 0 || (size_t)plen >= sizeof(pat)) return NULL;
-    const char *cursor = json;
-    const char *p = NULL;
-    while ((p = strstr(cursor, pat)) != NULL) {
-        cursor = p + (size_t)plen;
-        const char *v = cursor;
-        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
-        if (*v != ':') continue;
-        v++;
-        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
-        if (*v == '{') {
-            char *sub = NULL;
-            if (next_json_object_in_array(v, &sub) != NULL) {
-                return sub;
-            }
-            return NULL;
-        }
+    const char *v = store_json_locate_key_value(json, key);
+    if (!v || *v != '{') return NULL;
+    char *sub = NULL;
+    if (next_json_object_in_array(v, &sub) != NULL) {
+        return sub;
     }
     return NULL;
 }
@@ -615,13 +639,17 @@ static HRESULT CALLBACK store_str_provider(XAsyncOp op, const XAsyncProviderData
             }
             if (!ctx->result_str) {
                 ctx->result_str = (char *)calloc(1, 1);
+                if (!ctx->result_str) {
+                    xgr_async_complete(data->async, E_OUTOFMEMORY, 0);
+                    return S_OK;
+                }
             }
-            ctx->result_size = ctx->result_str ? (strlen(ctx->result_str) + 1) : 1;
+            ctx->result_size = strlen(ctx->result_str) + 1;
             xgr_async_complete(data->async, S_OK, ctx->result_size);
             return S_OK;
         }
         case XAsyncOp_GetResult:
-            if (!data->buffer || data->bufferSize < ctx->result_size) return E_INVALIDARG;
+            if (!data->buffer || !ctx->result_str || data->bufferSize < ctx->result_size) return E_INVALIDARG;
             memcpy(data->buffer, ctx->result_str, ctx->result_size);
             return S_OK;
         case XAsyncOp_Cleanup:
@@ -643,6 +671,10 @@ static HRESULT CALLBACK store_str_provider(XAsyncOp op, const XAsyncProviderData
 static HRESULT WINAPI xs_QueryInterface(void *iface, REFIID riid, void **ppv)
 {
     if (!ppv) return E_POINTER;
+    if (!riid) {
+        *ppv = NULL;
+        return E_INVALIDARG;
+    }
     if (IsEqualGUID(riid, &IID_IUnknown) ||
         IsEqualGUID(riid, &IID_IXStoreImpl) ||
         IsEqualGUID(riid, &IID_IXStoreImpl2) ||
@@ -863,13 +895,48 @@ static BOOLEAN WINAPI xs_XStoreProductsQueryHasMorePages(void *iface, const XSto
     return FALSE;
 }
 
+static HRESULT CALLBACK empty_prod_query_provider(XAsyncOp op, const XAsyncProviderData *data)
+{
+    XStoreProductQueryHandle *slot = (XStoreProductQueryHandle *)data->context;
+    switch (op) {
+        case XAsyncOp_Begin:
+            return xgr_async_schedule(data->async, 0);
+        case XAsyncOp_DoWork: {
+            XStoreProductQueryHandle q = (XStoreProductQueryHandle)calloc(1, sizeof(*q));
+            if (!q) {
+                xgr_async_complete(data->async, E_OUTOFMEMORY, 0);
+                return S_OK;
+            }
+            q->ref = 1;
+            *slot = q;
+            xgr_async_complete(data->async, S_OK, sizeof(XStoreProductQueryHandle));
+            return S_OK;
+        }
+        case XAsyncOp_GetResult:
+            if (!data->buffer || data->bufferSize < sizeof(XStoreProductQueryHandle)) return E_INVALIDARG;
+            *(XStoreProductQueryHandle *)data->buffer = *slot;
+            *slot = NULL;
+            return S_OK;
+        case XAsyncOp_Cleanup:
+            if (slot) {
+                if (*slot) close_product_query(*slot);
+                free(slot);
+            }
+            return S_OK;
+        default:
+            return S_OK;
+    }
+}
+
 static HRESULT WINAPI xs_XStoreProductsQueryNextPageAsync(void *iface, const XStoreProductQueryHandle q, XAsyncBlock *async)
 {
     (void)iface; (void)q;
-    char *p = (char *)malloc(32);
-    if (!p) return E_OUTOFMEMORY;
-    strcpy(p, "{\"products\":[]}");
-    return start_product_query_async("xstore.queryProducts", p, (const void *)xs_XStoreProductsQueryNextPageAsync, "XStoreProductsQueryNextPageAsync", async);
+    if (!async) return xgr_return_hr(E_INVALIDARG);
+    XStoreProductQueryHandle *slot = (XStoreProductQueryHandle *)calloc(1, sizeof(*slot));
+    if (!slot) return xgr_return_hr(E_OUTOFMEMORY);
+    HRESULT hr = xgr_async_begin(async, slot, (const void *)xs_XStoreProductsQueryNextPageAsync, "XStoreProductsQueryNextPageAsync", empty_prod_query_provider);
+    if (FAILED(hr)) free(slot);
+    return xgr_return_hr(hr);
 }
 
 static HRESULT WINAPI xs_XStoreProductsQueryNextPageResult(void *iface, XAsyncBlock *async, XStoreProductQueryHandle *out)
@@ -987,7 +1054,8 @@ static HRESULT WINAPI xs_XStoreQueryAddOnLicensesResult(void *iface, XAsyncBlock
 {
     (void)iface;
     if (count > 0 && !out) return E_INVALIDARG;
-    return xgr_return_hr(xgr_async_get_result(async, (const void *)xs_XStoreQueryAddOnLicensesAsync, count * sizeof(XStoreAddonLicense), out, NULL));
+    if ((size_t)count > SIZE_MAX / sizeof(XStoreAddonLicense)) return E_INVALIDARG;
+    return xgr_return_hr(xgr_async_get_result(async, (const void *)xs_XStoreQueryAddOnLicensesAsync, (size_t)count * sizeof(XStoreAddonLicense), out, NULL));
 }
 
 static HRESULT WINAPI xs_XStoreQueryConsumableBalanceRemainingAsync(void *iface, const XStoreContextHandle sc, const char *pid, XAsyncBlock *async)
@@ -1025,12 +1093,21 @@ static HRESULT start_store_str_async(const char *method, const char *ticket, con
     if (ticket) {
         size_t n = strlen(ticket) + 1;
         ctx->ticket = (char *)malloc(n);
-        if (ctx->ticket) memcpy(ctx->ticket, ticket, n);
+        if (!ctx->ticket) {
+            free(ctx);
+            return xgr_return_hr(E_OUTOFMEMORY);
+        }
+        memcpy(ctx->ticket, ticket, n);
     }
     if (pub_uid) {
         size_t n = strlen(pub_uid) + 1;
         ctx->pub_uid = (char *)malloc(n);
-        if (ctx->pub_uid) memcpy(ctx->pub_uid, pub_uid, n);
+        if (!ctx->pub_uid) {
+            free(ctx->ticket);
+            free(ctx);
+            return xgr_return_hr(E_OUTOFMEMORY);
+        }
+        memcpy(ctx->pub_uid, pub_uid, n);
     }
     HRESULT hr = xgr_async_begin(async, ctx, id, name, store_str_provider);
     if (FAILED(hr)) {
@@ -1132,9 +1209,24 @@ static HRESULT WINAPI xs_XStoreQueryLicenseTokenResult(void *iface, XAsyncBlock 
     return xgr_return_hr(xgr_async_get_result(async, (const void *)xs_XStoreQueryLicenseTokenAsync, size, result, NULL));
 }
 
-static HRESULT WINAPI xs_PADDING_1(void *iface) { (void)iface; return E_NOTIMPL; }
-static HRESULT WINAPI xs_PADDING_2(void *iface) { (void)iface; return E_NOTIMPL; }
-static HRESULT WINAPI xs_PADDING_3(void *iface) { (void)iface; return E_NOTIMPL; }
+/* Slots 46-48: XStoreSendRequestAsync / ResultSize / Result (exact __stdcall arity) */
+static HRESULT WINAPI xs_XStoreSendRequestAsync(void *iface, const XStoreContextHandle sc, const char *interfaceName, uint32_t requestId, const char *requestData, size_t requestDataSize, XAsyncBlock *async)
+{
+    (void)iface; (void)sc; (void)interfaceName; (void)requestId; (void)requestData; (void)requestDataSize; (void)async;
+    return xgr_return_hr(E_NOTIMPL);
+}
+static HRESULT WINAPI xs_XStoreSendRequestResultSize(void *iface, XAsyncBlock *async, size_t *size)
+{
+    (void)iface; (void)async;
+    if (size) *size = 0;
+    return xgr_return_hr(E_NOTIMPL);
+}
+static HRESULT WINAPI xs_XStoreSendRequestResult(void *iface, XAsyncBlock *async, size_t size, char *result, size_t *used)
+{
+    (void)iface; (void)async; (void)size; (void)result;
+    if (used) *used = 0;
+    return xgr_return_hr(E_NOTIMPL);
+}
 
 static HRESULT WINAPI xs_XStoreShowPurchaseUIAsync(void *iface, const XStoreContextHandle sc, const char *sid, const char *name, const char *ext, XAsyncBlock *ab)
 {
@@ -1218,7 +1310,9 @@ static HRESULT WINAPI xs_XStoreDownloadAndInstallPackagesAsync(void *iface, cons
 }
 static HRESULT WINAPI xs_XStoreDownloadAndInstallPackagesResultCount(void *iface, XAsyncBlock *ab, uint32_t *count)
 {
-    (void)iface; (void)ab;
+    (void)iface;
+    HRESULT hr = xgr_async_get_status(ab, false);
+    if (FAILED(hr)) return hr;
     if (count) *count = 0;
     return S_OK;
 }
@@ -1369,99 +1463,192 @@ static HRESULT WINAPI xs_XStoreShowGiftingUIResult(void *iface, XAsyncBlock *ab)
     return xgr_async_get_result(ab, NULL, 0, NULL, NULL);
 }
 
-static const void *const g_xstore6_vtbl[84] = {
-    (const void *)xs_QueryInterface,                                        /* 0 */
-    (const void *)xs_AddRef,                                                /* 1 */
-    (const void *)xs_Release,                                               /* 2 */
-    (const void *)xs_XStoreCreateContext,                                   /* 3 */
-    (const void *)xs_XStoreCloseContextHandle,                              /* 4 */
-    (const void *)xs_XStoreQueryAssociatedProductsAsync,                    /* 5 */
-    (const void *)xs_XStoreQueryAssociatedProductsResult,                   /* 6 */
-    (const void *)xs_XStoreQueryProductsAsync,                              /* 7 */
-    (const void *)xs_XStoreQueryProductsResult,                             /* 8 */
-    (const void *)xs_XStoreQueryEntitledProductsAsync,                      /* 9 */
-    (const void *)xs_XStoreQueryEntitledProductsResult,                     /* 10 */
-    (const void *)xs_XStoreQueryProductForCurrentGameAsync,                 /* 11 */
-    (const void *)xs_XStoreQueryProductForCurrentGameResult,                /* 12 */
-    (const void *)xs_XStoreQueryProductForPackageAsync,                     /* 13 */
-    (const void *)xs_XStoreQueryProductForPackageResult,                    /* 14 */
-    (const void *)xs_XStoreEnumerateProductsQuery,                          /* 15 */
-    (const void *)xs_XStoreProductsQueryHasMorePages,                       /* 16 */
-    (const void *)xs_XStoreProductsQueryNextPageAsync,                      /* 17 */
-    (const void *)xs_XStoreProductsQueryNextPageResult,                     /* 18 */
-    (const void *)xs_XStoreCloseProductsQueryHandle,                        /* 19 */
-    (const void *)xs_XStoreAcquireLicenseForPackageAsync,                   /* 20 */
-    (const void *)xs_XStoreAcquireLicenseForPackageResult,                  /* 21 */
-    (const void *)xs_XStoreIsLicenseValid,                                  /* 22 */
-    (const void *)xs_XStoreCloseLicenseHandle,                              /* 23 */
-    (const void *)xs_XStoreCanAcquireLicenseForStoreIdAsync,                /* 24 */
-    (const void *)xs_XStoreCanAcquireLicenseForStoreIdResult,               /* 25 */
-    (const void *)xs_XStoreCanAcquireLicenseForPackageAsync,                /* 26 */
-    (const void *)xs_XStoreCanAcquireLicenseForPackageResult,               /* 27 */
-    (const void *)xs_XStoreQueryGameLicenseAsync,                           /* 28 */
-    (const void *)xs_XStoreQueryGameLicenseResult,                          /* 29 */
-    (const void *)xs_XStoreQueryAddOnLicensesAsync,                         /* 30 */
-    (const void *)xs_XStoreQueryAddOnLicensesResultCount,                   /* 31 */
-    (const void *)xs_XStoreQueryAddOnLicensesResult,                        /* 32 */
-    (const void *)xs_XStoreQueryConsumableBalanceRemainingAsync,            /* 33 */
-    (const void *)xs_XStoreQueryConsumableBalanceRemainingResult,           /* 34 */
-    (const void *)xs_XStoreReportConsumableFulfillmentAsync,                /* 35 */
-    (const void *)xs_XStoreReportConsumableFulfillmentResult,               /* 36 */
-    (const void *)xs_XStoreGetUserCollectionsIdAsync,                       /* 37 */
-    (const void *)xs_XStoreGetUserCollectionsIdResultSize,                  /* 38 */
-    (const void *)xs_XStoreGetUserCollectionsIdResult,                      /* 39 */
-    (const void *)xs_XStoreGetUserPurchaseIdAsync,                          /* 40 */
-    (const void *)xs_XStoreGetUserPurchaseIdResultSize,                     /* 41 */
-    (const void *)xs_XStoreGetUserPurchaseIdResult,                         /* 42 */
-    (const void *)xs_XStoreQueryLicenseTokenAsync,                          /* 43 */
-    (const void *)xs_XStoreQueryLicenseTokenResultSize,                     /* 44 */
-    (const void *)xs_XStoreQueryLicenseTokenResult,                         /* 45 */
-    (const void *)xs_PADDING_1,                                             /* 46 */
-    (const void *)xs_PADDING_2,                                             /* 47 */
-    (const void *)xs_PADDING_3,                                             /* 48 */
-    (const void *)xs_XStoreShowPurchaseUIAsync,                             /* 49 */
-    (const void *)xs_XStoreShowPurchaseUIResult,                            /* 50 */
-    (const void *)xs_XStoreShowRateAndReviewUIAsync,                        /* 51 */
-    (const void *)xs_XStoreShowRateAndReviewUIResult,                       /* 52 */
-    (const void *)xs_XStoreShowRedeemTokenUIAsync,                          /* 53 */
-    (const void *)xs_XStoreShowRedeemTokenUIResult,                         /* 54 */
-    (const void *)xs_XStoreQueryGameAndDlcPackageUpdatesAsync,              /* 55 */
-    (const void *)xs_XStoreQueryGameAndDlcPackageUpdatesResultCount,        /* 56 */
-    (const void *)xs_XStoreQueryGameAndDlcPackageUpdatesResult,             /* 57 */
-    (const void *)xs_XStoreDownloadPackageUpdatesAsync,                     /* 58 */
-    (const void *)xs_XStoreDownloadPackageUpdatesResult,                    /* 59 */
-    (const void *)xs_XStoreDownloadAndInstallPackageUpdatesAsync,           /* 60 */
-    (const void *)xs_XStoreDownloadAndInstallPackageUpdatesResult,          /* 61 */
-    (const void *)xs_XStoreDownloadAndInstallPackagesAsync,                 /* 62 */
-    (const void *)xs_XStoreDownloadAndInstallPackagesResultCount,           /* 63 */
-    (const void *)xs_XStoreDownloadAndInstallPackagesResult,                /* 64 */
-    (const void *)xs_XStoreQueryPackageIdentifier,                          /* 65 */
-    (const void *)xs_XStoreRegisterGameLicenseChanged,                      /* 66 */
-    (const void *)xs_XStoreUnregisterGameLicenseChanged,                    /* 67 */
-    (const void *)xs_XStoreRegisterPackageLicenseLost,                      /* 68 */
-    (const void *)xs_XStoreUnregisterPackageLicenseLost,                    /* 69 */
+typedef struct IXStoreImpl6Vtbl {
+    HRESULT (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG   (WINAPI *AddRef)(void *iface);
+    ULONG   (WINAPI *Release)(void *iface);
+    HRESULT (WINAPI *XStoreCreateContext)(void *iface, const XUserHandle user, XStoreContextHandle *out);
+    void    (WINAPI *XStoreCloseContextHandle)(void *iface, XStoreContextHandle ctx);
+    HRESULT (WINAPI *XStoreQueryAssociatedProductsAsync)(void *iface, const XStoreContextHandle sc, uint32_t kinds, uint32_t maxItems, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreQueryAssociatedProductsResult)(void *iface, XAsyncBlock *async, XStoreProductQueryHandle *out);
+    HRESULT (WINAPI *XStoreQueryProductsAsync)(void *iface, const XStoreContextHandle sc, uint32_t kinds, const char **storeIds, SIZE_T storeIdsCount, const char **actionFilters, SIZE_T actionFiltersCount, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreQueryProductsResult)(void *iface, XAsyncBlock *async, XStoreProductQueryHandle *out);
+    HRESULT (WINAPI *XStoreQueryEntitledProductsAsync)(void *iface, const XStoreContextHandle sc, uint32_t kinds, uint32_t maxItems, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreQueryEntitledProductsResult)(void *iface, XAsyncBlock *async, XStoreProductQueryHandle *out);
+    HRESULT (WINAPI *XStoreQueryProductForCurrentGameAsync)(void *iface, const XStoreContextHandle sc, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreQueryProductForCurrentGameResult)(void *iface, XAsyncBlock *async, XStoreProductQueryHandle *out);
+    HRESULT (WINAPI *XStoreQueryProductForPackageAsync)(void *iface, const XStoreContextHandle sc, uint32_t kinds, const char *pkgId, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreQueryProductForPackageResult)(void *iface, XAsyncBlock *async, XStoreProductQueryHandle *out);
+    HRESULT (WINAPI *XStoreEnumerateProductsQuery)(void *iface, const XStoreProductQueryHandle q, void *context, XStoreProductQueryCallback *cb);
+    BOOLEAN (WINAPI *XStoreProductsQueryHasMorePages)(void *iface, const XStoreProductQueryHandle q);
+    HRESULT (WINAPI *XStoreProductsQueryNextPageAsync)(void *iface, const XStoreProductQueryHandle q, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreProductsQueryNextPageResult)(void *iface, XAsyncBlock *async, XStoreProductQueryHandle *out);
+    void    (WINAPI *XStoreCloseProductsQueryHandle)(void *iface, XStoreProductQueryHandle q);
+    HRESULT (WINAPI *XStoreAcquireLicenseForPackageAsync)(void *iface, const void *handle, const char *pkgId, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreAcquireLicenseForPackageResult)(void *iface, XAsyncBlock *async, XStoreLicenseHandle *out);
+    BOOLEAN (WINAPI *XStoreIsLicenseValid)(void *iface, const XStoreLicenseHandle lic);
+    void    (WINAPI *XStoreCloseLicenseHandle)(void *iface, XStoreLicenseHandle lic);
+    HRESULT (WINAPI *XStoreCanAcquireLicenseForStoreIdAsync)(void *iface, const XStoreContextHandle sc, const char *storeId, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreCanAcquireLicenseForStoreIdResult)(void *iface, XAsyncBlock *async, void *out);
+    HRESULT (WINAPI *XStoreCanAcquireLicenseForPackageAsync)(void *iface, const XStoreContextHandle sc, const char *pkgId, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreCanAcquireLicenseForPackageResult)(void *iface, XAsyncBlock *async, void *out);
+    HRESULT (WINAPI *XStoreQueryGameLicenseAsync)(void *iface, const XStoreContextHandle sc, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreQueryGameLicenseResult)(void *iface, XAsyncBlock *async, XStoreGameLicense *lic);
+    HRESULT (WINAPI *XStoreQueryAddOnLicensesAsync)(void *iface, const XStoreContextHandle sc, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreQueryAddOnLicensesResultCount)(void *iface, XAsyncBlock *async, uint32_t *count);
+    HRESULT (WINAPI *XStoreQueryAddOnLicensesResult)(void *iface, XAsyncBlock *async, uint32_t count, XStoreAddonLicense *out);
+    HRESULT (WINAPI *XStoreQueryConsumableBalanceRemainingAsync)(void *iface, const XStoreContextHandle sc, const char *pid, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreQueryConsumableBalanceRemainingResult)(void *iface, XAsyncBlock *async, uint32_t *qty);
+    HRESULT (WINAPI *XStoreReportConsumableFulfillmentAsync)(void *iface, const XStoreContextHandle sc, const char *pid, uint32_t qty, GUID trackingId, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreReportConsumableFulfillmentResult)(void *iface, XAsyncBlock *async, uint32_t *qty);
+    HRESULT (WINAPI *XStoreGetUserCollectionsIdAsync)(void *iface, const XStoreContextHandle sc, const char *ticket, const char *pubUid, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreGetUserCollectionsIdResultSize)(void *iface, XAsyncBlock *async, size_t *size);
+    HRESULT (WINAPI *XStoreGetUserCollectionsIdResult)(void *iface, XAsyncBlock *async, size_t size, char *result);
+    HRESULT (WINAPI *XStoreGetUserPurchaseIdAsync)(void *iface, const XStoreContextHandle sc, const char *ticket, const char *pubUid, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreGetUserPurchaseIdResultSize)(void *iface, XAsyncBlock *async, size_t *size);
+    HRESULT (WINAPI *XStoreGetUserPurchaseIdResult)(void *iface, XAsyncBlock *async, size_t size, char *result);
+    HRESULT (WINAPI *XStoreQueryLicenseTokenAsync)(void *iface, const XStoreContextHandle sc, const char **pids, size_t cnt, const char *devStr, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreQueryLicenseTokenResultSize)(void *iface, XAsyncBlock *async, size_t *size);
+    HRESULT (WINAPI *XStoreQueryLicenseTokenResult)(void *iface, XAsyncBlock *async, size_t size, char *result);
+    HRESULT (WINAPI *XStoreSendRequestAsync)(void *iface, const XStoreContextHandle sc, const char *interfaceName, uint32_t requestId, const char *requestData, size_t requestDataSize, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreSendRequestResultSize)(void *iface, XAsyncBlock *async, size_t *size);
+    HRESULT (WINAPI *XStoreSendRequestResult)(void *iface, XAsyncBlock *async, size_t size, char *result, size_t *used);
+    HRESULT (WINAPI *XStoreShowPurchaseUIAsync)(void *iface, const XStoreContextHandle sc, const char *sid, const char *name, const char *ext, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreShowPurchaseUIResult)(void *iface, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreShowRateAndReviewUIAsync)(void *iface, const XStoreContextHandle sc, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreShowRateAndReviewUIResult)(void *iface, XAsyncBlock *ab, uint8_t *wasUpdated);
+    HRESULT (WINAPI *XStoreShowRedeemTokenUIAsync)(void *iface, const XStoreContextHandle sc, const char *tok, const char **sids, SIZE_T cnt, BOOLEAN dis, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreShowRedeemTokenUIResult)(void *iface, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreQueryGameAndDlcPackageUpdatesAsync)(void *iface, const XStoreContextHandle sc, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreQueryGameAndDlcPackageUpdatesResultCount)(void *iface, XAsyncBlock *ab, uint32_t *count);
+    HRESULT (WINAPI *XStoreQueryGameAndDlcPackageUpdatesResult)(void *iface, XAsyncBlock *ab, uint32_t count, XStorePackageUpdate *updates);
+    HRESULT (WINAPI *XStoreDownloadPackageUpdatesAsync)(void *iface, const XStoreContextHandle sc, const char **pkgs, SIZE_T cnt, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreDownloadPackageUpdatesResult)(void *iface, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreDownloadAndInstallPackageUpdatesAsync)(void *iface, const XStoreContextHandle sc, const char **pkgs, SIZE_T cnt, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreDownloadAndInstallPackageUpdatesResult)(void *iface, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreDownloadAndInstallPackagesAsync)(void *iface, const XStoreContextHandle sc, const char **sids, SIZE_T cnt, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreDownloadAndInstallPackagesResultCount)(void *iface, XAsyncBlock *ab, uint32_t *count);
+    HRESULT (WINAPI *XStoreDownloadAndInstallPackagesResult)(void *iface, XAsyncBlock *ab, uint32_t count, char **pkgs);
+    HRESULT (WINAPI *XStoreQueryPackageIdentifier)(void *iface, const char *storeId, SIZE_T size, char *pkgId);
+    HRESULT (WINAPI *XStoreRegisterGameLicenseChanged)(void *iface, XStoreContextHandle sc, XTaskQueueHandle q, void *ctx, void *cb, XTaskQueueRegistrationToken *tok);
+    BOOLEAN (WINAPI *XStoreUnregisterGameLicenseChanged)(void *iface, XStoreContextHandle sc, XTaskQueueRegistrationToken tok, BOOLEAN wait);
+    HRESULT (WINAPI *XStoreRegisterPackageLicenseLost)(void *iface, XStoreLicenseHandle lic, XTaskQueueHandle q, void *ctx, void *cb, XTaskQueueRegistrationToken *tok);
+    BOOLEAN (WINAPI *XStoreUnregisterPackageLicenseLost)(void *iface, XStoreLicenseHandle lic, XTaskQueueRegistrationToken tok, BOOLEAN wait);
     /* IXStoreImpl2 */
-    (const void *)xs_XStoreIsAvailabilityPurchasable,                       /* 70 */
+    BOOLEAN (WINAPI *XStoreIsAvailabilityPurchasable)(void *iface, const XStoreAvailability avail);
     /* IXStoreImpl3 */
-    (const void *)xs_XStoreAcquireLicenseForDurablesAsync,                  /* 71 */
-    (const void *)xs_XStoreAcquireLicenseForDurablesResult,                 /* 72 */
+    HRESULT (WINAPI *XStoreAcquireLicenseForDurablesAsync)(void *iface, const XStoreContextHandle sc, const char *storeId, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreAcquireLicenseForDurablesResult)(void *iface, XAsyncBlock *async, XStoreLicenseHandle *out);
     /* IXStoreImpl4 */
-    (const void *)xs_XStoreShowAssociatedProductsUIAsync,                   /* 73 */
-    (const void *)xs_XStoreShowAssociatedProductsUIResult,                  /* 74 */
-    (const void *)xs_XStoreShowProductPageUIAsync,                         /* 75 */
-    (const void *)xs_XStoreShowProductPageUIResult,                        /* 76 */
+    HRESULT (WINAPI *XStoreShowAssociatedProductsUIAsync)(void *iface, const XStoreContextHandle sc, const char *sid, uint32_t kinds, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreShowAssociatedProductsUIResult)(void *iface, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreShowProductPageUIAsync)(void *iface, const XStoreContextHandle sc, const char *sid, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreShowProductPageUIResult)(void *iface, XAsyncBlock *ab);
     /* IXStoreImpl5 */
-    (const void *)xs_XStoreQueryAssociatedProductsForStoreIdAsync,          /* 77 */
-    (const void *)xs_XStoreQueryAssociatedProductsForStoreIdResult,         /* 78 */
-    (const void *)xs_XStoreQueryPackageUpdatesAsync,                        /* 79 */
-    (const void *)xs_XStoreQueryPackageUpdatesResultCount,                  /* 80 */
-    (const void *)xs_XStoreQueryPackageUpdatesResult,                       /* 81 */
+    HRESULT (WINAPI *XStoreQueryAssociatedProductsForStoreIdAsync)(void *iface, const XStoreContextHandle sc, const char *sid, uint32_t kinds, uint32_t maxItems, XAsyncBlock *async);
+    HRESULT (WINAPI *XStoreQueryAssociatedProductsForStoreIdResult)(void *iface, XAsyncBlock *async, XStoreProductQueryHandle *out);
+    HRESULT (WINAPI *XStoreQueryPackageUpdatesAsync)(void *iface, XStoreContextHandle sc, const char **pkgs, SIZE_T cnt, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreQueryPackageUpdatesResultCount)(void *iface, XAsyncBlock *ab, uint32_t *count);
+    HRESULT (WINAPI *XStoreQueryPackageUpdatesResult)(void *iface, XAsyncBlock *ab, uint32_t count, XStorePackageUpdate *updates);
     /* IXStoreImpl6 */
-    (const void *)xs_XStoreShowGiftingUIAsync,                              /* 82 */
-    (const void *)xs_XStoreShowGiftingUIResult                              /* 83 */
+    HRESULT (WINAPI *XStoreShowGiftingUIAsync)(void *iface, XStoreContextHandle sc, const char *sid, const char *name, const char *ext, XAsyncBlock *ab);
+    HRESULT (WINAPI *XStoreShowGiftingUIResult)(void *iface, XAsyncBlock *ab);
+} IXStoreImpl6Vtbl;
+_Static_assert(sizeof(IXStoreImpl6Vtbl) == 84 * sizeof(void *), "IXStoreImpl6Vtbl must have 84 slots");
+
+static const IXStoreImpl6Vtbl g_xstore6_vtbl = {
+    xs_QueryInterface,                                        /* 0 */
+    xs_AddRef,                                                /* 1 */
+    xs_Release,                                               /* 2 */
+    xs_XStoreCreateContext,                                   /* 3 */
+    xs_XStoreCloseContextHandle,                              /* 4 */
+    xs_XStoreQueryAssociatedProductsAsync,                    /* 5 */
+    xs_XStoreQueryAssociatedProductsResult,                   /* 6 */
+    xs_XStoreQueryProductsAsync,                              /* 7 */
+    xs_XStoreQueryProductsResult,                             /* 8 */
+    xs_XStoreQueryEntitledProductsAsync,                      /* 9 */
+    xs_XStoreQueryEntitledProductsResult,                     /* 10 */
+    xs_XStoreQueryProductForCurrentGameAsync,                 /* 11 */
+    xs_XStoreQueryProductForCurrentGameResult,                /* 12 */
+    xs_XStoreQueryProductForPackageAsync,                     /* 13 */
+    xs_XStoreQueryProductForPackageResult,                    /* 14 */
+    xs_XStoreEnumerateProductsQuery,                          /* 15 */
+    xs_XStoreProductsQueryHasMorePages,                       /* 16 */
+    xs_XStoreProductsQueryNextPageAsync,                      /* 17 */
+    xs_XStoreProductsQueryNextPageResult,                     /* 18 */
+    xs_XStoreCloseProductsQueryHandle,                        /* 19 */
+    xs_XStoreAcquireLicenseForPackageAsync,                   /* 20 */
+    xs_XStoreAcquireLicenseForPackageResult,                  /* 21 */
+    xs_XStoreIsLicenseValid,                                  /* 22 */
+    xs_XStoreCloseLicenseHandle,                              /* 23 */
+    xs_XStoreCanAcquireLicenseForStoreIdAsync,                /* 24 */
+    xs_XStoreCanAcquireLicenseForStoreIdResult,               /* 25 */
+    xs_XStoreCanAcquireLicenseForPackageAsync,                /* 26 */
+    xs_XStoreCanAcquireLicenseForPackageResult,               /* 27 */
+    xs_XStoreQueryGameLicenseAsync,                           /* 28 */
+    xs_XStoreQueryGameLicenseResult,                          /* 29 */
+    xs_XStoreQueryAddOnLicensesAsync,                         /* 30 */
+    xs_XStoreQueryAddOnLicensesResultCount,                   /* 31 */
+    xs_XStoreQueryAddOnLicensesResult,                        /* 32 */
+    xs_XStoreQueryConsumableBalanceRemainingAsync,            /* 33 */
+    xs_XStoreQueryConsumableBalanceRemainingResult,           /* 34 */
+    xs_XStoreReportConsumableFulfillmentAsync,                /* 35 */
+    xs_XStoreReportConsumableFulfillmentResult,               /* 36 */
+    xs_XStoreGetUserCollectionsIdAsync,                       /* 37 */
+    xs_XStoreGetUserCollectionsIdResultSize,                  /* 38 */
+    xs_XStoreGetUserCollectionsIdResult,                      /* 39 */
+    xs_XStoreGetUserPurchaseIdAsync,                          /* 40 */
+    xs_XStoreGetUserPurchaseIdResultSize,                     /* 41 */
+    xs_XStoreGetUserPurchaseIdResult,                         /* 42 */
+    xs_XStoreQueryLicenseTokenAsync,                          /* 43 */
+    xs_XStoreQueryLicenseTokenResultSize,                     /* 44 */
+    xs_XStoreQueryLicenseTokenResult,                         /* 45 */
+    xs_XStoreSendRequestAsync,                                /* 46 */
+    xs_XStoreSendRequestResultSize,                           /* 47 */
+    xs_XStoreSendRequestResult,                               /* 48 */
+    xs_XStoreShowPurchaseUIAsync,                             /* 49 */
+    xs_XStoreShowPurchaseUIResult,                            /* 50 */
+    xs_XStoreShowRateAndReviewUIAsync,                        /* 51 */
+    xs_XStoreShowRateAndReviewUIResult,                       /* 52 */
+    xs_XStoreShowRedeemTokenUIAsync,                          /* 53 */
+    xs_XStoreShowRedeemTokenUIResult,                         /* 54 */
+    xs_XStoreQueryGameAndDlcPackageUpdatesAsync,              /* 55 */
+    xs_XStoreQueryGameAndDlcPackageUpdatesResultCount,        /* 56 */
+    xs_XStoreQueryGameAndDlcPackageUpdatesResult,             /* 57 */
+    xs_XStoreDownloadPackageUpdatesAsync,                     /* 58 */
+    xs_XStoreDownloadPackageUpdatesResult,                    /* 59 */
+    xs_XStoreDownloadAndInstallPackageUpdatesAsync,           /* 60 */
+    xs_XStoreDownloadAndInstallPackageUpdatesResult,          /* 61 */
+    xs_XStoreDownloadAndInstallPackagesAsync,                 /* 62 */
+    xs_XStoreDownloadAndInstallPackagesResultCount,           /* 63 */
+    xs_XStoreDownloadAndInstallPackagesResult,                /* 64 */
+    xs_XStoreQueryPackageIdentifier,                          /* 65 */
+    xs_XStoreRegisterGameLicenseChanged,                      /* 66 */
+    xs_XStoreUnregisterGameLicenseChanged,                    /* 67 */
+    xs_XStoreRegisterPackageLicenseLost,                      /* 68 */
+    xs_XStoreUnregisterPackageLicenseLost,                    /* 69 */
+    /* IXStoreImpl2 */
+    xs_XStoreIsAvailabilityPurchasable,                       /* 70 */
+    /* IXStoreImpl3 */
+    xs_XStoreAcquireLicenseForDurablesAsync,                  /* 71 */
+    xs_XStoreAcquireLicenseForDurablesResult,                 /* 72 */
+    /* IXStoreImpl4 */
+    xs_XStoreShowAssociatedProductsUIAsync,                   /* 73 */
+    xs_XStoreShowAssociatedProductsUIResult,                  /* 74 */
+    xs_XStoreShowProductPageUIAsync,                          /* 75 */
+    xs_XStoreShowProductPageUIResult,                         /* 76 */
+    /* IXStoreImpl5 */
+    xs_XStoreQueryAssociatedProductsForStoreIdAsync,          /* 77 */
+    xs_XStoreQueryAssociatedProductsForStoreIdResult,         /* 78 */
+    xs_XStoreQueryPackageUpdatesAsync,                        /* 79 */
+    xs_XStoreQueryPackageUpdatesResultCount,                  /* 80 */
+    xs_XStoreQueryPackageUpdatesResult,                       /* 81 */
+    /* IXStoreImpl6 */
+    xs_XStoreShowGiftingUIAsync,                              /* 82 */
+    xs_XStoreShowGiftingUIResult                              /* 83 */
 };
 
-static struct { const void *lpVtbl; } g_xstore_singleton = { g_xstore6_vtbl };
+static struct { const IXStoreImpl6Vtbl *lpVtbl; } g_xstore_singleton = { &g_xstore6_vtbl };
 
 HRESULT xgr_query_store(REFIID iid, void **ppv)
 {

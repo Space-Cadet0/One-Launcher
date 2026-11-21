@@ -49,8 +49,96 @@ enum {
     XGR_LAUNCH_ERR_INVALID_ARGS   = 9001,
     XGR_LAUNCH_ERR_CREATE_PROCESS = 9002,
     XGR_LAUNCH_ERR_APC_INJECT     = 9003,
-    XGR_LAUNCH_ERR_RESUME_THREAD  = 9004
+    XGR_LAUNCH_ERR_RESUME_THREAD  = 9004,
+    XGR_LAUNCH_ERR_ARCH_MISMATCH  = 9005,
+    XGR_LAUNCH_ERR_INVALID_DLL    = 9006
 };
+
+#if defined(_WIN64) || defined(__x86_64__) || defined(_M_X64)
+#define XGR_LAUNCHER_EXPECTED_MACHINE IMAGE_FILE_MACHINE_AMD64
+#else
+#define XGR_LAUNCHER_EXPECTED_MACHINE IMAGE_FILE_MACHINE_I386
+#endif
+
+#define XGR_MAX_JOB_PID_CAP 65536u
+
+static bool read_pe_machine_w(const WCHAR *path, WORD *out_machine) {
+    if (!path || !path[0] || !out_machine) return false;
+    *out_machine = 0;
+
+    HANDLE hf = CreateFileW(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER fsz;
+    if (!GetFileSizeEx(hf, &fsz) || fsz.QuadPart < (LONGLONG)sizeof(IMAGE_DOS_HEADER)) {
+        CloseHandle(hf);
+        return false;
+    }
+
+    IMAGE_DOS_HEADER dos;
+    DWORD got = 0;
+    if (!ReadFile(hf, &dos, sizeof(dos), &got, NULL) || got != sizeof(dos) ||
+        dos.e_magic != IMAGE_DOS_SIGNATURE) {
+        CloseHandle(hf);
+        return false;
+    }
+
+    if (dos.e_lfanew < (LONG)sizeof(IMAGE_DOS_HEADER) ||
+        (LONGLONG)dos.e_lfanew + (LONGLONG)(sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER)) > fsz.QuadPart) {
+        CloseHandle(hf);
+        return false;
+    }
+
+    LARGE_INTEGER seek_pos;
+    seek_pos.QuadPart = (LONGLONG)dos.e_lfanew;
+    if (!SetFilePointerEx(hf, seek_pos, NULL, FILE_BEGIN)) {
+        CloseHandle(hf);
+        return false;
+    }
+
+    struct {
+        DWORD             sig;
+        IMAGE_FILE_HEADER fh;
+    } nt_hdr;
+    got = 0;
+    if (!ReadFile(hf, &nt_hdr, sizeof(nt_hdr), &got, NULL) || got != sizeof(nt_hdr) ||
+        nt_hdr.sig != IMAGE_NT_SIGNATURE) {
+        CloseHandle(hf);
+        return false;
+    }
+
+    CloseHandle(hf);
+    *out_machine = nt_hdr.fh.Machine;
+    return true;
+}
+
+static WCHAR *canonicalize_existing_file_alloc(const WCHAR *path) {
+    if (!path || !path[0]) return NULL;
+    DWORD need = GetFullPathNameW(path, 0, NULL, NULL);
+    if (need == 0 || need > 32768) return NULL;
+
+    WCHAR *full = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ((size_t)need + 1) * sizeof(WCHAR));
+    if (!full) return NULL;
+    DWORD got = GetFullPathNameW(path, need + 1, full, NULL);
+    if (got == 0 || got > need) {
+        HeapFree(GetProcessHeap(), 0, full);
+        return NULL;
+    }
+
+    DWORD attrs = GetFileAttributesW(full);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        HeapFree(GetProcessHeap(), 0, full);
+        return NULL;
+    }
+    return full;
+}
 
 static const WCHAR *skip_ws(const WCHAR *p) {
     while (p && (*p == L' ' || *p == L'\t')) {
@@ -175,6 +263,9 @@ static bool job_has_live_descendants(HANDLE job, DWORD exited_root_pid, HANDLE *
     HANDLE heap = GetProcessHeap();
     size_t pid_cap = 64;
     for (int attempt = 0; attempt < 8; attempt++) {
+        if (pid_cap > XGR_MAX_JOB_PID_CAP) {
+            pid_cap = XGR_MAX_JOB_PID_CAP;
+        }
         size_t buf_bytes = sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + pid_cap * sizeof(ULONG_PTR);
         JOBOBJECT_BASIC_PROCESS_ID_LIST *list =
             (JOBOBJECT_BASIC_PROCESS_ID_LIST *)HeapAlloc(heap, HEAP_ZERO_MEMORY, buf_bytes);
@@ -194,7 +285,14 @@ static bool job_has_live_descendants(HANDLE job, DWORD exited_root_pid, HANDLE *
         if (!ok && q_err == ERROR_MORE_DATA) {
             size_t needed = (size_t)list->NumberOfAssignedProcesses;
             HeapFree(heap, 0, list);
-            pid_cap = (needed >= pid_cap) ? (needed + 64) : (pid_cap * 2);
+            if (pid_cap >= XGR_MAX_JOB_PID_CAP) {
+                break;
+            }
+            size_t next_cap = (needed >= pid_cap) ? (needed + 64) : (pid_cap * 2);
+            if (next_cap < pid_cap || next_cap > XGR_MAX_JOB_PID_CAP) {
+                next_cap = XGR_MAX_JOB_PID_CAP;
+            }
+            pid_cap = next_cap;
             continue;
         }
 
@@ -214,6 +312,11 @@ static bool job_has_live_descendants(HANDLE job, DWORD exited_root_pid, HANDLE *
             if (!hp) {
                 if (GetLastError() == ERROR_ACCESS_DENIED) {
                     any_alive = true;
+                    if (inout_descendant && *inout_descendant != NULL &&
+                        WaitForSingleObject(*inout_descendant, 0) != WAIT_TIMEOUT) {
+                        CloseHandle(*inout_descendant);
+                        *inout_descendant = NULL;
+                    }
                 }
                 continue;
             }
@@ -308,6 +411,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ExitProcess(XGR_LAUNCH_ERR_INVALID_ARGS);
     }
 
+    WCHAR *canon_dll_path = canonicalize_existing_file_alloc(dll_path);
+    HeapFree(heap, 0, dll_path);
+    dll_path = canon_dll_path;
+    if (!dll_path) {
+        ExitProcess(XGR_LAUNCH_ERR_INVALID_DLL);
+    }
+
+    WORD dll_machine = 0;
+    if (!read_pe_machine_w(dll_path, &dll_machine) || dll_machine != XGR_LAUNCHER_EXPECTED_MACHINE) {
+        HeapFree(heap, 0, dll_path);
+        ExitProcess(dll_machine != 0 ? XGR_LAUNCH_ERR_ARCH_MISMATCH : XGR_LAUNCH_ERR_INVALID_DLL);
+    }
+
     const WCHAR *exe_cursor = target_cmdline_tail;
     WCHAR *target_exe_path = parse_next_arg_alloc(&exe_cursor);
     WCHAR *mutable_cmdline = dup_wstr_heap(target_cmdline_tail);
@@ -316,6 +432,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (mutable_cmdline) HeapFree(heap, 0, mutable_cmdline);
         HeapFree(heap, 0, dll_path);
         ExitProcess(XGR_LAUNCH_ERR_INVALID_ARGS);
+    }
+
+    /* Verify target EXE PE machine matches launcher architecture BEFORE spawning */
+    WORD target_machine = 0;
+    if (read_pe_machine_w(target_exe_path, &target_machine) &&
+        target_machine != XGR_LAUNCHER_EXPECTED_MACHINE) {
+        HeapFree(heap, 0, target_exe_path);
+        HeapFree(heap, 0, mutable_cmdline);
+        HeapFree(heap, 0, dll_path);
+        ExitProcess(XGR_LAUNCH_ERR_ARCH_MISMATCH);
     }
 
     STARTUPINFOW si;
@@ -345,10 +471,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ExitProcess(err != 0 ? (UINT)err : XGR_LAUNCH_ERR_CREATE_PROCESS);
     }
 
+    /* Cross-check runtime WOW64 bitness parity before queuing kernel32!LoadLibraryW APC */
+    {
+        BOOL self_wow64 = FALSE;
+        BOOL child_wow64 = FALSE;
+        if (IsWow64Process(GetCurrentProcess(), &self_wow64) &&
+            IsWow64Process(pi.hProcess, &child_wow64) &&
+            self_wow64 != child_wow64) {
+            TerminateProcess(pi.hProcess, XGR_LAUNCH_ERR_ARCH_MISMATCH);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            HeapFree(heap, 0, dll_path);
+            ExitProcess(XGR_LAUNCH_ERR_ARCH_MISMATCH);
+        }
+    }
+
     /*
      * Job Object + IOCP process-tree supervision:
      * 1. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` ensures terminating this launcher (e.g., user
      *    clicks Stop in One Launcher) cleanly terminates all child/descendant processes.
+     *    `JOB_OBJECT_LIMIT_BREAKAWAY_OK` is intentionally omitted so descendants cannot escape supervision.
      * 2. Associating an I/O Completion Port BEFORE assigning `pi.hProcess` guarantees kernel
      *    delivery of `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` at 0% CPU when a detached bootstrapper
      *    exits `0` after spawning the actual game process!
@@ -359,8 +501,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (job) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
         memset(&jeli, 0, sizeof(jeli));
-        jeli.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
             CloseHandle(job);
             job = NULL;

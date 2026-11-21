@@ -607,6 +607,10 @@ static INIT_ONCE          g_xinput_once = INIT_ONCE_STATIC_INIT;
 static PFN_XInputGetState g_pfn_XInputGetState = NULL;
 static PFN_XInputSetState g_pfn_XInputSetState = NULL;
 
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+
 static BOOL CALLBACK gi_init_xinput_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     static const wchar_t *const dll_names[] = {
         L"xinput1_4.dll",
@@ -618,12 +622,14 @@ static BOOL CALLBACK gi_init_xinput_once(PINIT_ONCE once, PVOID param, PVOID *ct
     (void)ctx;
 
     for (size_t i = 0; i < sizeof(dll_names) / sizeof(dll_names[0]); i++) {
-        HMODULE mod = LoadLibraryW(dll_names[i]);
+        HMODULE mod = LoadLibraryExW(dll_names[i], NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!mod) {
+            mod = LoadLibraryW(dll_names[i]);
+        }
         if (mod) {
-            /* Try ordinal 100 (Ex with Guide button) or standard XInputGetState */
-            PFN_XInputGetState get_fn = (PFN_XInputGetState)(void *)GetProcAddress(mod, (LPCSTR)100);
+            PFN_XInputGetState get_fn = (PFN_XInputGetState)(void *)GetProcAddress(mod, "XInputGetState");
             if (!get_fn) {
-                get_fn = (PFN_XInputGetState)(void *)GetProcAddress(mod, "XInputGetState");
+                get_fn = (PFN_XInputGetState)(void *)GetProcAddress(mod, (LPCSTR)100);
             }
             PFN_XInputSetState set_fn = (PFN_XInputSetState)(void *)GetProcAddress(mod, "XInputSetState");
             if (get_fn) {
@@ -631,6 +637,7 @@ static BOOL CALLBACK gi_init_xinput_once(PINIT_ONCE once, PVOID param, PVOID *ct
                 g_pfn_XInputSetState = set_fn;
                 break;
             }
+            FreeLibrary(mod);
         }
     }
     return TRUE;
@@ -677,6 +684,8 @@ typedef enum GI_InternalDevType {
 
 struct GI_ReadingImpl;
 
+#define GI_DEV_HISTORY_CAPACITY          32
+
 typedef struct GI_DeviceImpl {
     GI_IfaceSlot           v0_iface;
     GI_IfaceSlot           v1_iface;
@@ -686,8 +695,12 @@ typedef struct GI_DeviceImpl {
     int                    xinput_slot; /* 0..3 for gamepads, -1 otherwise */
     bool                   connected;
     bool                   has_last_snapshot;
-    volatile LONGLONG      next_probe_tick_ms;
+    _Alignas(8) volatile LONGLONG next_probe_tick_ms;
     struct GI_ReadingImpl *current_reading;
+    struct GI_ReadingImpl *dev_history[GI_DEV_HISTORY_CAPACITY];
+    size_t                 dev_history_count;
+    size_t                 dev_history_head;
+    char                   pnp_path[96];
     GI_String              display_str_v0;
     GI_DeviceInfo_v0       info_v0;
     GI_DeviceInfo_v1       info_v1;
@@ -802,7 +815,7 @@ typedef struct GI_ManagerImpl {
     CONDITION_VARIABLE     cb_cv;
     volatile LONG          focus_policy;
     uint64_t               next_sequence;
-    volatile LONGLONG      next_token;
+    _Alignas(8) volatile LONGLONG next_token;
     uint64_t               cached_input_ts_us;
     bool                   cached_input_valid;
     bool                   cached_focused;
@@ -827,6 +840,7 @@ static INIT_ONCE      g_mgr_once = INIT_ONCE_STATIC_INIT;
 static INIT_ONCE      g_pin_self_once = INIT_ONCE_STATIC_INIT;
 static volatile LONG  g_mgr_ready = 0;
 static volatile LONG  g_live_dispatchers = 0;
+static volatile LONG  g_live_readings = 0;
 static volatile LONG  g_worker_threads_spawned = 0;
 static GI_ManagerImpl g_mgr;
 
@@ -870,12 +884,28 @@ static inline void gi_pin_self_module(void) {
 #define RI_MOUSE_HWHEEL 0x0800
 #endif
 
-static INIT_ONCE         g_raw_mouse_once   = INIT_ONCE_STATIC_INIT;
-static volatile LONG     g_raw_mouse_active = 0;
-static volatile LONGLONG g_raw_mouse_x      = 0;
-static volatile LONGLONG g_raw_mouse_y      = 0;
-static volatile LONGLONG g_raw_wheel_x      = 0;
-static volatile LONGLONG g_raw_wheel_y      = 0;
+static INIT_ONCE                    g_raw_mouse_once   = INIT_ONCE_STATIC_INIT;
+static volatile LONG                g_raw_mouse_active = 0;
+_Alignas(8) static volatile LONGLONG g_raw_mouse_x     = 0;
+_Alignas(8) static volatile LONGLONG g_raw_mouse_y     = 0;
+_Alignas(8) static volatile LONGLONG g_raw_wheel_x     = 0;
+_Alignas(8) static volatile LONGLONG g_raw_wheel_y     = 0;
+
+typedef struct GI_RawMouseReadyCtx {
+    volatile LONG ref_count;
+    HANDLE        evt;
+} GI_RawMouseReadyCtx;
+
+static void gi_raw_mouse_ready_release(GI_RawMouseReadyCtx *ctx) {
+    if (!ctx) return;
+    if (InterlockedDecrement(&ctx->ref_count) <= 0) {
+        if (ctx->evt) {
+            CloseHandle(ctx->evt);
+            ctx->evt = NULL;
+        }
+        HeapFree(GetProcessHeap(), 0, ctx);
+    }
+}
 
 static bool gi_is_process_focused(GameInputFocusPolicy policy);
 
@@ -883,10 +913,13 @@ static LRESULT CALLBACK gi_raw_mouse_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
     if (msg == WM_INPUT) {
         GameInputFocusPolicy pol = (GameInputFocusPolicy)InterlockedCompareExchange(&g_mgr.focus_policy, 0, 0);
         if (gi_is_process_focused(pol)) {
-            BYTE stack_buf[128];
-            UINT sz = (UINT)sizeof(stack_buf);
-            if (GetRawInputData((HRAWINPUT)lparam, RID_INPUT, stack_buf, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1) {
-                const RAWINPUT *ri = (const RAWINPUT *)(const void *)stack_buf;
+            union {
+                RAWINPUT ri;
+                BYTE     bytes[128];
+            } raw_buf;
+            UINT sz = (UINT)sizeof(raw_buf);
+            if (GetRawInputData((HRAWINPUT)lparam, RID_INPUT, raw_buf.bytes, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1) {
+                const RAWINPUT *ri = &raw_buf.ri;
                 if (ri->header.dwType == RIM_TYPEMOUSE) {
                     if ((ri->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
                         if (ri->data.mouse.lLastX != 0) {
@@ -917,7 +950,7 @@ static LRESULT CALLBACK gi_raw_mouse_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
 }
 
 static DWORD WINAPI gi_raw_mouse_thread_proc(LPVOID param) {
-    HANDLE ready_evt = (HANDLE)param;
+    GI_RawMouseReadyCtx *ready_ctx = (GI_RawMouseReadyCtx *)param;
     HINSTANCE hinst = GetModuleHandleW(NULL);
     static const wchar_t k_cls_name[] = L"OneLauncherGameInputRawMouseSink";
 
@@ -947,8 +980,12 @@ static DWORD WINAPI gi_raw_mouse_thread_proc(LPVOID param) {
         }
     }
 
-    if (ready_evt) {
-        SetEvent(ready_evt);
+    if (ready_ctx) {
+        if (ready_ctx->evt) {
+            SetEvent(ready_ctx->evt);
+        }
+        gi_raw_mouse_ready_release(ready_ctx);
+        ready_ctx = NULL;
     }
     if (!hwnd) {
         InterlockedDecrement(&g_worker_threads_spawned);
@@ -971,18 +1008,36 @@ static BOOL CALLBACK gi_init_raw_mouse_once(PINIT_ONCE once, PVOID param, PVOID 
 
     gi_pin_self_module();
     InterlockedIncrement(&g_worker_threads_spawned);
-    HANDLE ready_evt = CreateEventW(NULL, TRUE, FALSE, NULL);
-    HANDLE th = CreateThread(NULL, 0, gi_raw_mouse_thread_proc, ready_evt, 0, NULL);
+
+    GI_RawMouseReadyCtx *ready_ctx = (GI_RawMouseReadyCtx *)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(GI_RawMouseReadyCtx));
+    if (ready_ctx) {
+        ready_ctx->evt = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!ready_ctx->evt) {
+            HeapFree(GetProcessHeap(), 0, ready_ctx);
+            ready_ctx = NULL;
+        } else {
+            /* 1 ref for init caller, 1 ref transferred to raw mouse thread */
+            ready_ctx->ref_count = 2;
+        }
+    }
+
+    HANDLE th = CreateThread(NULL, 0, gi_raw_mouse_thread_proc, ready_ctx, 0, NULL);
     if (th) {
-        if (ready_evt) {
-            (void)WaitForSingleObject(ready_evt, 150);
+        if (ready_ctx && ready_ctx->evt) {
+            (void)WaitForSingleObject(ready_ctx->evt, 150);
         }
         CloseHandle(th);
+        if (ready_ctx) {
+            gi_raw_mouse_ready_release(ready_ctx);
+        }
     } else {
         InterlockedDecrement(&g_worker_threads_spawned);
-    }
-    if (ready_evt) {
-        CloseHandle(ready_evt);
+        if (ready_ctx) {
+            /* Thread never started: drop both refs cleanly */
+            gi_raw_mouse_ready_release(ready_ctx);
+            gi_raw_mouse_ready_release(ready_ctx);
+        }
     }
     return TRUE;
 }
@@ -1294,13 +1349,24 @@ static HRESULT WINAPI gi_disp_OpenWaitHandle(void *iface, HANDLE *out_handle) {
     return S_OK;
 }
 
-static const void *const g_disp_vtbl[] = {
-    (const void *)gi_disp_QueryInterface,
-    (const void *)gi_disp_AddRef,
-    (const void *)gi_disp_Release,
-    (const void *)gi_disp_Dispatch,
-    (const void *)gi_disp_OpenWaitHandle
+typedef struct IGameInputDispatcherVtbl {
+    HRESULT (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG   (WINAPI *AddRef)(void *iface);
+    ULONG   (WINAPI *Release)(void *iface);
+    bool    (WINAPI *Dispatch)(void *iface, uint64_t quota_us);
+    HRESULT (WINAPI *OpenWaitHandle)(void *iface, HANDLE *out_handle);
+} IGameInputDispatcherVtbl;
+_Static_assert(sizeof(IGameInputDispatcherVtbl) == 5 * sizeof(void *), "IGameInputDispatcherVtbl must have 5 slots");
+
+static const IGameInputDispatcherVtbl g_disp_vtbl = {
+    gi_disp_QueryInterface,
+    gi_disp_AddRef,
+    gi_disp_Release,
+    gi_disp_Dispatch,
+    gi_disp_OpenWaitHandle
 };
+
+static void gi_enqueue_device_callbacks_locked(GI_DeviceImpl *dev, bool now_connected);
 
 /* -------------------------------------------------------------------------
  * IGameInputDevice Implementation (v0, v1, v2)
@@ -1397,11 +1463,18 @@ static GameInputDeviceStatus gi_device_status_value(const GI_DeviceImpl *dev, GI
 static GameInputDeviceStatus WINAPI gi_dev_GetDeviceStatus(void *iface) {
     GI_DeviceImpl *dev = gi_dev_from_any(iface);
     if (!dev) return GI_DeviceNoStatus;
-    if (dev->xinput_slot >= 0) {
-        (void)gi_probe_xinput_slot(dev, NULL, NULL);
-    }
     GI_ApiVer ver = (iface == (void *)&dev->v0_iface) ? GI_VER_0 : GI_VER_1;
-    return gi_device_status_value(dev, ver);
+    AcquireSRWLockExclusive(&g_mgr.lock);
+    if (dev->xinput_slot >= 0) {
+        bool conn_changed = false;
+        (void)gi_probe_xinput_slot(dev, NULL, &conn_changed);
+        if (conn_changed) {
+            gi_enqueue_device_callbacks_locked(dev, dev->connected);
+        }
+    }
+    GameInputDeviceStatus st = gi_device_status_value(dev, ver);
+    ReleaseSRWLockExclusive(&g_mgr.lock);
+    return st;
 }
 
 static void WINAPI gi_dev_v0_GetBatteryState(void *iface, GI_BatteryState *state) {
@@ -1541,76 +1614,208 @@ static HRESULT WINAPI gi_dev_v2_DirectInputEscape(void *iface, uint32_t cmd, con
     return E_NOTIMPL;
 }
 
-static const void *const g_dev_v0_vtbl[] = {
-    (const void *)gi_dev_QueryInterface,
-    (const void *)gi_dev_AddRef,
-    (const void *)gi_dev_Release,
-    (const void *)gi_dev_v0_GetDeviceInfo,
-    (const void *)gi_dev_GetDeviceStatus,
-    (const void *)gi_dev_v0_GetBatteryState,
-    (const void *)gi_dev_CreateForceFeedbackEffect,
-    (const void *)gi_dev_IsForceFeedbackMotorPoweredOn,
-    (const void *)gi_dev_SetForceFeedbackMotorGain,
-    (const void *)gi_dev_v0_SetHapticMotorState,
-    (const void *)gi_dev_SetRumbleState,
-    (const void *)gi_dev_v0_SetInputSynchronizationState,
-    (const void *)gi_dev_v0_SendInputSynchronizationHint,
-    (const void *)gi_dev_v0_PowerOff,
-    (const void *)gi_dev_v0_CreateRawDeviceReport,
-    (const void *)gi_dev_v0_GetRawDeviceFeature,
-    (const void *)gi_dev_v0_SetRawDeviceFeature,
-    (const void *)gi_dev_v0_SendRawDeviceOutput,
-    (const void *)gi_dev_v0_SendRawDeviceOutputWithResponse,
-    (const void *)gi_dev_v0_ExecuteRawDeviceIoControl,
-    (const void *)gi_dev_v0_AcquireExclusiveRawDeviceAccess,
-    (const void *)gi_dev_v0_ReleaseExclusiveRawDeviceAccess
+typedef struct IGameInputDeviceV0Vtbl {
+    HRESULT                  (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG                    (WINAPI *AddRef)(void *iface);
+    ULONG                    (WINAPI *Release)(void *iface);
+    const GI_DeviceInfo_v0 * (WINAPI *GetDeviceInfo)(void *iface);
+    GameInputDeviceStatus    (WINAPI *GetDeviceStatus)(void *iface);
+    void                     (WINAPI *GetBatteryState)(void *iface, GI_BatteryState *state);
+    HRESULT                  (WINAPI *CreateForceFeedbackEffect)(void *iface, uint32_t motor, const void *params, void **effect);
+    bool                     (WINAPI *IsForceFeedbackMotorPoweredOn)(void *iface, uint32_t motor);
+    void                     (WINAPI *SetForceFeedbackMotorGain)(void *iface, uint32_t motor, float gain);
+    HRESULT                  (WINAPI *SetHapticMotorState)(void *iface, uint32_t motor, const void *params);
+    void                     (WINAPI *SetRumbleState)(void *iface, const GI_RumbleParams *params);
+    void                     (WINAPI *SetInputSynchronizationState)(void *iface, bool enabled);
+    void                     (WINAPI *SendInputSynchronizationHint)(void *iface);
+    void                     (WINAPI *PowerOff)(void *iface);
+    HRESULT                  (WINAPI *CreateRawDeviceReport)(void *iface, uint32_t id, int32_t kind, void **report);
+    HRESULT                  (WINAPI *GetRawDeviceFeature)(void *iface, uint32_t id, void **report);
+    HRESULT                  (WINAPI *SetRawDeviceFeature)(void *iface, void *report);
+    HRESULT                  (WINAPI *SendRawDeviceOutput)(void *iface, void *report);
+    HRESULT                  (WINAPI *SendRawDeviceOutputWithResponse)(void *iface, void *req, void **resp);
+    HRESULT                  (WINAPI *ExecuteRawDeviceIoControl)(void *iface, uint32_t code, size_t in_sz, const void *in_buf, size_t out_sz, void *out_buf, size_t *written);
+    bool                     (WINAPI *AcquireExclusiveRawDeviceAccess)(void *iface, uint64_t timeout_us);
+    void                     (WINAPI *ReleaseExclusiveRawDeviceAccess)(void *iface);
+} IGameInputDeviceV0Vtbl;
+_Static_assert(sizeof(IGameInputDeviceV0Vtbl) == 22 * sizeof(void *), "IGameInputDeviceV0Vtbl must have 22 slots");
+
+static const IGameInputDeviceV0Vtbl g_dev_v0_vtbl = {
+    gi_dev_QueryInterface,
+    gi_dev_AddRef,
+    gi_dev_Release,
+    gi_dev_v0_GetDeviceInfo,
+    gi_dev_GetDeviceStatus,
+    gi_dev_v0_GetBatteryState,
+    gi_dev_CreateForceFeedbackEffect,
+    gi_dev_IsForceFeedbackMotorPoweredOn,
+    gi_dev_SetForceFeedbackMotorGain,
+    gi_dev_v0_SetHapticMotorState,
+    gi_dev_SetRumbleState,
+    gi_dev_v0_SetInputSynchronizationState,
+    gi_dev_v0_SendInputSynchronizationHint,
+    gi_dev_v0_PowerOff,
+    gi_dev_v0_CreateRawDeviceReport,
+    gi_dev_v0_GetRawDeviceFeature,
+    gi_dev_v0_SetRawDeviceFeature,
+    gi_dev_v0_SendRawDeviceOutput,
+    gi_dev_v0_SendRawDeviceOutputWithResponse,
+    gi_dev_v0_ExecuteRawDeviceIoControl,
+    gi_dev_v0_AcquireExclusiveRawDeviceAccess,
+    gi_dev_v0_ReleaseExclusiveRawDeviceAccess
 };
 
-static const void *const g_dev_v1_vtbl[] = {
-    (const void *)gi_dev_QueryInterface,
-    (const void *)gi_dev_AddRef,
-    (const void *)gi_dev_Release,
-    (const void *)gi_dev_v1_GetDeviceInfo,
-    (const void *)gi_dev_GetDeviceStatus,
-    (const void *)gi_dev_CreateForceFeedbackEffect,
-    (const void *)gi_dev_IsForceFeedbackMotorPoweredOn,
-    (const void *)gi_dev_SetForceFeedbackMotorGain,
-    (const void *)gi_dev_SetRumbleState
+typedef struct IGameInputDeviceV1Vtbl {
+    HRESULT               (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG                 (WINAPI *AddRef)(void *iface);
+    ULONG                 (WINAPI *Release)(void *iface);
+    HRESULT               (WINAPI *GetDeviceInfo)(void *iface, const GI_DeviceInfo_v1 **out_info);
+    GameInputDeviceStatus (WINAPI *GetDeviceStatus)(void *iface);
+    HRESULT               (WINAPI *CreateForceFeedbackEffect)(void *iface, uint32_t motor, const void *params, void **effect);
+    bool                  (WINAPI *IsForceFeedbackMotorPoweredOn)(void *iface, uint32_t motor);
+    void                  (WINAPI *SetForceFeedbackMotorGain)(void *iface, uint32_t motor, float gain);
+    void                  (WINAPI *SetRumbleState)(void *iface, const GI_RumbleParams *params);
+} IGameInputDeviceV1Vtbl;
+_Static_assert(sizeof(IGameInputDeviceV1Vtbl) == 9 * sizeof(void *), "IGameInputDeviceV1Vtbl must have 9 slots");
+
+static const IGameInputDeviceV1Vtbl g_dev_v1_vtbl = {
+    gi_dev_QueryInterface,
+    gi_dev_AddRef,
+    gi_dev_Release,
+    gi_dev_v1_GetDeviceInfo,
+    gi_dev_GetDeviceStatus,
+    gi_dev_CreateForceFeedbackEffect,
+    gi_dev_IsForceFeedbackMotorPoweredOn,
+    gi_dev_SetForceFeedbackMotorGain,
+    gi_dev_SetRumbleState
 };
 
-static const void *const g_dev_v2_vtbl[] = {
-    (const void *)gi_dev_QueryInterface,
-    (const void *)gi_dev_AddRef,
-    (const void *)gi_dev_Release,
-    (const void *)gi_dev_v2_GetDeviceInfo,
-    (const void *)gi_dev_v2_GetHapticInfo,
-    (const void *)gi_dev_GetDeviceStatus,
-    (const void *)gi_dev_CreateForceFeedbackEffect,
-    (const void *)gi_dev_IsForceFeedbackMotorPoweredOn,
-    (const void *)gi_dev_SetForceFeedbackMotorGain,
-    (const void *)gi_dev_SetRumbleState,
-    (const void *)gi_dev_v2_DirectInputEscape
+typedef struct IGameInputDeviceV2Vtbl {
+    HRESULT               (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG                 (WINAPI *AddRef)(void *iface);
+    ULONG                 (WINAPI *Release)(void *iface);
+    HRESULT               (WINAPI *GetDeviceInfo)(void *iface, const GI_DeviceInfo_v2 **out_info);
+    HRESULT               (WINAPI *GetHapticInfo)(void *iface, void *out_haptic);
+    GameInputDeviceStatus (WINAPI *GetDeviceStatus)(void *iface);
+    HRESULT               (WINAPI *CreateForceFeedbackEffect)(void *iface, uint32_t motor, const void *params, void **effect);
+    bool                  (WINAPI *IsForceFeedbackMotorPoweredOn)(void *iface, uint32_t motor);
+    void                  (WINAPI *SetForceFeedbackMotorGain)(void *iface, uint32_t motor, float gain);
+    void                  (WINAPI *SetRumbleState)(void *iface, const GI_RumbleParams *params);
+    HRESULT               (WINAPI *DirectInputEscape)(void *iface, uint32_t cmd, const void *in_buf, uint32_t in_sz, void *out_buf, uint32_t out_sz, uint32_t *written);
+} IGameInputDeviceV2Vtbl;
+_Static_assert(sizeof(IGameInputDeviceV2Vtbl) == 11 * sizeof(void *), "IGameInputDeviceV2Vtbl must have 11 slots");
+
+static const IGameInputDeviceV2Vtbl g_dev_v2_vtbl = {
+    gi_dev_QueryInterface,
+    gi_dev_AddRef,
+    gi_dev_Release,
+    gi_dev_v2_GetDeviceInfo,
+    gi_dev_v2_GetHapticInfo,
+    gi_dev_GetDeviceStatus,
+    gi_dev_CreateForceFeedbackEffect,
+    gi_dev_IsForceFeedbackMotorPoweredOn,
+    gi_dev_SetForceFeedbackMotorGain,
+    gi_dev_SetRumbleState,
+    gi_dev_v2_DirectInputEscape
 };
 
 /* -------------------------------------------------------------------------
  * IGameInputReading Implementation (v0, v1, v2)
  * ------------------------------------------------------------------------- */
-static const void *const g_reading_v0_vtbl[];
-static const void *const g_reading_v1_vtbl[];
-static const void *const g_reading_v2_vtbl[];
+typedef struct IGameInputReadingV0Vtbl {
+    HRESULT       (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG         (WINAPI *AddRef)(void *iface);
+    ULONG         (WINAPI *Release)(void *iface);
+    GameInputKind (WINAPI *GetInputKind)(void *iface);
+    uint64_t      (WINAPI *GetSequenceNumber)(void *iface, GameInputKind kind);
+    uint64_t      (WINAPI *GetTimestamp)(void *iface);
+    void          (WINAPI *GetDevice)(void *iface, void **out_device);
+    bool          (WINAPI *GetRawReport)(void *iface, void **out_report);
+    uint32_t      (WINAPI *GetControllerAxisCount)(void *iface);
+    uint32_t      (WINAPI *GetControllerAxisState)(void *iface, uint32_t count, float *state);
+    uint32_t      (WINAPI *GetControllerButtonCount)(void *iface);
+    uint32_t      (WINAPI *GetControllerButtonState)(void *iface, uint32_t count, bool *state);
+    uint32_t      (WINAPI *GetControllerSwitchCount)(void *iface);
+    uint32_t      (WINAPI *GetControllerSwitchState)(void *iface, uint32_t count, GameInputSwitchPosition *state);
+    uint32_t      (WINAPI *GetKeyCount)(void *iface);
+    uint32_t      (WINAPI *GetKeyState)(void *iface, uint32_t count, GI_KeyState *state);
+    bool          (WINAPI *GetMouseState)(void *iface, GI_MouseState_v0 *state);
+    uint32_t      (WINAPI *GetTouchCount)(void *iface);
+    uint32_t      (WINAPI *GetTouchState)(void *iface, uint32_t count, void *state);
+    bool          (WINAPI *GetMotionState)(void *iface, void *state);
+    bool          (WINAPI *GetArcadeStickState)(void *iface, void *state);
+    bool          (WINAPI *GetFlightStickState)(void *iface, void *state);
+    bool          (WINAPI *GetGamepadState)(void *iface, GI_GamepadState *state);
+    bool          (WINAPI *GetRacingWheelState)(void *iface, void *state);
+    bool          (WINAPI *GetUiNavigationState)(void *iface, GI_UiNavigationState *state);
+} IGameInputReadingV0Vtbl;
+_Static_assert(sizeof(IGameInputReadingV0Vtbl) == 25 * sizeof(void *), "IGameInputReadingV0Vtbl must have 25 slots");
+
+typedef struct IGameInputReadingV1Vtbl {
+    HRESULT       (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG         (WINAPI *AddRef)(void *iface);
+    ULONG         (WINAPI *Release)(void *iface);
+    GameInputKind (WINAPI *GetInputKind)(void *iface);
+    uint64_t      (WINAPI *GetTimestamp)(void *iface);
+    void          (WINAPI *GetDevice)(void *iface, void **out_device);
+    uint32_t      (WINAPI *GetControllerAxisCount)(void *iface);
+    uint32_t      (WINAPI *GetControllerAxisState)(void *iface, uint32_t count, float *state);
+    uint32_t      (WINAPI *GetControllerButtonCount)(void *iface);
+    uint32_t      (WINAPI *GetControllerButtonState)(void *iface, uint32_t count, bool *state);
+    uint32_t      (WINAPI *GetControllerSwitchCount)(void *iface);
+    uint32_t      (WINAPI *GetControllerSwitchState)(void *iface, uint32_t count, GameInputSwitchPosition *state);
+    uint32_t      (WINAPI *GetKeyCount)(void *iface);
+    uint32_t      (WINAPI *GetKeyState)(void *iface, uint32_t count, GI_KeyState *state);
+    bool          (WINAPI *GetMouseState)(void *iface, GI_MouseState_v1 *state);
+    bool          (WINAPI *GetArcadeStickState)(void *iface, void *state);
+    bool          (WINAPI *GetFlightStickState)(void *iface, void *state);
+    bool          (WINAPI *GetGamepadState)(void *iface, GI_GamepadState *state);
+    bool          (WINAPI *GetRacingWheelState)(void *iface, void *state);
+    bool          (WINAPI *GetUiNavigationState)(void *iface, GI_UiNavigationState *state);
+} IGameInputReadingV1Vtbl;
+_Static_assert(sizeof(IGameInputReadingV1Vtbl) == 20 * sizeof(void *), "IGameInputReadingV1Vtbl must have 20 slots");
+
+typedef struct IGameInputReadingV2Vtbl {
+    HRESULT       (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG         (WINAPI *AddRef)(void *iface);
+    ULONG         (WINAPI *Release)(void *iface);
+    GameInputKind (WINAPI *GetInputKind)(void *iface);
+    uint64_t      (WINAPI *GetTimestamp)(void *iface);
+    void          (WINAPI *GetDevice)(void *iface, void **out_device);
+    uint32_t      (WINAPI *GetControllerAxisCount)(void *iface);
+    uint32_t      (WINAPI *GetControllerAxisState)(void *iface, uint32_t count, float *state);
+    uint32_t      (WINAPI *GetControllerButtonCount)(void *iface);
+    uint32_t      (WINAPI *GetControllerButtonState)(void *iface, uint32_t count, bool *state);
+    uint32_t      (WINAPI *GetControllerSwitchCount)(void *iface);
+    uint32_t      (WINAPI *GetControllerSwitchState)(void *iface, uint32_t count, GameInputSwitchPosition *state);
+    uint32_t      (WINAPI *GetKeyCount)(void *iface);
+    uint32_t      (WINAPI *GetKeyState)(void *iface, uint32_t count, GI_KeyState *state);
+    bool          (WINAPI *GetMouseState)(void *iface, GI_MouseState_v1 *state);
+    bool          (WINAPI *GetSensorsState)(void *iface, void *state);
+    bool          (WINAPI *GetArcadeStickState)(void *iface, void *state);
+    bool          (WINAPI *GetFlightStickState)(void *iface, void *state);
+    bool          (WINAPI *GetGamepadState)(void *iface, GI_GamepadState *state);
+    bool          (WINAPI *GetRacingWheelState)(void *iface, void *state);
+    bool          (WINAPI *GetUiNavigationState)(void *iface, GI_UiNavigationState *state);
+} IGameInputReadingV2Vtbl;
+_Static_assert(sizeof(IGameInputReadingV2Vtbl) == 21 * sizeof(void *), "IGameInputReadingV2Vtbl must have 21 slots");
+
+static const IGameInputReadingV0Vtbl g_reading_v0_vtbl;
+static const IGameInputReadingV1Vtbl g_reading_v1_vtbl;
+static const IGameInputReadingV2Vtbl g_reading_v2_vtbl;
 
 static GI_ReadingImpl *gi_reading_from_any(void *iface, GI_ApiVer *out_ver) {
     if (!iface) return NULL;
     const void *vtbl = *(const void *const *)iface;
-    if (vtbl == (const void *)g_reading_v0_vtbl) {
+    if (vtbl == (const void *)&g_reading_v0_vtbl) {
         if (out_ver) *out_ver = GI_VER_0;
         return (GI_ReadingImpl *)((uint8_t *)iface - offsetof(GI_ReadingImpl, v0_iface));
     }
-    if (vtbl == (const void *)g_reading_v1_vtbl) {
+    if (vtbl == (const void *)&g_reading_v1_vtbl) {
         if (out_ver) *out_ver = GI_VER_1;
         return (GI_ReadingImpl *)((uint8_t *)iface - offsetof(GI_ReadingImpl, v1_iface));
     }
-    if (vtbl == (const void *)g_reading_v2_vtbl) {
+    if (vtbl == (const void *)&g_reading_v2_vtbl) {
         if (out_ver) *out_ver = GI_VER_2;
         return (GI_ReadingImpl *)((uint8_t *)iface - offsetof(GI_ReadingImpl, v2_iface));
     }
@@ -1620,12 +1825,23 @@ static GI_ReadingImpl *gi_reading_from_any(void *iface, GI_ApiVer *out_ver) {
 static void *gi_reading_iface_for_ver(GI_ReadingImpl *r, GI_ApiVer ver) {
     if (!r) return NULL;
     InterlockedIncrement(&r->ref_count);
+    InterlockedIncrement(&g_live_readings);
     switch (ver) {
         case GI_VER_0: return &r->v0_iface;
         case GI_VER_1: return &r->v1_iface;
         case GI_VER_2: return &r->v2_iface;
         default:       return &r->v0_iface;
     }
+}
+
+static ULONG gi_reading_release_internal(GI_ReadingImpl *r) {
+    if (!r) return 0;
+    LONG c = InterlockedDecrement(&r->ref_count);
+    if (c <= 0) {
+        HeapFree(GetProcessHeap(), 0, r);
+        return 0;
+    }
+    return (ULONG)c;
 }
 
 static HRESULT WINAPI gi_reading_QueryInterface(void *iface, REFIID riid, void **ppv) {
@@ -1636,6 +1852,7 @@ static HRESULT WINAPI gi_reading_QueryInterface(void *iface, REFIID riid, void *
 
     if (gi_guid_eq(riid, &GI_IID_IUnknown)) {
         InterlockedIncrement(&r->ref_count);
+        InterlockedIncrement(&g_live_readings);
         *ppv = iface;
         return S_OK;
     }
@@ -1657,18 +1874,17 @@ static HRESULT WINAPI gi_reading_QueryInterface(void *iface, REFIID riid, void *
 static ULONG WINAPI gi_reading_AddRef(void *iface) {
     GI_ReadingImpl *r = gi_reading_from_any(iface, NULL);
     if (!r) return 0;
+    InterlockedIncrement(&g_live_readings);
     return (ULONG)InterlockedIncrement(&r->ref_count);
 }
 
 static ULONG WINAPI gi_reading_Release(void *iface) {
     GI_ReadingImpl *r = gi_reading_from_any(iface, NULL);
     if (!r) return 0;
-    LONG c = InterlockedDecrement(&r->ref_count);
-    if (c <= 0) {
-        HeapFree(GetProcessHeap(), 0, r);
-        return 0;
+    if (InterlockedDecrement(&g_live_readings) < 0) {
+        InterlockedExchange(&g_live_readings, 0);
     }
-    return (ULONG)c;
+    return gi_reading_release_internal(r);
 }
 
 static GameInputKind WINAPI gi_reading_GetInputKind(void *iface) {
@@ -1842,79 +2058,79 @@ static bool WINAPI gi_reading_GetUiNavigationState(void *iface, GI_UiNavigationS
     return true;
 }
 
-static const void *const g_reading_v0_vtbl[] = {
-    (const void *)gi_reading_QueryInterface,
-    (const void *)gi_reading_AddRef,
-    (const void *)gi_reading_Release,
-    (const void *)gi_reading_GetInputKind,
-    (const void *)gi_reading_v0_GetSequenceNumber,
-    (const void *)gi_reading_GetTimestamp,
-    (const void *)gi_reading_GetDevice,
-    (const void *)gi_reading_v0_GetRawReport,
-    (const void *)gi_reading_GetControllerAxisCount,
-    (const void *)gi_reading_GetControllerAxisState,
-    (const void *)gi_reading_GetControllerButtonCount,
-    (const void *)gi_reading_GetControllerButtonState,
-    (const void *)gi_reading_GetControllerSwitchCount,
-    (const void *)gi_reading_GetControllerSwitchState,
-    (const void *)gi_reading_GetKeyCount,
-    (const void *)gi_reading_GetKeyState,
-    (const void *)gi_reading_v0_GetMouseState,
-    (const void *)gi_reading_v0_GetTouchCount,
-    (const void *)gi_reading_v0_GetTouchState,
-    (const void *)gi_reading_v0_GetMotionState,
-    (const void *)gi_reading_GetArcadeStickState,
-    (const void *)gi_reading_GetFlightStickState,
-    (const void *)gi_reading_GetGamepadState,
-    (const void *)gi_reading_GetRacingWheelState,
-    (const void *)gi_reading_GetUiNavigationState
+static const IGameInputReadingV0Vtbl g_reading_v0_vtbl = {
+    gi_reading_QueryInterface,
+    gi_reading_AddRef,
+    gi_reading_Release,
+    gi_reading_GetInputKind,
+    gi_reading_v0_GetSequenceNumber,
+    gi_reading_GetTimestamp,
+    gi_reading_GetDevice,
+    gi_reading_v0_GetRawReport,
+    gi_reading_GetControllerAxisCount,
+    gi_reading_GetControllerAxisState,
+    gi_reading_GetControllerButtonCount,
+    gi_reading_GetControllerButtonState,
+    gi_reading_GetControllerSwitchCount,
+    gi_reading_GetControllerSwitchState,
+    gi_reading_GetKeyCount,
+    gi_reading_GetKeyState,
+    gi_reading_v0_GetMouseState,
+    gi_reading_v0_GetTouchCount,
+    gi_reading_v0_GetTouchState,
+    gi_reading_v0_GetMotionState,
+    gi_reading_GetArcadeStickState,
+    gi_reading_GetFlightStickState,
+    gi_reading_GetGamepadState,
+    gi_reading_GetRacingWheelState,
+    gi_reading_GetUiNavigationState
 };
 
-static const void *const g_reading_v1_vtbl[] = {
-    (const void *)gi_reading_QueryInterface,
-    (const void *)gi_reading_AddRef,
-    (const void *)gi_reading_Release,
-    (const void *)gi_reading_GetInputKind,
-    (const void *)gi_reading_GetTimestamp,
-    (const void *)gi_reading_GetDevice,
-    (const void *)gi_reading_GetControllerAxisCount,
-    (const void *)gi_reading_GetControllerAxisState,
-    (const void *)gi_reading_GetControllerButtonCount,
-    (const void *)gi_reading_GetControllerButtonState,
-    (const void *)gi_reading_GetControllerSwitchCount,
-    (const void *)gi_reading_GetControllerSwitchState,
-    (const void *)gi_reading_GetKeyCount,
-    (const void *)gi_reading_GetKeyState,
-    (const void *)gi_reading_v1_GetMouseState,
-    (const void *)gi_reading_GetArcadeStickState,
-    (const void *)gi_reading_GetFlightStickState,
-    (const void *)gi_reading_GetGamepadState,
-    (const void *)gi_reading_GetRacingWheelState,
-    (const void *)gi_reading_GetUiNavigationState
+static const IGameInputReadingV1Vtbl g_reading_v1_vtbl = {
+    gi_reading_QueryInterface,
+    gi_reading_AddRef,
+    gi_reading_Release,
+    gi_reading_GetInputKind,
+    gi_reading_GetTimestamp,
+    gi_reading_GetDevice,
+    gi_reading_GetControllerAxisCount,
+    gi_reading_GetControllerAxisState,
+    gi_reading_GetControllerButtonCount,
+    gi_reading_GetControllerButtonState,
+    gi_reading_GetControllerSwitchCount,
+    gi_reading_GetControllerSwitchState,
+    gi_reading_GetKeyCount,
+    gi_reading_GetKeyState,
+    gi_reading_v1_GetMouseState,
+    gi_reading_GetArcadeStickState,
+    gi_reading_GetFlightStickState,
+    gi_reading_GetGamepadState,
+    gi_reading_GetRacingWheelState,
+    gi_reading_GetUiNavigationState
 };
 
-static const void *const g_reading_v2_vtbl[] = {
-    (const void *)gi_reading_QueryInterface,
-    (const void *)gi_reading_AddRef,
-    (const void *)gi_reading_Release,
-    (const void *)gi_reading_GetInputKind,
-    (const void *)gi_reading_GetTimestamp,
-    (const void *)gi_reading_GetDevice,
-    (const void *)gi_reading_GetControllerAxisCount,
-    (const void *)gi_reading_GetControllerAxisState,
-    (const void *)gi_reading_GetControllerButtonCount,
-    (const void *)gi_reading_GetControllerButtonState,
-    (const void *)gi_reading_GetControllerSwitchCount,
-    (const void *)gi_reading_GetControllerSwitchState,
-    (const void *)gi_reading_GetKeyCount,
-    (const void *)gi_reading_GetKeyState,
-    (const void *)gi_reading_v1_GetMouseState,
-    (const void *)gi_reading_v2_GetSensorsState,
-    (const void *)gi_reading_GetArcadeStickState,
-    (const void *)gi_reading_GetFlightStickState,
-    (const void *)gi_reading_GetGamepadState,
-    (const void *)gi_reading_GetRacingWheelState,
-    (const void *)gi_reading_GetUiNavigationState
+static const IGameInputReadingV2Vtbl g_reading_v2_vtbl = {
+    gi_reading_QueryInterface,
+    gi_reading_AddRef,
+    gi_reading_Release,
+    gi_reading_GetInputKind,
+    gi_reading_GetTimestamp,
+    gi_reading_GetDevice,
+    gi_reading_GetControllerAxisCount,
+    gi_reading_GetControllerAxisState,
+    gi_reading_GetControllerButtonCount,
+    gi_reading_GetControllerButtonState,
+    gi_reading_GetControllerSwitchCount,
+    gi_reading_GetControllerSwitchState,
+    gi_reading_GetKeyCount,
+    gi_reading_GetKeyState,
+    gi_reading_v1_GetMouseState,
+    gi_reading_v2_GetSensorsState,
+    gi_reading_GetArcadeStickState,
+    gi_reading_GetFlightStickState,
+    gi_reading_GetGamepadState,
+    gi_reading_GetRacingWheelState,
+    gi_reading_GetUiNavigationState
 };
 
 /* -------------------------------------------------------------------------
@@ -2205,7 +2421,7 @@ typedef void (WINAPI *PFN_GI_DeviceCallback)(
 static void gi_release_pending_cb_item(GI_PendingCallbackItem *item) {
     if (!item) return;
     if (item->reading) {
-        gi_reading_Release(&item->reading->v0_iface);
+        gi_reading_release_internal(item->reading);
         item->reading = NULL;
     }
     if (item->device) {
@@ -2332,9 +2548,9 @@ static GI_ReadingImpl *gi_alloc_reading_node_locked(const GI_ReadingSnapshot *fr
     GI_ReadingImpl *node = (GI_ReadingImpl *)HeapAlloc(
         GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(GI_ReadingImpl));
     if (!node) return NULL;
-    node->v0_iface.lpVtbl = g_reading_v0_vtbl;
-    node->v1_iface.lpVtbl = g_reading_v1_vtbl;
-    node->v2_iface.lpVtbl = g_reading_v2_vtbl;
+    node->v0_iface.lpVtbl = &g_reading_v0_vtbl;
+    node->v1_iface.lpVtbl = &g_reading_v1_vtbl;
+    node->v2_iface.lpVtbl = &g_reading_v2_vtbl;
     node->ref_count       = 1;
     node->snap            = *fresh;
     node->snap.sequence   = ++g_mgr.next_sequence;
@@ -2345,6 +2561,24 @@ static GI_ReadingImpl *gi_alloc_reading_node_locked(const GI_ReadingSnapshot *fr
 /* Must be called with g_mgr.lock held exclusively */
 static void gi_push_history_node_locked(GI_ReadingImpl *node) {
     if (!node) return;
+    /* 1. Per-device history ring (prevents 1000 Hz mouse readings from starving gamepad/keyboard history) */
+    GI_DeviceImpl *dev = node->snap.device;
+    if (dev) {
+        InterlockedIncrement(&node->ref_count);
+        if (dev->dev_history_count < GI_DEV_HISTORY_CAPACITY) {
+            size_t slot = (dev->dev_history_head + dev->dev_history_count) % GI_DEV_HISTORY_CAPACITY;
+            dev->dev_history[slot] = node;
+            dev->dev_history_count++;
+        } else {
+            GI_ReadingImpl *evicted = dev->dev_history[dev->dev_history_head];
+            dev->dev_history[dev->dev_history_head] = node;
+            dev->dev_history_head = (dev->dev_history_head + 1) % GI_DEV_HISTORY_CAPACITY;
+            if (evicted) {
+                gi_reading_release_internal(evicted);
+            }
+        }
+    }
+    /* 2. Global system history ring */
     InterlockedIncrement(&node->ref_count); /* History ring ownership ref */
     if (g_mgr.history_count < GI_HISTORY_CAPACITY) {
         size_t slot = (g_mgr.history_head + g_mgr.history_count) % GI_HISTORY_CAPACITY;
@@ -2355,7 +2589,7 @@ static void gi_push_history_node_locked(GI_ReadingImpl *node) {
         g_mgr.history[g_mgr.history_head] = node;
         g_mgr.history_head = (g_mgr.history_head + 1) % GI_HISTORY_CAPACITY;
         if (evicted) {
-            gi_reading_Release(&evicted->v0_iface);
+            gi_reading_release_internal(evicted);
         }
     }
 }
@@ -2369,11 +2603,11 @@ static GI_ReadingImpl *gi_record_or_reuse_snapshot_locked(const GI_ReadingSnapsh
         GI_ReadingImpl *initial = gi_alloc_reading_node_locked(fresh);
         if (!initial) return NULL;
         if (dev->current_reading) {
-            gi_reading_Release(&dev->current_reading->v0_iface);
+            gi_reading_release_internal(dev->current_reading);
         }
         dev->current_reading   = initial; /* Device owns initial ref_count == 1 */
         dev->has_last_snapshot = true;
-        /* Only push to global history on initial observation if non-neutral! */
+        /* Only push to history on initial observation if non-neutral! */
         if (!gi_snapshot_is_neutral(&initial->snap)) {
             gi_push_history_node_locked(initial);
             gi_enqueue_reading_callbacks_locked(initial);
@@ -2388,7 +2622,7 @@ static GI_ReadingImpl *gi_record_or_reuse_snapshot_locked(const GI_ReadingSnapsh
     GI_ReadingImpl *node = gi_alloc_reading_node_locked(fresh);
     if (!node) return dev->current_reading;
 
-    gi_reading_Release(&dev->current_reading->v0_iface);
+    gi_reading_release_internal(dev->current_reading);
     dev->current_reading   = node; /* Device owns ref_count == 1 */
     dev->has_last_snapshot = true;
     gi_push_history_node_locked(node);
@@ -2399,9 +2633,9 @@ static GI_ReadingImpl *gi_record_or_reuse_snapshot_locked(const GI_ReadingSnapsh
 /* Must be called with g_mgr.lock held exclusively */
 static GI_ReadingImpl *gi_find_latest_history_locked(GI_DeviceImpl *dev, GameInputKind kind_mask) {
     if (dev) {
-        for (size_t i = 0; i < g_mgr.history_count; i++) {
-            size_t idx = (g_mgr.history_head + g_mgr.history_count - 1 - i) % GI_HISTORY_CAPACITY;
-            GI_ReadingImpl *cand = g_mgr.history[idx];
+        for (size_t i = 0; i < dev->dev_history_count; i++) {
+            size_t idx = (dev->dev_history_head + dev->dev_history_count - 1 - i) % GI_DEV_HISTORY_CAPACITY;
+            GI_ReadingImpl *cand = dev->dev_history[idx];
             if (!cand || cand->snap.device != dev) continue;
             if (kind_mask != GI_KindUnknown && (cand->snap.kind & kind_mask) == 0) continue;
             return cand;
@@ -2475,8 +2709,22 @@ static void gi_refresh_desktop_cache_locked(void) {
     g_mgr.cached_focused = focused;
     if (focused) {
         gi_ensure_vk_table();
-        (void)GetKeyState(0);
-        if (!GetKeyboardState(g_mgr.cached_kb_state)) {
+        /*
+         * GetKeyboardState() reads the calling thread's own message queue; calling it
+         * from a background worker thread (with no foreground window/message pump) returns
+         * TRUE with 256 zero bytes, blanking game-thread keyboard readings for 2 ms!
+         * Only use GetKeyboardState() on the foreground window's own thread; otherwise
+         * sample live physical key state via GetAsyncKeyState().
+         */
+        HWND fg_hwnd = GetForegroundWindow();
+        DWORD fg_tid = fg_hwnd ? GetWindowThreadProcessId(fg_hwnd, NULL) : 0;
+        bool on_fg_thread = (fg_tid != 0 && fg_tid == GetCurrentThreadId());
+        bool got_kb = false;
+        if (on_fg_thread) {
+            (void)GetKeyState(0);
+            got_kb = (GetKeyboardState(g_mgr.cached_kb_state) != FALSE);
+        }
+        if (!got_kb) {
             memset(g_mgr.cached_kb_state, 0, sizeof(g_mgr.cached_kb_state));
             for (uint32_t vk = 0x01; vk <= 0xFE; vk++) {
                 if ((GetAsyncKeyState((int)vk) & 0x8000) != 0) {
@@ -2577,18 +2825,41 @@ static bool gi_drain_callbacks_outside_lock(uint64_t quota_us, bool poll_devices
         bool have_item = false;
 
         AcquireSRWLockExclusive(&g_mgr.lock);
-        while (g_mgr.cb_queue_count > 0) {
-            item = g_mgr.cb_queue[g_mgr.cb_queue_head];
-            g_mgr.cb_queue_head = (g_mgr.cb_queue_head + 1) % GI_CALLBACK_QUEUE_CAP;
-            g_mgr.cb_queue_count--;
-
-            GI_CallbackSlot *slot = gi_find_runnable_slot_locked(item.token);
+        /*
+         * Per-token serialization: scan FIFO queue for the first runnable item whose
+         * token is NOT currently in-flight on another thread. Dead/unregistered items
+         * are discarded immediately; items for busy tokens stay queued in FIFO order so
+         * slot->running_tid is never overwritten and self-unregister can never deadlock.
+         */
+        size_t scan = 0;
+        while (scan < g_mgr.cb_queue_count) {
+            size_t idx = (g_mgr.cb_queue_head + scan) % GI_CALLBACK_QUEUE_CAP;
+            GI_PendingCallbackItem cand = g_mgr.cb_queue[idx];
+            GI_CallbackSlot *slot = gi_find_runnable_slot_locked(cand.token);
             if (!slot) {
-                gi_release_pending_cb_item(&item);
-                memset(&item, 0, sizeof(item));
+                /* Remove dead entry at offset `scan` preserving FIFO order */
+                for (size_t k = scan; k + 1 < g_mgr.cb_queue_count; k++) {
+                    size_t dst_i = (g_mgr.cb_queue_head + k) % GI_CALLBACK_QUEUE_CAP;
+                    size_t src_i = (g_mgr.cb_queue_head + k + 1) % GI_CALLBACK_QUEUE_CAP;
+                    g_mgr.cb_queue[dst_i] = g_mgr.cb_queue[src_i];
+                }
+                g_mgr.cb_queue_count--;
+                gi_release_pending_cb_item(&cand);
                 continue;
             }
-            slot->in_flight++;
+            if (slot->in_flight > 0) {
+                scan++;
+                continue;
+            }
+            /* Dequeue runnable item at offset `scan` preserving FIFO order */
+            item = cand;
+            for (size_t k = scan; k + 1 < g_mgr.cb_queue_count; k++) {
+                size_t dst_i = (g_mgr.cb_queue_head + k) % GI_CALLBACK_QUEUE_CAP;
+                size_t src_i = (g_mgr.cb_queue_head + k + 1) % GI_CALLBACK_QUEUE_CAP;
+                g_mgr.cb_queue[dst_i] = g_mgr.cb_queue[src_i];
+            }
+            g_mgr.cb_queue_count--;
+            slot->in_flight = 1;
             slot->running_tid = GetCurrentThreadId();
             have_item = true;
             break;
@@ -2727,10 +2998,104 @@ static inline void gi_ensure_cb_worker(void) {
 /* -------------------------------------------------------------------------
  * IGameInput Implementation (v0, v0_2303, v1, v2)
  * ------------------------------------------------------------------------- */
-static const void *const g_mgr_v0_vtbl[];
-static const void *const g_mgr_v0_sys_vtbl[];
-static const void *const g_mgr_v1_vtbl[];
-static const void *const g_mgr_v2_vtbl[];
+typedef struct IGameInputV0Vtbl {
+    HRESULT  (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG    (WINAPI *AddRef)(void *iface);
+    ULONG    (WINAPI *Release)(void *iface);
+    uint64_t (WINAPI *GetCurrentTimestamp)(void *iface);
+    HRESULT  (WINAPI *GetCurrentReading)(void *iface, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *GetNextReading)(void *iface, void *raw_ref, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *GetPreviousReading)(void *iface, void *raw_ref, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *GetTemporalReading)(void *iface, uint64_t timestamp, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *RegisterReadingCallback)(void *iface, void *raw_device, GameInputKind kind, float threshold, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterDeviceCallback)(void *iface, void *raw_device, GameInputKind kind, GameInputDeviceStatus status_filter, GameInputEnumerationKind enum_kind, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterGuideButtonCallback)(void *iface, void *raw_device, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterKeyboardLayoutCallback)(void *iface, void *raw_device, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    void     (WINAPI *StopCallback)(void *iface, GameInputCallbackToken token);
+    bool     (WINAPI *UnregisterCallback)(void *iface, GameInputCallbackToken token, uint64_t timeout_us);
+    HRESULT  (WINAPI *CreateDispatcher)(void *iface, void **out_dispatcher);
+    HRESULT  (WINAPI *CreateAggregateDevice)(void *iface, GameInputKind kind, void **out_device);
+    HRESULT  (WINAPI *FindDeviceFromId)(void *iface, const GI_APP_LOCAL_DEVICE_ID *id, void **out_device);
+    HRESULT  (WINAPI *FindDeviceFromObject)(void *iface, IUnknown *obj, void **out_device);
+    HRESULT  (WINAPI *FindDeviceFromPlatformHandle)(void *iface, HANDLE handle, void **out_device);
+    HRESULT  (WINAPI *FindDeviceFromPlatformString)(void *iface, LPCWSTR str, void **out_device);
+    HRESULT  (WINAPI *EnableOemDeviceSupport)(void *iface, uint16_t vid, uint16_t pid, uint8_t if_num, uint8_t col_num);
+    void     (WINAPI *SetFocusPolicy)(void *iface, GameInputFocusPolicy policy);
+} IGameInputV0Vtbl;
+_Static_assert(sizeof(IGameInputV0Vtbl) == 22 * sizeof(void *), "IGameInputV0Vtbl must have 22 slots");
+
+typedef struct IGameInputV0SysVtbl {
+    HRESULT  (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG    (WINAPI *AddRef)(void *iface);
+    ULONG    (WINAPI *Release)(void *iface);
+    uint64_t (WINAPI *GetCurrentTimestamp)(void *iface);
+    HRESULT  (WINAPI *GetCurrentReading)(void *iface, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *GetNextReading)(void *iface, void *raw_ref, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *GetPreviousReading)(void *iface, void *raw_ref, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *GetTemporalReading)(void *iface, uint64_t timestamp, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *RegisterReadingCallback)(void *iface, void *raw_device, GameInputKind kind, float threshold, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterDeviceCallback)(void *iface, void *raw_device, GameInputKind kind, GameInputDeviceStatus status_filter, GameInputEnumerationKind enum_kind, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterSystemButtonCallback)(void *iface, void *raw_device, GameInputSystemButtons button_filter, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterKeyboardLayoutCallback)(void *iface, void *raw_device, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    void     (WINAPI *StopCallback)(void *iface, GameInputCallbackToken token);
+    bool     (WINAPI *UnregisterCallback)(void *iface, GameInputCallbackToken token, uint64_t timeout_us);
+    HRESULT  (WINAPI *CreateDispatcher)(void *iface, void **out_dispatcher);
+    HRESULT  (WINAPI *CreateAggregateDevice)(void *iface, GameInputKind kind, void **out_device);
+    HRESULT  (WINAPI *FindDeviceFromId)(void *iface, const GI_APP_LOCAL_DEVICE_ID *id, void **out_device);
+    HRESULT  (WINAPI *FindDeviceFromObject)(void *iface, IUnknown *obj, void **out_device);
+    HRESULT  (WINAPI *FindDeviceFromPlatformHandle)(void *iface, HANDLE handle, void **out_device);
+    HRESULT  (WINAPI *FindDeviceFromPlatformString)(void *iface, LPCWSTR str, void **out_device);
+    HRESULT  (WINAPI *EnableOemDeviceSupport)(void *iface, uint16_t vid, uint16_t pid, uint8_t if_num, uint8_t col_num);
+    void     (WINAPI *SetFocusPolicy)(void *iface, GameInputFocusPolicy policy);
+} IGameInputV0SysVtbl;
+_Static_assert(sizeof(IGameInputV0SysVtbl) == 22 * sizeof(void *), "IGameInputV0SysVtbl must have 22 slots");
+
+typedef struct IGameInputV1Vtbl {
+    HRESULT  (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG    (WINAPI *AddRef)(void *iface);
+    ULONG    (WINAPI *Release)(void *iface);
+    uint64_t (WINAPI *GetCurrentTimestamp)(void *iface);
+    HRESULT  (WINAPI *GetCurrentReading)(void *iface, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *GetNextReading)(void *iface, void *raw_ref, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *GetPreviousReading)(void *iface, void *raw_ref, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *RegisterReadingCallback)(void *iface, void *raw_device, GameInputKind kind, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterDeviceCallback)(void *iface, void *raw_device, GameInputKind kind, GameInputDeviceStatus status_filter, GameInputEnumerationKind enum_kind, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterSystemButtonCallback)(void *iface, void *raw_device, GameInputSystemButtons button_filter, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterKeyboardLayoutCallback)(void *iface, void *raw_device, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    void     (WINAPI *StopCallback)(void *iface, GameInputCallbackToken token);
+    bool     (WINAPI *UnregisterCallback)(void *iface, GameInputCallbackToken token);
+    HRESULT  (WINAPI *CreateDispatcher)(void *iface, void **out_dispatcher);
+    HRESULT  (WINAPI *FindDeviceFromId)(void *iface, const GI_APP_LOCAL_DEVICE_ID *id, void **out_device);
+    HRESULT  (WINAPI *FindDeviceFromPlatformString)(void *iface, LPCWSTR str, void **out_device);
+    void     (WINAPI *SetFocusPolicy)(void *iface, GameInputFocusPolicy policy);
+} IGameInputV1Vtbl;
+_Static_assert(sizeof(IGameInputV1Vtbl) == 17 * sizeof(void *), "IGameInputV1Vtbl must have 17 slots");
+
+typedef struct IGameInputV2Vtbl {
+    HRESULT  (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);
+    ULONG    (WINAPI *AddRef)(void *iface);
+    ULONG    (WINAPI *Release)(void *iface);
+    uint64_t (WINAPI *GetCurrentTimestamp)(void *iface);
+    HRESULT  (WINAPI *GetCurrentReading)(void *iface, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *GetNextReading)(void *iface, void *raw_ref, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *GetPreviousReading)(void *iface, void *raw_ref, GameInputKind kind, void *raw_device, void **out_reading);
+    HRESULT  (WINAPI *RegisterReadingCallback)(void *iface, void *raw_device, GameInputKind kind, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterDeviceCallback)(void *iface, void *raw_device, GameInputKind kind, GameInputDeviceStatus status_filter, GameInputEnumerationKind enum_kind, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterSystemButtonCallback)(void *iface, void *raw_device, GameInputSystemButtons button_filter, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    HRESULT  (WINAPI *RegisterKeyboardLayoutCallback)(void *iface, void *raw_device, void *context, void *callback_fn, GameInputCallbackToken *out_token);
+    void     (WINAPI *StopCallback)(void *iface, GameInputCallbackToken token);
+    bool     (WINAPI *UnregisterCallback)(void *iface, GameInputCallbackToken token);
+    HRESULT  (WINAPI *CreateDispatcher)(void *iface, void **out_dispatcher);
+    HRESULT  (WINAPI *FindDeviceFromId)(void *iface, const GI_APP_LOCAL_DEVICE_ID *id, void **out_device);
+    HRESULT  (WINAPI *FindDeviceFromPlatformString)(void *iface, LPCWSTR str, void **out_device);
+    void     (WINAPI *SetFocusPolicy)(void *iface, GameInputFocusPolicy policy);
+} IGameInputV2Vtbl;
+_Static_assert(sizeof(IGameInputV2Vtbl) == 17 * sizeof(void *), "IGameInputV2Vtbl must have 17 slots");
+
+static const IGameInputV0Vtbl g_mgr_v0_vtbl;
+static const IGameInputV0SysVtbl g_mgr_v0_sys_vtbl;
+static const IGameInputV1Vtbl g_mgr_v1_vtbl;
+static const IGameInputV2Vtbl g_mgr_v2_vtbl;
 
 static GI_ApiVer gi_mgr_ver_from_iface(void *iface) {
     if (iface == (void *)&g_mgr.v1_iface) return GI_VER_1;
@@ -2857,9 +3222,14 @@ static HRESULT WINAPI gi_mgr_GetNextReading(void *iface, void *raw_ref, GameInpu
 
     GI_ReadingImpl *found_next = NULL;
     bool ref_seen = false;
-    for (size_t i = 0; i < g_mgr.history_count; i++) {
-        size_t idx = (g_mgr.history_head + i) % GI_HISTORY_CAPACITY;
-        GI_ReadingImpl *cand = g_mgr.history[idx];
+    GI_ReadingImpl **ring = filter_dev ? filter_dev->dev_history : g_mgr.history;
+    size_t ring_count = filter_dev ? filter_dev->dev_history_count : g_mgr.history_count;
+    size_t ring_head  = filter_dev ? filter_dev->dev_history_head  : g_mgr.history_head;
+    size_t ring_cap   = filter_dev ? GI_DEV_HISTORY_CAPACITY       : GI_HISTORY_CAPACITY;
+
+    for (size_t i = 0; i < ring_count; i++) {
+        size_t idx = (ring_head + i) % ring_cap;
+        GI_ReadingImpl *cand = ring[idx];
         if (!cand) continue;
         if (cand->snap.sequence == ref->snap.sequence) {
             ref_seen = true;
@@ -2873,8 +3243,8 @@ static HRESULT WINAPI gi_mgr_GetNextReading(void *iface, void *raw_ref, GameInpu
         }
     }
 
-    if (!ref_seen && g_mgr.history_count > 0) {
-        GI_ReadingImpl *oldest = g_mgr.history[g_mgr.history_head];
+    if (!ref_seen && ring_count > 0) {
+        GI_ReadingImpl *oldest = ring[ring_head];
         if (oldest && ref->snap.sequence < oldest->snap.sequence) {
             ReleaseSRWLockExclusive(&g_mgr.lock);
             if (InterlockedCompareExchange(&g_live_dispatchers, 0, 0) == 0) {
@@ -2916,11 +3286,16 @@ static HRESULT WINAPI gi_mgr_GetPreviousReading(void *iface, void *raw_ref, Game
         if (filter_dev->dev_type == GI_DEV_AGGREGATE) filter_dev = NULL;
     }
 
-    AcquireSRWLockExclusive(&g_mgr.lock);
+    AcquireSRWLockShared(&g_mgr.lock);
     GI_ReadingImpl *found_prev = NULL;
-    for (size_t i = 0; i < g_mgr.history_count; i++) {
-        size_t idx = (g_mgr.history_head + i) % GI_HISTORY_CAPACITY;
-        GI_ReadingImpl *cand = g_mgr.history[idx];
+    GI_ReadingImpl **ring = filter_dev ? filter_dev->dev_history : g_mgr.history;
+    size_t ring_count = filter_dev ? filter_dev->dev_history_count : g_mgr.history_count;
+    size_t ring_head  = filter_dev ? filter_dev->dev_history_head  : g_mgr.history_head;
+    size_t ring_cap   = filter_dev ? GI_DEV_HISTORY_CAPACITY       : GI_HISTORY_CAPACITY;
+
+    for (size_t i = 0; i < ring_count; i++) {
+        size_t idx = (ring_head + i) % ring_cap;
+        GI_ReadingImpl *cand = ring[idx];
         if (!cand) continue;
         if (cand->snap.sequence >= ref->snap.sequence) break;
         if (filter_dev && cand->snap.device != filter_dev) continue;
@@ -2929,12 +3304,12 @@ static HRESULT WINAPI gi_mgr_GetPreviousReading(void *iface, void *raw_ref, Game
     }
 
     if (!found_prev) {
-        ReleaseSRWLockExclusive(&g_mgr.lock);
+        ReleaseSRWLockShared(&g_mgr.lock);
         return GI_E_READING_NOT_FOUND;
     }
 
     *out_reading = gi_reading_iface_for_ver(found_prev, ver);
-    ReleaseSRWLockExclusive(&g_mgr.lock);
+    ReleaseSRWLockShared(&g_mgr.lock);
     return S_OK;
 }
 
@@ -3066,7 +3441,11 @@ static HRESULT WINAPI gi_mgr_RegisterDeviceCallback(
                 if (filter_dev && filter_dev->dev_type != GI_DEV_AGGREGATE && filter_dev != dev) continue;
                 if (kind != GI_KindUnknown && (dev->info_v1.supportedInput & kind) == 0) continue;
                 if (dev->xinput_slot >= 0) {
-                    (void)gi_probe_xinput_slot(dev, NULL, NULL);
+                    bool conn_changed = false;
+                    (void)gi_probe_xinput_slot(dev, NULL, &conn_changed);
+                    if (conn_changed) {
+                        gi_enqueue_device_callbacks_locked(dev, dev->connected);
+                    }
                 }
                 GameInputDeviceStatus st = gi_device_status_value(dev, ver);
                 if ((st & GI_DeviceConnected) != 0) {
@@ -3096,9 +3475,38 @@ static HRESULT WINAPI gi_mgr_RegisterDeviceCallback(
                     ver == GI_VER_0 ? (void *)&dev->v0_iface :
                     ver == GI_VER_1 ? (void *)&dev->v1_iface : (void *)&dev->v2_iface);
                 if ((st & GI_DeviceConnected) != 0) {
+                    bool can_invoke = false;
+                    AcquireSRWLockExclusive(&g_mgr.lock);
+                    GI_CallbackSlot *slot = gi_find_runnable_slot_locked(tok);
+                    if (slot && slot->in_flight == 0) {
+                        slot->in_flight = 1;
+                        slot->running_tid = GetCurrentThreadId();
+                        can_invoke = true;
+                    }
+                    ReleaseSRWLockExclusive(&g_mgr.lock);
+
+                    if (!can_invoke) break;
+
                     void *dev_iface = gi_device_iface_for_ver(dev, ver);
                     cb(tok, context, dev_iface, now_ts, st, GI_DeviceNoStatus);
                     gi_dev_Release(dev_iface);
+
+                    AcquireSRWLockExclusive(&g_mgr.lock);
+                    for (size_t s = 0; s < GI_MAX_CALLBACKS; s++) {
+                        GI_CallbackSlot *cs = &g_mgr.callbacks[s];
+                        if (cs->active && cs->token == tok) {
+                            if (cs->in_flight > 0) cs->in_flight--;
+                            if (cs->in_flight == 0) {
+                                cs->running_tid = 0;
+                                if (cs->unregistering) {
+                                    memset(cs, 0, sizeof(*cs));
+                                }
+                                WakeAllConditionVariable(&g_mgr.cb_cv);
+                            }
+                            break;
+                        }
+                    }
+                    ReleaseSRWLockExclusive(&g_mgr.lock);
                 }
             }
         }
@@ -3259,7 +3667,7 @@ static HRESULT WINAPI gi_mgr_CreateDispatcher(void *iface, void **out_dispatcher
         GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(GI_DispatcherImpl));
     if (!disp) return E_OUTOFMEMORY;
 
-    disp->iface.lpVtbl = g_disp_vtbl;
+    disp->iface.lpVtbl = &g_disp_vtbl;
     disp->ref_count    = 1;
     disp->wait_event   = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!disp->wait_event) {
@@ -3358,94 +3766,94 @@ static void WINAPI gi_mgr_SetFocusPolicy(void *iface, GameInputFocusPolicy polic
     ReleaseSRWLockExclusive(&g_mgr.lock);
 }
 
-static const void *const g_mgr_v0_vtbl[] = {
-    (const void *)gi_mgr_QueryInterface,
-    (const void *)gi_mgr_AddRef,
-    (const void *)gi_mgr_Release,
-    (const void *)gi_mgr_GetCurrentTimestamp,
-    (const void *)gi_mgr_GetCurrentReading,
-    (const void *)gi_mgr_GetNextReading,
-    (const void *)gi_mgr_GetPreviousReading,
-    (const void *)gi_mgr_v0_GetTemporalReading,
-    (const void *)gi_mgr_v0_RegisterReadingCallback,
-    (const void *)gi_mgr_RegisterDeviceCallback,
-    (const void *)gi_mgr_v0_RegisterGuideButtonCallback,
-    (const void *)gi_mgr_RegisterKeyboardLayoutCallback,
-    (const void *)gi_mgr_StopCallback,
-    (const void *)gi_mgr_v0_UnregisterCallback,
-    (const void *)gi_mgr_CreateDispatcher,
-    (const void *)gi_mgr_v0_CreateAggregateDevice,
-    (const void *)gi_mgr_FindDeviceFromId,
-    (const void *)gi_mgr_v0_FindDeviceFromObject,
-    (const void *)gi_mgr_v0_FindDeviceFromPlatformHandle,
-    (const void *)gi_mgr_FindDeviceFromPlatformString,
-    (const void *)gi_mgr_v0_EnableOemDeviceSupport,
-    (const void *)gi_mgr_SetFocusPolicy
+static const IGameInputV0Vtbl g_mgr_v0_vtbl = {
+    gi_mgr_QueryInterface,
+    gi_mgr_AddRef,
+    gi_mgr_Release,
+    gi_mgr_GetCurrentTimestamp,
+    gi_mgr_GetCurrentReading,
+    gi_mgr_GetNextReading,
+    gi_mgr_GetPreviousReading,
+    gi_mgr_v0_GetTemporalReading,
+    gi_mgr_v0_RegisterReadingCallback,
+    gi_mgr_RegisterDeviceCallback,
+    gi_mgr_v0_RegisterGuideButtonCallback,
+    gi_mgr_RegisterKeyboardLayoutCallback,
+    gi_mgr_StopCallback,
+    gi_mgr_v0_UnregisterCallback,
+    gi_mgr_CreateDispatcher,
+    gi_mgr_v0_CreateAggregateDevice,
+    gi_mgr_FindDeviceFromId,
+    gi_mgr_v0_FindDeviceFromObject,
+    gi_mgr_v0_FindDeviceFromPlatformHandle,
+    gi_mgr_FindDeviceFromPlatformString,
+    gi_mgr_v0_EnableOemDeviceSupport,
+    gi_mgr_SetFocusPolicy
 };
 
-static const void *const g_mgr_v0_sys_vtbl[] = {
-    (const void *)gi_mgr_QueryInterface,
-    (const void *)gi_mgr_AddRef,
-    (const void *)gi_mgr_Release,
-    (const void *)gi_mgr_GetCurrentTimestamp,
-    (const void *)gi_mgr_GetCurrentReading,
-    (const void *)gi_mgr_GetNextReading,
-    (const void *)gi_mgr_GetPreviousReading,
-    (const void *)gi_mgr_v0_GetTemporalReading,
-    (const void *)gi_mgr_v0_RegisterReadingCallback,
-    (const void *)gi_mgr_RegisterDeviceCallback,
-    (const void *)gi_mgr_v0_RegisterSystemButtonCallback,
-    (const void *)gi_mgr_RegisterKeyboardLayoutCallback,
-    (const void *)gi_mgr_StopCallback,
-    (const void *)gi_mgr_v0_UnregisterCallback,
-    (const void *)gi_mgr_CreateDispatcher,
-    (const void *)gi_mgr_v0_CreateAggregateDevice,
-    (const void *)gi_mgr_FindDeviceFromId,
-    (const void *)gi_mgr_v0_FindDeviceFromObject,
-    (const void *)gi_mgr_v0_FindDeviceFromPlatformHandle,
-    (const void *)gi_mgr_FindDeviceFromPlatformString,
-    (const void *)gi_mgr_v0_EnableOemDeviceSupport,
-    (const void *)gi_mgr_SetFocusPolicy
+static const IGameInputV0SysVtbl g_mgr_v0_sys_vtbl = {
+    gi_mgr_QueryInterface,
+    gi_mgr_AddRef,
+    gi_mgr_Release,
+    gi_mgr_GetCurrentTimestamp,
+    gi_mgr_GetCurrentReading,
+    gi_mgr_GetNextReading,
+    gi_mgr_GetPreviousReading,
+    gi_mgr_v0_GetTemporalReading,
+    gi_mgr_v0_RegisterReadingCallback,
+    gi_mgr_RegisterDeviceCallback,
+    gi_mgr_v0_RegisterSystemButtonCallback,
+    gi_mgr_RegisterKeyboardLayoutCallback,
+    gi_mgr_StopCallback,
+    gi_mgr_v0_UnregisterCallback,
+    gi_mgr_CreateDispatcher,
+    gi_mgr_v0_CreateAggregateDevice,
+    gi_mgr_FindDeviceFromId,
+    gi_mgr_v0_FindDeviceFromObject,
+    gi_mgr_v0_FindDeviceFromPlatformHandle,
+    gi_mgr_FindDeviceFromPlatformString,
+    gi_mgr_v0_EnableOemDeviceSupport,
+    gi_mgr_SetFocusPolicy
 };
 
-static const void *const g_mgr_v1_vtbl[] = {
-    (const void *)gi_mgr_QueryInterface,
-    (const void *)gi_mgr_AddRef,
-    (const void *)gi_mgr_Release,
-    (const void *)gi_mgr_GetCurrentTimestamp,
-    (const void *)gi_mgr_GetCurrentReading,
-    (const void *)gi_mgr_GetNextReading,
-    (const void *)gi_mgr_GetPreviousReading,
-    (const void *)gi_mgr_v1_RegisterReadingCallback,
-    (const void *)gi_mgr_RegisterDeviceCallback,
-    (const void *)gi_mgr_v1_RegisterSystemButtonCallback,
-    (const void *)gi_mgr_RegisterKeyboardLayoutCallback,
-    (const void *)gi_mgr_StopCallback,
-    (const void *)gi_mgr_v1_UnregisterCallback,
-    (const void *)gi_mgr_CreateDispatcher,
-    (const void *)gi_mgr_FindDeviceFromId,
-    (const void *)gi_mgr_FindDeviceFromPlatformString,
-    (const void *)gi_mgr_SetFocusPolicy
+static const IGameInputV1Vtbl g_mgr_v1_vtbl = {
+    gi_mgr_QueryInterface,
+    gi_mgr_AddRef,
+    gi_mgr_Release,
+    gi_mgr_GetCurrentTimestamp,
+    gi_mgr_GetCurrentReading,
+    gi_mgr_GetNextReading,
+    gi_mgr_GetPreviousReading,
+    gi_mgr_v1_RegisterReadingCallback,
+    gi_mgr_RegisterDeviceCallback,
+    gi_mgr_v1_RegisterSystemButtonCallback,
+    gi_mgr_RegisterKeyboardLayoutCallback,
+    gi_mgr_StopCallback,
+    gi_mgr_v1_UnregisterCallback,
+    gi_mgr_CreateDispatcher,
+    gi_mgr_FindDeviceFromId,
+    gi_mgr_FindDeviceFromPlatformString,
+    gi_mgr_SetFocusPolicy
 };
 
-static const void *const g_mgr_v2_vtbl[] = {
-    (const void *)gi_mgr_QueryInterface,
-    (const void *)gi_mgr_AddRef,
-    (const void *)gi_mgr_Release,
-    (const void *)gi_mgr_GetCurrentTimestamp,
-    (const void *)gi_mgr_GetCurrentReading,
-    (const void *)gi_mgr_GetNextReading,
-    (const void *)gi_mgr_GetPreviousReading,
-    (const void *)gi_mgr_v1_RegisterReadingCallback,
-    (const void *)gi_mgr_RegisterDeviceCallback,
-    (const void *)gi_mgr_v1_RegisterSystemButtonCallback,
-    (const void *)gi_mgr_RegisterKeyboardLayoutCallback,
-    (const void *)gi_mgr_StopCallback,
-    (const void *)gi_mgr_v1_UnregisterCallback,
-    (const void *)gi_mgr_CreateDispatcher,
-    (const void *)gi_mgr_FindDeviceFromId,
-    (const void *)gi_mgr_FindDeviceFromPlatformString,
-    (const void *)gi_mgr_SetFocusPolicy
+static const IGameInputV2Vtbl g_mgr_v2_vtbl = {
+    gi_mgr_QueryInterface,
+    gi_mgr_AddRef,
+    gi_mgr_Release,
+    gi_mgr_GetCurrentTimestamp,
+    gi_mgr_GetCurrentReading,
+    gi_mgr_GetNextReading,
+    gi_mgr_GetPreviousReading,
+    gi_mgr_v1_RegisterReadingCallback,
+    gi_mgr_RegisterDeviceCallback,
+    gi_mgr_v1_RegisterSystemButtonCallback,
+    gi_mgr_RegisterKeyboardLayoutCallback,
+    gi_mgr_StopCallback,
+    gi_mgr_v1_UnregisterCallback,
+    gi_mgr_CreateDispatcher,
+    gi_mgr_FindDeviceFromId,
+    gi_mgr_FindDeviceFromPlatformString,
+    gi_mgr_SetFocusPolicy
 };
 
 /* -------------------------------------------------------------------------
@@ -3466,13 +3874,35 @@ static void gi_init_single_device(
     const char *display_name)
 {
     memset(dev, 0, sizeof(*dev));
-    dev->v0_iface.lpVtbl = g_dev_v0_vtbl;
-    dev->v1_iface.lpVtbl = g_dev_v1_vtbl;
-    dev->v2_iface.lpVtbl = g_dev_v2_vtbl;
+    dev->v0_iface.lpVtbl = &g_dev_v0_vtbl;
+    dev->v1_iface.lpVtbl = &g_dev_v1_vtbl;
+    dev->v2_iface.lpVtbl = &g_dev_v2_vtbl;
     dev->ref_count       = 1;
     dev->dev_type        = dev_type;
     dev->xinput_slot     = xinput_slot;
     dev->connected       = initially_connected;
+
+    static const char *const k_pnp_suffix[GI_DEV_COUNT] = {
+        "Keyboard",
+        "Mouse",
+        "Gamepad0",
+        "Gamepad1",
+        "Gamepad2",
+        "Gamepad3",
+        "Aggregate"
+    };
+    const char *suffix = ((size_t)dev_type < GI_DEV_COUNT) ? k_pnp_suffix[dev_type] : "Device";
+    {
+        static const char pnp_prefix[] = "\\\\?\\HID#OneLauncherVirtualGameInput#";
+        size_t plen = sizeof(pnp_prefix) - 1;
+        size_t slen = strlen(suffix);
+        if (plen + slen >= sizeof(dev->pnp_path)) {
+            slen = sizeof(dev->pnp_path) - 1 - plen;
+        }
+        memcpy(dev->pnp_path, pnp_prefix, plen);
+        memcpy(dev->pnp_path + plen, suffix, slen);
+        dev->pnp_path[plen + slen] = '\0';
+    }
 
     GI_APP_LOCAL_DEVICE_ID dev_id;
     memset(&dev_id, 0, sizeof(dev_id));
@@ -3514,7 +3944,7 @@ static void gi_init_single_device(
     dev->info_v1.supportedInput        = supported_input;
     dev->info_v1.supportedRumbleMotors = rumble;
     dev->info_v1.displayName           = display_name;
-    dev->info_v1.pnpPath               = "\\\\?\\HID#OneLauncherVirtualGameInput";
+    dev->info_v1.pnpPath               = dev->pnp_path;
 
     /* Populate v2_GameInputDeviceInfo */
     dev->info_v2.vendorId              = vid;
@@ -3530,7 +3960,7 @@ static void gi_init_single_device(
     dev->info_v2.supportedInput        = supported_input;
     dev->info_v2.supportedRumbleMotors = rumble;
     dev->info_v2.displayName           = display_name;
-    dev->info_v2.pnpPath               = "\\\\?\\HID#OneLauncherVirtualGameInput";
+    dev->info_v2.pnpPath               = dev->pnp_path;
 
     if ((supported_input & GI_KindKeyboard) != 0) {
         dev->info_v0.keyboardInfo = &g_kb_info_v0;
@@ -3589,10 +4019,10 @@ static BOOL CALLBACK gi_init_mgr_once(PINIT_ONCE once, PVOID param, PVOID *ctx) 
     (void)ctx;
 
     memset(&g_mgr, 0, sizeof(g_mgr));
-    g_mgr.v0_iface.lpVtbl     = g_mgr_v0_vtbl;
-    g_mgr.v0_sys_iface.lpVtbl = g_mgr_v0_sys_vtbl;
-    g_mgr.v1_iface.lpVtbl     = g_mgr_v1_vtbl;
-    g_mgr.v2_iface.lpVtbl     = g_mgr_v2_vtbl;
+    g_mgr.v0_iface.lpVtbl     = &g_mgr_v0_vtbl;
+    g_mgr.v0_sys_iface.lpVtbl = &g_mgr_v0_sys_vtbl;
+    g_mgr.v1_iface.lpVtbl     = &g_mgr_v1_vtbl;
+    g_mgr.v2_iface.lpVtbl     = &g_mgr_v2_vtbl;
     InitializeSRWLock(&g_mgr.lock);
     InitializeConditionVariable(&g_mgr.cb_cv);
 
@@ -3662,6 +4092,9 @@ HRESULT WINAPI DllCanUnloadNow(void) {
         return S_FALSE;
     }
     if (InterlockedCompareExchange(&g_live_dispatchers, 0, 0) > 0) {
+        return S_FALSE;
+    }
+    if (InterlockedCompareExchange(&g_live_readings, 0, 0) > 0) {
         return S_FALSE;
     }
     for (size_t d = 0; d < GI_DEV_COUNT; d++) {
