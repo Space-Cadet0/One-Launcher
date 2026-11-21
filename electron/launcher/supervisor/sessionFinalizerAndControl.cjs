@@ -936,16 +936,18 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
 
   /** @type {Promise<any>} */
   let bottleGogPostExitPromise = Promise.resolve({ completed: false, closedBottleGog: false });
-  if (
+  const shouldShutdownBottleGog = Boolean(
     entry.wokeBottleGogByLauncher &&
-    lifecyclePolicy === 'minimal_and_close_if_started' &&
-    entry.wineBinary &&
-    entry.bottleGogExe
-  ) {
+      lifecyclePolicy === 'minimal_and_close_if_started' &&
+      entry.wineBinary &&
+      entry.bottleGogExe
+  );
+  const shouldFlushBottleGogUri = Boolean(isStorefrontUri && entry.bottleGogExe && entry.winePrefix);
+  if (shouldShutdownBottleGog || shouldFlushBottleGogUri) {
     bottleGogPostExitPromise = trackPostSessionPromise(
       Promise.allSettled([gogCloudSaveSyncPromise])
         .then(async () => {
-          if (isPrefixBusyWithOtherSession()) {
+          if (shouldShutdownBottleGog && isPrefixBusyWithOtherSession()) {
             return { completed: false, closedBottleGog: false };
           }
           await waitForGogPostExitFlush({
@@ -960,6 +962,9 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
               : {}),
             options: mergedOptions,
           });
+          if (!shouldShutdownBottleGog) {
+            return { completed: true, closedBottleGog: false };
+          }
           const execFileImpl =
             typeof mergedOptions.execFileImpl === 'function'
               ? mergedOptions.execFileImpl

@@ -356,34 +356,10 @@ const MAC_NATIVE_PUBLISHER_APPS = Object.freeze({
  * @returns {boolean}
  */
 function lineMatchesStrictBottlePrefix(rawCmd, bottleNormLower, realBottleNormLower) {
-  const lowerCmd = String(rawCmd || '')
-    .replace(/\\/g, '/')
-    .toLowerCase();
-  if (!lowerCmd || (!bottleNormLower && !realBottleNormLower)) return false;
-  const hasExplicitBottleScope =
-    /\bwineprefix=|\/bottles\//i.test(lowerCmd) ||
-    (Boolean(bottleNormLower) && lowerCmd.includes(bottleNormLower)) ||
-    (Boolean(realBottleNormLower) && lowerCmd.includes(realBottleNormLower));
-  if (!hasExplicitBottleScope) return false;
-
-  const matchBottlePrefix =
-    /** @type {(rawLine: string, normTargetPrefix: string | null | undefined, normRealTargetPrefix?: string | null | undefined, opts?: { allowUnscopedFallback?: boolean }) => boolean} */ (
-      lineMatchesBottlePrefix
-    );
-  if (
-    matchBottlePrefix(rawCmd, bottleNormLower, realBottleNormLower, {
-      allowUnscopedFallback: false,
-    })
-  ) {
-    return true;
-  }
-  if (/\bwineprefix=/i.test(rawCmd) && /\s[A-Za-z]:[\\/]/.test(rawCmd)) {
-    const normalizedDriveCmd = rawCmd.replace(/(\s)([A-Za-z]:[\\/])/g, '$1/$2');
-    return matchBottlePrefix(normalizedDriveCmd, bottleNormLower, realBottleNormLower, {
-      allowUnscopedFallback: false,
-    });
-  }
-  return false;
+  if (!rawCmd || (!bottleNormLower && !realBottleNormLower)) return false;
+  return lineMatchesBottlePrefix(rawCmd, bottleNormLower, realBottleNormLower, {
+    allowUnscopedFallback: false,
+  });
 }
 
 /**
