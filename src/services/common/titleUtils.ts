@@ -4,6 +4,13 @@
  * and Scraper Services.
  */
 
+import { decodeHtmlEntities } from './htmlEntities';
+import { LruMap } from './lruMap';
+
+export const CURRENT_YEAR = new Date().getFullYear();
+const MAX_DISAMBIGUATION_RELEASE_YEAR = CURRENT_YEAR + 1;
+const MAX_ALLOWED_RELEASE_YEAR = CURRENT_YEAR + 10;
+
 export const EDITION_TOKENS = new Set<string>([
   'edition',
   'standard',
@@ -66,50 +73,9 @@ const NATURAL_WINDOWS_PREDECESSOR_RE =
 
 const DISAMBIGUATOR_HINT_RE =
   /[()[\]:\-–—]|\b(?:pc|win(?:dows|\s*10|\s*11)?|xbox|store|preview|play|base|edition|version)\b/i;
-const YEAR_EDITION_HINT_RE = /\b(?:year|anniversary|edition)\b/i;
+const YEAR_EDITION_HINT_RE =
+  /\b(?:year|anniversary|edition|celebration|goty)\b|\s[-–—−]\s+(?:19|20)\d{2}\s*$/i;
 const NON_ASCII_RE = /[^\x00-\x7f]/;
-
-const HTML_ENTITY_LOOKUP: Record<string, string> = {
-  trade: '™',
-  '#8482': '™',
-  '#x2122': '™',
-  reg: '®',
-  '#174': '®',
-  '#xae': '®',
-  copy: '©',
-  '#169': '©',
-  '#xa9': '©',
-  rsquo: '\u2019',
-  '#8217': '\u2019',
-  '#x2019': '\u2019',
-  lsquo: '\u2018',
-  '#8216': '\u2018',
-  '#x2018': '\u2018',
-  apos: "'",
-  '#39': "'",
-  '#x27': "'",
-  quot: '"',
-  '#34': '"',
-  '#x22': '"',
-  ldquo: '\u201c',
-  '#8220': '\u201c',
-  '#x201c': '\u201c',
-  rdquo: '\u201d',
-  '#8221': '\u201d',
-  '#x201d': '\u201d',
-  ndash: '\u2013',
-  '#8211': '\u2013',
-  '#x2013': '\u2013',
-  mdash: '\u2014',
-  '#8212': '\u2014',
-  '#x2014': '\u2014',
-  nbsp: ' ',
-  '#160': ' ',
-  '#xa0': ' ',
-  amp: '&',
-  '#38': '&',
-  '#x26': '&',
-};
 
 const LATIN_LIGATURE_MAP: Record<string, string> = {
   Ø: 'O',
@@ -138,18 +104,7 @@ const LATIN_LIGATURE_RE = /[ØøẞßÆæŒœŁłĐđÐðÞþ]/g;
  */
 export function decodeTitleHtmlEntities(input: string): string {
   if (!input || !input.includes('&')) return input || '';
-  return input.replace(/&(?:#x0*([0-9a-f]+)|#0*(\d+)|([a-z0-9]+));/gi, (full, hex, dec, named) => {
-    if (hex !== undefined) {
-      const key = `#x${String(hex).toLowerCase()}`;
-      return HTML_ENTITY_LOOKUP[key] ?? full;
-    }
-    if (dec !== undefined) {
-      const key = `#${String(dec)}`;
-      return HTML_ENTITY_LOOKUP[key] ?? full;
-    }
-    const key = String(named).toLowerCase();
-    return HTML_ENTITY_LOOKUP[key] ?? full;
-  });
+  return decodeHtmlEntities(input, { preserveInvalidNumeric: true });
 }
 
 /**
@@ -237,17 +192,110 @@ const YEAR_NUMBER_WORDS = new Set([
   'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
 ]);
 
+const EDITION_PRECEDED_YEAR_RE =
+  /\b(edition|anniversary|celebration|goty|game\s+of\s+the\s+year)\s*[:\-–—−]\s*((?:19|20)\d{2})\b/gi;
+const TRAILING_DASH_RELEASE_YEAR_RE = /^(.+?)\s+[-–—−]\s+((?:19|20)\d{2})\s*$/;
+const TRAILING_PAREN_RELEASE_YEAR_RE =
+  /^(.+?)\s*([\(\[])\s*(?:([^)\]]*?)\s*[,\s-]\s*)?((?:19|20)\d{2})\s*([\)\]])\s*$/;
+
+function isValidDisambiguationReleaseYear(year: number): boolean {
+  return Number.isInteger(year) && year >= 1975 && year <= MAX_DISAMBIGUATION_RELEASE_YEAR;
+}
+
+function hasSubstantiveTitlePrefix(prefix: string): boolean {
+  return prefix.replace(/[^a-z0-9]/gi, '').length >= 2;
+}
+
+function extractTrailingDashReleaseYear(title: string): number | null {
+  if (!title || typeof title !== 'string') return null;
+  const trimmed = title.trim();
+  const match = trimmed.match(TRAILING_DASH_RELEASE_YEAR_RE);
+  if (!match || !hasSubstantiveTitlePrefix(match[1])) return null;
+  const yr = parseInt(match[2], 10);
+  return isValidDisambiguationReleaseYear(yr) ? yr : null;
+}
+
+/**
+ * Extracts a trailing explicitly-delimited 4-digit release year suffix:
+ * - Spaced dash/en-dash/em-dash/minus: `"Title - 2009"`, `"Title – 2009"`, `"Title — 2009"`
+ * - Trailing parenthesized/bracketed: `"Title (2009)"`, `"Title [2023]"`, `"Title (Classic, 2005)"`
+ *
+ * Strictly returns `null` for bare un-delimited 4-digit numbers in titles (`"Metro 2033"`,
+ * `"Cyberpunk 2077"`, `"Battlefield 2042"`, `"Anno 1800"`, `"Warhammer 40,000"`, `"1942"`,
+ * `"SimCity 2000"`) and years outside `[1975, CURRENT_YEAR + 1]`.
+ */
+export function extractTrailingDelimitedReleaseYear(title: string): number | null {
+  if (!title || typeof title !== 'string') return null;
+  const trimmed = title.trim();
+  if (!trimmed) return null;
+
+  const dashYr = extractTrailingDashReleaseYear(trimmed);
+  if (dashYr !== null) {
+    return dashYr;
+  }
+
+  const parenMatch = trimmed.match(TRAILING_PAREN_RELEASE_YEAR_RE);
+  if (parenMatch && hasSubstantiveTitlePrefix(parenMatch[1])) {
+    const yr = parseInt(parenMatch[4], 10);
+    if (isValidDisambiguationReleaseYear(yr)) {
+      return yr;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Strips a trailing explicitly-delimited 4-digit release year (`"Title - 2009"`, `"Title – 2009"`,
+ * `"Title — 2009"`, `"Title (2009)"`, `"Title [2023]"`) when the year is in `[1975, CURRENT_YEAR + 1]`
+ * and a substantive title prefix remains.
+ *
+ * Never strips bare title/sequel/future numbers (`"Metro 2033"`, `"Cyberpunk 2077"`,
+ * `"Battlefield 2042"`, `"Anno 1800"`, `"Warhammer 40,000"`, `"1942"`).
+ */
+export function stripTrailingDelimitedReleaseYear(title: string): string {
+  if (!title || typeof title !== 'string') return '';
+  const trimmed = title.trim();
+  if (!trimmed) return '';
+
+  const dashMatch = trimmed.match(TRAILING_DASH_RELEASE_YEAR_RE);
+  if (dashMatch && hasSubstantiveTitlePrefix(dashMatch[1])) {
+    const yr = parseInt(dashMatch[2], 10);
+    if (isValidDisambiguationReleaseYear(yr)) {
+      return dashMatch[1].trim();
+    }
+  }
+
+  const parenMatch = trimmed.match(TRAILING_PAREN_RELEASE_YEAR_RE);
+  if (parenMatch && hasSubstantiveTitlePrefix(parenMatch[1])) {
+    const yr = parseInt(parenMatch[4], 10);
+    if (isValidDisambiguationReleaseYear(yr)) {
+      const prefix = parenMatch[1].trim();
+      const qualifier = (parenMatch[3] || '').trim();
+      if (qualifier) {
+        return `${prefix} ${parenMatch[2]}${qualifier}${parenMatch[5]}`;
+      }
+      return prefix;
+    }
+  }
+
+  return trimmed;
+}
+
 /**
  * Strips live-service season/year pass suffixes ("Year 1 Edition", "Year 5 Pass",
- * "20 Year Celebration", "40th Anniversary Edition", "(2009 Edition)") so embedded
- * numerals are never misclassified as franchise sequel numbers.
+ * "20 Year Celebration", "40th Anniversary Edition", "(2009 Edition)",
+ * "Game of the Year Edition – 2009", "GOTY - 2009", and trailing spaced-dash disambiguation
+ * release years "Title – 2009") so embedded numerals are never misclassified as franchise
+ * sequel numbers. Preserves parenthetical reboot years ("DOOM (2016)") and bare title numbers
+ * ("Metro 2033", "Cyberpunk 2077", "Battlefield 2042", "Anno 1800", "Warhammer 40,000", "1942").
  */
 export function stripYearEditionPhrases(title: string): string {
   if (!title) return '';
   if (!YEAR_EDITION_HINT_RE.test(title)) {
     return title.replace(/\s+/g, ' ').trim();
   }
-  return title
+  let cur = title
     .replace(
       /(?:[:\-–—]\s*|\s+|\s*[\(\[]\s*)\bYear\s+(?:\d+|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)\s+(?:Edition|Pass|Bundle|Pack|Upgrade)\b\s*[\)\]]?/gi,
       ' '
@@ -261,8 +309,22 @@ export function stripYearEditionPhrases(title: string): string {
       ' '
     )
     .replace(/(?:\s*[\(\[]\s*(?:19|20)\d{2}\s+Edition\s*[\)\]]|(?:[:\-–—]\s*|\s+)\b(?:19|20)\d{2}\s+Edition\b)/gi, ' ')
+    .replace(EDITION_PRECEDED_YEAR_RE, (full, edWord: string, yrStr: string) => {
+      const yr = parseInt(yrStr, 10);
+      return isValidDisambiguationReleaseYear(yr) ? edWord : full;
+    })
     .replace(/\s+/g, ' ')
     .trim();
+
+  const trailingDashMatch = cur.match(TRAILING_DASH_RELEASE_YEAR_RE);
+  if (trailingDashMatch && hasSubstantiveTitlePrefix(trailingDashMatch[1])) {
+    const yr = parseInt(trailingDashMatch[2], 10);
+    if (isValidDisambiguationReleaseYear(yr)) {
+      cur = trailingDashMatch[1].trim();
+    }
+  }
+
+  return cur;
 }
 
 const PAREN_RELEASE_YEAR_RE = /[\(\[]\s*(?:[^)\]]*?[,\s-])?((?:19|20)\d{2})\s*[\)\]]/g;
@@ -270,17 +332,16 @@ const PAREN_RELEASE_YEAR_RE = /[\(\[]\s*(?:[^)\]]*?[,\s-])?((?:19|20)\d{2})\s*[\
 /**
  * Extracts a parenthesized or bracketed 4-digit disambiguation release year
  * (e.g. "DOOM (2016)" -> 2016, "STAR WARS Battlefront II (Classic, 2005)" -> 2005,
- * "Resident Evil 4 [2023]" -> 2023), preferring the last valid match in [1975, currentYear + 1].
+ * "Resident Evil 4 [2023]" -> 2023), preferring the last valid match in [1975, CURRENT_YEAR + 1].
  * Strictly returns null for bare unparenthesized 4-digit title numbers ("Metro 2033 Redux",
  * "Cyberpunk 2077", "Battlefield 2042", "SimCity 2000") and year-edition suffixes ("2026 Edition").
  */
 export function extractParentheticalReleaseYear(title: string): number | null {
   if (!title || typeof title !== 'string') return null;
-  const maxYear = new Date().getFullYear() + 1;
   let found: number | null = null;
   for (const m of title.matchAll(PAREN_RELEASE_YEAR_RE)) {
     const yr = parseInt(m[1], 10);
-    if (yr >= 1975 && yr <= maxYear) {
+    if (isValidDisambiguationReleaseYear(yr)) {
       found = yr;
     }
   }
@@ -327,10 +388,11 @@ export function stripPackagingEditionPhrases(title: string): string {
 }
 
 /**
- * Returns true ONLY when the given numeric token participates in an explicit year-edition or
- * anniversary/season-pass phrase in `title` (e.g. "2026" in "Sea of Thieves: 2026 Edition",
- * "20" in "20 Year Celebration", "1" in "Year 1 Edition"), never for bare title numbers
- * ("2033" in "Metro 2033 Redux", "2077" in "Cyberpunk 2077: Ultimate Edition", "2000" in "SimCity 2000 Special Edition").
+ * Returns true ONLY when the given numeric token participates in an explicit year-edition,
+ * anniversary/season-pass phrase, edition-preceded year (`Edition – 2009`, `GOTY - 2009`),
+ * or trailing spaced-dash disambiguation year (`Title – 2009`) in `title`, never for bare title numbers
+ * ("2033" in "Metro 2033 Redux", "2077" in "Cyberpunk 2077: Ultimate Edition", "2000" in "SimCity 2000 Special Edition",
+ * "1800" in "Anno 1800", or standalone "1942").
  */
 export function isYearEditionToken(title: string, token: string): boolean {
   if (!title || !token) return false;
@@ -339,10 +401,27 @@ export function isYearEditionToken(title: string, token: string): boolean {
 
   const escaped = cleanToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   if (/^(?:19|20)\d{2}$/.test(cleanToken)) {
-    return new RegExp(
-      `\\b${escaped}[\\s\\-]+(?:edition|anniversary(?:[\\s\\-]+edition)?|celebration(?:[\\s\\-]+edition)?)\\b`,
-      'i'
-    ).test(title);
+    if (
+      new RegExp(
+        `\\b${escaped}[\\s\\-]+(?:edition|anniversary(?:[\\s\\-]+edition)?|celebration(?:[\\s\\-]+edition)?)\\b`,
+        'i'
+      ).test(title)
+    ) {
+      return true;
+    }
+    const yr = parseInt(cleanToken, 10);
+    if (!isValidDisambiguationReleaseYear(yr)) {
+      return false;
+    }
+    if (
+      new RegExp(
+        `\\b(?:edition|anniversary|celebration|goty|game\\s+of\\s+the\\s+year)\\s*[:\\-–—−]\\s*${escaped}\\b`,
+        'i'
+      ).test(title)
+    ) {
+      return true;
+    }
+    return extractTrailingDashReleaseYear(title) === yr;
   }
 
   const numericOnly = cleanToken.replace(/(?:st|nd|rd|th)$/i, '');
@@ -357,8 +436,8 @@ export function isYearEditionToken(title: string, token: string): boolean {
 }
 
 const MAX_TITLE_MEMO_ENTRIES = 32768;
-const normalizeTitleKeyMemo = new Map<string, string>();
-const stripEditionSuffixMemo = new Map<string, string>();
+const normalizeTitleKeyMemo = new LruMap<string, string>(MAX_TITLE_MEMO_ENTRIES);
+const stripEditionSuffixMemo = new LruMap<string, string>(MAX_TITLE_MEMO_ENTRIES);
 
 /**
  * Normalizes title string by collapsing dotted acronyms, normalizing diacritics,
@@ -386,10 +465,6 @@ export function normalizeTitleKey(title: string): string {
     .replace(/\s+/g, ' ')
     .trim();
 
-  if (normalizeTitleKeyMemo.size >= MAX_TITLE_MEMO_ENTRIES) {
-    const oldest = normalizeTitleKeyMemo.keys().next().value;
-    if (oldest !== undefined) normalizeTitleKeyMemo.delete(oldest);
-  }
   normalizeTitleKeyMemo.set(title, result);
   return result;
 }
@@ -483,10 +558,6 @@ export function stripEditionSuffix(title: string): string {
 
   const result = stripped || fallbackNormalized;
 
-  if (stripEditionSuffixMemo.size >= MAX_TITLE_MEMO_ENTRIES) {
-    const oldest = stripEditionSuffixMemo.keys().next().value;
-    if (oldest !== undefined) stripEditionSuffixMemo.delete(oldest);
-  }
   stripEditionSuffixMemo.set(title, result);
   return result;
 }
@@ -511,6 +582,28 @@ export const ROMAN_TO_ARABIC: Record<string, string> = {
   xviii: '18',
   xix: '19',
   xx: '20',
+};
+
+export const ARABIC_TO_ROMAN: Record<string, string> = {
+  '2': 'II',
+  '3': 'III',
+  '4': 'IV',
+  '5': 'V',
+  '6': 'VI',
+  '7': 'VII',
+  '8': 'VIII',
+  '9': 'IX',
+  '10': 'X',
+  '11': 'XI',
+  '12': 'XII',
+  '13': 'XIII',
+  '14': 'XIV',
+  '15': 'XV',
+  '16': 'XVI',
+  '17': 'XVII',
+  '18': 'XVIII',
+  '19': 'XIX',
+  '20': 'XX',
 };
 
 export const NUMERIC_SEQUELS = new Set([
@@ -608,7 +701,7 @@ function tokenizeCompilationClause(str: string): string[] {
   return substantive.length > 0 ? substantive : baseTokens;
 }
 
-const sequelTokensMemo = new Map<string, string[]>();
+const sequelTokensMemo = new LruMap<string, string[]>(MAX_TITLE_MEMO_ENTRIES);
 
 function getNormalizedSequelTokens(str: string): string[] {
   const cached = sequelTokensMemo.get(str);
@@ -627,10 +720,6 @@ function getNormalizedSequelTokens(str: string): string[] {
     .split(/\s+/)
     .filter(Boolean)
     .map((token) => ROMAN_TO_ARABIC[token] || token);
-  if (sequelTokensMemo.size >= MAX_TITLE_MEMO_ENTRIES) {
-    const oldest = sequelTokensMemo.keys().next().value;
-    if (oldest !== undefined) sequelTokensMemo.delete(oldest);
-  }
   sequelTokensMemo.set(str, tokens);
   return tokens;
 }
@@ -689,6 +778,7 @@ const GENERIC_SUBTITLE_TOKENS = new Set<string>([
   'expansion',
   'set',
   'soundtrack',
+  'soundtracks',
   'ost',
   'original',
   'role',
@@ -713,11 +803,48 @@ const GENERIC_SUBTITLE_TOKENS = new Set<string>([
   'anniversary',
   'goty',
   'upgrade',
+  'bonus',
+  'content',
+  'free',
+  'trial',
+  'download',
+  'map',
+  'maps',
+  'dlc',
+  'demo',
+  'beta',
+  'playtest',
+  'artbook',
+  'skin',
+  'skins',
+  'cosmetic',
+  'cosmetics',
+  'weapon',
+  'weapons',
+  'character',
+  'characters',
+  'costume',
+  'costumes',
+  'extra',
+  'extras',
+  'addon',
+  'addons',
+  'digital',
+  'goodies',
+  'wallpaper',
+  'wallpapers',
+  'avatar',
+  'avatars',
+  'currency',
+  'coins',
+  'credits',
+  'points',
+  'voucher',
 ]);
 
 const GENERIC_SUBTITLE_PHRASE_PATTERNS: readonly RegExp[] = [
   /^(?:a\s+)?post[\s-]+nuclear\s+role[\s-]+playing(?:\s+game)?$/i,
-  /\b(?:role[\s-]+playing\s+game|season\s+pass|expansion\s+(?:pass|set|pack)|battle\s+chest|war\s+chest|original\s+soundtrack|starter\s+pack|upgrade\s+pack)\b/i,
+  /\b(?:role[\s-]+playing\s+game|season\s+pass|expansion\s+(?:pass|set|pack)|battle\s+chest|war\s+chest|original\s+soundtrack|starter\s+pack|upgrade\s+pack|art\s+book|bonus\s+content|free\s+trial)\b/i,
 ];
 
 function toCanonicalNumericToken(token: string): string | null {
@@ -744,10 +871,9 @@ function cleanAndTokenizeForSubtitleNumeral(title: string): string[] {
   let cleaned = stripPlatformAndDistributionNoise(title);
   cleaned = stripYearEditionPhrases(cleaned);
   cleaned = stripPackagingEditionPhrases(cleaned);
-  const maxYear = new Date().getFullYear() + 1;
   cleaned = cleaned.replace(PAREN_RELEASE_YEAR_RE, (full, yrStr: string) => {
     const yr = parseInt(yrStr, 10);
-    return yr >= 1975 && yr <= maxYear ? ' ' : full;
+    return isValidDisambiguationReleaseYear(yr) ? ' ' : full;
   });
   cleaned = foldLatinLigaturesAndDiacritics(cleaned)
     .toLowerCase()
@@ -901,12 +1027,57 @@ export function stripIntermediateSubtitleNumeral(title: string): string | null {
 }
 
 /**
+ * Converts an intermediate sequel numeral between Roman and Arabic forms when the title
+ * matches `<Franchise> <2..20|II..XX>: <Distinctive Subtitle>` (e.g. `"The Witcher II: Assassins of Kings"`
+ * <-> `"The Witcher 2: Assassins of Kings"`), returning `null` otherwise.
+ */
+export function convertIntermediateSubtitleNumeral(title: string): string | null {
+  if (!title || typeof title !== 'string') return null;
+  const cleaned = stripPlatformAndDistributionNoise(title).trim();
+  if (!cleaned) return null;
+
+  const match = cleaned.match(INTERMEDIATE_SUBTITLE_NUMERAL_RE);
+  if (!match) return null;
+
+  const prefix = match[1].trim();
+  const rawNum = match[2].trim();
+  const sep = match[3];
+  const subtitle = match[4].trim();
+  if (!prefix || !rawNum || !subtitle) return null;
+
+  const normalizedSep = sep.includes(':') ? ': ' : sep;
+  const strippedCandidate = `${prefix}${normalizedSep}${subtitle}`;
+  if (!isIntermediateNumeralSubtitleMatch(cleaned, strippedCandidate)) {
+    return null;
+  }
+
+  const lowerNum = rawNum.toLowerCase();
+  let converted: string | null = null;
+  if (ROMAN_TO_ARABIC[lowerNum]) {
+    converted = ROMAN_TO_ARABIC[lowerNum];
+  } else if (ARABIC_TO_ROMAN[lowerNum]) {
+    converted = ARABIC_TO_ROMAN[lowerNum];
+  } else if (WORD_TO_ARABIC[lowerNum]) {
+    converted = WORD_TO_ARABIC[lowerNum];
+  }
+
+  if (!converted) return null;
+  return `${prefix} ${converted}${normalizedSep}${subtitle}`;
+}
+
+/**
  * Validates whether two game titles represent different numbered sequels or distinct variants.
  * Returns TRUE if there is a sequel/variant mismatch (i.e. DO NOT MATCH).
  * Returns FALSE if they are compatible.
  */
 export function isSequelMismatch(query: string, candidateName: string): boolean {
   if (!query || !candidateName || query === candidateName) return false;
+
+  const qTrailYr = extractTrailingDelimitedReleaseYear(query);
+  const cTrailYr = extractTrailingDelimitedReleaseYear(candidateName);
+  if (qTrailYr !== null && cTrailYr !== null && Math.abs(qTrailYr - cTrailYr) >= 2) {
+    return true;
+  }
 
   const qTokens = getNormalizedSequelTokens(query);
   const cTokens = getNormalizedSequelTokens(candidateName);
@@ -1037,8 +1208,6 @@ export function alignCompoundWordTokens(words1: string[], words2: string[]): [st
   const aligned2 = mergeAgainstSet(words2, new Set(aligned1));
   return [aligned1, aligned2];
 }
-
-const MAX_ALLOWED_RELEASE_YEAR = new Date().getFullYear() + 10;
 
 /**
  * Validates and normalizes storefront release dates, stripping placeholder strings
@@ -1223,7 +1392,9 @@ export function normalizeTitleForStoreSearch(
  * Generates up to 3 deduplicated token-array search passes for HowLongToBeat `/api/search/site`:
  * - Pass 1: Platform-cleaned, year-unwrapped, preserving edition words and ASCII word-internal hyphens.
  * - Pass 2: Edition-stripped and hyphen-split.
- * - Pass 3: Pre-colon / pre-dash base franchise clause (when >= 2 alphanumeric characters).
+ * - Pass 3 (when applicable): Intermediate subtitle numeral stripped (`"Deus Ex 2: Invisible War"` -> `"Deus Ex: Invisible War"`)
+ *   and Roman↔Arabic swapped intermediate numeral (`"The Witcher II: Assassins of Kings"` -> `"The Witcher 2: Assassins of Kings"`).
+ * - Fallback pass: Pre-colon / pre-dash base franchise clause (when >= 2 alphanumeric characters).
  */
 export function buildHltbSearchTermPasses(rawTitle: string): string[][] {
   if (!rawTitle || typeof rawTitle !== 'string') return [];
@@ -1244,6 +1415,26 @@ export function buildHltbSearchTermPasses(rawTitle: string): string[][] {
   addPass(sanitizeSearchQueryClause(rawTitle, { stripEditions: true, splitHyphens: true }));
 
   const preCleaned = stripPlatformAndDistributionNoise(rawTitle);
+  const intermediateStripped = stripIntermediateSubtitleNumeral(preCleaned);
+  if (intermediateStripped) {
+    addPass(
+      sanitizeSearchQueryClause(intermediateStripped, {
+        stripEditions: true,
+        splitHyphens: true,
+      })
+    );
+  }
+
+  const intermediateSwapped = convertIntermediateSubtitleNumeral(preCleaned);
+  if (intermediateSwapped) {
+    addPass(
+      sanitizeSearchQueryClause(intermediateSwapped, {
+        stripEditions: true,
+        splitHyphens: true,
+      })
+    );
+  }
+
   const delimiterMatch = preCleaned.match(/^(.*?)(?::|\s+[\-–—−]\s+)/);
   if (delimiterMatch && delimiterMatch[1]) {
     const baseClause = sanitizeSearchQueryClause(delimiterMatch[1], {

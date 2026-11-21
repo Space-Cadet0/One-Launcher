@@ -1,11 +1,30 @@
 import DOMPurify from 'dompurify';
+import { isAllowedOlMediaUrl, parseSafeHttpUrl } from './storeUrlUtils';
 
 /**
- * Strict URI allowlist for untrusted storefront HTML (`https:` and `ol-media:` only).
- * Blocks `file:`, `javascript:`, `data:`, `vbscript:`, and unencrypted `http:` schemes.
+ * Strict URI allowlist for untrusted storefront HTML (`https://` and validated
+ * `ol-media://asset`, `ol-media://covers`, `ol-media://vault` only).
+ * Blocks `file:`, `javascript:`, `data:`, `vbscript:`, arbitrary `ol-media://` authorities,
+ * and unencrypted `http:` schemes.
  */
-export const ALLOWED_STORE_URI_REGEXP = /^(?:https:|ol-media:)/i;
+export const ALLOWED_STORE_URI_REGEXP =
+  /^(?:https:\/\/|ol-media:\/\/(?:asset(?:\?|\/)|(?:covers|vault)\/))/i;
 export const SAFE_STORE_URI_REGEXP = ALLOWED_STORE_URI_REGEXP;
+
+/**
+ * Internal URI pattern passed to DOMPurify so protocol-relative `//cdn.host/path`
+ * attributes can reach `beforeSanitizeAttributes` / `afterSanitizeAttributes` hooks and be
+ * upgraded to `https://` cleanly without regex-rewriting text inside `<code>` / `<pre>`.
+ */
+const DOMPURIFY_ALLOWED_URI_REGEXP =
+  /^(?:https:\/\/|ol-media:\/\/(?:asset(?:\?|\/)|(?:covers|vault)\/)|\/\/[^/])/i;
+
+/**
+ * Strict class token allowlist blocking Tailwind UI-redressing utility classes
+ * (`fixed`, `absolute`, `inset-*`, `z-*`, `bg-*`, etc.) while preserving legitimate
+ * Steam/BBCode structural classes (`bb_*`, `steam_*`, `lead`).
+ */
+export const ALLOWED_STORE_CLASS_TOKEN_REGEXP = /^(?:bb_[a-z0-9_-]+|steam_[a-z0-9_-]+|lead)$/;
 
 /**
  * Canonical allowlist of safe structural & media HTML element names for storefront descriptions
@@ -122,6 +141,8 @@ interface SanitizerCapableDocumentConstructor {
   parseHTML(input: string, options?: { sanitizer?: NativeSanitizerConfig }): Document;
 }
 
+type DomPurifyHookName = 'beforeSanitizeAttributes' | 'afterSanitizeAttributes';
+
 interface DomPurifyLike {
   sanitize: (
     dirty: string,
@@ -135,22 +156,15 @@ interface DomPurifyLike {
       RETURN_DOM_FRAGMENT?: boolean;
     }
   ) => string | DocumentFragment;
-  addHook?: (hookName: 'afterSanitizeAttributes', cb: (node: Element) => void) => void;
+  addHook?: (hookName: DomPurifyHookName, cb: (node: Element) => void) => void;
   isSupported?: boolean;
 }
 
 type DomPurifyFactory = (root?: Window) => DomPurifyLike;
 
-type DomPurifyImportedModule = {
-  default?: DomPurifyFactory | DomPurifyLike;
-  sanitize?: DomPurifyLike['sanitize'];
-  addHook?: DomPurifyLike['addHook'];
-  isSupported?: boolean;
-};
-
 let cachedPurifier: DomPurifyLike | null = null;
 let cachedPurifierWindow: Window | null = null;
-const hookedPurifiers = new WeakSet<object>();
+const hookedPurifierTargets = new WeakSet<object>();
 
 /**
  * Upgrades protocol-relative `//cdn.host/path` references (used by Steam store HTML)
@@ -167,27 +181,39 @@ export function upgradeProtocolRelativeUrl(raw?: string | null): string {
 }
 
 /**
+ * Filters a raw HTML `class` attribute value down to strictly allowlisted
+ * storefront/BBCode tokens (`bb_*`, `steam_*`, `lead`), blocking Tailwind
+ * positioning/overlay UI-redressing classes.
+ */
+export function sanitizeStoreClassValue(rawClass?: string | null): string {
+  if (!rawClass || typeof rawClass !== 'string') return '';
+  const allowedTokens = rawClass
+    .trim()
+    .split(/\s+/)
+    .filter((token) => ALLOWED_STORE_CLASS_TOKEN_REGEXP.test(token));
+  return allowedTokens.join(' ');
+}
+
+/**
  * Validates an attribute URI after upgrading protocol-relative `//...` references:
- * - Must match `https:` or `ol-media:`
- * - Must parse cleanly via `new URL()` with a non-empty host (for `https:`)
+ * - Must match `https://` (valid host via `new URL()`) or validated `ol-media://asset` / `ol-media://covers`
+ * - Rejects traversal (`..`, `%2e%2e`), arbitrary `ol-media://` authorities, `http:`, `javascript:`, `data:`, `file:`
  */
 export function sanitizeAllowedStoreUri(raw?: string | null): string {
   const upgraded = upgradeProtocolRelativeUrl(raw);
   if (!upgraded || !ALLOWED_STORE_URI_REGEXP.test(upgraded)) {
     return '';
   }
-  try {
-    const parsed = new URL(upgraded);
-    if (parsed.protocol === 'https:') {
-      return parsed.hostname ? upgraded : '';
-    }
-    if (parsed.protocol === 'ol-media:') {
-      return upgraded;
-    }
-    return '';
-  } catch {
-    return '';
+
+  if (/^https:\/\//i.test(upgraded)) {
+    return parseSafeHttpUrl(upgraded, { allowHttp: false }) ? upgraded : '';
   }
+
+  if (/^ol-media:\/\//i.test(upgraded)) {
+    return isAllowedOlMediaUrl(upgraded) ? upgraded : '';
+  }
+
+  return '';
 }
 
 export function sanitizeSrcsetValue(rawSrcset?: string | null): string {
@@ -206,29 +232,35 @@ export function sanitizeSrcsetValue(rawSrcset?: string | null): string {
     .join(', ');
 }
 
-function preNormalizeProtocolRelativeHtml(rawHtml: string): string {
-  return rawHtml
-    .replace(
-      /\b(src|href|poster)\s*=\s*(["'])\s*\/\/(?!\/)/gi,
-      (_match, attrName: string, quote: string) => `${attrName}=${quote}https://`
-    )
-    .replace(/\bsrcset\s*=\s*(["'])([^"']*)\1/gi, (_match, quote: string, val: string) => {
-      const upgraded = val
-        .split(',')
-        .map((part) => {
-          const trimmed = part.trim();
-          if (!trimmed) return '';
-          const tokens = trimmed.split(/\s+/);
-          const first = upgradeProtocolRelativeUrl(tokens[0]);
-          return tokens.length > 1 ? `${first} ${tokens.slice(1).join(' ')}` : first;
-        })
-        .filter(Boolean)
-        .join(', ');
-      return `srcset=${quote}${upgraded}${quote}`;
-    });
+function upgradeProtocolRelativeElementAttributes(el: Element): void {
+  if (!el || typeof el.hasAttribute !== 'function') return;
+
+  for (const attr of ['href', 'src', 'poster']) {
+    if (el.hasAttribute(attr)) {
+      const raw = el.getAttribute(attr);
+      if (raw && raw.trim().startsWith('//')) {
+        const upgraded = upgradeProtocolRelativeUrl(raw);
+        el.setAttribute(attr, upgraded);
+      }
+    }
+  }
+
+  if (el.hasAttribute('srcset')) {
+    const rawSrcset = el.getAttribute('srcset');
+    if (rawSrcset && rawSrcset.includes('//')) {
+      const cleaned = sanitizeSrcsetValue(rawSrcset);
+      if (cleaned) {
+        el.setAttribute('srcset', cleaned);
+      } else {
+        el.removeAttribute('srcset');
+      }
+    }
+  }
 }
 
 function applyElementSecurityRules(el: Element): void {
+  if (!el || typeof el.hasAttribute !== 'function') return;
+
   for (const attr of ['href', 'src', 'poster']) {
     if (el.hasAttribute(attr)) {
       const safeUri = sanitizeAllowedStoreUri(el.getAttribute(attr));
@@ -249,6 +281,15 @@ function applyElementSecurityRules(el: Element): void {
     }
   }
 
+  if (el.hasAttribute('class')) {
+    const safeClass = sanitizeStoreClassValue(el.getAttribute('class'));
+    if (safeClass) {
+      el.setAttribute('class', safeClass);
+    } else {
+      el.removeAttribute('class');
+    }
+  }
+
   const tag = el.tagName ? el.tagName.toLowerCase() : '';
   if (tag === 'a') {
     el.setAttribute('rel', 'noopener noreferrer');
@@ -262,7 +303,8 @@ function applyElementSecurityRules(el: Element): void {
 
 /**
  * Post-sanitization walk on a `DocumentFragment` or `Element` subtree enforcing:
- * - Only validated `https:` and `ol-media:` URIs survive on `href`, `src`, `poster`, and `srcset`
+ * - Only validated `https://` and `ol-media://(?:asset|covers)` URIs survive on `href`, `src`, `poster`, and `srcset`
+ * - `class` tokens are restricted strictly to `ALLOWED_STORE_CLASS_TOKEN_REGEXP`
  * - Every `<a>` anchor carries `rel="noopener noreferrer"` and `target="_blank"` (when `href` exists)
  */
 export function enforceFragmentSecurityPolicy(root: DocumentFragment | Element): void {
@@ -297,47 +339,78 @@ function isSanitizerCapableElement(el: Element): el is SanitizerCapableElement {
   );
 }
 
-function bindPurifierFromModule(mod: DomPurifyImportedModule): DomPurifyLike | null {
-  const currentWindow = typeof window !== 'undefined' ? window : null;
-  if (mod && mod.isSupported !== false && typeof mod.sanitize === 'function') {
-    const direct: DomPurifyLike = {
-      sanitize: mod.sanitize.bind(mod),
-      addHook: typeof mod.addHook === 'function' ? mod.addHook.bind(mod) : undefined,
-      isSupported: mod.isSupported,
-    };
-    installPurifierHook(direct);
-    cachedPurifier = direct;
-    cachedPurifierWindow = currentWindow;
-    return direct;
+function isDomPurifyLike(value: unknown): value is DomPurifyLike {
+  if (!value || (typeof value !== 'object' && typeof value !== 'function')) {
+    return false;
   }
+  const candidate = value as Partial<DomPurifyLike>;
+  return typeof candidate.sanitize === 'function' && candidate.isSupported !== false;
+}
 
-  const candidate = mod?.default ?? mod;
+function isDomPurifyFactory(value: unknown): value is DomPurifyFactory {
+  return typeof value === 'function';
+}
+
+function installPurifierHooksOnce(
+  underlyingTarget: object,
+  addHook?: DomPurifyLike['addHook']
+): void {
+  if (hookedPurifierTargets.has(underlyingTarget) || typeof addHook !== 'function') {
+    return;
+  }
+  hookedPurifierTargets.add(underlyingTarget);
+  addHook('beforeSanitizeAttributes', (node: Element) => {
+    upgradeProtocolRelativeElementAttributes(node);
+  });
+  addHook('afterSanitizeAttributes', (node: Element) => {
+    applyElementSecurityRules(node);
+  });
+}
+
+function resolvePurifierFromCandidate(
+  rawCandidate: unknown,
+  currentWindow: Window | null
+): DomPurifyLike | null {
+  let candidate: unknown = rawCandidate;
   if (
     candidate &&
     typeof candidate === 'object' &&
-    'sanitize' in candidate &&
-    typeof candidate.sanitize === 'function' &&
-    candidate.isSupported !== false
+    'default' in candidate &&
+    !isDomPurifyLike(candidate)
   ) {
+    candidate = (candidate as { default?: unknown }).default;
+  }
+
+  if (isDomPurifyLike(candidate)) {
+    const boundAddHook =
+      typeof candidate.addHook === 'function' ? candidate.addHook.bind(candidate) : undefined;
+    // Key hook deduplication strictly on the underlying DOMPurify instance, never on a wrapper object
+    installPurifierHooksOnce(candidate, boundAddHook);
     const resolved: DomPurifyLike = {
       sanitize: candidate.sanitize.bind(candidate),
-      addHook: typeof candidate.addHook === 'function' ? candidate.addHook.bind(candidate) : undefined,
+      addHook: boundAddHook,
       isSupported: candidate.isSupported,
     };
-    installPurifierHook(resolved);
     cachedPurifier = resolved;
     cachedPurifierWindow = currentWindow;
     return resolved;
   }
 
-  if (typeof candidate === 'function' && currentWindow) {
+  if (isDomPurifyFactory(candidate) && currentWindow) {
     try {
       const created = candidate(currentWindow);
-      if (created && created.isSupported !== false && typeof created.sanitize === 'function') {
-        installPurifierHook(created);
-        cachedPurifier = created;
+      if (isDomPurifyLike(created)) {
+        const boundAddHook =
+          typeof created.addHook === 'function' ? created.addHook.bind(created) : undefined;
+        installPurifierHooksOnce(created, boundAddHook);
+        const resolved: DomPurifyLike = {
+          sanitize: created.sanitize.bind(created),
+          addHook: boundAddHook,
+          isSupported: created.isSupported,
+        };
+        cachedPurifier = resolved;
         cachedPurifierWindow = currentWindow;
-        return created;
+        return resolved;
       }
     } catch {
       return null;
@@ -347,34 +420,32 @@ function bindPurifierFromModule(mod: DomPurifyImportedModule): DomPurifyLike | n
   return null;
 }
 
-function installPurifierHook(purifier: DomPurifyLike): void {
-  if (hookedPurifiers.has(purifier) || typeof purifier.addHook !== 'function') {
-    return;
-  }
-  hookedPurifiers.add(purifier);
-  purifier.addHook('afterSanitizeAttributes', (node: Element) => {
-    applyElementSecurityRules(node);
-  });
-}
-
-/**
- * Resolves the `DOMPurify` fallback synchronously on engines that lack the native Sanitizer API
- * (`Document.parseHTML` / `Element.prototype.setHTML`), guaranteeing initial synchronous renders
- * (`AboutThisGame` mount & `SystemRequirements` `useMemo`) never miss sanitization.
- */
-export function ensureDomPurifyFallbackLoaded(): Promise<DomPurifyLike | null> {
-  if ((typeof Document !== 'undefined' && hasNativeParseHtml(Document)) || hasNativeElementSetHtml()) {
-    return Promise.resolve(null);
-  }
-  return Promise.resolve(getReadyPurifier());
-}
-
 function getReadyPurifier(): DomPurifyLike | null {
   const currentWindow = typeof window !== 'undefined' ? window : null;
   if (cachedPurifier && cachedPurifierWindow === currentWindow) {
     return cachedPurifier;
   }
-  return bindPurifierFromModule({ default: DOMPurify as unknown as DomPurifyFactory | DomPurifyLike });
+  const rawModule: unknown = DOMPurify;
+  return resolvePurifierFromCandidate(rawModule, currentWindow);
+}
+
+/**
+ * Resolves the `DOMPurify` fallback synchronously on engines that lack the native Sanitizer API
+ * (`Document.parseHTML` / inert `Element.prototype.setHTML`), guaranteeing initial synchronous renders
+ * (`AboutThisGame` mount & `SystemRequirements` `useMemo`) never miss sanitization.
+ */
+export function ensureDomPurifyFallbackLoaded(): Promise<DomPurifyLike | null> {
+  if (typeof Document !== 'undefined' && hasNativeParseHtml(Document)) {
+    return Promise.resolve(null);
+  }
+  if (
+    hasNativeElementSetHtml() &&
+    typeof document !== 'undefined' &&
+    typeof document.implementation?.createHTMLDocument === 'function'
+  ) {
+    return Promise.resolve(null);
+  }
+  return Promise.resolve(getReadyPurifier());
 }
 
 /**
@@ -409,62 +480,82 @@ function scrubDomSubtree(root: ParentNode): void {
   }
 }
 
-function parseSanitizedFragmentNativeOrFallback(normalizedHtml: string): DocumentFragment | null {
+function createInertHtmlDocument(): Document | null {
+  if (
+    typeof document !== 'undefined' &&
+    document.implementation &&
+    typeof document.implementation.createHTMLDocument === 'function'
+  ) {
+    try {
+      return document.implementation.createHTMLDocument('');
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function parseSanitizedFragmentNativeOrFallback(rawHtml: string): DocumentFragment | null {
   if (typeof document === 'undefined' || typeof document.createDocumentFragment !== 'function') {
     return null;
   }
 
-  // 1. Native Sanitizer API fast path: Document.parseHTML()
+  // 1. Native Sanitizer API fast path: Document.parseHTML() parses into an INERT document
+  //    (zero speculative HTTP media fetches). Enforce policy BEFORE moving into live fragment.
   if (typeof Document !== 'undefined' && hasNativeParseHtml(Document)) {
     try {
-      const doc = Document.parseHTML(normalizedHtml, {
+      const doc = Document.parseHTML(rawHtml, {
         sanitizer: {
           elements: ALLOWED_STORE_ELEMENT_NAMES,
           attributes: ALLOWED_STORE_ATTR,
         },
       });
+      enforceFragmentSecurityPolicy(doc.body);
       const fragment = document.createDocumentFragment();
       while (doc.body.firstChild) {
         fragment.appendChild(doc.body.firstChild);
       }
-      enforceFragmentSecurityPolicy(fragment);
       return fragment;
     } catch {
       // Fall through if custom config rejected by partial implementation
     }
   }
 
-  // 2. Native Sanitizer API fast path: Element.prototype.setHTML()
-  if (hasNativeElementSetHtml() && typeof document.createElement === 'function') {
-    try {
-      const host = document.createElement('div');
-      if (isSanitizerCapableElement(host)) {
-        host.setHTML(normalizedHtml, {
-          sanitizer: {
-            elements: ALLOWED_STORE_ELEMENT_NAMES,
-            attributes: ALLOWED_STORE_ATTR,
-          },
-        });
-        const fragment = document.createDocumentFragment();
-        while (host.firstChild) {
-          fragment.appendChild(host.firstChild);
+  // 2. Native Sanitizer API Element.prototype.setHTML() strictly inside an INERT HTMLDocument
+  //    so untrusted `http:` images/media can NEVER trigger speculative live-document requests.
+  if (hasNativeElementSetHtml()) {
+    const inertDoc = createInertHtmlDocument();
+    if (inertDoc && typeof inertDoc.createElement === 'function') {
+      try {
+        const host = inertDoc.createElement('div');
+        if (isSanitizerCapableElement(host)) {
+          host.setHTML(rawHtml, {
+            sanitizer: {
+              elements: ALLOWED_STORE_ELEMENT_NAMES,
+              attributes: ALLOWED_STORE_ATTR,
+            },
+          });
+          enforceFragmentSecurityPolicy(host);
+          const fragment = document.createDocumentFragment();
+          while (host.firstChild) {
+            fragment.appendChild(host.firstChild);
+          }
+          return fragment;
         }
-        enforceFragmentSecurityPolicy(fragment);
-        return fragment;
+      } catch {
+        // Fall through
       }
-    } catch {
-      // Fall through
     }
   }
 
-  // 3. Loaded DOMPurify fallback with native-equivalent flags (`KEEP_CONTENT: false`)
+  // 3. DOMPurify fallback (parses inside an inert document/template, with single-registered hooks)
   const purifier = getReadyPurifier();
   if (purifier) {
-    const res = purifier.sanitize(normalizedHtml, {
+    const res = purifier.sanitize(rawHtml, {
       RETURN_DOM_FRAGMENT: true,
       ALLOWED_TAGS: ALLOWED_DOMPURIFY_TAGS,
       ALLOWED_ATTR: [...ALLOWED_STORE_ATTR],
-      ALLOWED_URI_REGEXP: ALLOWED_STORE_URI_REGEXP,
+      ALLOWED_URI_REGEXP: DOMPURIFY_ALLOWED_URI_REGEXP,
       ALLOW_ARIA_ATTR: false,
       ALLOW_DATA_ATTR: false,
       KEEP_CONTENT: false,
@@ -475,19 +566,19 @@ function parseSanitizedFragmentNativeOrFallback(normalizedHtml: string): Documen
     }
   }
 
-  // 4. Synchronous inert DOMParser + strict allowlist scrubber while lazy DOMPurify chunk resolves
+  // 4. Synchronous inert DOMParser + strict allowlist scrubber
   if (typeof DOMParser !== 'undefined') {
     try {
       const parser = new DOMParser();
-      const doc = parser.parseFromString(normalizedHtml, 'text/html');
+      const doc = parser.parseFromString(rawHtml, 'text/html');
       if (doc?.body) {
-        // Remove <head> script/style/meta payloads completely; only scrub inert <body>
+        // Scrub and enforce full security policy inside inert <body> BEFORE moving into live fragment
         scrubDomSubtree(doc.body);
+        enforceFragmentSecurityPolicy(doc.body);
         const fragment = document.createDocumentFragment();
         while (doc.body.firstChild) {
           fragment.appendChild(doc.body.firstChild);
         }
-        enforceFragmentSecurityPolicy(fragment);
         return fragment;
       }
     } catch {
@@ -514,67 +605,44 @@ export function escapeHtml(raw: string | undefined | null): string {
 /**
  * Sanitizes untrusted HTML into a detached `DocumentFragment` without re-serializing
  * to `innerHTML` (preventing mXSS), enforcing `KEEP_CONTENT: false`, `ALLOW_ARIA_ATTR: false`,
- * `ALLOW_DATA_ATTR: false`, protocol-relative `//` -> `https://` upgrades with `new URL()`
- * validation, and `rel="noopener noreferrer"` on anchors.
+ * `ALLOW_DATA_ATTR: false`, protocol-relative `//` -> `https://` upgrades on element attributes only
+ * (preserving `//` inside `<code>`/`<pre>`), allowlisted `class` tokens, strict `ol-media://`
+ * authority validation, and `rel="noopener noreferrer"` on anchors.
  */
-export function sanitizeSafeDomFragment(rawHtml: string | undefined | null): DocumentFragment | null {
+export function sanitizeSafeDomFragment(
+  rawHtml: string | undefined | null
+): DocumentFragment | null {
   if (!rawHtml) {
     if (typeof document !== 'undefined' && typeof document.createDocumentFragment === 'function') {
       return document.createDocumentFragment();
     }
     return null;
   }
-  const normalizedInput = preNormalizeProtocolRelativeHtml(rawHtml);
-  return parseSanitizedFragmentNativeOrFallback(normalizedInput);
-}
-
-/**
- * Asynchronously inserts untrusted HTML directly into a target `Element` using native
- * `Element.prototype.setHTML()` when supported or lazy-loaded `DOMPurify` + `DocumentFragment`
- * insertion otherwise.
- */
-export async function safeSetStoreHtml(
-  element: Element,
-  rawHtml: string | undefined | null
-): Promise<void> {
-  if (!rawHtml) {
-    element.replaceChildren();
-    return;
-  }
-  const normalizedInput = preNormalizeProtocolRelativeHtml(rawHtml);
-  if (isSanitizerCapableElement(element)) {
-    element.setHTML(normalizedInput, {
-      sanitizer: {
-        elements: ALLOWED_STORE_ELEMENT_NAMES,
-        attributes: ALLOWED_STORE_ATTR,
-      },
-    });
-    enforceFragmentSecurityPolicy(element);
-    return;
-  }
-
-  await ensureDomPurifyFallbackLoaded();
-  const fragment = parseSanitizedFragmentNativeOrFallback(normalizedInput);
-  if (fragment) {
-    element.replaceChildren(fragment);
-  } else {
-    element.textContent = rawHtml;
-  }
+  return parseSanitizedFragmentNativeOrFallback(rawHtml);
 }
 
 /**
  * Sanitizes untrusted storefront HTML strings with strict URI scheme allowlisting
- * (`https:` and `ol-media:` only, upgrading protocol-relative `//...` URLs to `https://`),
- * `ALLOW_ARIA_ATTR: false`, `ALLOW_DATA_ATTR: false`, `KEEP_CONTENT: false`, and
+ * (`https://` and validated `ol-media://asset` / `ol-media://covers` only, upgrading
+ * protocol-relative `//...` attributes to `https://`), `ALLOW_ARIA_ATTR: false`,
+ * `ALLOW_DATA_ATTR: false`, `KEEP_CONTENT: false`, allowlisted `class` tokens, and
  * mandatory `rel="noopener noreferrer"` on anchors.
  */
 export function sanitizeStoreHtml(html: string | undefined | null): string {
   if (!html) return '';
   const fragment = sanitizeSafeDomFragment(html);
-  if (fragment && typeof document !== 'undefined' && typeof document.createElement === 'function') {
-    const container = document.createElement('div');
-    container.appendChild(fragment);
-    return container.innerHTML;
+  if (fragment) {
+    const inertDoc = createInertHtmlDocument();
+    if (inertDoc && typeof inertDoc.createElement === 'function') {
+      const container = inertDoc.createElement('div');
+      container.appendChild(fragment);
+      return container.innerHTML;
+    }
+    if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+      const container = document.createElement('div');
+      container.appendChild(fragment);
+      return container.innerHTML;
+    }
   }
   return escapeHtml(html);
 }

@@ -25,7 +25,7 @@ export function getAlphabeticalTitleSortKey(
   rawTitle: string | undefined | null,
   ignoreLeadingThe = true
 ): string {
-  const trimmed = (rawTitle || '').trim();
+  const trimmed = typeof rawTitle === 'string' ? rawTitle.trim() : '';
   if (!trimmed || !ignoreLeadingThe) {
     return trimmed;
   }
@@ -40,6 +40,18 @@ export function getAlphabeticalTitleSortKey(
 }
 
 /**
+ * Locale-aware base-sensitivity comparator over raw trimmed titles using `LIBRARY_TITLE_COLLATOR`.
+ */
+export function compareBaseTitles(
+  titleA: string | undefined | null,
+  titleB: string | undefined | null
+): number {
+  const rawA = typeof titleA === 'string' ? titleA.trim() : '';
+  const rawB = typeof titleB === 'string' ? titleB.trim() : '';
+  return LIBRARY_TITLE_COLLATOR.compare(rawA, rawB);
+}
+
+/**
  * Deterministic comparator for two titles with optional leading-"The" stripping:
  * 1. Primary: collator compare of computed sort keys
  * 2. Secondary: collator compare of raw trimmed titles (e.g. "Forest" before "The Forest")
@@ -51,8 +63,8 @@ export function compareGameTitles(
   options?: TitleSortOptions & { idA?: string; idB?: string }
 ): number {
   const ignoreLeadingThe = options?.ignoreLeadingThe ?? true;
-  const rawA = (titleA || '').trim();
-  const rawB = (titleB || '').trim();
+  const rawA = typeof titleA === 'string' ? titleA.trim() : '';
+  const rawB = typeof titleB === 'string' ? titleB.trim() : '';
   const keyA = getAlphabeticalTitleSortKey(rawA, ignoreLeadingThe);
   const keyB = getAlphabeticalTitleSortKey(rawB, ignoreLeadingThe);
 
@@ -86,7 +98,8 @@ export function sortByTitleKey<T>(
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    const raw = (getTitle(item) || '').trim();
+    const titleVal = getTitle(item);
+    const raw = typeof titleVal === 'string' ? titleVal.trim() : '';
     decorated[i] = {
       item,
       key: getAlphabeticalTitleSortKey(raw, ignoreLeadingThe),

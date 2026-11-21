@@ -43,8 +43,14 @@ export function formatBytes(
   bytes: number | undefined | null,
   options?: FormatBytesOptions
 ): string {
-  const decimals = options?.decimals ?? 1;
-  const tbDecimals = options?.tbDecimals ?? 2;
+  const rawDecimals = options?.decimals ?? 1;
+  const decimals =
+    Number.isFinite(rawDecimals) && rawDecimals >= 0 ? Math.min(20, Math.floor(rawDecimals)) : 1;
+  const rawTbDecimals = options?.tbDecimals ?? 2;
+  const tbDecimals =
+    Number.isFinite(rawTbDecimals) && rawTbDecimals >= 0
+      ? Math.min(20, Math.floor(rawTbDecimals))
+      : 2;
   const fallback = options?.fallback ?? 'Unknown';
 
   if (bytes == null || !Number.isFinite(bytes) || bytes <= 0) {
@@ -164,10 +170,11 @@ export function parseStorageRequirementBytesClient(
   }
 
   const normalizedBlock = rawHtmlOrText
+    .replace(/<!--[\s\S]*?-->/g, ' ')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/(?:li|p|tr|div|h[1-6]|dd|dt)\s*>/gi, '\n')
     .replace(/<\/(?:td|th)\s*>/gi, ' ')
-    .replace(/<[^>]+>/g, '')
+    .replace(/<\/?[a-z][a-z0-9:-]*(?:\s[^<>]*)?\s*\/?>/gi, '')
     .replace(/&nbsp;|&#160;|&#xa0;/gi, ' ')
     .replace(/&#58;|&#x3a;/gi, ':')
     .replace(/&ndash;|&#8211;/gi, '–')

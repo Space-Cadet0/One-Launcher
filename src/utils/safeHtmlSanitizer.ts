@@ -7,7 +7,7 @@ import {
   sanitizeAllowedStoreUri,
   sanitizeSafeDomFragment,
   sanitizeSrcsetValue,
-  sanitizeStoreHtml,
+  sanitizeStoreClassValue,
   upgradeProtocolRelativeUrl,
 } from '../services/common/htmlSanitizer';
 import { stripHtmlToPlainText } from '../services/common/synopsisTextUtils';
@@ -18,10 +18,9 @@ export {
   sanitizeAllowedStoreUri,
   sanitizeSafeDomFragment,
   sanitizeSrcsetValue,
+  sanitizeStoreClassValue,
   upgradeProtocolRelativeUrl,
 };
-
-export const sanitizeSafeHtmlString = sanitizeStoreHtml;
 
 const VOID_HTML_TAGS = new Set(['br', 'hr', 'img', 'source', 'wbr']);
 const ALLOWED_REACT_TAGS = new Set<string>(ALLOWED_STORE_ELEMENT_NAMES);
@@ -63,7 +62,12 @@ function mapDomAttributesToReactProps(el: Element, tagName: string): Record<stri
       continue;
     }
     if (rawName === 'class') {
-      props.className = rawVal;
+      const safeClass = sanitizeStoreClassValue(rawVal);
+      if (safeClass) props.className = safeClass;
+      continue;
+    }
+    if (rawName === 'datetime') {
+      props.dateTime = rawVal;
       continue;
     }
     if (rawName === 'colspan') {
