@@ -233,6 +233,10 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     platformId: form.preferredPlatformId,
     isFastDirectActive: form.isFastDirectActive,
     onAlignToInstallBottle: form.handleAlignToInstallBottle,
+    numericSteamAppId: form.numericSteamAppId,
+    bottleSteamFixState: form.bottleSteamFixState,
+    onFixBottleSteam: form.handleFixBottleSteam,
+    onCancelFixBottleSteam: form.handleCancelFixBottleSteam,
   };
 
   const activeStorefrontPolicyPill = (() => {
