@@ -4,6 +4,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { diagLog } = require('../../utils/diagnosticLogger.cjs');
 const { isNetworkOnlineForLaunch } = require('../engineStateRegistry.cjs');
 const {
@@ -36,6 +37,244 @@ const {
 
 /** @type {WeakMap<Function, Set<string>>} */
 const virtualMockPreLaunchByExecFn = new WeakMap();
+
+const MAX_NESTED_GOG_INFO_SUBDIRS = 32;
+
+/**
+ * Normalize a filesystem path to lowercase POSIX form (stripping trailing slashes) for
+ * cross-bottle path comparison and deterministic hashing.
+ *
+ * @param {string} rawPath
+ * @returns {string}
+ */
+function normalizeComparableFsPath(rawPath) {
+  const trimmed = String(rawPath || '').trim();
+  if (!trimmed) return '';
+  const resolved = path.resolve(toHostFilesystemPath(trimmed));
+  return resolved.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
+/**
+ * Compute a deterministic per-bottle scope key (`bottle:<safeSlug>_<sha256_8>`) from a
+ * Wine/CrossOver prefix path so cloud-save watermarks never collide across bottles.
+ *
+ * @param {string} winePrefix
+ * @returns {string}
+ */
+function computeWinePrefixBottleScope(winePrefix) {
+  const canonicalPrefixLower = normalizeComparableFsPath(winePrefix);
+  if (!canonicalPrefixLower) return 'bottle:unknown';
+  const safeSlug =
+    path.posix
+      .basename(canonicalPrefixLower)
+      .replace(/[^a-z0-9_-]/g, '_')
+      .slice(0, 24) || 'bottle';
+  const hash8 = crypto
+    .createHash('sha256')
+    .update(canonicalPrefixLower)
+    .digest('hex')
+    .slice(0, 8);
+  return `bottle:${safeSlug}_${hash8}`;
+}
+
+/**
+ * Parse Epic `CloudIncludeList` / `CloudExcludeList` attribute values (string or string[])
+ * into trimmed, POSIX-normalized glob patterns.
+ *
+ * @param {unknown} raw
+ * @returns {string[]}
+ */
+function parseEpicCloudPatternList(raw) {
+  /** @type {string[]} */
+  const rawItems = Array.isArray(raw)
+    ? raw.map((v) => String(v ?? ''))
+    : typeof raw === 'string'
+      ? raw.split(/[,;\r\n]+/)
+      : [];
+  /** @type {string[]} */
+  const out = [];
+  for (const item of rawItems) {
+    let norm = item.trim().replace(/\\/g, '/');
+    norm = norm.replace(/^(?:\.\/)+/, '').replace(/^\/+/, '');
+    if (norm) out.push(norm);
+  }
+  return out;
+}
+
+/**
+ * Tokenize a single POSIX glob pattern into linear DP tokens supporting single-wildcard (`*`),
+ * double-wildcard (`**`), directory-globstar (`globstar_dir`), and single-char (`?`).
+ *
+ * @param {string} pattern
+ * @returns {Array<{ kind: 'lit' | 'qmark' | 'star' | 'globstar' | 'globstar_dir', ch?: string }>}
+ */
+function tokenizeGlobPattern(pattern) {
+  const effective = pattern.endsWith('/') ? `${pattern}**` : pattern;
+  /** @type {Array<{ kind: 'lit' | 'qmark' | 'star' | 'globstar' | 'globstar_dir', ch?: string }>} */
+  const tokens = [];
+  let i = 0;
+  while (i < effective.length) {
+    if (effective[i] === '*') {
+      if (effective[i + 1] === '*') {
+        while (i < effective.length && effective[i] === '*') i += 1;
+        if (effective[i] === '/') {
+          while (i < effective.length && effective[i] === '/') i += 1;
+          const prev = tokens[tokens.length - 1];
+          if (!prev || (prev.kind !== 'globstar' && prev.kind !== 'globstar_dir')) {
+            tokens.push({ kind: 'globstar_dir' });
+          }
+        } else {
+          const prev = tokens[tokens.length - 1];
+          if (prev && prev.kind === 'globstar_dir') {
+            tokens[tokens.length - 1] = { kind: 'globstar' };
+          } else if (!prev || prev.kind !== 'globstar') {
+            tokens.push({ kind: 'globstar' });
+          }
+        }
+      } else {
+        i += 1;
+        const prev = tokens[tokens.length - 1];
+        if (!prev || prev.kind !== 'star') {
+          tokens.push({ kind: 'star' });
+        }
+      }
+    } else if (effective[i] === '?') {
+      i += 1;
+      tokens.push({ kind: 'qmark' });
+    } else {
+      tokens.push({ kind: 'lit', ch: effective[i] });
+      i += 1;
+    }
+  }
+  return tokens;
+}
+
+/**
+ * Strictly linear-time O(tokens * text) ReDoS-safe glob matcher (zero regex backtracking).
+ *
+ * @param {Array<{ kind: 'lit' | 'qmark' | 'star' | 'globstar' | 'globstar_dir', ch?: string }>} tokens
+ * @param {string} text
+ * @returns {boolean}
+ */
+function matchGlobTokensLinear(tokens, text) {
+  const n = text.length;
+  let prev = new Uint8Array(n + 1);
+  let next = new Uint8Array(n + 1);
+  prev[0] = 1;
+
+  for (let t = 0; t < tokens.length; t += 1) {
+    const tok = tokens[t];
+    next.fill(0);
+    if (tok.kind === 'lit') {
+      const ch = tok.ch || '';
+      for (let j = 0; j < n; j += 1) {
+        if (prev[j] && text[j] === ch) {
+          next[j + 1] = 1;
+        }
+      }
+    } else if (tok.kind === 'qmark') {
+      for (let j = 0; j < n; j += 1) {
+        if (prev[j] && text[j] !== '/') {
+          next[j + 1] = 1;
+        }
+      }
+    } else if (tok.kind === 'star') {
+      next[0] = prev[0];
+      for (let j = 0; j < n; j += 1) {
+        if (prev[j + 1]) {
+          next[j + 1] = 1;
+        } else if (next[j] && text[j] !== '/') {
+          next[j + 1] = 1;
+        }
+      }
+    } else if (tok.kind === 'globstar') {
+      let seen = 0;
+      for (let j = 0; j <= n; j += 1) {
+        if (prev[j]) seen = 1;
+        next[j] = seen;
+      }
+    } else if (tok.kind === 'globstar_dir') {
+      let seen = 0;
+      for (let j = 0; j <= n; j += 1) {
+        if (prev[j]) {
+          next[j] = 1;
+          seen = 1;
+        }
+        if (seen && j < n && text[j] === '/') {
+          next[j + 1] = 1;
+        }
+      }
+    }
+    const tmp = prev;
+    prev = next;
+    next = tmp;
+  }
+
+  return prev[n] === 1;
+}
+
+/**
+ * Build a ReDoS-safe pure relative-POSIX-path predicate from Epic `CloudIncludeList` /
+ * `CloudExcludeList` patterns. Patterns without `/` match the file basename; patterns with `/`
+ * match the full relative POSIX path.
+ *
+ * @param {string[]} [includePatterns]
+ * @param {string[]} [excludePatterns]
+ * @param {boolean} [caseInsensitive=true]
+ * @returns {(relPosixPath: string) => boolean}
+ */
+function createEpicCloudFileFilter(
+  includePatterns = [],
+  excludePatterns = [],
+  caseInsensitive = true
+) {
+  /** @param {string[]} list */
+  const compileList = (list) =>
+    (Array.isArray(list) ? list : [])
+      .map((raw) => String(raw || '').trim().replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').replace(/^\/+/, ''))
+      .filter(Boolean)
+      .map((pat) => {
+        const effectivePat = caseInsensitive ? pat.toLowerCase() : pat;
+        const matchFullPath = effectivePat.includes('/');
+        return {
+          matchFullPath,
+          tokens: tokenizeGlobPattern(effectivePat),
+        };
+      });
+
+  const compiledIncludes = compileList(includePatterns);
+  const compiledExcludes = compileList(excludePatterns);
+
+  /**
+   * @param {string} relPosixPath
+   * @returns {boolean}
+   */
+  return (relPosixPath) => {
+    const norm = String(relPosixPath || '')
+      .replace(/\\/g, '/')
+      .replace(/^(?:\.\/)+/, '')
+      .replace(/^\/+/, '');
+    if (!norm) return false;
+    const cmpPath = caseInsensitive ? norm.toLowerCase() : norm;
+    const cmpBase = path.posix.basename(cmpPath);
+
+    if (compiledIncludes.length > 0) {
+      const matchedInclude = compiledIncludes.some((entry) =>
+        matchGlobTokensLinear(entry.tokens, entry.matchFullPath ? cmpPath : cmpBase)
+      );
+      if (!matchedInclude) return false;
+    }
+
+    if (compiledExcludes.length > 0) {
+      const matchedExclude = compiledExcludes.some((entry) =>
+        matchGlobTokensLinear(entry.tokens, entry.matchFullPath ? cmpPath : cmpBase)
+      );
+      if (matchedExclude) return false;
+    }
+
+    return true;
+  };
+}
 
 /**
  * Factory building the `createCloudSaveRunner(deps)` function wired to facade-injected
@@ -134,38 +373,76 @@ function createCloudSaveRunnerFactory(facadeDeps) {
 
       // 1. Discover per-game GOG clientId (rejecting poisoned GOG_GALAXY_LAUNCHER_CLIENT_ID)
       let clientId = sanitizeGogGameClientId(
-        options.gogClientId || payload.gogClientId || '',
+        options.gogClientId || payload.gogClientId || payload.clientId || '',
         hasRemoteConfigOverride
       );
+      let effectiveInstallPath = installPath;
 
-      if (!clientId && installPath && (await pathExistsAsync(installPath))) {
-        const candidateInfoPaths = [
-          path.join(installPath, `goggame-${gameId}.info`),
-          path.join(installPath, `.goggame-${gameId}.info`),
-          path.join(installPath, 'Contents', 'Resources', `goggame-${gameId}.info`),
-          path.join(installPath, 'Contents', 'Resources', `.goggame-${gameId}.info`),
+      if (installPath && (await pathExistsAsync(installPath))) {
+        const rootInfoPrimary = path.join(installPath, `goggame-${gameId}.info`);
+        const rootInfoHidden = path.join(installPath, `.goggame-${gameId}.info`);
+        const hasRootInfo =
+          (await pathExistsAsync(rootInfoPrimary)) || (await pathExistsAsync(rootInfoHidden));
+
+        /** @type {Array<{ infoPath: string, nestedSubDir?: string }>} */
+        const candidateInfoEntries = [
+          { infoPath: rootInfoPrimary },
+          { infoPath: rootInfoHidden },
+          { infoPath: path.join(installPath, 'Contents', 'Resources', `goggame-${gameId}.info`) },
+          { infoPath: path.join(installPath, 'Contents', 'Resources', `.goggame-${gameId}.info`) },
         ];
+        /** @type {string[]} */
+        const nestedSubDirsScanned = [];
         try {
           const instStat = await fs.promises.stat(installPath);
           if (instStat.isDirectory() && !installPath.toLowerCase().endsWith('.app')) {
-            const entries = await fs.promises.readdir(installPath, { withFileTypes: true });
+            const entries = (await fs.promises.readdir(installPath, { withFileTypes: true })).sort(
+              (a, b) => a.name.localeCompare(b.name)
+            );
             for (const entry of entries) {
-              if (entry.isDirectory() && entry.name.toLowerCase().endsWith('.app')) {
-                candidateInfoPaths.push(
-                  path.join(
-                    installPath,
-                    entry.name,
-                    'Contents',
-                    'Resources',
-                    `goggame-${gameId}.info`
-                  ),
-                  path.join(
-                    installPath,
-                    entry.name,
-                    'Contents',
-                    'Resources',
-                    `.goggame-${gameId}.info`
-                  )
+              if (entry.isSymbolicLink()) continue;
+              const childPath = path.join(installPath, entry.name);
+              let isDir = entry.isDirectory();
+              if (!isDir) {
+                try {
+                  const childStat = await fs.promises.lstat(childPath);
+                  if (childStat.isSymbolicLink()) continue;
+                  isDir = childStat.isDirectory();
+                } catch {
+                  continue;
+                }
+              }
+              if (!isDir) continue;
+              if (entry.name.toLowerCase().endsWith('.app')) {
+                candidateInfoEntries.push(
+                  {
+                    infoPath: path.join(
+                      childPath,
+                      'Contents',
+                      'Resources',
+                      `goggame-${gameId}.info`
+                    ),
+                  },
+                  {
+                    infoPath: path.join(
+                      childPath,
+                      'Contents',
+                      'Resources',
+                      `.goggame-${gameId}.info`
+                    ),
+                  }
+                );
+              } else if (!hasRootInfo && nestedSubDirsScanned.length < MAX_NESTED_GOG_INFO_SUBDIRS) {
+                nestedSubDirsScanned.push(childPath);
+                candidateInfoEntries.push(
+                  {
+                    infoPath: path.join(childPath, `goggame-${gameId}.info`),
+                    nestedSubDir: childPath,
+                  },
+                  {
+                    infoPath: path.join(childPath, `.goggame-${gameId}.info`),
+                    nestedSubDir: childPath,
+                  }
                 );
               }
             }
@@ -175,26 +452,44 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         }
         const parentDir = path.dirname(installPath);
         if (parentDir && parentDir !== installPath) {
-          candidateInfoPaths.push(
-            path.join(parentDir, `goggame-${gameId}.info`),
-            path.join(parentDir, `.goggame-${gameId}.info`)
+          candidateInfoEntries.push(
+            { infoPath: path.join(parentDir, `goggame-${gameId}.info`) },
+            { infoPath: path.join(parentDir, `.goggame-${gameId}.info`) }
           );
         }
 
-        for (const infoPath of candidateInfoPaths) {
-          if (!infoPath || !(await pathExistsAsync(infoPath))) continue;
-          try {
-            const parsedInfo = JSON.parse(await fs.promises.readFile(infoPath, 'utf8'));
-            const candidateClientId = sanitizeGogGameClientId(
-              parsedInfo?.clientId,
-              hasRemoteConfigOverride
-            );
-            if (candidateClientId) {
-              clientId = candidateClientId;
+        if (!hasRootInfo && nestedSubDirsScanned.length > 0) {
+          for (const subDir of nestedSubDirsScanned) {
+            if (
+              (await pathExistsAsync(path.join(subDir, `goggame-${gameId}.info`))) ||
+              (await pathExistsAsync(path.join(subDir, `.goggame-${gameId}.info`)))
+            ) {
+              effectiveInstallPath = subDir;
               break;
             }
-          } catch (infoErr) {
-            diagLog.warn('cloudSave.gogParseInfoJson', infoErr, { infoPath });
+          }
+        }
+
+        if (!clientId) {
+          for (const entry of candidateInfoEntries) {
+            const { infoPath, nestedSubDir } = entry;
+            if (!infoPath || !(await pathExistsAsync(infoPath))) continue;
+            try {
+              const parsedInfo = JSON.parse(await fs.promises.readFile(infoPath, 'utf8'));
+              const candidateClientId = sanitizeGogGameClientId(
+                parsedInfo?.clientId,
+                hasRemoteConfigOverride
+              );
+              if (candidateClientId) {
+                clientId = candidateClientId;
+                if (!hasRootInfo && nestedSubDir) {
+                  effectiveInstallPath = nestedSubDir;
+                }
+                break;
+              }
+            } catch (infoErr) {
+              diagLog.warn('cloudSave.gogParseInfoJson', infoErr, { infoPath });
+            }
           }
         }
       }
@@ -456,11 +751,12 @@ function createCloudSaveRunnerFactory(facadeDeps) {
               },
             ];
 
+      const effectiveWinePrefix = String(options.winePrefix || payload.winePrefix || '').trim();
       const resolvedLocations = resolveGogCloudSaveLocations(effectiveLocations, {
         platform: targetPlatform,
         useCompatLayer,
-        winePrefix: options.winePrefix || payload.winePrefix,
-        installPath,
+        winePrefix: effectiveWinePrefix,
+        installPath: effectiveInstallPath,
         homedir,
         clientId,
         windowsKnownFolders: options.windowsKnownFolders,
@@ -500,6 +796,12 @@ function createCloudSaveRunnerFactory(facadeDeps) {
       if (!timestampsData.gog || typeof timestampsData.gog !== 'object') {
         timestampsData.gog = {};
       }
+      if (
+        !timestampsData.gogLegacyMigrated ||
+        typeof timestampsData.gogLegacyMigrated !== 'object'
+      ) {
+        timestampsData.gogLegacyMigrated = {};
+      }
 
       const backupQuotaOpts = {
         maxTotalBackupBytes: options.maxTotalBackupBytes,
@@ -515,10 +817,13 @@ function createCloudSaveRunnerFactory(facadeDeps) {
       const syncedLocations = [];
       /** @type {Record<string, number>} */
       const updatedTimestampDeltas = {};
+      /** @type {Record<string, string>} */
+      const updatedLegacyMigrationClaims = {};
       let anySuccess = false;
       let lastFailureReason = '';
       let lastBackupPath = null;
       const syncTimeoutMs = Number(options.cloudSyncTimeoutMs || 60000);
+      const osKey = useWindowsLocations ? 'windows' : 'osx';
 
       for (const loc of resolvedLocations) {
         if (
@@ -594,13 +899,51 @@ function createCloudSaveRunnerFactory(facadeDeps) {
           continue;
         }
 
-        const locKey = `${gameId}:${useWindowsLocations ? 'windows' : 'osx'}:${loc.name}`;
-        const lastTs =
-          Number(timestampsData.gog[locKey] || 0) ||
-          (Number(options.fallbackLastSyncTsSec) > 0
-            ? Math.floor(Number(options.fallbackLastSyncTsSec))
-            : 0);
+        const isInstallScopedLocation = /^<\?INSTALL\?>/i.test(String(loc.location || '').trim());
+        const bottleScope = !useCompatLayer
+          ? 'host'
+          : isInstallScopedLocation
+            ? 'install'
+            : computeWinePrefixBottleScope(effectiveWinePrefix);
+        const scopedLocKey = `${gameId}:${osKey}:${bottleScope}:${loc.name}`;
+        const legacyLocKey = `${gameId}:${osKey}:${loc.name}`;
         const hygiene = await purgeOsMetadataAndCountRealFilesAsync(hostLocPath);
+        const dirExistsBeforeSync = await pathExistsAsync(hostLocPath);
+
+        const scopedStoredTs = Number(timestampsData.gog[scopedLocKey] || 0);
+        const legacyStoredTs = Number(timestampsData.gog[legacyLocKey] || 0);
+        const existingLegacyClaim =
+          typeof timestampsData.gogLegacyMigrated[legacyLocKey] === 'string'
+            ? timestampsData.gogLegacyMigrated[legacyLocKey]
+            : '';
+
+        let inheritedFromLegacy = false;
+        let lastTs = 0;
+        if (scopedStoredTs > 0) {
+          lastTs = scopedStoredTs;
+        } else if (legacyStoredTs > 0) {
+          if (bottleScope === 'host' || bottleScope === 'install') {
+            lastTs = legacyStoredTs;
+            inheritedFromLegacy = true;
+          } else if (
+            hygiene.realFileCount > 0 &&
+            (!existingLegacyClaim || existingLegacyClaim === bottleScope)
+          ) {
+            lastTs = legacyStoredTs;
+            inheritedFromLegacy = true;
+          } else {
+            lastTs = 0;
+          }
+        } else if (Number(options.fallbackLastSyncTsSec) > 0) {
+          lastTs = Math.floor(Number(options.fallbackLastSyncTsSec));
+        }
+
+        // Empty-dir pre-launch safety: NEVER allow gogdl --skip-upload to treat missing files
+        // in a new/empty bottle as local deletions!
+        const effectiveLastTs =
+          mode === 'pre_launch' && (!dirExistsBeforeSync || hygiene.realFileCount === 0)
+            ? 0
+            : lastTs;
 
         if (mode === 'pre_launch' || mode === 'both') {
           const safeLocName = String(loc.name || '__default').replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -630,7 +973,7 @@ function createCloudSaveRunnerFactory(facadeDeps) {
           } catch (mkdirErr) {
             diagLog.warn('cloudSave.gogMkdirSaveDir', mkdirErr, { path: loc.resolvedPath });
           }
-        } else if (!(await pathExistsAsync(hostLocPath)) || hygiene.realFileCount === 0) {
+        } else if (!dirExistsBeforeSync || hygiene.realFileCount === 0) {
           continue;
         }
 
@@ -641,9 +984,9 @@ function createCloudSaveRunnerFactory(facadeDeps) {
           loc.resolvedPath,
           String(gameId),
           '--ts',
-          String(lastTs),
+          String(effectiveLastTs),
           '--os',
-          useWindowsLocations ? 'windows' : 'osx',
+          osKey,
         ];
         if (loc.name && loc.name !== '__default') {
           syncArgs.push('--name', loc.name);
@@ -654,30 +997,52 @@ function createCloudSaveRunnerFactory(facadeDeps) {
           syncArgs.push('--skip-download');
         }
 
-        const execRes = await execCliWithTreeTimeout(
-          gogdlBin,
-          syncArgs,
-          {
-            env: {
-              ...process.env,
-              ...(useCompatLayer && options.winePrefix ? { WINEPREFIX: options.winePrefix } : {}),
-            },
-            timeout: syncTimeoutMs,
+        const gogdlExecOpts = {
+          env: {
+            ...process.env,
+            ...(useCompatLayer && effectiveWinePrefix ? { WINEPREFIX: effectiveWinePrefix } : {}),
           },
-          options
-        );
+          timeout: syncTimeoutMs,
+        };
+        let execRes = await execCliWithTreeTimeout(gogdlBin, syncArgs, gogdlExecOpts, options);
+        let combinedOutput = `${execRes.stdout}\n${execRes.stderr}`.trim();
 
-        const combinedOutput = `${execRes.stdout}\n${execRes.stderr}`.trim();
+        if (
+          execRes.err &&
+          mode === 'post_exit' &&
+          /FileNotFoundError|No such file or directory/i.test(
+            `${combinedOutput}\n${execRes.err?.message || ''}`
+          )
+        ) {
+          const retryDelayMs = isTestEnvironment(options) ? 0 : 750;
+          if (retryDelayMs > 0) {
+            await sleepUnrefWithAbortAsync(retryDelayMs, options.signal);
+          }
+          const retryHygiene = await purgeOsMetadataAndCountRealFilesAsync(hostLocPath);
+          if ((await pathExistsAsync(hostLocPath)) && retryHygiene.realFileCount > 0) {
+            execRes = await execCliWithTreeTimeout(gogdlBin, syncArgs, gogdlExecOpts, options);
+            combinedOutput = `${execRes.stdout}\n${execRes.stderr}`.trim();
+          }
+        }
+
         if (!execRes.err) {
           const updatedTs = parseGogdlSyncTimestampFromStdout(execRes);
-          timestampsData.gog[locKey] = updatedTs;
-          updatedTimestampDeltas[locKey] = updatedTs;
+          timestampsData.gog[scopedLocKey] = updatedTs;
+          updatedTimestampDeltas[scopedLocKey] = updatedTs;
+          if (bottleScope === 'host' || bottleScope === 'install') {
+            timestampsData.gog[legacyLocKey] = updatedTs;
+            updatedTimestampDeltas[legacyLocKey] = updatedTs;
+          } else if (inheritedFromLegacy) {
+            timestampsData.gogLegacyMigrated[legacyLocKey] = bottleScope;
+            updatedLegacyMigrationClaims[legacyLocKey] = bottleScope;
+          }
           anySuccess = true;
           syncedLocations.push({
             name: loc.name,
             resolvedPath: loc.resolvedPath,
             args: syncArgs,
             timestamp: updatedTs,
+            bottleScope,
           });
         } else {
           lastFailureReason =
@@ -706,6 +1071,19 @@ function createCloudSaveRunnerFactory(facadeDeps) {
             }
             for (const [k, v] of Object.entries(updatedTimestampDeltas)) {
               freshTimestamps.gog[k] = v;
+            }
+            if (Object.keys(updatedLegacyMigrationClaims).length > 0) {
+              if (
+                !freshTimestamps.gogLegacyMigrated ||
+                typeof freshTimestamps.gogLegacyMigrated !== 'object'
+              ) {
+                freshTimestamps.gogLegacyMigrated = {};
+              }
+              for (const [k, v] of Object.entries(updatedLegacyMigrationClaims)) {
+                if (!freshTimestamps.gogLegacyMigrated[k]) {
+                  freshTimestamps.gogLegacyMigrated[k] = v;
+                }
+              }
             }
             await atomicWriteFileAsync(timestampsPath, JSON.stringify(freshTimestamps, null, 2));
           });
@@ -823,8 +1201,13 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         hasCloudSaveFolder = true;
       }
 
+      const hasExplicitInclude = options.cloudIncludeList !== undefined;
+      const hasExplicitExclude = options.cloudExcludeList !== undefined;
+      let includePatterns = parseEpicCloudPatternList(options.cloudIncludeList);
+      let excludePatterns = parseEpicCloudPatternList(options.cloudExcludeList);
+
       const legCfgDir = getLegendaryConfigDir(options);
-      if (!cloudSaveFolderTemplate) {
+      if (!cloudSaveFolderTemplate || (!hasExplicitInclude && !hasExplicitExclude)) {
         /** @type {Set<string>} */
         const candidateMetaFiles = new Set();
         if (legCfgDir) {
@@ -847,8 +1230,9 @@ function createCloudSaveRunnerFactory(facadeDeps) {
           try {
             const parsed = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
             const attrs = parsed?.metadata?.customAttributes || parsed?.customAttributes || {};
-            const folderVal =
-              targetPlatform === 'darwin' && !useCompatLayer
+            const isNativeMac = targetPlatform === 'darwin' && !useCompatLayer;
+            if (!cloudSaveFolderTemplate) {
+              const folderVal = isNativeMac
                 ? attrs?.CloudSaveFolder_MAC?.value ||
                   attrs?.CloudSaveFolder_Mac?.value ||
                   attrs?.CloudSaveFolder?.value ||
@@ -857,9 +1241,28 @@ function createCloudSaveRunnerFactory(facadeDeps) {
                   attrs?.CloudSaveFolder_MAC?.value ||
                   attrs?.CloudSaveFolder_Mac?.value ||
                   '';
-            if (typeof folderVal === 'string' && folderVal.trim()) {
-              hasCloudSaveFolder = true;
-              cloudSaveFolderTemplate = folderVal.trim();
+              if (typeof folderVal === 'string' && folderVal.trim()) {
+                hasCloudSaveFolder = true;
+                cloudSaveFolderTemplate = folderVal.trim();
+              }
+            }
+            if (!hasExplicitInclude && includePatterns.length === 0) {
+              const rawInclude = isNativeMac
+                ? attrs?.CloudIncludeList_MAC?.value ||
+                  attrs?.CloudIncludeList_Mac?.value ||
+                  attrs?.CloudIncludeList?.value
+                : attrs?.CloudIncludeList?.value;
+              includePatterns = parseEpicCloudPatternList(rawInclude);
+            }
+            if (!hasExplicitExclude && excludePatterns.length === 0) {
+              const rawExclude = isNativeMac
+                ? attrs?.CloudExcludeList_MAC?.value ||
+                  attrs?.CloudExcludeList_Mac?.value ||
+                  attrs?.CloudExcludeList?.value
+                : attrs?.CloudExcludeList?.value;
+              excludePatterns = parseEpicCloudPatternList(rawExclude);
+            }
+            if (cloudSaveFolderTemplate) {
               break;
             }
           } catch (metaReadErr) {
@@ -948,15 +1351,8 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         ...(useCompatLayer && winePrefix ? { WINEPREFIX: winePrefix } : {}),
       };
 
-      // Official Epic Games Launcher auto-import into Legendary installed.json when missing,
-      // recording the external import in `one_launcher_epic_imports.json` so Windows uninstaller never deletes it!
-      if (
-        installPath &&
-        !installPath.startsWith('-') &&
-        (await pathExistsAsync(installPath)) &&
-        legCfgDir
-      ) {
-        let isRegisteredInLegendary = false;
+      const readLegendaryInstalledEntryAsync = async () => {
+        if (!legCfgDir) return null;
         const installedJsonCandidates = [
           path.join(legCfgDir, 'installed.json'),
           path.join(legCfgDir, 'legendary', 'installed.json'),
@@ -966,27 +1362,38 @@ function createCloudSaveRunnerFactory(facadeDeps) {
           try {
             const installedMap = JSON.parse(await fs.promises.readFile(instPath, 'utf8'));
             if (installedMap && typeof installedMap === 'object' && installedMap[appName]) {
-              isRegisteredInLegendary = true;
-              break;
+              return installedMap[appName];
             }
           } catch (instErr) {
             diagLog.warn('cloudSave.epicReadInstalledJson', instErr, { instPath });
           }
         }
+        return null;
+      };
 
-        if (!isRegisteredInLegendary) {
-          const importPlatform = useCompatLayer || targetPlatform === 'win32' ? 'Windows' : 'Mac';
-          const importRes = await execCliWithTreeTimeout(
-            legendaryBin,
-            ['import', appName, installPath, '--platform', importPlatform, '--disable-check', '-y'],
-            { env: legEnv, timeout: 15000 },
-            options
-          );
-          if (!importRes.err) {
-            recordImportedEpicInstall(appName, installPath, options);
-          } else {
-            diagLog.warn('cloudSave.epicImportFailed', importRes.err, { appName, installPath });
-          }
+      let installedJsonRecord = await readLegendaryInstalledEntryAsync();
+
+      // Official Epic Games Launcher auto-import into Legendary installed.json when missing,
+      // recording the external import in `one_launcher_epic_imports.json` so Windows uninstaller never deletes it!
+      if (
+        installPath &&
+        !installPath.startsWith('-') &&
+        (await pathExistsAsync(installPath)) &&
+        legCfgDir &&
+        !installedJsonRecord
+      ) {
+        const importPlatform = useCompatLayer || targetPlatform === 'win32' ? 'Windows' : 'Mac';
+        const importRes = await execCliWithTreeTimeout(
+          legendaryBin,
+          ['import', appName, installPath, '--platform', importPlatform, '--disable-check', '-y'],
+          { env: legEnv, timeout: 15000 },
+          options
+        );
+        if (!importRes.err) {
+          recordImportedEpicInstall(appName, installPath, options);
+          installedJsonRecord = await readLegendaryInstalledEntryAsync();
+        } else {
+          diagLog.warn('cloudSave.epicImportFailed', importRes.err, { appName, installPath });
         }
       }
 
@@ -1007,6 +1414,26 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         Boolean(resolvedSavePath) &&
         !/\{[^}]+\}/.test(resolvedSavePath) &&
         !resolvedSavePath.trim().startsWith('-');
+
+      if (useCompatLayer && !hasCompleteResolvedSavePath) {
+        diagLog.warn(
+          'cloudSave.epicUnresolvedBottleSavePathBlocked',
+          'Blocked Epic cloud save sync under compatibility layer without a complete resolved bottle save path',
+          {
+            appName,
+            mode,
+            cloudSaveFolder: cloudSaveFolderTemplate || null,
+            hasWinePrefix: Boolean(winePrefix),
+          }
+        );
+        return {
+          synced: false,
+          appName,
+          mode,
+          cloudSaveFolder: cloudSaveFolderTemplate || null,
+          reason: 'unresolved_bottle_save_path',
+        };
+      }
 
       if (hasCompleteResolvedSavePath) {
         const epicAnchorMeta = getResolvedEpicPathAnchor(resolvedSavePath);
@@ -1073,6 +1500,22 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         Boolean(hostResolvedSavePath) &&
         (await pathExistsAsync(hostResolvedSavePath));
 
+      const isSaveRootSameAsInstallDir = Boolean(
+        installPath &&
+          hostResolvedSavePath &&
+          normalizeComparableFsPath(hostResolvedSavePath) ===
+            normalizeComparableFsPath(installPath)
+      );
+      const skipInstallDirWithoutIncludeList = Boolean(
+        isSaveRootSameAsInstallDir && includePatterns.length === 0
+      );
+      const epicCaseInsensitive =
+        targetPlatform === 'win32' || useCompatLayer || targetPlatform === 'darwin';
+      const epicFileFilter =
+        includePatterns.length > 0 || excludePatterns.length > 0
+          ? createEpicCloudFileFilter(includePatterns, excludePatterns, epicCaseInsensitive)
+          : null;
+
       /** @type {Record<string, any> | null} */
       let placeholderCheck = null;
       if (saveDirExistsBefore) {
@@ -1117,8 +1560,16 @@ function createCloudSaveRunnerFactory(facadeDeps) {
 
       let realFileCount = 0;
       if (saveDirExistsBefore) {
-        const hygiene = await purgeOsMetadataAndCountRealFilesAsync(hostResolvedSavePath);
-        realFileCount = hygiene.realFileCount;
+        if (skipInstallDirWithoutIncludeList) {
+          // Avoid full-tree metadata purge across multi-GB {InstallDir} without CloudIncludeList
+          realFileCount = 1;
+        } else {
+          const hygiene = await purgeOsMetadataAndCountRealFilesAsync(
+            hostResolvedSavePath,
+            epicFileFilter ? { fileFilter: epicFileFilter } : undefined
+          );
+          realFileCount = hygiene.realFileCount;
+        }
       }
 
       if (mode === 'post_exit' && hasCompleteResolvedSavePath) {
@@ -1141,29 +1592,59 @@ function createCloudSaveRunnerFactory(facadeDeps) {
       }
 
       let backupPath = null;
+      let backupSkippedReason = '';
       if ((mode === 'pre_launch' || mode === 'both') && hasCompleteResolvedSavePath) {
-        const safeAppName = appName.replace(/[^a-zA-Z0-9_-]/g, '_');
-        const backupRoot = path.join(userDataDir, 'cloud_save_backups', 'epic', safeAppName);
-        const backupRes = await createCloudSaveRollingBackupAsync(
-          hostResolvedSavePath,
-          backupRoot,
-          Number(options.maxBackupBytes) > 0
-            ? Number(options.maxBackupBytes)
-            : resolveDefaultPerSnapshotMaxBackupBytes(options),
-          placeholderCheck
-            ? { ...backupQuotaOpts, precheckedPlaceholderState: placeholderCheck }
-            : backupQuotaOpts
-        );
-        if (backupRes?.backupPath) {
-          backupPath = backupRes.backupPath;
+        if (skipInstallDirWithoutIncludeList) {
+          backupSkippedReason = 'install_dir_without_include_list_skipped';
+          diagLog.info(
+            'cloudSave.epicInstallDirBackupSkipped',
+            'Skipped rolling backup because CloudSaveFolder resolves to {InstallDir} without CloudIncludeList',
+            { appName, resolvedSavePath }
+          );
+        } else {
+          const safeAppName = appName.replace(/[^a-zA-Z0-9_-]/g, '_');
+          const backupRoot = path.join(userDataDir, 'cloud_save_backups', 'epic', safeAppName);
+          const backupRes = await createCloudSaveRollingBackupAsync(
+            hostResolvedSavePath,
+            backupRoot,
+            Number(options.maxBackupBytes) > 0
+              ? Number(options.maxBackupBytes)
+              : resolveDefaultPerSnapshotMaxBackupBytes(options),
+            {
+              ...backupQuotaOpts,
+              ...(placeholderCheck ? { precheckedPlaceholderState: placeholderCheck } : {}),
+              ...(epicFileFilter ? { fileFilter: epicFileFilter } : {}),
+            }
+          );
+          if (backupRes?.backupPath) {
+            backupPath = backupRes.backupPath;
+          }
         }
       }
+
+      const recordedInstalledSavePath = String(installedJsonRecord?.save_path || '').trim();
+      const installedSavePathPointsElsewhere = Boolean(
+        recordedInstalledSavePath &&
+          hasCompleteResolvedSavePath &&
+          normalizeComparableFsPath(recordedInstalledSavePath) !==
+            normalizeComparableFsPath(resolvedSavePath)
+      );
+      const shouldForceDownloadEmptyCrossBottle = Boolean(
+        mode === 'pre_launch' &&
+          useCompatLayer &&
+          hasCompleteResolvedSavePath &&
+          installedSavePathPointsElsewhere &&
+          realFileCount === 0
+      );
 
       const syncArgs = ['sync-saves', appName, '-y'];
       if (mode === 'pre_launch') {
         syncArgs.push('--skip-upload');
       } else if (mode === 'post_exit') {
         syncArgs.push('--skip-download');
+      }
+      if (shouldForceDownloadEmptyCrossBottle) {
+        syncArgs.push('--force-download');
       }
       if (hasCompleteResolvedSavePath) {
         syncArgs.push('--save-path', resolvedSavePath);
@@ -1198,6 +1679,7 @@ function createCloudSaveRunnerFactory(facadeDeps) {
           resolvedSavePath: hasCompleteResolvedSavePath ? resolvedSavePath : null,
           reason: failReason,
           ...(backupPath ? { backupPath } : {}),
+          ...(backupSkippedReason ? { backupSkippedReason } : {}),
         };
       }
 
@@ -1214,6 +1696,44 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         }
       }
 
+      const epicBottleScope = !useCompatLayer
+        ? 'host'
+        : isSaveRootSameAsInstallDir ||
+            /^\{InstallDir\}(?:[\\/]|$)/i.test(cloudSaveFolderTemplate)
+          ? 'install'
+          : computeWinePrefixBottleScope(winePrefix);
+      const postInstalledRecord =
+        (await readLegendaryInstalledEntryAsync()) || installedJsonRecord;
+      const latestSaveTimestamp = postInstalledRecord?.save_timestamp ?? null;
+
+      if (userDataDir) {
+        const timestampsPath = path.join(userDataDir, 'one_launcher_cloud_sync_timestamps.json');
+        const epicWatermarkKey = `${appName}:${epicBottleScope}`;
+        try {
+          await withCloudManifestFileLock(timestampsPath, async () => {
+            /** @type {Record<string, any>} */
+            let freshTimestamps = {};
+            try {
+              if (await pathExistsAsync(timestampsPath)) {
+                freshTimestamps =
+                  JSON.parse(await fs.promises.readFile(timestampsPath, 'utf8')) || {};
+              }
+            } catch {}
+            if (!freshTimestamps.epic || typeof freshTimestamps.epic !== 'object') {
+              freshTimestamps.epic = {};
+            }
+            freshTimestamps.epic[epicWatermarkKey] = {
+              savePath: hasCompleteResolvedSavePath ? resolvedSavePath : null,
+              lastSyncedAt: Date.now(),
+              saveTimestamp: latestSaveTimestamp,
+            };
+            await atomicWriteFileAsync(timestampsPath, JSON.stringify(freshTimestamps, null, 2));
+          });
+        } catch (tsWriteErr) {
+          diagLog.warn('cloudSave.epicWriteTimestamps', tsWriteErr, { timestampsPath, appName });
+        }
+      }
+
       return {
         synced: true,
         appName,
@@ -1222,6 +1742,7 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         cloudSaveFolder: cloudSaveFolderTemplate || null,
         resolvedSavePath: hasCompleteResolvedSavePath ? resolvedSavePath : null,
         ...(backupPath ? { backupPath } : {}),
+        ...(backupSkippedReason ? { backupSkippedReason } : {}),
       };
     }
 
@@ -1384,16 +1905,109 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         }
       }
 
+      const resolveBootstrapLogPathAsync = async () => {
+        const primary = trimmedRoot ? path.join(trimmedRoot, 'logs', 'bootstrap_log.txt') : '';
+        if (primary && (await pathExistsAsync(primary))) {
+          return primary;
+        }
+        if (targetPlatform === 'darwin' && !options.steamRootStrict) {
+          const macBootLog = path.join(
+            options.homedir || os.homedir(),
+            'Library',
+            'Application Support',
+            'Steam',
+            'logs',
+            'bootstrap_log.txt'
+          );
+          if (await pathExistsAsync(macBootLog)) {
+            return macBootLog;
+          }
+          return primary || macBootLog;
+        }
+        return primary;
+      };
+
+      const initialBootstrapLogPath = await resolveBootstrapLogPathAsync();
+      let baseBootstrapOffset = 0;
+      if (
+        typeof options.preBootBootstrapLogOffset === 'number' &&
+        options.preBootBootstrapLogOffset >= 0
+      ) {
+        baseBootstrapOffset = options.preBootBootstrapLogOffset;
+      } else if (initialBootstrapLogPath) {
+        try {
+          baseBootstrapOffset = (await fs.promises.stat(initialBootstrapLogPath)).size;
+        } catch {
+          baseBootstrapOffset = 0;
+        }
+      }
+
       const pollIntervalMs = Math.max(10, Number(options.pollIntervalMs || 250));
       const defaultStartupWaitMs = options.isBottleSteam ? 35000 : 25000;
       const maxStartupCloudWaitMs = Math.max(
         0,
         Number(options.maxStartupCloudWaitMs ?? defaultStartupWaitMs)
       );
+      const enableSelfUpdateExtension =
+        !isTestEnvironment(options) || options.enableSelfUpdateExtensionInTest === true;
+      const maxSelfUpdateWaitMs = Math.max(
+        maxStartupCloudWaitMs,
+        Number(options.maxSelfUpdateWaitMs ?? (options.isBottleSteam ? 120000 : 90000))
+      );
+      const selfUpdateActiveWindowMs = Math.max(
+        1000,
+        Number(options.selfUpdateActiveWindowMs ?? 15000)
+      );
+      const selfUpdateRestartGraceMs = Math.max(
+        1000,
+        Number(options.selfUpdateRestartGraceMs ?? 8000)
+      );
+      const livenessGraceMs = Math.max(0, Number(options.livenessGraceMs ?? 5000));
+      const selfUpdatePatternRegex =
+        /Downloading\s+update|Extracting\s+package|Installing\s+update|Verifying\s+installation/i;
       const settleAfterClientSyncMs =
         options.settleAfterClientSyncMs !== undefined
           ? Math.max(0, Number(options.settleAfterClientSyncMs))
           : 900;
+
+      const inspectBootstrapUpdateActivityAsync = async () => {
+        const bootPath = await resolveBootstrapLogPathAsync();
+        if (!bootPath || !(await pathExistsAsync(bootPath))) {
+          return { active: false, recentRestart: false, size: 0, mtimeMs: 0 };
+        }
+        let fh = null;
+        try {
+          fh = await openFileBoundedNoRecallAsync(bootPath, 'r', 2500);
+          const st = await fh.stat();
+          const effectiveBootOffset = st.size < baseBootstrapOffset ? 0 : baseBootstrapOffset;
+          const availableBytes = Math.max(0, st.size - effectiveBootOffset);
+          const ageMs = Math.max(0, Date.now() - st.mtimeMs);
+          if (availableBytes === 0) {
+            return { active: false, recentRestart: false, size: st.size, mtimeMs: st.mtimeMs };
+          }
+          const readLen = Math.min(availableBytes, 65536);
+          const startPos = st.size - readLen;
+          const buf = Buffer.alloc(readLen);
+          const { bytesRead } = await fh.read(buf, 0, readLen, startPos);
+          const appendedText = buf.subarray(0, bytesRead).toString('utf8');
+          const matchesUpdateLine = selfUpdatePatternRegex.test(appendedText);
+          const recentWrite = ageMs <= selfUpdateActiveWindowMs;
+          return {
+            active: recentWrite || matchesUpdateLine,
+            recentRestart: ageMs <= selfUpdateRestartGraceMs,
+            size: st.size,
+            mtimeMs: st.mtimeMs,
+          };
+        } catch {
+          return { active: false, recentRestart: false, size: 0, mtimeMs: 0 };
+        } finally {
+          if (fh) {
+            try {
+              await fh.close();
+            } catch {}
+          }
+        }
+      };
 
       const readAppendedConnectionLogAsync = async () => {
         const connPath = await resolveConnectionLogPathAsync();
@@ -1475,7 +2089,7 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         : null;
 
       const downloadQueuedRegex =
-        /(?:Need\s+to\s+download\s+file|Need\s+to\s+sync\s+from\s+local\s+change\s+number|Starting\s+sync\s*\([^)]*down,|HTTP\s+download\s+.*\s+beginning)/i;
+        /(?:Need\s+to\s+download\s+file|Need\s+to\s+sync\s+from\s+local\s+change\s+number(?!.*but\s+not\s+attempting\s+now)|Starting\s+sync\s*\([^)]*down,|HTTP\s+download\s+.*\s+beginning)/i;
       const downloadCompleteRegex = /Download\s+complete/i;
       const inFlightStartRegex =
         /(?:Starting\s+sync|Need\s+to\s+upload\s+file|HTTP\s+upload\s+.*\s+beginning)/i;
@@ -1547,10 +2161,62 @@ function createCloudSaveRunnerFactory(facadeDeps) {
       };
 
       const startedWait = Date.now();
+      let effectiveMaxWaitMs = maxStartupCloudWaitMs;
+      let notifiedSelfUpdate = false;
       let readySinceMs = 0;
       let readyAtSize = -1;
       let loginConfirmedAtMs = 0;
-      const loginOnlySettleMs = Math.max(settleAfterClientSyncMs, 1500);
+      const defaultLoginOnlySettleMs = isTestEnvironment(options) ? 1500 : 3500;
+      const loginOnlySettleMs = Math.max(
+        settleAfterClientSyncMs,
+        options.loginOnlySettleMs !== undefined
+          ? Math.max(0, Number(options.loginOnlySettleMs))
+          : defaultLoginOnlySettleMs
+      );
+      const isSteamAliveFn =
+        typeof options.isSteamAliveFn === 'function' ? options.isSteamAliveFn : null;
+
+      const checkSelfUpdateExtensionAsync = async () => {
+        if (!enableSelfUpdateExtension) return false;
+        const bootActivity = await inspectBootstrapUpdateActivityAsync();
+        if (bootActivity.active) {
+          const extended = Math.min(
+            maxSelfUpdateWaitMs,
+            Math.max(
+              effectiveMaxWaitMs,
+              Date.now() - startedWait + Math.max(maxStartupCloudWaitMs, selfUpdateActiveWindowMs)
+            )
+          );
+          if (extended > effectiveMaxWaitMs) {
+            effectiveMaxWaitMs = extended;
+          }
+          if (!notifiedSelfUpdate && typeof options.onStatusUpdate === 'function') {
+            notifiedSelfUpdate = true;
+            try {
+              options.onStatusUpdate('Updating Steam client...');
+            } catch {}
+          }
+          return true;
+        }
+        return false;
+      };
+
+      const checkEarlySteamExitAsync = async () => {
+        if (!isSteamAliveFn) return false;
+        if (Date.now() - startedWait < livenessGraceMs) return false;
+        let alive = true;
+        try {
+          alive = Boolean(await Promise.resolve(isSteamAliveFn()));
+        } catch {
+          alive = true;
+        }
+        if (alive) return false;
+        const bootActivity = await inspectBootstrapUpdateActivityAsync();
+        if (bootActivity.recentRestart) {
+          return false;
+        }
+        return true;
+      };
 
       const checkConnectionLogLoginAsync = async () => {
         if (loginConfirmedAtMs > 0) return true;
@@ -1576,9 +2242,11 @@ function createCloudSaveRunnerFactory(facadeDeps) {
             reason: 'startup_cloud_synced',
           };
         }
+      } else if (!firstSnap || !firstSnap.text || !clientSyncRegex.test(firstSnap.text)) {
+        await checkSelfUpdateExtensionAsync();
       }
 
-      while (Date.now() - startedWait < maxStartupCloudWaitMs) {
+      while (Date.now() - startedWait < effectiveMaxWaitMs) {
         if (options.signal?.aborted) {
           return {
             ready: false,
@@ -1587,7 +2255,7 @@ function createCloudSaveRunnerFactory(facadeDeps) {
             reason: 'aborted',
           };
         }
-        const remainingBudget = maxStartupCloudWaitMs - (Date.now() - startedWait);
+        const remainingBudget = effectiveMaxWaitMs - (Date.now() - startedWait);
         if (remainingBudget <= 0) break;
 
         let waitSlice = pollIntervalMs;
@@ -1603,6 +2271,9 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         await checkConnectionLogLoginAsync();
         const snap = await readAppendedLogAsync();
         const now = Date.now();
+        if (!snap || !snap.text || !clientSyncRegex.test(snap.text)) {
+          await checkSelfUpdateExtensionAsync();
+        }
         if (!snap || !snap.text) {
           readySinceMs = 0;
           readyAtSize = -1;
@@ -1614,6 +2285,13 @@ function createCloudSaveRunnerFactory(facadeDeps) {
               reason: 'connection_logged_on_settled',
             };
           }
+          if (await checkEarlySteamExitAsync()) {
+            return {
+              ready: false,
+              waitedMs: Date.now() - startedWait,
+              reason: 'steam_exited_early',
+            };
+          }
           continue;
         }
 
@@ -1621,6 +2299,13 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         if (!evalRes.ready) {
           readySinceMs = 0;
           readyAtSize = -1;
+          if (await checkEarlySteamExitAsync()) {
+            return {
+              ready: false,
+              waitedMs: Date.now() - startedWait,
+              reason: 'steam_exited_early',
+            };
+          }
           continue;
         }
 
@@ -1659,6 +2344,7 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         {
           appId: cleanAppId,
           maxStartupCloudWaitMs,
+          effectiveMaxWaitMs,
         }
       );
       return {
@@ -1712,14 +2398,33 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         return { completed: true, waitedMs: 0, reason: 'no_active_cloud_job' };
       }
 
+      const hasSessionStartOffset =
+        typeof options.sessionStartOffset === 'number' &&
+        Number.isFinite(options.sessionStartOffset) &&
+        options.sessionStartOffset >= 0;
+      const sessionStartOffset = hasSessionStartOffset
+        ? Math.floor(options.sessionStartOffset)
+        : -1;
+
       const readLogTailAsync = async () => {
         let fh = null;
         try {
           fh = await openFileBoundedNoRecallAsync(cloudLogPath, 'r', 2500);
           const st = await fh.stat();
           const maxRead = 65536;
-          const readLen = Math.min(st.size, maxRead);
-          const startPos = Math.max(0, st.size - readLen);
+          const startPos = hasSessionStartOffset
+            ? st.size < sessionStartOffset
+              ? 0
+              : Math.max(sessionStartOffset, st.size - maxRead)
+            : Math.max(0, st.size - maxRead);
+          const readLen = Math.max(0, st.size - startPos);
+          if (readLen === 0) {
+            return {
+              text: '',
+              size: st.size,
+              mtimeMs: st.mtimeMs,
+            };
+          }
           const buf = Buffer.alloc(readLen);
           const { bytesRead } = await fh.read(buf, 0, readLen, startPos);
           return {
@@ -1752,7 +2457,7 @@ function createCloudSaveRunnerFactory(facadeDeps) {
       const exitUploadCompletionRegex =
         /(?:Upload\s+complete|Sync\s+complete|Cloud\s+sync\s+complete|Syncing\s+to\s+Steam\s+Cloud\s+succeeded|AppCloudStateChange[^\n]*synced|Nothing\s+to\s+sync|0\s+files\s+to\s+upload|Job\s+complete|Job\s+Canceled|ReleaseAppLock)/i;
       const downloadStartRegex =
-        /(?:Need\s+to\s+download\s+file|Need\s+to\s+sync\s+from\s+local\s+change\s+number|Starting\s+sync\s*\([^)]*down,|HTTP\s+download\s+.*\s+beginning|\bDownloading\b)/i;
+        /(?:Need\s+to\s+download\s+file|Need\s+to\s+sync\s+from\s+local\s+change\s+number(?!.*but\s+not\s+attempting\s+now)|Starting\s+sync\s*\([^)]*down,|HTTP\s+download\s+.*\s+beginning|\bDownloading\b)/i;
       const downloadCompletionRegex = /Download\s+complete/i;
       const launchEvalStartRegex =
         /(?:Starting\s+sync\s*\((?:init,)?(?:AC\s+Launch,|eval,|down,|Get\s+App\s+Quota)|Running\s+AutoCloud\s+on\s+launch|Starting\s+sync|\bSyncing\b|Writing|Evaluating|Locking|in\s+progress|pending|queued)/i;
@@ -1763,13 +2468,15 @@ function createCloudSaveRunnerFactory(facadeDeps) {
       /** @param {{ text: string, size: number, mtimeMs: number } | null} logSnapshot */
       const inspectCloudState = (logSnapshot) => {
         if (!logSnapshot || !logSnapshot.text) {
-          return { active: false, completed: false };
+          return { active: false, completed: false, exitUploadCompleted: false };
         }
         const lines = logSnapshot.text.split(/\r?\n/);
         let exitOrUploadActive = false;
         let launchOrEvalActive = false;
         let downloadPending = false;
         let sawCompletion = false;
+        let sawExitUploadStart = false;
+        let sawExitUploadCompleted = false;
 
         for (let i = 0; i < lines.length; i++) {
           const line = lines[i];
@@ -1781,12 +2488,17 @@ function createCloudSaveRunnerFactory(facadeDeps) {
           }
 
           if (exitUploadCompletionRegex.test(line)) {
+            if (sawExitUploadStart) {
+              sawExitUploadCompleted = true;
+            }
             exitOrUploadActive = false;
             launchOrEvalActive = false;
             downloadPending = false;
             sawCompletion = true;
           } else if (exitUploadStartRegex.test(line)) {
             exitOrUploadActive = true;
+            sawExitUploadStart = true;
+            sawExitUploadCompleted = false;
           } else if (downloadCompletionRegex.test(line)) {
             downloadPending = false;
             launchOrEvalActive = false;
@@ -1808,6 +2520,7 @@ function createCloudSaveRunnerFactory(facadeDeps) {
         return {
           active: isActive,
           completed: !isActive && sawCompletion,
+          exitUploadCompleted: !isActive && sawExitUploadCompleted,
         };
       };
 
@@ -1846,14 +2559,27 @@ function createCloudSaveRunnerFactory(facadeDeps) {
       let baselineSnap = initialSnap;
       const initialState = inspectCloudState(initialSnap);
 
+      if (
+        options.mode === 'post_exit' &&
+        hasSessionStartOffset &&
+        !initialState.active &&
+        initialState.exitUploadCompleted
+      ) {
+        return { completed: true, waitedMs: 0, reason: 'cloud_sync_completed' };
+      }
+
       if (!initialState.active) {
         const postExitGraceMs =
           options.mode === 'post_exit'
-            ? options.postExitGraceMs !== undefined
+            ? options.postExitGraceMs !== undefined && options.postExitGraceMs !== null
               ? Math.max(0, Number(options.postExitGraceMs))
               : isTestEnvironment(options)
                 ? 0
-                : 2500
+                : options.isFastDirectBypass && !options.wokeSteamByLauncher
+                  ? 0
+                  : options.isBottleSteam
+                    ? 6000
+                    : 4500
             : 0;
 
         if (postExitGraceMs <= 0) {
@@ -1907,9 +2633,11 @@ function createCloudSaveRunnerFactory(facadeDeps) {
             const newlyAppendedSlice =
               newlyAppendedLen > 0 ? graceSnap.text.slice(-newlyAppendedLen) : graceSnap.text;
             const appendedLines = newlyAppendedSlice.split(/\r?\n/);
-            const completedDuringGrace = appendedLines.some(
-              (ln) => appIdLineRegex.test(ln) && exitUploadCompletionRegex.test(ln)
-            );
+            const completedDuringGrace =
+              graceState.exitUploadCompleted ||
+              appendedLines.some(
+                (ln) => appIdLineRegex.test(ln) && exitUploadCompletionRegex.test(ln)
+              );
             if (completedDuringGrace) {
               return {
                 completed: true,
@@ -2060,4 +2788,7 @@ function createCloudSaveRunnerFactory(facadeDeps) {
 
 module.exports = {
   createCloudSaveRunnerFactory,
+  computeWinePrefixBottleScope,
+  parseEpicCloudPatternList,
+  createEpicCloudFileFilter,
 };

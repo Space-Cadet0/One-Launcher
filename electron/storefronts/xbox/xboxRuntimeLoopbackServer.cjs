@@ -11,6 +11,7 @@ const {
   loadWgsSyncSidecar,
   saveWgsSyncSidecar,
   syncXboxTitleStorage,
+  acquireXboxTitleStorageSessionLock,
   releaseXboxTitleStorageSessionLock,
 } = require('./xboxTitleStorageSync.cjs');
 const {
@@ -77,10 +78,43 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
     wgsRootDir = null, // Optional alias for `.../SystemAppData/wgs`
     bottleUsersDir = null, // Optional host path `<Bottle>/drive_c/users/<wineuser>/AppData/Local`
     enableCloudSaveSync = Boolean(authProvider?.getTokenAndSignatureForUrl),
+    initialPreLaunchSync = null,
     titleStorageOrigin,
     fetchImpl,
     onTelemetry,
   } = options;
+
+  const INITIAL_PRE_LAUNCH_SYNC_TTL_MS = 30_000;
+
+  /**
+   * Returns true if `initialPreLaunchSync` already completed a fresh pre-launch pull for
+   * `targetScid` (matching `resolvedScid` or `scid`) within the last `30_000 ms`.
+   *
+   * @param {string} targetScid
+   * @returns {boolean}
+   */
+  function matchesInitialPreLaunchSync(targetScid) {
+    if (!initialPreLaunchSync || typeof initialPreLaunchSync !== 'object') return false;
+    if (initialPreLaunchSync.synced !== true) return false;
+    const syncedAtMs = Number(
+      initialPreLaunchSync.syncedAtMs ??
+        initialPreLaunchSync.timestampMs ??
+        initialPreLaunchSync.atMs ??
+        0
+    );
+    if (!Number.isFinite(syncedAtMs) || syncedAtMs <= 0) return false;
+    const ageMs = Date.now() - syncedAtMs;
+    if (ageMs < -5_000 || ageMs > INITIAL_PRE_LAUNCH_SYNC_TTL_MS) return false;
+
+    const reqLower = String(targetScid || '').trim().toLowerCase();
+    if (!reqLower) return false;
+    const preResolved = String(initialPreLaunchSync.resolvedScid || '').trim().toLowerCase();
+    const preScid = String(initialPreLaunchSync.scid || '').trim().toLowerCase();
+    return (
+      (Boolean(preResolved) && preResolved === reqLower) ||
+      (Boolean(preScid) && preScid === reqLower)
+    );
+  }
 
   const maxConcurrentSockets = Math.max(
     1,
@@ -545,6 +579,71 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
             let initPromise = inFlightSaveInits.get(syncKey);
             if (!initPromise) {
               const executeInit = async () => {
+                if (matchesInitialPreLaunchSync(scid)) {
+                  const effectiveLockScid = validateSafeScid(
+                    initialPreLaunchSync?.resolvedScid || scid
+                  );
+                  const seedQuota =
+                    Number(initialPreLaunchSync?.quotaBytes) > 0
+                      ? Number(initialPreLaunchSync.quotaBytes)
+                      : 256 * 1024 * 1024;
+                  const seedRemaining = Number.isFinite(initialPreLaunchSync?.remainingQuotaBytes)
+                    ? Number(initialPreLaunchSync.remainingQuotaBytes)
+                    : seedQuota;
+
+                  const lockRes = await acquireXboxTitleStorageSessionLock({
+                    xuid,
+                    scid: effectiveLockScid,
+                    fallbackScid: state.fallbackScid || state.scid,
+                    packageFamilyName: pfn,
+                    msaAppId: state.msaAppId,
+                    titleId: state.titleId,
+                    authProvider,
+                    titleStorageOrigin,
+                    fetchImpl,
+                    quotaBytes: seedQuota,
+                  });
+                  const resolvedQuota =
+                    Number(lockRes?.quotaBytes) > 0 ? Number(lockRes.quotaBytes) : seedQuota;
+                  const resolvedRemaining = Math.min(resolvedQuota, Math.max(0, seedRemaining));
+                  const resolvedScid = validateSafeScid(
+                    lockRes?.resolvedScid || effectiveLockScid
+                  );
+                  setBoundedMapEntry(
+                    state.saveQuotas,
+                    syncKey,
+                    resolvedQuota,
+                    MAX_BOUNDED_STATE_ENTRIES
+                  );
+                  setBoundedMapEntry(
+                    state.remainingSaveQuotas,
+                    syncKey,
+                    resolvedRemaining,
+                    MAX_BOUNDED_STATE_ENTRIES
+                  );
+                  addBoundedSetEntry(state.initializedSaves, syncKey, MAX_BOUNDED_STATE_ENTRIES);
+                  if (lockRes?.locked) {
+                    setBoundedMapEntry(
+                      state.heldCloudLocks,
+                      syncKey,
+                      {
+                        xuid,
+                        scid,
+                        resolvedScid,
+                        pfn,
+                        lockHeld: true,
+                        hadWrites: false,
+                      },
+                      MAX_BOUNDED_STATE_ENTRIES
+                    );
+                  }
+                  return {
+                    quotaBytes: resolvedQuota,
+                    remainingQuotaBytes: resolvedRemaining,
+                    synced: true,
+                  };
+                }
+
                 const res = await syncXboxTitleStorage({
                   mode: 'pre_launch',
                   wgsUserDir,
@@ -586,6 +685,7 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
                     syncKey,
                     {
                       xuid,
+                      scid,
                       resolvedScid,
                       pfn,
                       lockHeld: true,
@@ -725,6 +825,7 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
                     syncKey,
                     {
                       xuid,
+                      scid,
                       resolvedScid: validateSafeScid(
                         syncRes?.resolvedScid || priorLock?.resolvedScid || scid
                       ),
@@ -905,6 +1006,38 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
     },
     getActiveScids() {
       return Array.from(activeScids);
+    },
+    /**
+     * Atomically pops the matching held Title Storage session lock for `scid`
+     * (case-insensitive against `scid` or `resolvedScid`) so post-exit sync can
+     * reuse it and issue a single authoritative `DELETE /lock?newSavesUploaded=<hadWrites>`.
+     *
+     * @param {string} [scid]
+     */
+    consumeHeldLock(scid) {
+      const needle = String(scid || '').trim().toLowerCase();
+      if (!needle) return null;
+      for (const [key, entry] of state.heldCloudLocks.entries()) {
+        const entryScid = String(entry?.scid || '').trim().toLowerCase();
+        const entryResolvedScid = String(entry?.resolvedScid || '').trim().toLowerCase();
+        const keyScid = String(key || '').includes(':')
+          ? String(key)
+              .slice(String(key).indexOf(':') + 1)
+              .trim()
+              .toLowerCase()
+          : '';
+        if (entryScid === needle || entryResolvedScid === needle || keyScid === needle) {
+          state.heldCloudLocks.delete(key);
+          return {
+            lockHeld: Boolean(entry?.lockHeld),
+            hadWrites: Boolean(entry?.hadWrites),
+            xuid: String(entry?.xuid || ''),
+            resolvedScid: String(entry?.resolvedScid || entry?.scid || scid || ''),
+            pfn: String(entry?.pfn || ''),
+          };
+        }
+      }
+      return null;
     },
     async flushPendingSaves() {
       await state.pendingSaveChain.catch(() => {});

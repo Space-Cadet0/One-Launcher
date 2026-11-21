@@ -23,6 +23,25 @@ const {
   writeLocalWgsWorkspace,
 } = require('./wgsLocalWorkspace.cjs');
 
+const RESERVED_NON_XGS_TOP_DIRS = new Set(['playfabgamesaves']);
+
+/**
+ * Returns true if a container name's leading path segment is a reserved non-XGS top-level
+ * directory (such as `PlayFabGameSaves`, managed independently by the PlayFab save shim).
+ *
+ * @param {unknown} rawContainerName
+ * @returns {boolean}
+ */
+function isReservedNonXgsContainerName(rawContainerName) {
+  const norm = String(rawContainerName || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '');
+  if (!norm) return false;
+  const firstSeg = norm.split('/')[0].toLowerCase();
+  return RESERVED_NON_XGS_TOP_DIRS.has(firstSeg);
+}
+
 /**
  * Ensures `xgsUserDir` points to `.../SystemAppData/xgs/<HexXuid>_<Scid>` when `wgsUserDir`
  * is user-scoped (`.../SystemAppData/wgs/<HexXuid>_<Scid>`) and a caller mistakenly passed
@@ -48,7 +67,8 @@ function resolveEffectiveXgsUserDir(xgsUserDir, wgsUserDir) {
 
 /**
  * Self-heals `containers.index` workspaces that were previously poisoned by walking `SystemAppData/xgs`
- * instead of `SystemAppData/xgs/<HexXuid>_<Scid>`, producing `<HexXuid>_<Scid>/<containerName>` duplicates.
+ * instead of `SystemAppData/xgs/<HexXuid>_<Scid>`, producing `<HexXuid>_<Scid>/<containerName>` duplicates,
+ * and strips reserved non-XGS top-level trees such as `PlayFabGameSaves`.
  *
  * @param {Map<string, any> | null | undefined} containersMap
  * @param {Set<string> | null} [pendingDeletionsSet]
@@ -60,6 +80,7 @@ function sanitizePoisonedWgsContainersMap(containersMap, pendingDeletionsSet = n
     for (const delName of Array.from(pendingDeletionsSet.values())) {
       if (
         POISONED_USER_SCID_PREFIX_RE.test(String(delName)) ||
+        isReservedNonXgsContainerName(delName) ||
         !isValidTitleStorageContainerName(String(delName))
       ) {
         pendingDeletionsSet.delete(delName);
@@ -70,12 +91,21 @@ function sanitizePoisonedWgsContainersMap(containersMap, pendingDeletionsSet = n
   if (!containersMap || typeof containersMap.entries !== 'function') return mutated;
 
   for (const [cName, container] of Array.from(containersMap.entries())) {
+    if (isReservedNonXgsContainerName(cName)) {
+      containersMap.delete(cName);
+      mutated = true;
+      continue;
+    }
     const poisonedMatch = POISONED_USER_SCID_PREFIX_RE.exec(String(cName));
     if (poisonedMatch) {
       const cleanName = poisonedMatch[2];
       containersMap.delete(cName);
       mutated = true;
-      if (isValidTitleStorageContainerName(cleanName) && !containersMap.has(cleanName)) {
+      if (
+        !isReservedNonXgsContainerName(cleanName) &&
+        isValidTitleStorageContainerName(cleanName) &&
+        !containersMap.has(cleanName)
+      ) {
         containersMap.set(cleanName, {
           ...container,
           name: cleanName,
@@ -108,7 +138,13 @@ async function cleanupStaleRootXgsDuplicates(effectiveXgsUserDir, containerNames
   const topSegments = new Set();
   for (const rawName of containerNamesIterable || []) {
     const clean = String(rawName || '').replace(/\\/g, '/').split('/')[0];
-    if (clean && clean !== '.' && clean !== '..' && !WGS_USER_SCID_DIR_RE.test(clean)) {
+    if (
+      clean &&
+      clean !== '.' &&
+      clean !== '..' &&
+      !WGS_USER_SCID_DIR_RE.test(clean) &&
+      !RESERVED_NON_XGS_TOP_DIRS.has(clean.toLowerCase())
+    ) {
       topSegments.add(clean);
     }
   }
@@ -143,6 +179,7 @@ async function discoverXgsContainersMetadataOnDisk(effectiveXgsUserDir) {
     const dirents = await fs.promises.readdir(curDir, { withFileTypes: true });
     for (const d of dirents) {
       if (d.name.startsWith('.')) continue;
+      if (relParts.length === 0 && RESERVED_NON_XGS_TOP_DIRS.has(d.name.toLowerCase())) continue;
       if (WGS_USER_SCID_DIR_RE.test(d.name)) continue;
       if (d.isSymbolicLink()) continue;
       const full = path.join(curDir, d.name);
@@ -199,11 +236,17 @@ async function exportWgsToXgsFolder(wgsUserDir, xgsUserDir, options = {}) {
     xgsMeta.deletedContainers.length > 0 ||
     existingOnDisk.size > 0;
 
-  const tombstonedSet = new Set([
-    ...(workspace.sidecar.deletedContainers || []),
-    ...(xgsMeta.deletedContainers || []),
-  ]);
-  const knownSet = new Set([...xgsMeta.knownContainers, ...existingOnDisk.keys()]);
+  const tombstonedSet = new Set(
+    [
+      ...(workspace.sidecar.deletedContainers || []),
+      ...(xgsMeta.deletedContainers || []),
+    ].filter((name) => !isReservedNonXgsContainerName(name))
+  );
+  const knownSet = new Set(
+    [...xgsMeta.knownContainers, ...existingOnDisk.keys()].filter(
+      (name) => !isReservedNonXgsContainerName(name)
+    )
+  );
   const cloudPulledSet =
     options.cloudPulledContainerNames instanceof Set
       ? options.cloudPulledContainerNames
@@ -220,6 +263,10 @@ async function exportWgsToXgsFolder(wgsUserDir, xgsUserDir, options = {}) {
   if (remotelyPrunedSet && remotelyPrunedSet.size > 0) {
     for (const prunedName of remotelyPrunedSet) {
       const normalizedPruned = String(prunedName || '').replace(/\\/g, '/');
+      if (isReservedNonXgsContainerName(normalizedPruned)) {
+        knownSet.delete(prunedName);
+        continue;
+      }
       if (isValidTitleStorageContainerName(normalizedPruned)) {
         const safeParts = normalizedPruned
           .split('/')
@@ -248,6 +295,7 @@ async function exportWgsToXgsFolder(wgsUserDir, xgsUserDir, options = {}) {
   let wroteAny = false;
   for (const container of workspace.containers.values()) {
     const rawName = String(container.name || '').replace(/\\/g, '/');
+    if (isReservedNonXgsContainerName(rawName)) continue;
     if (!isValidTitleStorageContainerName(rawName)) continue;
     if (tombstonedSet.has(rawName)) continue;
 
@@ -335,6 +383,20 @@ async function importXgsFolderIntoWgs(xgsUserDir, wgsUserDir, storePkgAumid = ''
   const xgsKnownSet = new Set(xgsMeta.knownContainers || []);
   const xgsDeletedSet = new Set(xgsMeta.deletedContainers || []);
   let anyMutated = sanitizePoisonedWgsContainersMap(workspace.containers, pendingDeletionsSet);
+  let xgsMetaMutated = false;
+
+  for (const k of Array.from(xgsKnownSet)) {
+    if (isReservedNonXgsContainerName(k)) {
+      xgsKnownSet.delete(k);
+      xgsMetaMutated = true;
+    }
+  }
+  for (const k of Array.from(xgsDeletedSet)) {
+    if (isReservedNonXgsContainerName(k)) {
+      xgsDeletedSet.delete(k);
+      xgsMetaMutated = true;
+    }
+  }
 
   const discovered = await discoverXgsContainersMetadataOnDisk(effectiveXgsUserDir);
   const xgsHasHistory =
@@ -347,7 +409,6 @@ async function importXgsFolderIntoWgs(xgsUserDir, wgsUserDir, storePkgAumid = ''
   if (discovered.size === 0 && !workspace.exists && !xgsHasHistory) return false;
 
   const updatedContainers = [];
-  let xgsMetaMutated = false;
 
   // Check existing containers for modifications or save-slot deletions in xgs/
   for (const [cName, existing] of workspace.containers.entries()) {
@@ -467,6 +528,8 @@ async function importXgsFolderIntoWgs(xgsUserDir, wgsUserDir, storePkgAumid = ''
 }
 
 module.exports = {
+  RESERVED_NON_XGS_TOP_DIRS,
+  isReservedNonXgsContainerName,
   resolveEffectiveXgsUserDir,
   sanitizePoisonedWgsContainersMap,
   cleanupStaleRootXgsDuplicates,

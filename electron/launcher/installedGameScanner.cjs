@@ -1291,6 +1291,11 @@ function processGogInfoJson(
       isWindowsBinaryOnMac = true;
     }
 
+    const gogClientId =
+      typeof raw.clientId === 'string' || typeof raw.clientId === 'number'
+        ? String(raw.clientId).trim()
+        : '';
+
     addRecord({
       platformId: 'gog',
       platformGameId: gameId,
@@ -1298,6 +1303,7 @@ function processGogInfoJson(
       installPath,
       executablePath,
       ...(launchArguments ? { launchArguments } : {}),
+      ...(gogClientId ? { clientId: gogClientId, gogClientId } : {}),
       version: raw.version
         ? String(raw.version)
         : raw.buildId

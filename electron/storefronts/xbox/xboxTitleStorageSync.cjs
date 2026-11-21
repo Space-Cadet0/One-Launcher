@@ -83,6 +83,7 @@ async function syncXboxTitleStorage(options = {}) {
     fetchImpl,
     keepLockHeld = false,
     alreadyLocked = false,
+    priorHadWrites = false,
     signal,
   } = options;
   const wgsUserDir = options.wgsUserDir || options.wgsDir;
@@ -587,7 +588,9 @@ async function syncXboxTitleStorage(options = {}) {
     }
 
     if (lockAcquired && !keepLockHeld) {
-      await client.releaseLock(uploadedContainers > 0 || deletedRemoteContainers > 0, signal);
+      const hadWrites =
+        Boolean(priorHadWrites) || uploadedContainers > 0 || deletedRemoteContainers > 0;
+      await client.releaseLock(hadWrites, signal);
       lockAcquired = false;
     }
 
@@ -629,9 +632,117 @@ async function syncXboxTitleStorage(options = {}) {
     };
   } catch (err) {
     if (lockAcquired && !keepLockHeld) {
-      await client.releaseLock(uploadedContainers > 0, signal);
+      const hadWrites =
+        Boolean(priorHadWrites) || uploadedContainers > 0 || deletedRemoteContainers > 0;
+      await client.releaseLock(hadWrites, signal);
     }
     throw err;
+  }
+}
+
+/**
+ * Acquires ONLY the lightweight Xbox Title Storage session lock (`PUT /lock`) without listing
+ * or re-downloading containers (used when pre-launch sync already completed moments earlier).
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ locked: boolean, quotaBytes: number, resolvedScid: string, readOnlyFallback?: boolean, ownerChangeId?: string }>}
+ */
+async function acquireXboxTitleStorageSessionLock(options = {}) {
+  const {
+    xuid,
+    scid,
+    fallbackScid = '',
+    msaAppId = '',
+    titleId = '',
+    authProvider,
+    authorizationHeader,
+    fetchImpl,
+    signal,
+  } = options;
+  const packageFamilyName = options.packageFamilyName || options.pfn || '';
+  const titleStorageOrigin =
+    options.titleStorageOrigin || options.baseUrl || options.origin;
+  const defaultQuota =
+    Number(options.quotaBytes) > 0 ? Number(options.quotaBytes) : 256 * 1024 * 1024;
+  const normalizedScid = String(scid || '').trim().toLowerCase();
+
+  if (!xuid || !normalizedScid) {
+    return {
+      locked: false,
+      quotaBytes: defaultQuota,
+      resolvedScid: normalizedScid,
+    };
+  }
+
+  /** @param {string} targetScid */
+  const tryAcquire = async (targetScid) => {
+    const client = createTitleStorageClient({
+      xuid,
+      scid: targetScid,
+      packageFamilyName,
+      msaAppId,
+      titleId,
+      titleStorageOrigin,
+      allowLoopbackOrigin: options.allowLoopbackOrigin,
+      authProvider,
+      authorizationHeader,
+      fetchImpl,
+    });
+    const lockInfo = await client.acquireLock(signal);
+    return {
+      locked: Boolean(lockInfo.locked),
+      quotaBytes: Number(lockInfo.quotaBytes) > 0 ? Number(lockInfo.quotaBytes) : defaultQuota,
+      resolvedScid: targetScid,
+      ownerChangeId: lockInfo.ownerChangeId || '',
+    };
+  };
+
+  try {
+    return await tryAcquire(normalizedScid);
+  } catch (/** @type {any} */ lockErr) {
+    const explicitFallback = String(fallbackScid || '').trim().toLowerCase();
+    const derivedFromTitleId = titleId ? deriveDefaultScidFromTitleId(titleId).toLowerCase() : '';
+    const candidateFallback =
+      VALID_SCID_UUID_RE.test(explicitFallback) && explicitFallback !== normalizedScid
+        ? explicitFallback
+        : VALID_SCID_UUID_RE.test(derivedFromTitleId) && derivedFromTitleId !== normalizedScid
+          ? derivedFromTitleId
+          : '';
+
+    if (
+      candidateFallback &&
+      (lockErr?.status === 404 ||
+        (lockErr?.status === 403 && Number(lockErr?.xblCode) !== 2016))
+    ) {
+      try {
+        return await tryAcquire(candidateFallback);
+      } catch (/** @type {any} */ fbErr) {
+        if (
+          fbErr?.status === 403 &&
+          (fbErr?.xblCode === undefined || Number(fbErr?.xblCode) === 2016)
+        ) {
+          return {
+            locked: false,
+            readOnlyFallback: true,
+            quotaBytes: defaultQuota,
+            resolvedScid: candidateFallback,
+          };
+        }
+        throw fbErr;
+      }
+    }
+    if (
+      lockErr?.status === 403 &&
+      (lockErr?.xblCode === undefined || Number(lockErr?.xblCode) === 2016)
+    ) {
+      return {
+        locked: false,
+        readOnlyFallback: true,
+        quotaBytes: defaultQuota,
+        resolvedScid: normalizedScid,
+      };
+    }
+    throw lockErr;
   }
 }
 
@@ -677,5 +788,6 @@ module.exports = {
   importXgsFolderIntoWgs,
   createTitleStorageClient,
   syncXboxTitleStorage,
+  acquireXboxTitleStorageSessionLock,
   releaseXboxTitleStorageSessionLock,
 };

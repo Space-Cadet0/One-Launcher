@@ -114,7 +114,15 @@ function resolveGogCloudSaveLocations(locations, context = {}) {
 
   /** @type {Record<string, string>} */
   let placeholderMap;
-  if (useCompatLayer && context.winePrefix) {
+  if (useCompatLayer) {
+    if (!context.winePrefix || !String(context.winePrefix).trim()) {
+      diagLog.warn(
+        'cloudSave.gogMissingWinePrefixBlocked',
+        'Blocked GOG cloud save path resolution under compatibility layer without winePrefix',
+        { platform: targetPlatform, locationCount: locations.length }
+      );
+      return [];
+    }
     const shell = readWinePrefixShellFolders(context.winePrefix);
     placeholderMap = {
       INSTALL: installPath,
@@ -316,15 +324,25 @@ function resolveEpicSavePathTemplate(template, context = {}) {
   let userSavedGames;
   let userLibrary;
 
-  if (useCompatLayer && context.winePrefix) {
-    const shell = readWinePrefixShellFolders(context.winePrefix);
-    userDir = shell.documents;
-    userProfile = shell.userProfile;
-    appData = shell.appDataLocal;
-    appDataLocalLow = shell.appDataLocalLow;
-    appDataRoaming = shell.appDataRoaming;
-    userSavedGames = shell.savedGames;
-    userLibrary = shell.appDataLocal;
+  if (useCompatLayer) {
+    if (!context.winePrefix || !String(context.winePrefix).trim()) {
+      userDir = '';
+      userProfile = '';
+      appData = '';
+      appDataLocalLow = '';
+      appDataRoaming = '';
+      userSavedGames = '';
+      userLibrary = '';
+    } else {
+      const shell = readWinePrefixShellFolders(context.winePrefix);
+      userDir = shell.documents;
+      userProfile = shell.userProfile;
+      appData = shell.appDataLocal;
+      appDataLocalLow = shell.appDataLocalLow;
+      appDataRoaming = shell.appDataRoaming;
+      userSavedGames = shell.savedGames;
+      userLibrary = shell.appDataLocal;
+    }
   } else if (targetPlatform === 'win32') {
     const winKnown = resolveHostWindowsKnownFolders({
       homedir,
@@ -775,6 +793,19 @@ function applyPruneCloudSaveTimestampsData(data, platformId, cleanId) {
     for (const key of Object.keys(data.gog)) {
       if (key === cleanId || key.startsWith(prefix)) {
         delete data.gog[key];
+        modified = true;
+      }
+    }
+  }
+  if (
+    (!platformId || platformId === 'gog') &&
+    data.gogLegacyMigrated &&
+    typeof data.gogLegacyMigrated === 'object'
+  ) {
+    const prefix = `${cleanId}:`;
+    for (const key of Object.keys(data.gogLegacyMigrated)) {
+      if (key === cleanId || key.startsWith(prefix)) {
+        delete data.gogLegacyMigrated[key];
         modified = true;
       }
     }

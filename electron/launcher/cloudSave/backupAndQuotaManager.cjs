@@ -795,7 +795,7 @@ function createBackupAndQuotaManager(deps) {
       };
     }
 
-    const prefixMatch = /^(gog|epic|xbox|steam)[-_]/i.exec(rawInputId);
+    const prefixMatch = /^(gog|epic|xbox|steam)[-_:]/i.exec(rawInputId);
     const explicitPlatform = String(
       options?.platformId || payloadObj.platformId || (prefixMatch ? prefixMatch[1] : '')
     )
@@ -812,16 +812,58 @@ function createBackupAndQuotaManager(deps) {
       };
     }
 
-    const strippedId = rawInputId.replace(/^(gog|epic|xbox|steam)[-_]/i, '').trim();
+    const rawGameId = String(payloadObj.gameId || '').trim();
+    const strippedId = rawInputId.replace(/^(gog|epic|xbox|steam)[-_:]/i, '').trim();
+    const strippedGameId = rawGameId.replace(/^(gog|epic|xbox|steam)[-_:]/i, '').trim();
+    const normalizedPlatPrefixes = explicitPlatform ? [explicitPlatform] : ['xbox'];
+
+    /** @type {string[]} */
+    const rawCandidateDirNames = [
+      rawInputId,
+      strippedId,
+      rawInputId.replace(/[^A-Za-z0-9._-]/g, '_'),
+      strippedId.replace(/[^A-Za-z0-9._-]/g, '_'),
+      strippedId.replace(/[^a-zA-Z0-9_-]/g, '_'),
+    ];
+    if (rawGameId && rawGameId !== rawInputId) {
+      rawCandidateDirNames.push(
+        rawGameId,
+        rawGameId.replace(/[^A-Za-z0-9._-]/g, '_'),
+        rawGameId.replace(/[^a-zA-Z0-9_-]/g, '_')
+      );
+    }
+    if (strippedGameId && strippedGameId !== strippedId) {
+      rawCandidateDirNames.push(
+        strippedGameId,
+        strippedGameId.replace(/[^A-Za-z0-9._-]/g, '_'),
+        strippedGameId.replace(/[^a-zA-Z0-9_-]/g, '_')
+      );
+    }
+    for (const plat of normalizedPlatPrefixes) {
+      if (strippedId) {
+        const dashVariant = `${plat}-${strippedId}`;
+        const underVariant = `${plat}_${strippedId}`;
+        rawCandidateDirNames.push(
+          dashVariant,
+          underVariant,
+          dashVariant.replace(/[^A-Za-z0-9._-]/g, '_'),
+          underVariant.replace(/[^A-Za-z0-9._-]/g, '_')
+        );
+      }
+      if (strippedGameId && strippedGameId !== strippedId) {
+        const dashVariant = `${plat}-${strippedGameId}`;
+        const underVariant = `${plat}_${strippedGameId}`;
+        rawCandidateDirNames.push(
+          dashVariant,
+          underVariant,
+          dashVariant.replace(/[^A-Za-z0-9._-]/g, '_'),
+          underVariant.replace(/[^A-Za-z0-9._-]/g, '_')
+        );
+      }
+    }
 
     const candidateDirNames = new Set(
-      [
-        rawInputId,
-        strippedId,
-        rawInputId.replace(/[^A-Za-z0-9._-]/g, '_'),
-        strippedId.replace(/[^A-Za-z0-9._-]/g, '_'),
-        strippedId.replace(/[^a-zA-Z0-9_-]/g, '_'),
-      ]
+      rawCandidateDirNames
         .map((s) => s.trim().toLowerCase())
         .filter(
           (s) =>
@@ -987,6 +1029,9 @@ function createBackupAndQuotaManager(deps) {
 
       const copyRes = copyRealDirBoundedSync(sourceDir, snapshotDir, effectiveMaxBytes, {
         requireNonEmpty: true,
+        ...(typeof quotaOptions?.fileFilter === 'function'
+          ? { fileFilter: quotaOptions.fileFilter }
+          : {}),
       });
       if (!copyRes.copied) {
         const reason =
@@ -1132,6 +1177,9 @@ function createBackupAndQuotaManager(deps) {
 
       const copyRes = await copyRealDirBoundedAsync(sourceDir, snapshotDir, effectiveMaxBytes, {
         requireNonEmpty: true,
+        ...(typeof quotaOptions?.fileFilter === 'function'
+          ? { fileFilter: quotaOptions.fileFilter }
+          : {}),
       });
       if (!copyRes.copied) {
         const reason =
