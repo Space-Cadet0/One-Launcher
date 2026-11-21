@@ -9,6 +9,7 @@ import {
 } from '../common/titleUtils';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
+import { buildDevProxyUrlForRoute } from '../network/browserDevProxy';
 import { vaultGet, vaultSet } from '../storage/indexedDbVault';
 
 export interface HltbData {
@@ -53,8 +54,11 @@ interface CachedHltbRecord extends HltbData {
 
 const memoryCache = new Map<string, CachedHltbRecord>();
 const inFlightHltbRequests = new Map<string, Promise<HltbData | null>>();
+const purgedCorruptedKeys = new Set<string>();
 let cacheHydrated = false;
-let vaultHydrationStarted = false;
+let vaultHydrationPromise: Promise<void> | null = null;
+let vaultHydrationComplete = false;
+let pendingVaultFlushQueued = false;
 let persistDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let hltbCacheDirty = false;
 let hltbFlushListenersAttached = false;
@@ -75,6 +79,9 @@ function setLruEntry(key: string, value: CachedHltbRecord): void {
   const isPositive = value.isAccurate !== false && !value.unmatched;
   const isValidNegative = isUnexpiredNegativeHltbEntry(value);
   if (!isPositive && !isValidNegative) return;
+  if (isPositive) {
+    purgedCorruptedKeys.delete(key);
+  }
   if (memoryCache.has(key)) {
     memoryCache.delete(key);
   }
@@ -86,13 +93,7 @@ function setLruEntry(key: string, value: CachedHltbRecord): void {
   }
 }
 
-function flushConsolidatedHltbCache(): void {
-  if (typeof window === 'undefined') return;
-  if (persistDebounceTimer) {
-    clearTimeout(persistDebounceTimer);
-    persistDebounceTimer = null;
-  }
-  hltbCacheDirty = false;
+function buildConsolidatedHltbPayload(): Record<string, CachedHltbRecord> {
   const payload: Record<string, CachedHltbRecord> = {};
   for (const [k, v] of memoryCache.entries()) {
     if (!v) continue;
@@ -102,7 +103,10 @@ function flushConsolidatedHltbCache(): void {
       payload[k] = v;
     }
   }
-  void vaultSet('hltb_lru_v3', payload);
+  return payload;
+}
+
+function writeLocalStorageHltbPayload(payload: Record<string, CachedHltbRecord>): void {
   try {
     const serialized = JSON.stringify(payload);
     if (typeof localStorage !== 'undefined') {
@@ -111,6 +115,53 @@ function flushConsolidatedHltbCache(): void {
   } catch {
     // QuotaExceededError: memoryCache + vault retain entries
   }
+}
+
+function ensureVaultHydrationStarted(): Promise<void> {
+  if (typeof window === 'undefined') {
+    vaultHydrationComplete = true;
+    return Promise.resolve();
+  }
+  if (vaultHydrationComplete) {
+    return Promise.resolve();
+  }
+  if (!vaultHydrationPromise) {
+    const markComplete = () => {
+      vaultHydrationComplete = true;
+    };
+    vaultHydrationPromise = hydrateHltbCacheFromVault().then(markComplete, markComplete);
+  }
+  return vaultHydrationPromise;
+}
+
+function flushConsolidatedHltbCache(): void {
+  if (typeof window === 'undefined') return;
+  if (persistDebounceTimer) {
+    clearTimeout(persistDebounceTimer);
+    persistDebounceTimer = null;
+  }
+  hltbCacheDirty = false;
+  const payload = buildConsolidatedHltbPayload();
+  writeLocalStorageHltbPayload(payload);
+
+  // Hydration-before-write barrier: never overwrite IndexedDB 'hltb_lru_v3' before initial
+  // vault hydration has resolved and merged, so cold-boot writes never clobber a 5k-entry vault.
+  if (vaultHydrationComplete) {
+    void vaultSet('hltb_lru_v3', payload);
+    return;
+  }
+
+  if (pendingVaultFlushQueued) {
+    return;
+  }
+  pendingVaultFlushQueued = true;
+  const runDeferredVaultFlush = () => {
+    pendingVaultFlushQueued = false;
+    const mergedPayload = buildConsolidatedHltbPayload();
+    void vaultSet('hltb_lru_v3', mergedPayload);
+    writeLocalStorageHltbPayload(mergedPayload);
+  };
+  void ensureVaultHydrationStarted().then(runDeferredVaultFlush, runDeferredVaultFlush);
 }
 
 const HLTB_FLUSH_CLEANUP_SYMBOL = Symbol.for('one_launcher_hltb_flush_cleanup');
@@ -172,6 +223,22 @@ function isValidHltbEntry(raw: unknown): raw is CachedHltbRecord {
   );
 }
 
+function choosePreferredHltbRecord(
+  vaultRec: CachedHltbRecord,
+  liveRec: CachedHltbRecord
+): CachedHltbRecord {
+  const vaultPositive = vaultRec.isAccurate !== false && !vaultRec.unmatched;
+  const livePositive = liveRec.isAccurate !== false && !liveRec.unmatched;
+
+  // Positive verified data always beats negative unmatched records
+  if (livePositive && !vaultPositive) return liveRec;
+  if (vaultPositive && !livePositive) return vaultRec;
+
+  const liveTs = typeof liveRec.cachedAt === 'number' ? liveRec.cachedAt : 0;
+  const vaultTs = typeof vaultRec.cachedAt === 'number' ? vaultRec.cachedAt : 0;
+  return vaultTs > liveTs ? vaultRec : liveRec;
+}
+
 async function hydrateHltbCacheFromVault(): Promise<void> {
   if (typeof window === 'undefined') return;
   try {
@@ -179,24 +246,48 @@ async function hydrateHltbCacheFromVault(): Promise<void> {
     if (!vaultPayload || typeof vaultPayload !== 'object' || Array.isArray(vaultPayload)) {
       return;
     }
+
+    // Snapshot live in-memory entries (from localStorage or fresh cold-boot fetches)
+    // and overlay them on top of hydrated vault entries so live writes retain LRU recency
+    // and positive-beats-negative / newer-cachedAt precedence is strictly enforced.
+    const liveEntries = Array.from(memoryCache.entries());
+    const merged = new Map<string, CachedHltbRecord>();
+
     for (const [k, v] of Object.entries(vaultPayload)) {
       if (!k || !v || typeof v !== 'object') continue;
-      const existing = memoryCache.get(k);
-      const existingTs = existing?.cachedAt ?? 0;
-      const incomingTs =
-        typeof (v as Partial<CachedHltbRecord>).cachedAt === 'number'
-          ? ((v as Partial<CachedHltbRecord>).cachedAt as number)
-          : 0;
-      if (existing && existing.isAccurate !== false && !existing.unmatched) {
-        if (incomingTs <= existingTs) continue;
-      }
       if (isValidHltbEntry(v)) {
-        setLruEntry(k, { ...v, isAccurate: true });
+        merged.set(k, { ...v, isAccurate: true });
       } else if (isUnexpiredNegativeHltbEntry(v)) {
-        if (!existing || (existing.unmatched && incomingTs > existingTs)) {
-          setLruEntry(k, v);
+        if (
+          purgedCorruptedKeys.has(k) &&
+          (v.queryNormVersion ?? 1) < HLTB_QUERY_NORM_VERSION
+        ) {
+          continue;
         }
+        merged.set(k, v);
       }
+    }
+
+    for (const [k, liveRec] of liveEntries) {
+      const vaultRec = merged.get(k);
+      if (!vaultRec) {
+        merged.set(k, liveRec);
+      } else {
+        const winner = choosePreferredHltbRecord(vaultRec, liveRec);
+        merged.delete(k);
+        merged.set(k, winner);
+      }
+    }
+
+    while (merged.size > MAX_HLTB_CACHE_ENTRIES) {
+      const oldest = merged.keys().next().value;
+      if (oldest === undefined) break;
+      merged.delete(oldest);
+    }
+
+    memoryCache.clear();
+    for (const [k, v] of merged.entries()) {
+      memoryCache.set(k, v);
     }
   } catch {
     // Ignore vault hydration errors
@@ -204,9 +295,8 @@ async function hydrateHltbCacheFromVault(): Promise<void> {
 }
 
 function ensureHltbCacheHydrated(): void {
-  if (typeof window !== 'undefined' && !vaultHydrationStarted) {
-    vaultHydrationStarted = true;
-    void hydrateHltbCacheFromVault();
+  if (typeof window !== 'undefined' && !vaultHydrationPromise && !vaultHydrationComplete) {
+    void ensureVaultHydrationStarted();
   }
   if (cacheHydrated || typeof window === 'undefined' || typeof localStorage === 'undefined') {
     return;
@@ -317,11 +407,13 @@ function purgeCorruptedNegativeCacheEntries(rawTitle?: string, appId?: number): 
     const norm = normalizeTitleForHltb(rawTitle);
     if (norm && memoryCache.get(norm)?.unmatched) {
       memoryCache.delete(norm);
+      purgedCorruptedKeys.add(norm);
       deleted = true;
     }
     const legacyNorm = legacyNormalizeTitleForHltbV1(rawTitle);
     if (legacyNorm && legacyNorm !== norm && memoryCache.get(legacyNorm)?.unmatched) {
       memoryCache.delete(legacyNorm);
+      purgedCorruptedKeys.add(legacyNorm);
       deleted = true;
     }
   }
@@ -329,6 +421,7 @@ function purgeCorruptedNegativeCacheEntries(rawTitle?: string, appId?: number): 
     const appKey = `app_${appId}`;
     if (memoryCache.get(appKey)?.unmatched) {
       memoryCache.delete(appKey);
+      purgedCorruptedKeys.add(appKey);
       deleted = true;
     }
   }
@@ -503,7 +596,7 @@ export function findBestHltbMatch(
   };
 
   let bestCandidate: HltbSearchResultItem | null = null;
-  let bestSimilarity = 0;
+  let bestSimilarity = -1;
   let bestHasPrefixMatch = false;
 
   for (const r of compatibleResults) {
@@ -540,18 +633,23 @@ export function findBestHltbMatch(
       targetBaseTokens.length === candBaseTokens.length &&
       targetBaseTokens.every((t, i) => candBaseTokens[i] === t);
 
-    if (similarity > bestSimilarity || (!bestCandidate && isBasePrefixMatch)) {
+    const qualifies = similarity >= 0.6 || isBasePrefixMatch;
+    if (!qualifies) {
+      continue;
+    }
+
+    if (
+      !bestCandidate ||
+      similarity > bestSimilarity ||
+      (similarity === bestSimilarity && isBasePrefixMatch && !bestHasPrefixMatch)
+    ) {
       bestSimilarity = similarity;
       bestCandidate = r;
       bestHasPrefixMatch = isBasePrefixMatch;
     }
   }
 
-  if (bestCandidate && (bestSimilarity >= 0.6 || bestHasPrefixMatch)) {
-    return bestCandidate;
-  }
-
-  return null;
+  return bestCandidate;
 }
 
 /**
@@ -733,13 +831,8 @@ export async function fetchAndCacheHltb(
         try {
           const termPasses = buildHltbSearchTermPasses(gameTitle);
           if (termPasses.length > 0) {
-            const isLocalhost = window.location.hostname === 'localhost';
-            const initUrl = isLocalhost
-              ? `/api/hltb/api/search/site/init?t=${Date.now()}`
-              : `https://howlongtobeat.com/api/search/site/init?t=${Date.now()}`;
-            const searchUrl = isLocalhost
-              ? '/api/hltb/api/search/site'
-              : 'https://howlongtobeat.com/api/search/site';
+            const initUrl = buildDevProxyUrlForRoute('hltb', `/api/search/site/init?t=${Date.now()}`);
+            const searchUrl = buildDevProxyUrlForRoute('hltb', '/api/search/site');
 
             const initRes = await requestScheduler.schedule(
               initUrl,
@@ -868,6 +961,5 @@ export async function fetchAndCacheHltb(
 }
 
 if (typeof window !== 'undefined') {
-  vaultHydrationStarted = true;
-  void hydrateHltbCacheFromVault();
+  void ensureVaultHydrationStarted();
 }

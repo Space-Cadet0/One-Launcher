@@ -15,9 +15,9 @@ export interface ReviewScoreRoute {
 }
 
 export interface MetadataSourceOption {
-  id: string; // e.g. 'steam-1966900', 'gog-12345', 'epic-...', 'igdb-...'
-  source: 'steam' | 'gog' | 'epic' | 'igdb' | 'original';
-  sourceLabel: string; // e.g. 'Steam Store Metadata', 'GOG.com Metadata', 'Epic Games Store', 'IGDB Metadata'
+  id: string; // e.g. 'steam-1966900', 'gog-12345', 'epic-...', 'xbox-...', 'igdb-...'
+  source: 'steam' | 'gog' | 'epic' | 'xbox' | 'igdb' | 'original';
+  sourceLabel: string; // e.g. 'Steam Store Metadata', 'GOG.com Metadata', 'Epic Games Store', 'Xbox / Microsoft Store', 'IGDB Metadata'
   matchedId: string | number;
   storeUrl?: string;
   steamAppId?: number;
@@ -96,13 +96,13 @@ export interface SearchMatchCandidate {
 
 export interface ScrapedCoverOption {
   url: string;
-  source: 'steam' | 'igdb' | 'gog' | 'epic' | 'original';
+  source: 'steam' | 'igdb' | 'gog' | 'epic' | 'xbox' | 'original';
   label: string;
   dimensions?: string;
 }
 
 export interface ScrapedMetadataBundle {
-  matchedStore: 'steam' | 'gog' | 'epic' | 'igdb';
+  matchedStore: 'steam' | 'gog' | 'epic' | 'xbox' | 'igdb';
   matchedId: string | number;
   title: string;
   sortTitle: string;
@@ -135,7 +135,7 @@ export interface UserGameOverride {
   originalSourcePlatformId?: StorefrontId;
   splitFromMerged?: boolean;
   isHidden?: boolean;
-  matchedStore: 'steam' | 'gog' | 'epic' | 'igdb' | 'custom';
+  matchedStore: 'steam' | 'gog' | 'epic' | 'xbox' | 'igdb' | 'custom';
   matchedId?: string | number;
   title?: string;
   sortTitle?: string;

@@ -1,109 +1,84 @@
 import { CriticScoreData, OpenCriticData, StorefrontReviewAnchor } from '../../contracts/critic';
-import { classifyNetworkError } from '../../contracts/network';
-import type { CanonicalGame, GamePlatformOwnership } from '../../contracts/game';
-import type { StorefrontId } from '../../contracts/platform';
-import type { UserGameOverride, ReviewScoreRoute } from '../../contracts/override';
-import { KNOWN_CRITIC_SCORES, KNOWN_UNRATED_TITLES } from './knownCriticScores';
-import steamEnrichedCache from '../storage/steamEnrichedCache.json';
-import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
+import type { CanonicalGame } from '../../contracts/game';
+import type { ReviewScoreRoute, UserGameOverride } from '../../contracts/override';
+import { extractParentheticalReleaseYear } from '../common/titleUtils';
+import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 import {
-  determineGameMutabilityTier,
-  saveStagedCache,
-  loadStagedCache,
-  evictStagedCache,
+  MutabilityTier,
+  TIER_TTLS,
   clearExpiredStagedCache,
+  determineGameMutabilityTier,
+  evictStagedCache,
   isCacheEntryValid,
   isStagedVaultHydrationComplete,
-  TIER_TTLS,
-  MutabilityTier,
+  loadStagedCache,
+  saveStagedCache,
 } from '../storage/stagedCacheService';
 import {
-  getUserOverrideForGame,
-  loadUserOverrides,
   inferReviewRouteFromOverride,
   patchUserOverrideReviewScore,
 } from '../storage/userOverrideStorage';
 import {
   calculateSyntheticSteamScore,
   calculateTier,
-  getTierColor,
   getReviewSourceAuthorityRank,
   getReviewSourceDisplayMeta,
+  getTierColor,
+  isSequelMismatch,
   normalizeCriticTitleKey,
   stripEditionSuffix,
-  isSequelMismatch,
 } from './criticUtils';
-import {
-  extractParentheticalReleaseYear,
-  normalizeTitleForStoreSearch,
-} from '../common/titleUtils';
-import {
-  metacriticResolver,
-  isTitleCompatible,
-  isAnchorMatch,
-  isAnchorSlugCompatible,
-  sanitizeMetacriticDescription,
-  hasExplicitClassicOrOriginalEditionTag,
-} from './metacriticResolver';
-import { steamReviewResolver } from './steamReviewResolver';
-import { storefrontStarResolver } from './storefrontStarResolver';
-import {
-  storefrontReviewHarvester,
-  extractMetacriticSlugFromUrl,
-} from './storefrontReviewHarvester';
-import { wikidataBridge, normalizeWikidataGogSlug } from './wikidataBridge';
+import { KNOWN_CRITIC_SCORES, KNOWN_UNRATED_TITLES } from './knownCriticScores';
+import { metacriticResolver } from './metacriticResolver';
 import { openCriticResolver } from './openCriticResolver';
-import { Priority } from '../network/requestScheduler';
-import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
+import { steamReviewResolver } from './steamReviewResolver';
+import { storefrontReviewHarvester } from './storefrontReviewHarvester';
+import { storefrontStarResolver } from './storefrontStarResolver';
+import { wikidataBridge } from './wikidataBridge';
+import {
+  collectGameEvictionTargets,
+  purgeAllCriticKeysFromStorage,
+  purgeLegacyCriticKeysFromStorage,
+  purgeNegativeCriticKeysFromStorage,
+} from './core/criticCacheEviction';
+import {
+  type DynamicCascadeOptions,
+  runDynamicCriticCascade,
+} from './core/criticDynamicCascade';
+import {
+  extractValidGameOverrideFromEventDetail,
+  findMatchingUserOverrideWithMemo,
+  resolveRoutedCriticScore,
+} from './core/criticOverrideBridge';
+import {
+  type CriticMigrationCallbacks,
+  createEmptyMigrationCatalogMaps,
+  finalizeSchemaV16Migration,
+  isLegacyCriticStorageKey,
+  populateCatalogMapsForMigration,
+  runSchemaV16MigrationSync,
+  shouldEvictV8KeyDuringMigration,
+} from './core/criticSchemaMigration';
+import { validateScoreSemanticCompatibilityWithMemo } from './core/criticSemanticValidator';
+import {
+  CRITIC_SCHEMA_V16_KEY,
+  type CompiledReviewOverrideIndex,
+  type CriticEntitlementPlatform,
+  type CriticScoreContext,
+  LAZY_MIGRATION_CHUNK_SIZE,
+  MAX_NON_CRITIC_TTL_MS,
+  MAX_TRANSIENT_FALLBACK_TTL_MS,
+  type MigrationV8Record,
+  NON_GAME_ADDON_OR_BETA_REGEX,
+  NON_OVERRIDE_EVENT_TYPES,
+  PREV_STORAGE_PREFIX,
+  STEAM_ENRICHED_CRITIC_MAP,
+  STORAGE_PREFIX,
+  hasAnyKnownCriticScore,
+  hasAnySteamEnrichedCriticEntry,
+} from './core/criticServiceTypes';
+import { CriticVaultWriteThroughQueue } from './core/criticVaultWriteThrough';
 
-const NON_OVERRIDE_EVENT_TYPES: ReadonlySet<string> = new Set([
-  'confirmed-non-game',
-  'confirmed-non-game-batch',
-  'batch-confirmed-non-game',
-  'unconfirmed-non-game',
-  'hidden',
-  'unhidden',
-]);
-
-function extractValidGameOverrideFromEventDetail(
-  detail: unknown
-): { override: UserGameOverride; oldGame?: CanonicalGame } | null {
-  if (!detail || typeof detail !== 'object') return null;
-  const record = detail as Record<string, unknown>;
-  const hasExplicitOverride = Boolean(record.override && typeof record.override === 'object');
-  if (
-    !hasExplicitOverride &&
-    ('isHidden' in record ||
-      'hiddenGameId' in record ||
-      'unhiddenKey' in record ||
-      (typeof record.type === 'string' && NON_OVERRIDE_EVENT_TYPES.has(record.type)))
-  ) {
-    return null;
-  }
-
-  const candidate = (hasExplicitOverride ? record.override : record) as Partial<UserGameOverride> & {
-    type?: unknown;
-  };
-  if (!candidate || typeof candidate !== 'object') return null;
-  if (typeof candidate.type === 'string' && NON_OVERRIDE_EVENT_TYPES.has(candidate.type)) {
-    return null;
-  }
-
-  const hasValidIdentifier =
-    (typeof candidate.gameId === 'string' && candidate.gameId.trim().length > 0) ||
-    (typeof candidate.title === 'string' && candidate.title.trim().length > 0) ||
-    (typeof candidate.steamAppId === 'number' && candidate.steamAppId > 0) ||
-    (typeof candidate.platformGameId === 'string' && candidate.platformGameId.trim().length > 0);
-  if (!hasValidIdentifier) {
-    return null;
-  }
-
-  const oldGame =
-    record.oldGame && typeof record.oldGame === 'object'
-      ? (record.oldGame as CanonicalGame)
-      : undefined;
-  return { override: candidate as UserGameOverride, oldGame };
-}
 // Re-export master dataset, utilities and exclusions for consumers and tests
 export {
   KNOWN_CRITIC_SCORES,
@@ -118,133 +93,23 @@ export {
   isSequelMismatch,
   storefrontStarResolver,
 };
-
-interface EnrichedSteamCriticCacheEntry {
-  name?: string;
-  releaseDate?: string;
-  release_date?: string;
-  genres?: string[];
-  enrichedSource?: string;
-  metadataQuality?: string;
-  metacritic?: {
-    score?: number;
-    url?: string;
-  };
-  reviewSummary?: {
-    positivePercent?: number;
-    totalReviews?: number;
-  };
-}
-
-const STEAM_ENRICHED_CRITIC_MAP: Record<string, EnrichedSteamCriticCacheEntry> = steamEnrichedCache;
-
-function isUrlHostMatching(rawUrl: string | undefined, expectedDomain: string): boolean {
-  if (!rawUrl || typeof rawUrl !== 'string') return false;
-  try {
-    const host = new URL(rawUrl).hostname.toLowerCase();
-    const target = expectedDomain.toLowerCase();
-    return host === target || host.endsWith(`.${target}`);
-  } catch {
-    return false;
-  }
-}
-
-const STEAM_APP_ID_TO_TITLE = new Map<number, string>();
-for (const [idStr, info] of Object.entries(STEAM_ENRICHED_CRITIC_MAP)) {
-  if (info?.name) {
-    STEAM_APP_ID_TO_TITLE.set(Number(idStr), String(info.name));
-  }
-}
-for (const g of FULL_USER_STEAM_GAMES) {
-  if (g.steamAppId && g.title && !STEAM_APP_ID_TO_TITLE.has(g.steamAppId)) {
-    STEAM_APP_ID_TO_TITLE.set(g.steamAppId, g.title);
-  }
-}
-
-const NON_GAME_ADDON_OR_BETA_REGEX =
-  /\b(public testing|tech beta|playtest|test branch|alpha version|beta version|closed beta|open beta|official walkthrough|walkthrough|digital goodies|digital comics|pre-game editor|resource archiver|playable teaser|bonus content)\b|\bcontent$/i;
+export type { CriticEntitlementPlatform, CriticScoreContext };
 
 /**
  * Unified Critic Score Service with Cascading Live Multi-Tier Resolution:
- * 1. Instant Cache & Master Dataset (0ms).
+ * 1. Instant Memory Cache & Master Dataset (0ms, zero sync `localStorage` on warm hits).
  * 2. Tier 1: Metacritic Live Critic Metascore (verified press consensus, >= 4 reviews).
- * 3. Tier 2: OpenCritic Live API (verified press consensus, >= 4 reviews).
+ * 3. Tier 2: OpenCritic Live SSR (verified press consensus, >= 4 reviews).
  * 4. Tier 3: Metacritic Live User Score (authentic player sentiment, >= 4 user reviews).
  * 5. Tier 4: Steam Live Community Reviews (authentic player sentiment, >= 10 reviews).
- * 6. Tier 5: Storefront Star Rating (GOG/Epic 5-star rating converted to 0-100, >= 4 reviews).
+ * 6. Tier 5: Storefront Star Rating (GOG/Epic/Xbox 5-star rating converted to 0-100, >= 4 reviews).
  * 7. Tier 6: Null / Truly Unrated (betas, dev tools, internal playtests).
  */
-const STORAGE_PREFIX = 'antigravity_critic_v8_';
-const PREV_STORAGE_PREFIX = 'antigravity_critic_v7_';
-const LEGACY_STORAGE_PREFIX = 'antigravity_critic_score_';
-
-export interface CriticEntitlementPlatform {
-  platformId: string;
-  platformGameId?: string;
-  xboxProductId?: string;
-  storefrontAppId?: string;
-}
-
-export interface CriticScoreContext {
-  gameId?: string;
-  platforms?: CriticEntitlementPlatform[];
-}
-
-function parseOverrideUpdatedAt(ov?: UserGameOverride): number {
-  if (!ov || typeof ov.updatedAt !== 'string') return 0;
-  const parsed = Date.parse(ov.updatedAt);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-interface CompiledReviewOverrideIndex {
-  hasAnyReviewOverride: boolean;
-  byKey: Map<string, UserGameOverride>;
-  byGameId: Map<string, UserGameOverride[]>;
-  bySteamId: Map<number, UserGameOverride[]>;
-  byLowerTitle: Map<string, UserGameOverride[]>;
-  byNormTitle: Map<string, UserGameOverride[]>;
-}
-
-const CRITIC_SCHEMA_V16_KEY = 'antigravity_critic_schema_v16';
-const LAZY_MIGRATION_CHUNK_SIZE = 100;
-const MAX_NON_CRITIC_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
-const MAX_TRANSIENT_FALLBACK_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
-const SELF_HEAL_FALLBACK_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-const VAULT_WRITE_THROUGH_DEBOUNCE_MS = 250;
-
-const NON_CRITIC_FALLBACK_SOURCES: ReadonlySet<CriticScoreData['source']> = new Set([
-  'metacritic_user',
-  'steam',
-  'gog',
-  'epic',
-  'xbox',
-]);
-
-interface MigrationV8Record {
-  key: string;
-  rawKey: string;
-  appId?: number;
-  effectiveTitle: string;
-  normGroup: string;
-  data: CriticScoreData | null;
-  tier: MutabilityTier;
-  cachedAt: number;
-  ttlMs: number;
-  rank: number;
-  isOverride: boolean;
-}
-
-interface PendingVaultCriticWrite {
-  gameId: string;
-  steamAppId?: number | null;
-  canonicalTitle?: string;
-  criticScore: CriticScoreData;
-}
-
 export class CriticScoreService {
   public static readonly MAX_IN_MEMORY_CACHE_SIZE = 4096;
   public static readonly EVICT_TARGET_CACHE_SIZE = 3500;
   private inMemoryCache = new Map<string, CriticScoreData | null>();
+  private tier0OverrideKeys = new Set<string>();
   private semanticValidationMemo = new WeakMap<CriticScoreData, Map<string, boolean>>();
   private compiledOverrideIndexMemo = new WeakMap<object, CompiledReviewOverrideIndex>();
   private inFlightResolutions = new Map<string, Promise<CriticScoreData | null>>();
@@ -253,14 +118,15 @@ export class CriticScoreService {
   private stubPinnedKeys = new Set<string>();
   private transientFailureCounts = new Map<string, number>();
   private pendingStorageTasks = new Map<string, () => void>();
-  private pendingVaultCriticWrites = new Map<string, PendingVaultCriticWrite>();
-  private vaultWriteThroughTimer: ReturnType<typeof setTimeout> | null = null;
+  private vaultWriteThrough = new CriticVaultWriteThroughQueue();
   private storageFlushScheduled = false;
   private isPassiveRenderTrigger = false;
   private lazyMigrationTimer: ReturnType<typeof setTimeout> | null = null;
   private listenersInitialized = false;
   private listenerCleanups: Array<() => void> = [];
   private storageHydrated = false;
+  private cacheEpoch = 0;
+  private keyEpochs = new Map<string, number>();
 
   private setInMemoryCache(key: string, value: CriticScoreData | null): void {
     if (this.inMemoryCache.has(key)) {
@@ -272,8 +138,20 @@ export class CriticScoreService {
         const oldestKey = this.inMemoryCache.keys().next().value;
         if (oldestKey === undefined) break;
         this.inMemoryCache.delete(oldestKey);
+        this.tier0OverrideKeys.delete(oldestKey);
       }
     }
+  }
+
+  private isEpochCurrent(
+    capturedEpoch: number,
+    key: string,
+    capturedKeyEpoch: number
+  ): boolean {
+    return (
+      capturedEpoch === this.cacheEpoch &&
+      (this.keyEpochs.get(key) ?? 0) === capturedKeyEpoch
+    );
   }
 
   private scheduleDeferredStorageTask(dedupKey: string, task: () => void): void {
@@ -315,78 +193,26 @@ export class CriticScoreService {
     }
   }
 
-  private clearPendingVaultWrites(): void {
-    if (this.vaultWriteThroughTimer !== null) {
-      clearTimeout(this.vaultWriteThroughTimer);
-      this.vaultWriteThroughTimer = null;
-    }
-    this.pendingVaultCriticWrites.clear();
-  }
-
-  private scheduleVaultCriticWriteThrough(
-    gameId: string,
-    criticScore: CriticScoreData,
-    steamAppId?: number | null,
-    canonicalTitle?: string
-  ): void {
-    if (!gameId || !criticScore || typeof criticScore.score !== 'number' || criticScore.score <= 0) {
-      return;
-    }
-    if (
-      typeof window === 'undefined' ||
-      typeof window.electronAPI?.offlineVault?.saveGameDetail !== 'function'
-    ) {
-      return;
-    }
-
-    const existing = this.pendingVaultCriticWrites.get(gameId);
-    if (existing) {
-      const existingRank = getReviewSourceAuthorityRank(existing.criticScore);
-      const incomingRank = getReviewSourceAuthorityRank(criticScore);
-      if (incomingRank < existingRank) {
-        return;
-      }
-    }
-
-    this.pendingVaultCriticWrites.set(gameId, {
-      gameId,
-      steamAppId: typeof steamAppId === 'number' && steamAppId > 0 ? steamAppId : null,
-      canonicalTitle: canonicalTitle?.trim() || undefined,
-      criticScore,
-    });
-
-    if (this.vaultWriteThroughTimer !== null) {
-      return;
-    }
-
-    const handle = setTimeout(() => {
-      this.vaultWriteThroughTimer = null;
-      if (
-        typeof window === 'undefined' ||
-        typeof window.electronAPI?.offlineVault?.saveGameDetail !== 'function'
-      ) {
-        this.pendingVaultCriticWrites.clear();
-        return;
-      }
-      const batch = Array.from(this.pendingVaultCriticWrites.values());
-      this.pendingVaultCriticWrites.clear();
-      for (const item of batch) {
-        try {
-          void window.electronAPI.offlineVault
-            .saveGameDetail({
-              gameId: item.gameId,
-              steamAppId: item.steamAppId ?? null,
-              canonicalTitle: item.canonicalTitle,
-              criticScore: { ...item.criticScore } as unknown as Record<string, unknown>,
-            })
-            ?.catch?.(() => {});
-        } catch {}
-      }
-    }, VAULT_WRITE_THROUGH_DEBOUNCE_MS);
-    if (handle && typeof (handle as { unref?: () => void }).unref === 'function') {
-      (handle as { unref: () => void }).unref();
-    }
-    this.vaultWriteThroughTimer = handle;
+  private buildMigrationCallbacks(): CriticMigrationCallbacks {
+    return {
+      validateSemantic: (title, scoreData, steamAppId) =>
+        this.validateScoreSemanticCompatibility(title, scoreData, steamAppId),
+      findMatchingOverride: (steamAppId, title) =>
+        this.findMatchingUserOverride(steamAppId, title),
+      onEvictRawKey: (rawKey) => {
+        this.keyEpochs.set(rawKey, (this.keyEpochs.get(rawKey) ?? 0) + 1);
+        this.inMemoryCache.delete(rawKey);
+        this.tier0OverrideKeys.delete(rawKey);
+        this.attemptedDynamicResolutions.delete(rawKey);
+      },
+      onPromoteRawKey: (rawKey, data, gameId, steamAppId, effectiveTitle) => {
+        this.setInMemoryCache(rawKey, data);
+        this.attemptedDynamicResolutions.delete(rawKey);
+        if (gameId) {
+          this.vaultWriteThrough.schedule(gameId, data, steamAppId, effectiveTitle);
+        }
+      },
+    };
   }
 
   constructor() {
@@ -398,8 +224,6 @@ export class CriticScoreService {
     this.storageHydrated = true;
     if (typeof localStorage === 'undefined') return;
     try {
-      // M2: Fast O(1) short-circuit once v16 schema migration has completed —
-      // zero synchronous full-storage scans and zero 12 MB catalog JSON.parse on startup.
       if (localStorage.getItem(CRITIC_SCHEMA_V16_KEY) === '1') {
         return;
       }
@@ -431,40 +255,24 @@ export class CriticScoreService {
           localStorage.setItem(CRITIC_SCHEMA_V16_KEY, '1');
           return;
         }
-        const allKeys: string[] = [];
-        for (let i = 0; i < totalKeys; i++) {
-          const k = localStorage.key(i);
-          if (k) allKeys.push(k);
-        }
         const legacyKeys: string[] = [];
         const v8Keys: string[] = [];
-        for (const key of allKeys) {
-          if (
-            key.startsWith(LEGACY_STORAGE_PREFIX) ||
-            key.startsWith(PREV_STORAGE_PREFIX) ||
-            key.startsWith('antigravity_critic_v6_') ||
-            key.startsWith('antigravity_critic_v5_')
-          ) {
+        for (let i = 0; i < totalKeys; i++) {
+          const key = localStorage.key(i);
+          if (!key) continue;
+          if (isLegacyCriticStorageKey(key)) {
             legacyKeys.push(key);
           } else if (key.startsWith(STORAGE_PREFIX)) {
             v8Keys.push(key);
           }
         }
 
-        // Only parse the catalog if v8 critic entries actually exist to validate / self-heal
-        const catalogTitleByAppId = new Map<number, string>();
-        const catalogAppIdByTitle = new Map<string, number>();
-        const catalogGameIdByAppId = new Map<number, string>();
-        const catalogGameIdByNormTitle = new Map<string, string>();
+        const maps = createEmptyMigrationCatalogMaps();
         if (v8Keys.length > 0) {
-          this.populateCatalogMapsForMigration(
-            catalogTitleByAppId,
-            catalogAppIdByTitle,
-            catalogGameIdByAppId,
-            catalogGameIdByNormTitle
-          );
+          populateCatalogMapsForMigration(maps);
         }
 
+        const callbacks = this.buildMigrationCallbacks();
         let legacyIdx = 0;
         let v8Idx = 0;
         const v8Remove: string[] = [];
@@ -489,14 +297,7 @@ export class CriticScoreService {
               const key = v8Keys[v8Idx];
               v8Idx += 1;
               processed += 1;
-              if (
-                this.shouldEvictV8KeyDuringMigration(
-                  key,
-                  catalogTitleByAppId,
-                  catalogAppIdByTitle,
-                  siblingGroups
-                )
-              ) {
+              if (shouldEvictV8KeyDuringMigration(key, maps, siblingGroups, callbacks)) {
                 v8Remove.push(key);
               }
             }
@@ -504,356 +305,15 @@ export class CriticScoreService {
               scheduleChunk(runNextChunk);
               return;
             }
-            for (const k of v8Remove) {
-              localStorage.removeItem(k);
-              if (k.startsWith(STORAGE_PREFIX)) {
-                const rawKey = k.slice(STORAGE_PREFIX.length);
-                this.inMemoryCache.delete(rawKey);
-                this.attemptedDynamicResolutions.delete(rawKey);
-              }
-            }
-            const promotedCount = this.promoteShadowedAliasesDuringV16Migration(
-              siblingGroups,
-              catalogGameIdByAppId,
-              catalogGameIdByNormTitle
-            );
-            this.cleanStaleSteamMatcherEntries();
-            clearExpiredStagedCache({ onlyNegativeAndTransient: true });
-            localStorage.setItem('antigravity_critic_schema_v9', '1');
-            localStorage.setItem('antigravity_critic_schema_v10', '1');
-            localStorage.setItem('antigravity_critic_schema_v11', '1');
-            localStorage.setItem('antigravity_critic_schema_v12', '1');
-            localStorage.setItem('antigravity_critic_schema_v13', '1');
-            localStorage.setItem('antigravity_critic_schema_v14', '1');
-            localStorage.setItem('antigravity_critic_schema_v15', '1');
-            localStorage.setItem(CRITIC_SCHEMA_V16_KEY, '1');
-            if (
-              promotedCount > 0 &&
-              typeof window !== 'undefined' &&
-              typeof window.dispatchEvent === 'function'
-            ) {
-              try {
-                window.dispatchEvent(
-                  new CustomEvent('antigravity_critic_updated', {
-                    detail: { hydratedFromVault: true },
-                  })
-                );
-              } catch {}
-            }
+            finalizeSchemaV16Migration(v8Remove, siblingGroups, maps, callbacks, {
+              clearExpiredStaged: true,
+            });
           } catch {}
         };
 
         runNextChunk();
       } catch {}
     });
-  }
-
-  private populateCatalogMapsForMigration(
-    catalogTitleByAppId: Map<number, string>,
-    catalogAppIdByTitle: Map<string, number>,
-    catalogGameIdByAppId?: Map<number, string>,
-    catalogGameIdByNormTitle?: Map<string, string>
-  ): void {
-    try {
-      const rawCat = localStorage.getItem('universal_game_library_catalog');
-      if (!rawCat) return;
-      const parsedCat: unknown = JSON.parse(rawCat);
-      if (!Array.isArray(parsedCat)) return;
-      for (const item of parsedCat) {
-        if (!item || typeof item !== 'object') continue;
-        const g = item as { title?: unknown; steamAppId?: unknown; id?: unknown };
-        if (typeof g.title !== 'string' || !g.title) continue;
-        const normTitle = normalizeCriticTitleKey(g.title);
-        const gameId = typeof g.id === 'string' && g.id.trim() ? g.id.trim() : '';
-        if (gameId && normTitle && catalogGameIdByNormTitle) {
-          catalogGameIdByNormTitle.set(normTitle, gameId);
-        }
-        const sid =
-          typeof g.steamAppId === 'number' && g.steamAppId > 0
-            ? g.steamAppId
-            : typeof g.id === 'string' && g.id.startsWith('steam-')
-            ? Number(g.id.slice(6))
-            : 0;
-        if (sid > 0) {
-          catalogTitleByAppId.set(sid, g.title);
-          catalogAppIdByTitle.set(g.title.toLowerCase().trim(), sid);
-          if (normTitle) {
-            catalogAppIdByTitle.set(normTitle, sid);
-          }
-          if (gameId && catalogGameIdByAppId) {
-            catalogGameIdByAppId.set(sid, gameId);
-          }
-        }
-      }
-    } catch {}
-  }
-
-  private shouldEvictV8KeyDuringMigration(
-    key: string,
-    catalogTitleByAppId: Map<number, string>,
-    catalogAppIdByTitle: Map<string, number>,
-    siblingGroups?: Map<string, MigrationV8Record[]>
-  ): boolean {
-    const val = localStorage.getItem(key);
-    if (!val) return true;
-    try {
-      const parsed = JSON.parse(val) as Record<string, unknown> & {
-        data?: CriticScoreData | null;
-        tier?: string;
-        summary?: string;
-        cachedAt?: number;
-        ttlMs?: number;
-        ttl?: number;
-        dynamicResolved?: boolean;
-      };
-      const isStaged = Boolean(parsed && typeof parsed === 'object' && 'data' in parsed);
-      const data: CriticScoreData | null = isStaged
-        ? (parsed.data ?? null)
-        : (parsed as unknown as CriticScoreData);
-      const tier = isStaged ? parsed.tier : undefined;
-      const rawKey = key.slice(STORAGE_PREFIX.length);
-      const titleFromKey = rawKey.startsWith('title:') ? rawKey.slice(6).toLowerCase().trim() : '';
-      const appId = rawKey.startsWith('id:')
-        ? Number(rawKey.slice(3))
-        : titleFromKey
-        ? catalogAppIdByTitle.get(titleFromKey)
-        : undefined;
-      const effectiveTitle = rawKey.startsWith('title:')
-        ? rawKey.slice(6)
-        : appId
-        ? STEAM_APP_ID_TO_TITLE.get(appId) || catalogTitleByAppId.get(appId) || ''
-        : '';
-      const normGroup = effectiveTitle ? normalizeCriticTitleKey(effectiveTitle) : '';
-
-      const recordSibling = (entry: MigrationV8Record) => {
-        if (!siblingGroups || !entry.normGroup) return;
-        const list = siblingGroups.get(entry.normGroup);
-        if (list) {
-          list.push(entry);
-        } else {
-          siblingGroups.set(entry.normGroup, [entry]);
-        }
-      };
-
-      if (tier === MutabilityTier.TIER_0_USER_OVERRIDE || tier === 'override') {
-        recordSibling({
-          key,
-          rawKey,
-          appId,
-          effectiveTitle,
-          normGroup,
-          data,
-          tier: MutabilityTier.TIER_0_USER_OVERRIDE,
-          cachedAt: typeof parsed.cachedAt === 'number' ? parsed.cachedAt : Date.now(),
-          ttlMs: Infinity,
-          rank: 5,
-          isOverride: true,
-        });
-        return false;
-      }
-      if (
-        isStaged &&
-        data === null &&
-        (tier === 'negative' || tier === 'transient_error') &&
-        isCacheEntryValid(parsed as unknown as Parameters<typeof isCacheEntryValid>[0])
-      ) {
-        return false;
-      }
-
-      if (
-        data &&
-        typeof data.score === 'number' &&
-        data.score > 0 &&
-        (data.source === 'metacritic' ||
-          data.source === 'opencritic' ||
-          data.source === 'metacritic_user' ||
-          data.source === 'steam' ||
-          data.source === 'gog' ||
-          data.source === 'epic' ||
-          data.source === 'xbox')
-      ) {
-        const origSummary = data.summary;
-        if (effectiveTitle && !this.validateScoreSemanticCompatibility(effectiveTitle, data, appId)) {
-          return true;
-        }
-        let mutated = false;
-        if (origSummary && (data.source === 'metacritic' || data.source === 'metacritic_user')) {
-          const sanitized = sanitizeMetacriticDescription(origSummary, data.numReviews || 20);
-          if (sanitized !== origSummary) {
-            data.summary = sanitized;
-            if (isStaged && 'summary' in parsed) {
-              parsed.summary = sanitized;
-            }
-            mutated = true;
-          }
-        }
-
-        // Stage 0 v16 non-destructive fallback TTL un-pinning:
-        // Cap any non-override MCU/STM/GOG/EGS/XBX entry with ttlMs > 14d down to 7d
-        // without deleting the score (zero UI blanking while unlocking background upgrade).
-        let effectiveTier: MutabilityTier =
-          tier === 'immutable' ||
-          tier === 'mature' ||
-          tier === 'fresh' ||
-          tier === 'early_access' ||
-          tier === 'negative' ||
-          tier === 'transient_error'
-            ? tier
-            : MutabilityTier.TIER_2_MATURE;
-        const rawTtl =
-          typeof parsed.ttlMs === 'number'
-            ? parsed.ttlMs
-            : typeof parsed.ttl === 'number'
-            ? parsed.ttl
-            : TIER_TTLS[effectiveTier];
-        let effectiveTtlMs = rawTtl;
-        const effectiveCachedAt = typeof parsed.cachedAt === 'number' ? parsed.cachedAt : Date.now();
-
-        if (
-          isStaged &&
-          NON_CRITIC_FALLBACK_SOURCES.has(data.source) &&
-          typeof rawTtl === 'number' &&
-          rawTtl > MAX_NON_CRITIC_TTL_MS
-        ) {
-          effectiveTtlMs = SELF_HEAL_FALLBACK_TTL_MS;
-          if (effectiveTier === MutabilityTier.TIER_1_IMMUTABLE) {
-            effectiveTier = MutabilityTier.TIER_2_MATURE;
-          }
-          const fullDataForSave = parsed.__vaultFull
-            ? (loadStagedCache<CriticScoreData>(key, false).data ?? data)
-            : data;
-          saveStagedCache<CriticScoreData>(key, fullDataForSave, effectiveTier, {
-            source: fullDataForSave.source,
-            isVerified: fullDataForSave.isVerified,
-            dynamicResolved: parsed.dynamicResolved === true,
-            cachedAt: effectiveCachedAt,
-            customTtlMs: SELF_HEAL_FALLBACK_TTL_MS,
-          });
-          mutated = false;
-        } else if (mutated) {
-          localStorage.setItem(key, JSON.stringify(parsed));
-        }
-
-        recordSibling({
-          key,
-          rawKey,
-          appId,
-          effectiveTitle,
-          normGroup,
-          data,
-          tier: effectiveTier,
-          cachedAt: effectiveCachedAt,
-          ttlMs: effectiveTtlMs,
-          rank: getReviewSourceAuthorityRank(data),
-          isOverride: false,
-        });
-        return false;
-      }
-      return true;
-    } catch {
-      return true;
-    }
-  }
-
-  private promoteShadowedAliasesDuringV16Migration(
-    siblingGroups: Map<string, MigrationV8Record[]>,
-    catalogGameIdByAppId: Map<number, string>,
-    catalogGameIdByNormTitle: Map<string, string>
-  ): number {
-    let promotedCount = 0;
-    for (const group of siblingGroups.values()) {
-      if (group.length < 2) continue;
-
-      let bestDonor: MigrationV8Record | null = null;
-      for (const entry of group) {
-        if (entry.isOverride || !entry.data) continue;
-        const isVerifiedPressCritic =
-          entry.data.isVerified === true &&
-          (entry.data.source === 'metacritic' || entry.data.source === 'opencritic') &&
-          entry.rank >= 3;
-        if (!isVerifiedPressCritic) continue;
-        if (
-          !bestDonor ||
-          entry.rank > bestDonor.rank ||
-          (entry.rank === bestDonor.rank && entry.cachedAt > bestDonor.cachedAt)
-        ) {
-          bestDonor = entry;
-        }
-      }
-
-      if (!bestDonor || !bestDonor.data) continue;
-
-      for (const target of group) {
-        if (target.isOverride || target.rank >= bestDonor.rank) continue;
-        const targetOverride = this.findMatchingUserOverride(target.appId, target.effectiveTitle);
-        if (
-          targetOverride &&
-          (targetOverride.reviewScoreOverride !== undefined ||
-            targetOverride.reviewRoute !== undefined)
-        ) {
-          continue;
-        }
-        if (
-          target.effectiveTitle &&
-          !this.validateScoreSemanticCompatibility(target.effectiveTitle, bestDonor.data, target.appId)
-        ) {
-          continue;
-        }
-
-        saveStagedCache<CriticScoreData>(target.key, bestDonor.data, bestDonor.tier, {
-          source: bestDonor.data.source,
-          isVerified: bestDonor.data.isVerified,
-          dynamicResolved: true,
-          cachedAt: bestDonor.cachedAt,
-          customTtlMs: bestDonor.ttlMs,
-        });
-        this.setInMemoryCache(target.rawKey, bestDonor.data);
-        this.attemptedDynamicResolutions.delete(target.rawKey);
-
-        const gameId =
-          (target.appId ? catalogGameIdByAppId.get(target.appId) : undefined) ||
-          catalogGameIdByNormTitle.get(target.normGroup);
-        if (gameId) {
-          this.scheduleVaultCriticWriteThrough(
-            gameId,
-            bestDonor.data,
-            target.appId ?? null,
-            target.effectiveTitle || bestDonor.effectiveTitle
-          );
-        }
-        promotedCount += 1;
-      }
-    }
-    return promotedCount;
-  }
-
-  private cleanStaleSteamMatcherEntries(): void {
-    const rawMatched = localStorage.getItem('antigravity_steam_matched_app_ids');
-    if (!rawMatched) return;
-    try {
-      const parsedMatched = JSON.parse(rawMatched) as Record<string, unknown>;
-      if (parsedMatched && typeof parsedMatched === 'object') {
-        let changed = false;
-        for (const [mk, mv] of Object.entries(parsedMatched)) {
-          if (mv === null || typeof mv === 'object') {
-            delete parsedMatched[mk];
-            changed = true;
-          } else if (typeof mv === 'number') {
-            const enrichedName = STEAM_ENRICHED_CRITIC_MAP[String(mv)]?.name;
-            if (
-              enrichedName &&
-              (isSequelMismatch(mk, enrichedName) || !isTitleCompatible(mk, enrichedName))
-            ) {
-              delete parsedMatched[mk];
-              changed = true;
-            }
-          }
-        }
-        if (changed) {
-          localStorage.setItem('antigravity_steam_matched_app_ids', JSON.stringify(parsedMatched));
-        }
-      }
-    } catch {}
   }
 
   /**
@@ -871,134 +331,18 @@ export class CriticScoreService {
       platforms?: CriticEntitlementPlatform[];
     }
   ): void {
-    const keysToEvict = new Set<string>();
-    const titlesToEvict = new Set<string>();
-    const steamIdsToEvict = new Set<number>();
-    const xboxIdsToEvict = new Set<string>();
+    const targets = collectGameEvictionTargets(gameId, title, steamAppId, extra);
 
-    const addTitleKeys = (rawTitle?: string | null) => {
-      if (!rawTitle || typeof rawTitle !== 'string') return;
-      const trimmed = rawTitle.trim();
-      const lower = trimmed.toLowerCase();
-      if (!lower) return;
-      titlesToEvict.add(trimmed);
-      titlesToEvict.add(lower);
-      keysToEvict.add(`title:${lower}`);
-      const aposStripped = lower.replace(/['’ʼ`]/g, '');
-      if (aposStripped && aposStripped !== lower) {
-        keysToEvict.add(`title:${aposStripped}`);
-      }
-      const norm = normalizeCriticTitleKey(trimmed);
-      if (norm) {
-        titlesToEvict.add(norm);
-        keysToEvict.add(`title:${norm}`);
-      }
-      const stripped = stripEditionSuffix(trimmed);
-      if (stripped) {
-        keysToEvict.add(`title:${stripped}`);
-      }
-    };
-
-    const addSteamIdKeys = (rawAppId?: number | null) => {
-      if (typeof rawAppId === 'number' && Number.isFinite(rawAppId) && rawAppId > 0) {
-        steamIdsToEvict.add(rawAppId);
-        keysToEvict.add(`id:${rawAppId}`);
-        keysToEvict.add(`steam-${rawAppId}`);
-        keysToEvict.add(String(rawAppId));
-      }
-    };
-
-    const addIdKeys = (rawId?: string | number | null) => {
-      if (rawId === undefined || rawId === null) return;
-      const str = String(rawId).trim();
-      if (!str) return;
-      keysToEvict.add(str);
-      const cleanId = str.replace(/^steam[-_:]/i, '');
-      if (cleanId) {
-        keysToEvict.add(`id:${cleanId}`);
-        if (/^\d+$/.test(cleanId)) {
-          const parsedNum = Number(cleanId);
-          if (parsedNum > 0) steamIdsToEvict.add(parsedNum);
-        }
-      }
-      const xboxMatch = str.match(/^xbox[-_:]([a-z0-9]{12})$/i);
-      if (xboxMatch?.[1]) {
-        xboxIdsToEvict.add(xboxMatch[1]);
-      } else if (/^[a-z0-9]{12}$/i.test(str) && !/^\d+$/.test(str)) {
-        xboxIdsToEvict.add(str);
-      }
-      addTitleKeys(str);
-    };
-
-    const addPlatforms = (plats?: Array<{ platformId?: string; platformGameId?: string; xboxProductId?: string }>) => {
-      if (!Array.isArray(plats)) return;
-      for (const p of plats) {
-        if (!p) continue;
-        if (p.platformId === 'steam' && p.platformGameId && /^\d+$/.test(String(p.platformGameId))) {
-          addSteamIdKeys(Number(p.platformGameId));
-        } else if (p.platformId === 'xbox') {
-          const xid = p.xboxProductId || p.platformGameId;
-          if (xid) xboxIdsToEvict.add(String(xid));
-        }
-        if (p.platformId && p.platformGameId) {
-          keysToEvict.add(`${p.platformId}:${p.platformGameId}`);
-          keysToEvict.add(`${p.platformId}-${p.platformGameId}`);
-        }
-      }
-    };
-
-    addIdKeys(gameId);
-    addTitleKeys(title);
-    addSteamIdKeys(steamAppId);
-    addPlatforms(extra?.platforms);
-
-    if (Array.isArray(extra?.deletedKeys)) {
-      for (const dk of extra.deletedKeys) {
-        addIdKeys(dk);
-      }
-    }
-
-    const oldOverride = extra?.oldOverride;
-    if (oldOverride) {
-      addIdKeys(oldOverride.gameId);
-      addSteamIdKeys(oldOverride.steamAppId);
-      if (oldOverride.matchedId !== undefined) {
-        addIdKeys(oldOverride.matchedId);
-      }
-      if (oldOverride.platformId && oldOverride.platformGameId) {
-        addPlatforms([{ platformId: oldOverride.platformId, platformGameId: oldOverride.platformGameId }]);
-      }
-      addSteamIdKeys(oldOverride.nativeBaseline?.steamAppId);
-      addIdKeys(oldOverride.nativeBaseline?.id);
-      addTitleKeys(oldOverride.title);
-      addTitleKeys(oldOverride.originalSourceTitle);
-      addTitleKeys(oldOverride.nativeBaseline?.title);
-      if (oldOverride.reviewRoute) {
-        addTitleKeys(oldOverride.reviewRoute.targetTitle);
-        addSteamIdKeys(oldOverride.reviewRoute.steamAppId);
-        if (oldOverride.reviewRoute.xboxProductId) {
-          xboxIdsToEvict.add(oldOverride.reviewRoute.xboxProductId);
-        }
-      }
-    }
-
-    const oldGame = extra?.oldGame;
-    if (oldGame) {
-      addIdKeys(oldGame.id);
-      addSteamIdKeys(oldGame.steamAppId);
-      addTitleKeys(oldGame.title);
-      addTitleKeys(oldGame.originalStoreTitle);
-      addPlatforms(oldGame.platforms);
-    }
-
-    for (const key of keysToEvict) {
+    for (const key of targets.keysToEvict) {
+      this.keyEpochs.set(key, (this.keyEpochs.get(key) ?? 0) + 1);
       this.inMemoryCache.delete(key);
+      this.tier0OverrideKeys.delete(key);
       this.attemptedDynamicResolutions.delete(key);
       this.inFlightResolutions.delete(key);
       this.pendingPassiveTriggers.delete(key);
       this.stubPinnedKeys.delete(key);
       this.transientFailureCounts.delete(key);
-      this.pendingVaultCriticWrites.delete(key);
+      this.vaultWriteThrough.delete(key);
       this.cancelDeferredStorageTasksForKey(key);
       evictStagedCache(`${STORAGE_PREFIX}${key}`);
       evictStagedCache(`${PREV_STORAGE_PREFIX}${key}`);
@@ -1010,29 +354,37 @@ export class CriticScoreService {
         } catch {}
       }
     }
-    if (gameId) this.pendingVaultCriticWrites.delete(gameId);
-    if (oldOverride?.gameId) this.pendingVaultCriticWrites.delete(oldOverride.gameId);
-    if (oldGame?.id) this.pendingVaultCriticWrites.delete(oldGame.id);
+    if (gameId) this.vaultWriteThrough.delete(gameId);
+    if (extra?.oldOverride?.gameId) this.vaultWriteThrough.delete(extra.oldOverride.gameId);
+    if (extra?.oldGame?.id) this.vaultWriteThrough.delete(extra.oldGame.id);
     if (Array.isArray(extra?.deletedKeys)) {
       for (const dk of extra.deletedKeys) {
-        if (dk) this.pendingVaultCriticWrites.delete(dk);
+        if (dk) this.vaultWriteThrough.delete(dk);
       }
     }
 
-    for (const t of titlesToEvict) {
+    for (const t of targets.titlesToEvict) {
       metacriticResolver.evictForGame(t);
       steamReviewResolver.evictForGame(t, null);
       storefrontStarResolver.evictForGame(t, null);
       storefrontReviewHarvester.evictForGame({ gameId, title: t, platforms: extra?.platforms });
+      wikidataBridge.evictForGame({ title: t });
     }
-    for (const sid of steamIdsToEvict) {
+    for (const sid of targets.steamIdsToEvict) {
       steamReviewResolver.evictForGame(null, sid);
       storefrontReviewHarvester.evictForGame({ gameId, steamAppId: sid, platforms: extra?.platforms });
+      wikidataBridge.evictForGame({ steamAppId: sid });
+    }
+    for (const gslug of targets.gogSlugsToEvict) {
+      wikidataBridge.evictForGame({ gogSlug: gslug });
+    }
+    for (const ocId of targets.openCriticIdsToEvict) {
+      openCriticResolver.evictId(ocId);
     }
     if (gameId || (extra?.platforms && extra.platforms.length > 0)) {
       storefrontReviewHarvester.evictForGame({ gameId, title, steamAppId, platforms: extra?.platforms });
     }
-    for (const xid of xboxIdsToEvict) {
+    for (const xid of targets.xboxIdsToEvict) {
       storefrontStarResolver.evictForGame(null, xid);
     }
   }
@@ -1041,7 +393,11 @@ export class CriticScoreService {
     if (this.listenersInitialized) return;
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
       const onOverrideUpdated = ((e: CustomEvent) => {
-        if (e.detail && typeof e.detail === 'object' && (e.detail as { hydratedFromVault?: boolean }).hydratedFromVault) {
+        if (
+          e.detail &&
+          typeof e.detail === 'object' &&
+          (e.detail as { hydratedFromVault?: boolean }).hydratedFromVault
+        ) {
           return;
         }
         const extracted = extractValidGameOverrideFromEventDetail(e.detail);
@@ -1099,7 +455,7 @@ export class CriticScoreService {
             typeof window !== 'undefined' &&
             typeof window.electronAPI?.offlineVault?.saveGameDetail === 'function'
           ) {
-            this.pendingVaultCriticWrites.delete(vaultGameId);
+            this.vaultWriteThrough.delete(vaultGameId);
             try {
               void window.electronAPI.offlineVault
                 .saveGameDetail({
@@ -1124,7 +480,7 @@ export class CriticScoreService {
       const unsubscribeOnline = onlineLifecycleManager.onOnline(() => {
         this.attemptedDynamicResolutions.clear();
         for (const [k, v] of this.inMemoryCache.entries()) {
-          if (v === null) {
+          if (v === null && !this.tier0OverrideKeys.has(k)) {
             this.inMemoryCache.delete(k);
           }
         }
@@ -1141,7 +497,7 @@ export class CriticScoreService {
 
   public disposeEventListeners(): void {
     this.cancelLazyMigrationTimer();
-    this.clearPendingVaultWrites();
+    this.vaultWriteThrough.clear();
     for (const cleanup of this.listenerCleanups) {
       try {
         cleanup();
@@ -1187,7 +543,10 @@ export class CriticScoreService {
 
     const vaultGameId = (override.gameId || oldGame?.id || '').trim();
     const targetTitle = (override.title || oldGame?.title || '').trim();
-    const targetSteamId = typeof override.steamAppId === 'number' && override.steamAppId > 0 ? override.steamAppId : undefined;
+    const targetSteamId =
+      typeof override.steamAppId === 'number' && override.steamAppId > 0
+        ? override.steamAppId
+        : undefined;
     const cacheKey = targetSteamId ? `id:${targetSteamId}` : `title:${targetTitle.toLowerCase()}`;
     const stagedKey = `${STORAGE_PREFIX}${cacheKey}`;
 
@@ -1202,7 +561,7 @@ export class CriticScoreService {
       ) {
         return;
       }
-      this.pendingVaultCriticWrites.delete(vaultGameId);
+      this.vaultWriteThrough.delete(vaultGameId);
       try {
         if (mode === 'clear') {
           void window.electronAPI.offlineVault
@@ -1219,7 +578,7 @@ export class CriticScoreService {
               gameId: vaultGameId,
               ...(targetSteamId ? { steamAppId: targetSteamId } : {}),
               ...(targetTitle ? { canonicalTitle: targetTitle } : {}),
-              criticScore: { ...scoreData } as unknown as Record<string, unknown>,
+              criticScore: { ...scoreData },
               forceCriticScore: true,
             })
             ?.catch?.(() => {});
@@ -1235,10 +594,12 @@ export class CriticScoreService {
 
       if (route.mode === 'unrated') {
         this.setInMemoryCache(cacheKey, null);
+        this.tier0OverrideKeys.add(cacheKey);
         saveStagedCache<CriticScoreData>(stagedKey, null, MutabilityTier.TIER_0_USER_OVERRIDE);
         for (const k of keysToSet) {
           if (k !== cacheKey) {
             this.setInMemoryCache(k, null);
+            this.tier0OverrideKeys.add(k);
           }
         }
         persistOverrideCriticToVault('clear');
@@ -1255,10 +616,12 @@ export class CriticScoreService {
       if (route.mode === 'static') {
         const staticData = override.reviewScoreOverride ?? null;
         this.setInMemoryCache(cacheKey, staticData);
+        this.tier0OverrideKeys.add(cacheKey);
         saveStagedCache<CriticScoreData>(stagedKey, staticData, MutabilityTier.TIER_0_USER_OVERRIDE);
         for (const k of keysToSet) {
           if (k !== cacheKey) {
             this.setInMemoryCache(k, staticData);
+            this.tier0OverrideKeys.add(k);
           }
         }
         if (staticData && typeof staticData.score === 'number' && staticData.score > 0) {
@@ -1295,7 +658,12 @@ export class CriticScoreService {
         if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
           window.dispatchEvent(
             new CustomEvent('antigravity_critic_updated', {
-              detail: { cacheKey, title: targetTitle, steamAppId: targetSteamId, data: override.reviewScoreOverride },
+              detail: {
+                cacheKey,
+                title: targetTitle,
+                steamAppId: targetSteamId,
+                data: override.reviewScoreOverride,
+              },
             })
           );
         }
@@ -1308,382 +676,36 @@ export class CriticScoreService {
     }
 
     if (targetTitle) {
-      this.resolveDynamicScore(targetTitle, targetSteamId, undefined, override.storefrontAnchor).catch(() => {});
+      this.resolveDynamicScore(targetTitle, targetSteamId, undefined, override.storefrontAnchor).catch(
+        () => {}
+      );
     }
   }
 
-  /**
-   * Resolves a routed review score dynamically from its pinned provider, falling back to fallbackScore if offline/unreachable.
-   */
   public async resolveRoutedScore(
     route: ReviewScoreRoute,
     fallbackTitle: string,
     releaseYear?: number | string | null,
     fallbackScore?: CriticScoreData | null
   ): Promise<CriticScoreData | null> {
-    if (!route || route.mode === 'unrated') {
-      return null;
-    }
-    if (route.mode === 'static') {
-      return fallbackScore ?? null;
-    }
-
-    const targetTitle = (route.targetTitle || fallbackTitle || '').trim();
-    const yearNum =
-      typeof releaseYear === 'number'
-        ? releaseYear
-        : releaseYear
-        ? parseInt(String(releaseYear).match(/\b(19\d\d|20\d\d)\b/)?.[1] || '', 10) || undefined
-        : undefined;
-
-    try {
-      if (route.source === 'metacritic' || route.source === 'metacritic_user') {
-        const slug =
-          route.metacriticSlug ||
-          route.url?.match(/metacritic\.com\/game\/(?:pc\/)?([^/?#]+)/i)?.[1];
-        const anchorArg = slug
-          ? ({
-              gameId: slug,
-              storefront: 'steam',
-              metacriticSlug: slug,
-              metacriticUrl: route.url,
-            } as StorefrontReviewAnchor & { gameId?: string })
-          : undefined;
-        const bundle = await metacriticResolver.resolveMetacritic(
-          targetTitle,
-          yearNum,
-          anchorArg,
-          Priority.P1_VIEWPORT
-        );
-        if (route.source === 'metacritic' && bundle?.critic && bundle.critic.score > 0) {
-          return bundle.critic;
-        }
-        if (route.source === 'metacritic_user' && bundle?.user && bundle.user.score > 0) {
-          return bundle.user;
-        }
-      } else if (route.source === 'opencritic') {
-        const routeWithExternal = route as ReviewScoreRoute & { externalId?: string | number };
-        const rawExternalId =
-          routeWithExternal.externalId !== undefined && routeWithExternal.externalId !== null
-            ? Number(String(routeWithExternal.externalId).trim())
-            : 0;
-        const urlOcId = Number(route.url?.match(/\/game\/(\d+)/i)?.[1] || 0);
-        const ocId =
-          (typeof route.openCriticId === 'number' &&
-          Number.isSafeInteger(route.openCriticId) &&
-          route.openCriticId > 0
-            ? route.openCriticId
-            : 0) ||
-          (Number.isSafeInteger(urlOcId) && urlOcId > 0 ? urlOcId : 0) ||
-          (Number.isSafeInteger(rawExternalId) && rawExternalId > 0 ? rawExternalId : 0);
-
-        const ocResolved =
-          ocId > 0
-            ? await openCriticResolver.resolveById(ocId, {
-                expectedTitle: targetTitle || undefined,
-                releaseYear: yearNum ?? releaseYear,
-                priority: Priority.P1_VIEWPORT,
-                isVerifiedAnchor: true,
-                anchorUrl: route.url,
-                bypassCache: true,
-              })
-            : targetTitle
-            ? await openCriticResolver.resolveForGame({
-                title: targetTitle,
-                steamAppId: route.steamAppId ?? null,
-                gogSlug: normalizeWikidataGogSlug(route.gogId) ?? null,
-                releaseYear: yearNum ?? releaseYear,
-                priority: Priority.P1_VIEWPORT,
-                bypassCache: true,
-              })
-            : null;
-
-        if (ocResolved && ocResolved.score > 0) {
-          return {
-            ...ocResolved,
-            url: route.url || ocResolved.url,
-            numReviews: ocResolved.numReviews ?? fallbackScore?.numReviews,
-            summary: ocResolved.summary || fallbackScore?.summary,
-          };
-        }
-      } else if (route.source === 'steam') {
-        const appId =
-          route.steamAppId ||
-          Number(route.url?.match(/store\.steampowered\.com\/app\/(\d+)/i)?.[1] || 0);
-        if (appId > 0) {
-          const steamRes = await steamReviewResolver.resolveScore(targetTitle, appId);
-          if (steamRes && steamRes.score > 0) {
-            return steamRes;
-          }
-        }
-      } else if (route.source === 'gog' || route.source === 'epic' || route.source === 'xbox') {
-        const starRes = await storefrontStarResolver.resolveScore({
-          title: targetTitle,
-          gogId: route.gogId,
-          epicId: route.epicId,
-          xboxProductId: route.xboxProductId,
-        });
-        if (starRes && starRes.score > 0) {
-          return {
-            ...starRes,
-            source: route.source,
-          };
-        }
-      }
-    } catch {}
-
-    return fallbackScore ?? null;
+    return resolveRoutedCriticScore(route, fallbackTitle, releaseYear, fallbackScore);
   }
 
-  private getCompiledReviewOverrideIndex(
-    overrides: Record<string, UserGameOverride>
-  ): CompiledReviewOverrideIndex {
-    const existing = this.compiledOverrideIndexMemo.get(overrides);
-    if (existing) return existing;
-
-    const byKey = new Map<string, UserGameOverride>();
-    const byGameId = new Map<string, UserGameOverride[]>();
-    const bySteamId = new Map<number, UserGameOverride[]>();
-    const byLowerTitle = new Map<string, UserGameOverride[]>();
-    const byNormTitle = new Map<string, UserGameOverride[]>();
-    let hasAnyReviewOverride = false;
-
-    const pushUnique = <K>(map: Map<K, UserGameOverride[]>, key: K, ov: UserGameOverride) => {
-      let list = map.get(key);
-      if (!list) {
-        list = [];
-        map.set(key, list);
-      }
-      if (!list.includes(ov)) {
-        list.push(ov);
-      }
-    };
-
-    for (const [k, ov] of Object.entries(overrides)) {
-      if (!ov || (ov.reviewScoreOverride === undefined && ov.reviewRoute === undefined)) {
-        continue;
-      }
-      hasAnyReviewOverride = true;
-      byKey.set(k, ov);
-      if (ov.gameId) {
-        pushUnique(byGameId, ov.gameId, ov);
-      }
-      if (typeof ov.steamAppId === 'number' && ov.steamAppId > 0) {
-        pushUnique(bySteamId, ov.steamAppId, ov);
-      }
-      if (ov.title) {
-        const lower = ov.title.toLowerCase().trim();
-        if (lower) {
-          pushUnique(byLowerTitle, lower, ov);
-        }
-        const norm = normalizeCriticTitleKey(ov.title);
-        if (norm) {
-          pushUnique(byNormTitle, norm, ov);
-        }
-      }
-    }
-
-    const sortNewestFirst = (a: UserGameOverride, b: UserGameOverride) =>
-      parseOverrideUpdatedAt(b) - parseOverrideUpdatedAt(a);
-    for (const list of byGameId.values()) list.sort(sortNewestFirst);
-    for (const list of bySteamId.values()) list.sort(sortNewestFirst);
-    for (const list of byLowerTitle.values()) list.sort(sortNewestFirst);
-    for (const list of byNormTitle.values()) list.sort(sortNewestFirst);
-
-    const compiled: CompiledReviewOverrideIndex = {
-      hasAnyReviewOverride,
-      byKey,
-      byGameId,
-      bySteamId,
-      byLowerTitle,
-      byNormTitle,
-    };
-    this.compiledOverrideIndexMemo.set(overrides, compiled);
-    return compiled;
-  }
-
-  /**
-   * Helper to locate an active user override matching the provided game by steamAppId, title, or platform combinations.
-   * Respects full entitlement context (`platforms`) when provided and breaks ties deterministically by newest `updatedAt`.
-   */
   public findMatchingUserOverride(
     steamAppId?: number | null,
     title?: string,
     gameId?: string,
     platforms?: CriticEntitlementPlatform[]
   ): UserGameOverride | undefined {
-    try {
-      const overrides = loadUserOverrides();
-      if (!overrides) return undefined;
-
-      const idx = this.getCompiledReviewOverrideIndex(overrides);
-      if (!idx.hasAnyReviewOverride) return undefined;
-
-      const normalizedPlatforms: GamePlatformOwnership[] = Array.isArray(platforms)
-        ? platforms
-            .filter((p) => Boolean(p && p.platformId))
-            .map((p) => ({
-              platformId: p.platformId as StorefrontId,
-              platformGameId: String(p.platformGameId || p.xboxProductId || p.storefrontAppId || ''),
-              storefrontAppId: p.storefrontAppId,
-              installed: false,
-            }))
-        : [];
-      const hasPlatforms = normalizedPlatforms.length > 0;
-      const parsedGameIdPlatform = (() => {
-        if (!gameId) return null;
-        const m = gameId.match(/^(steam|gog|epic|xbox|ea|ubisoft|battlenet|itch)[-_:](\S+)$/i);
-        if (!m) return null;
-        return { platformId: m[1].toLowerCase(), platformGameId: m[2].toLowerCase() };
-      })();
-
-      const isOverrideCompatible = (ov?: UserGameOverride): boolean => {
-        if (!ov) return false;
-        if (ov.splitFromMerged) {
-          if (!hasPlatforms || normalizedPlatforms.length !== 1) return false;
-          const p = normalizedPlatforms[0];
-          if (ov.platformId && String(p.platformId).toLowerCase() !== String(ov.platformId).toLowerCase()) {
-            return false;
-          }
-          if (
-            ov.platformGameId &&
-            String(p.platformGameId).toLowerCase() !== String(ov.platformGameId).toLowerCase()
-          ) {
-            return false;
-          }
-          return true;
-        }
-
-        if (hasPlatforms && ov.platformId && ov.platformGameId) {
-          const ovPlat = String(ov.platformId).toLowerCase();
-          const ovPlatGame = String(ov.platformGameId).toLowerCase();
-          const ownsMatchingPlat = normalizedPlatforms.some(
-            (p) =>
-              String(p.platformId).toLowerCase() === ovPlat &&
-              String(p.platformGameId).toLowerCase() === ovPlatGame
-          );
-          if (ownsMatchingPlat) return true;
-          if (gameId && ov.gameId && gameId === ov.gameId) {
-            const onlyConflictingStore = normalizedPlatforms.every(
-              (p) => String(p.platformId).toLowerCase() !== ovPlat
-            );
-            if (onlyConflictingStore) return false;
-            return true;
-          }
-          return false;
-        }
-
-        if (!hasPlatforms && parsedGameIdPlatform && ov.platformId && ov.platformGameId) {
-          if (gameId && ov.gameId && gameId === ov.gameId) return true;
-          const ovPlat = String(ov.platformId).toLowerCase();
-          const ovPlatGame = String(ov.platformGameId).toLowerCase();
-          if (
-            parsedGameIdPlatform.platformId !== ovPlat ||
-            parsedGameIdPlatform.platformGameId !== ovPlatGame
-          ) {
-            return false;
-          }
-        }
-
-        return true;
-      };
-
-      const pickNewestCompatible = (candidates: Iterable<UserGameOverride | undefined>): UserGameOverride | undefined => {
-        let best: UserGameOverride | undefined;
-        let bestTs = -1;
-        for (const cand of candidates) {
-          if (!cand || !isOverrideCompatible(cand)) continue;
-          const ts = parseOverrideUpdatedAt(cand);
-          if (!best || ts > bestTs) {
-            best = cand;
-            bestTs = ts;
-          }
-        }
-        return best;
-      };
-
-      const synthGame: CanonicalGame = {
-        id: gameId || (steamAppId ? `steam-${steamAppId}` : (title ? `game-${title.toLowerCase().trim()}` : '')),
-        title: title || '',
-        sortTitle: title || '',
-        steamAppId: typeof steamAppId === 'number' && steamAppId > 0 ? steamAppId : undefined,
-        platforms: normalizedPlatforms,
-        headerImage: '',
-        developers: [],
-        publishers: [],
-        genres: [],
-        tags: [],
-      };
-      const directMatch = getUserOverrideForGame(synthGame, overrides);
-      if (
-        directMatch &&
-        (directMatch.reviewScoreOverride !== undefined || directMatch.reviewRoute !== undefined) &&
-        isOverrideCompatible(directMatch)
-      ) {
-        return directMatch;
-      }
-
-      if (gameId) {
-        const directGameCandidates: Array<UserGameOverride | undefined> = [
-          idx.byKey.get(gameId),
-          ...(idx.byGameId.get(gameId) || []),
-        ];
-        const byGame = pickNewestCompatible(directGameCandidates);
-        if (byGame) return byGame;
-      }
-
-      if (hasPlatforms) {
-        const platCandidates: Array<UserGameOverride | undefined> = [];
-        for (const p of normalizedPlatforms) {
-          if (!p.platformGameId) continue;
-          const pId = String(p.platformId);
-          const pLower = pId.toLowerCase();
-          const bare = String(p.platformGameId);
-          const bareLower = bare.toLowerCase();
-          platCandidates.push(
-            idx.byKey.get(`${pId}:${bare}`),
-            idx.byKey.get(`${pLower}:${bareLower}`),
-            idx.byKey.get(`${pId}-${bare}`),
-            idx.byKey.get(`${pLower}-${bareLower}`),
-            ...(pLower === 'xbox' ? [idx.byKey.get(`xbox:${bare.toUpperCase()}`)] : [])
-          );
-        }
-        const byPlat = pickNewestCompatible(platCandidates);
-        if (byPlat) return byPlat;
-      }
-
-      if (typeof steamAppId === 'number' && steamAppId > 0) {
-        const steamCandidates: Array<UserGameOverride | undefined> = [
-          idx.byKey.get(`steam-${steamAppId}`),
-          idx.byKey.get(String(steamAppId)),
-          ...(idx.bySteamId.get(steamAppId) || []),
-        ];
-        const bySteam = pickNewestCompatible(steamCandidates);
-        if (bySteam) return bySteam;
-      }
-
-      const lower = title ? title.toLowerCase().trim() : '';
-      const normSearchTitle = title ? normalizeCriticTitleKey(title) : '';
-      const titleFallbackCandidates: Array<UserGameOverride | undefined> = [];
-      if (lower) {
-        titleFallbackCandidates.push(
-          idx.byKey.get(lower),
-          idx.byKey.get(`title:${lower}`),
-          ...(idx.byLowerTitle.get(lower) || [])
-        );
-      }
-      if (normSearchTitle) {
-        titleFallbackCandidates.push(...(idx.byNormTitle.get(normSearchTitle) || []));
-      }
-      const byTitle = pickNewestCompatible(titleFallbackCandidates);
-      if (byTitle) return byTitle;
-    } catch {}
-    return undefined;
+    return findMatchingUserOverrideWithMemo(
+      this.compiledOverrideIndexMemo,
+      steamAppId,
+      title,
+      gameId,
+      platforms
+    );
   }
 
-  /**
-   * Public semantic compatibility guard for unified callers (`reviewScoreResolver`, vault hydration).
-   */
   public isScoreSemanticallyCompatible(
     rawTitle: string,
     scoreData: CriticScoreData | null | undefined,
@@ -1698,254 +720,36 @@ export class CriticScoreService {
     );
   }
 
-  /**
-   * Universal semantic compatibility validator for cached or candidate critic scores.
-   * Memoizes validation outcomes per `CriticScoreData` object reference (`WeakMap`) so hot-path
-   * cache hits run in O(1) without repeating regex/slug/summary passes.
-   */
   private validateScoreSemanticCompatibility(
     rawTitle: string,
     scoreData: CriticScoreData | null | undefined,
     steamAppId?: number | null,
     verifiedAnchorSlug?: string | null
   ): boolean {
-    if (!scoreData || typeof scoreData.score !== 'number' || scoreData.score <= 0) return false;
-
-    const memoKey = `${steamAppId ?? ''}|${verifiedAnchorSlug ?? ''}|${rawTitle}`;
-    let byQuery = this.semanticValidationMemo.get(scoreData);
-    if (byQuery && byQuery.has(memoKey)) {
-      return byQuery.get(memoKey)!;
-    }
-
-    const recordValidation = (valid: boolean): boolean => {
-      if (!byQuery) {
-        byQuery = new Map<string, boolean>();
-        this.semanticValidationMemo.set(scoreData, byQuery);
-      } else if (byQuery.size >= 32) {
-        const oldest = byQuery.keys().next().value;
-        if (oldest !== undefined) byQuery.delete(oldest);
-      }
-      byQuery.set(memoKey, valid);
-      return valid;
-    };
-
-    const isNonGameAddonOrBeta = NON_GAME_ADDON_OR_BETA_REGEX.test(rawTitle);
-    if (isNonGameAddonOrBeta && !scoreData.isSynthetic) {
-      return recordValidation(false);
-    }
-    if (
-      rawTitle &&
-      (KNOWN_UNRATED_TITLES.has(rawTitle.toLowerCase().trim()) ||
-        KNOWN_UNRATED_TITLES.has(normalizeCriticTitleKey(rawTitle))) &&
-      !scoreData.isSynthetic
-    ) {
-      return recordValidation(false);
-    }
-    if (scoreData.source === 'steam' && scoreData.url?.includes('/search/?term=') && !steamAppId) {
-      return recordValidation(false);
-    }
-    if (scoreData.source === 'opencritic' && isUrlHostMatching(scoreData.url, 'gog.com') && steamAppId) {
-      return recordValidation(false);
-    }
-
-    if (scoreData.url && rawTitle) {
-      const slugMatch = scoreData.url.match(/\/game\/(?:[0-9]+\/)?([^\/?#]+)/);
-      const slug = slugMatch ? slugMatch[1] : '';
-      if (slug && !(scoreData.source === 'opencritic' && slug.toLowerCase() === 'game')) {
-        const compatQueryTitle =
-          scoreData.source === 'gog' ? rawTitle.replace(/\bplus\b/gi, '').trim() || rawTitle : rawTitle;
-        const parenYear = extractParentheticalReleaseYear(rawTitle);
-        const buildSlugTitles = (rawSlug: string): { fullTitle: string; strippedTitle: string } => {
-          const fullTitle = rawSlug.replace(/[_-]/g, ' ').trim();
-          const trailingYearMatch = rawSlug.match(/^(.*)[-_]((?:19|20)\d{2})$/);
-          if (!trailingYearMatch || !trailingYearMatch[1]) {
-            return { fullTitle, strippedTitle: fullTitle };
-          }
-          const trailingYear = trailingYearMatch[2];
-          const yearPresentInTitle = new RegExp(`\\b${trailingYear}\\b`).test(rawTitle);
-          const shouldStrip =
-            (parenYear !== null && String(parenYear) === trailingYear) || !yearPresentInTitle;
-          const strippedTitle = shouldStrip
-            ? trailingYearMatch[1].replace(/[_-]/g, ' ').trim()
-            : fullTitle;
-          return { fullTitle, strippedTitle };
-        };
-
-        if (scoreData.source === 'gog') {
-          const nonGameGog = /\b(demo|prologue|soundtrack|ost|artbook|dlc|upgrade|walkthrough)\b/i;
-          if (nonGameGog.test(slug.replace(/_/g, ' ')) && !nonGameGog.test(rawTitle)) {
-            return recordValidation(false);
-          }
-          const gogTitles = buildSlugTitles(slug);
-          const gogVariants = Array.from(new Set([gogTitles.strippedTitle, gogTitles.fullTitle]));
-          const gogCompatible = gogVariants.some(
-            (gt) =>
-              !isSequelMismatch(compatQueryTitle, gt) &&
-              isTitleCompatible(compatQueryTitle, gt) &&
-              isTitleCompatible(gt, compatQueryTitle)
-          );
-          if (!gogCompatible) {
-            return recordValidation(false);
-          }
-        }
-
-        const normalizedSlug = !/\b(season|episode)\b/i.test(rawTitle)
-          ? slug.replace(/-episode-(?:1|one)\b.*$/i, '')
-          : slug;
-        const { fullTitle: fullSlugTitle, strippedTitle: slugTitle } = buildSlugTitles(normalizedSlug);
-
-        let corroboratedMcAnchorSlug: string | undefined = verifiedAnchorSlug || undefined;
-        if (!corroboratedMcAnchorSlug && scoreData.source === 'metacritic') {
-          const wdCachedSlug = wikidataBridge.getCachedLinks({
-            steamAppId,
-            title: rawTitle,
-          })?.metacriticSlug;
-          if (wdCachedSlug) {
-            corroboratedMcAnchorSlug = wdCachedSlug;
-          } else if (steamAppId) {
-            const enrichedMcUrl = STEAM_ENRICHED_CRITIC_MAP[String(steamAppId)]?.metacritic?.url;
-            const enrichedSlug = extractMetacriticSlugFromUrl(enrichedMcUrl);
-            if (enrichedSlug) {
-              corroboratedMcAnchorSlug = enrichedSlug;
-            } else {
-              const knownEntry = KNOWN_CRITIC_SCORES[steamAppId];
-              if (knownEntry?.source === 'metacritic' && knownEntry.url) {
-                corroboratedMcAnchorSlug = extractMetacriticSlugFromUrl(knownEntry.url);
-              }
-            }
-          }
-        }
-
-        const isVerifiedMetacriticAnchor = Boolean(
-          scoreData.source === 'metacritic' &&
-            scoreData.isVerified &&
-            isAnchorSlugCompatible(rawTitle, slug) &&
-            (scoreData.summary?.includes('store review anchor') ||
-              (corroboratedMcAnchorSlug && isAnchorMatch(slug, corroboratedMcAnchorSlug)))
-        );
-
-        const isVerifiedStoreAnchor =
-          isVerifiedMetacriticAnchor ||
-          Boolean(
-            scoreData.summary?.includes('store review anchor') && isAnchorSlugCompatible(rawTitle, slug)
-          );
-
-        const asciiProjectedQueryTitle =
-          scoreData.source === 'opencritic'
-            ? compatQueryTitle.replace(/[^\x00-\x7f]+/g, ' ').replace(/\s+/g, ' ').trim()
-            : '';
-
-        const slugTitleVariants = Array.from(
-          new Set([
-            slugTitle,
-            fullSlugTitle,
-            slugTitle.replace(/^([a-z0-9]+)\s+(a|an|the)\s+/i, '$1: $2 '),
-            fullSlugTitle.replace(/^([a-z0-9]+)\s+(a|an|the)\s+/i, '$1: $2 '),
-          ])
-        );
-
-        const passesSequelCheck =
-          isVerifiedStoreAnchor ||
-          slugTitleVariants.some((st) => !isSequelMismatch(compatQueryTitle, st)) ||
-          Boolean(
-            asciiProjectedQueryTitle &&
-              asciiProjectedQueryTitle !== compatQueryTitle &&
-              slugTitleVariants.some((st) => !isSequelMismatch(asciiProjectedQueryTitle, st))
-          );
-        if (!passesSequelCheck) {
-          return recordValidation(false);
-        }
-
-        const passesTitleCompatibility =
-          isVerifiedStoreAnchor ||
-          slugTitleVariants.some((st) => isTitleCompatible(compatQueryTitle, st)) ||
-          Boolean(
-            asciiProjectedQueryTitle &&
-              asciiProjectedQueryTitle !== compatQueryTitle &&
-              slugTitleVariants.some((st) => isTitleCompatible(asciiProjectedQueryTitle, st))
-          );
-
-        if (!passesTitleCompatibility) {
-          return recordValidation(false);
-        }
-
-        // Guard against explicit first-installment or retro classic matching an unnumbered modern reboot
-        const titleNoYear = rawTitle.replace(/\s*\((?:19|20)\d{2}\)/g, '').trim();
-        const isFirstInstallment = /\b(?:1|i)\b/i.test(titleNoYear) && !/\b(?:1|i)\b/i.test(slugTitle);
-        const isExplicitRetro =
-          (hasExplicitClassicOrOriginalEditionTag(titleNoYear) ||
-            /\b(plus|dos)\b/i.test(titleNoYear)) &&
-          !/\b(classic|original|plus|dos)\b/i.test(slugTitle);
-
-        if (
-          (isFirstInstallment || isExplicitRetro) &&
-          (scoreData.source === 'opencritic' ||
-            /[-_](200[89]|201\d|202\d)$/.test(slug) ||
-            /\b(reimagination|reimagining|remake of the|modern reboot|reboot of the|completely remastered|playstation 5|xbox series)\b/i.test(
-              scoreData.summary || ''
-            ))
-        ) {
-          return recordValidation(false);
-        }
-
-        // Guard against franchise spinoff subtitle collisions on base-title review URLs
-        const summaryText = scoreData.summary || '';
-        const escapedBase = titleNoYear.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        if (escapedBase && !rawTitle.includes(':')) {
-          const spinoffColonRe = new RegExp(`\\b${escapedBase}:\\s+([A-Z][A-Za-z0-9'\\s-]{2,})`, 'i');
-          const spinoffMatch = summaryText.match(spinoffColonRe);
-          if (spinoffMatch?.[1]) {
-            const subLower = spinoffMatch[1].trim().toLowerCase();
-            if (subLower && !rawTitle.toLowerCase().includes(subLower)) {
-              return recordValidation(false);
-            }
-          }
-        }
-      }
-    }
-
-    if (scoreData.summary && scoreData.source === 'metacritic') {
-      scoreData.summary = sanitizeMetacriticDescription(scoreData.summary, scoreData.numReviews || 20);
-    }
-    return recordValidation(true);
+    return validateScoreSemanticCompatibilityWithMemo(
+      this.semanticValidationMemo,
+      rawTitle,
+      scoreData,
+      steamAppId,
+      verifiedAnchorSlug
+    );
   }
 
-  /**
-   * Cleanses all stale unversioned and previous version score keys from localStorage.
-   */
   public purgeLegacyScores(): void {
     this.storageHydrated = true;
     clearExpiredStagedCache({ onlyNegativeAndTransient: true });
-    if (typeof localStorage === 'undefined') return;
-    try {
-      const keysToRemove: string[] = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (
-          key &&
-          (key.startsWith(LEGACY_STORAGE_PREFIX) ||
-            key.startsWith(PREV_STORAGE_PREFIX) ||
-            key.startsWith('antigravity_critic_v6_') ||
-            key.startsWith('antigravity_critic_v5_'))
-        ) {
-          keysToRemove.push(key);
-        }
-      }
-      for (const k of keysToRemove) {
-        localStorage.removeItem(k);
-      }
-    } catch {}
+    purgeLegacyCriticKeysFromStorage();
   }
 
-  /**
-   * Completely purges all stored critic scores in localStorage and memory.
-   */
   public purgeAllScoreCache(): void {
     this.storageHydrated = true;
+    this.cacheEpoch += 1;
+    this.keyEpochs.clear();
     this.cancelLazyMigrationTimer();
-    this.clearPendingVaultWrites();
+    this.vaultWriteThrough.clear();
     this.pendingStorageTasks.clear();
     this.inMemoryCache.clear();
+    this.tier0OverrideKeys.clear();
     this.inFlightResolutions.clear();
     this.pendingPassiveTriggers.clear();
     this.attemptedDynamicResolutions.clear();
@@ -1956,32 +760,9 @@ export class CriticScoreService {
     storefrontStarResolver.clearCache();
     storefrontReviewHarvester.clearCache();
     clearExpiredStagedCache();
-    if (typeof localStorage === 'undefined') return;
-    try {
-      const keysToRemove: string[] = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (
-          key &&
-          (key.startsWith(STORAGE_PREFIX) ||
-            key.startsWith(PREV_STORAGE_PREFIX) ||
-            key.startsWith('antigravity_critic_v6_') ||
-            key.startsWith('antigravity_critic_v5_') ||
-            key.startsWith(LEGACY_STORAGE_PREFIX))
-        ) {
-          keysToRemove.push(key);
-        }
-      }
-      for (const k of keysToRemove) {
-        localStorage.removeItem(k);
-      }
-    } catch {}
+    purgeAllCriticKeysFromStorage();
   }
 
-  /**
-   * Purges legacy or stale "null" strings and semantically poisoned entries from localStorage.
-   * Preserves valid StagedCacheEntry negative records (< 7 days) and purges expired ones.
-   */
   public purgeStaleNullScores(): void {
     this.storageHydrated = true;
     this.cancelLazyMigrationTimer();
@@ -1989,80 +770,7 @@ export class CriticScoreService {
     try {
       const schemaUpgraded = localStorage.getItem(CRITIC_SCHEMA_V16_KEY) === '1';
       if (!schemaUpgraded) {
-        const v8Keys: string[] = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          if (key && key.startsWith(STORAGE_PREFIX)) {
-            v8Keys.push(key);
-          }
-        }
-        const catalogTitleByAppId = new Map<number, string>();
-        const catalogAppIdByTitle = new Map<string, number>();
-        const catalogGameIdByAppId = new Map<number, string>();
-        const catalogGameIdByNormTitle = new Map<string, string>();
-        if (v8Keys.length > 0) {
-          this.populateCatalogMapsForMigration(
-            catalogTitleByAppId,
-            catalogAppIdByTitle,
-            catalogGameIdByAppId,
-            catalogGameIdByNormTitle
-          );
-        }
-
-        const v16Remove: string[] = [];
-        const siblingGroups = new Map<string, MigrationV8Record[]>();
-        for (const key of v8Keys) {
-          if (
-            this.shouldEvictV8KeyDuringMigration(
-              key,
-              catalogTitleByAppId,
-              catalogAppIdByTitle,
-              siblingGroups
-            )
-          ) {
-            v16Remove.push(key);
-          }
-        }
-        for (const k of v16Remove) {
-          localStorage.removeItem(k);
-          if (k.startsWith(STORAGE_PREFIX)) {
-            const rawKey = k.slice(STORAGE_PREFIX.length);
-            this.inMemoryCache.delete(rawKey);
-            this.attemptedDynamicResolutions.delete(rawKey);
-          }
-        }
-
-        const promotedCount = this.promoteShadowedAliasesDuringV16Migration(
-          siblingGroups,
-          catalogGameIdByAppId,
-          catalogGameIdByNormTitle
-        );
-
-        // Clean stale negative or semantically incompatible Steam matcher entries
-        this.cleanStaleSteamMatcherEntries();
-
-        localStorage.setItem('antigravity_critic_schema_v9', '1');
-        localStorage.setItem('antigravity_critic_schema_v10', '1');
-        localStorage.setItem('antigravity_critic_schema_v11', '1');
-        localStorage.setItem('antigravity_critic_schema_v12', '1');
-        localStorage.setItem('antigravity_critic_schema_v13', '1');
-        localStorage.setItem('antigravity_critic_schema_v14', '1');
-        localStorage.setItem('antigravity_critic_schema_v15', '1');
-        localStorage.setItem(CRITIC_SCHEMA_V16_KEY, '1');
-
-        if (
-          promotedCount > 0 &&
-          typeof window !== 'undefined' &&
-          typeof window.dispatchEvent === 'function'
-        ) {
-          try {
-            window.dispatchEvent(
-              new CustomEvent('antigravity_critic_updated', {
-                detail: { hydratedFromVault: true },
-              })
-            );
-          } catch {}
-        }
+        runSchemaV16MigrationSync(this.buildMigrationCallbacks());
       }
 
       if (!onlineLifecycleManager.isOnline()) {
@@ -2072,14 +780,7 @@ export class CriticScoreService {
       const keysToRemove: string[] = [];
       for (let i = 0; i < localStorage.length; i++) {
         const key = localStorage.key(i);
-        if (
-          key &&
-          (key.startsWith(STORAGE_PREFIX) ||
-            key.startsWith(PREV_STORAGE_PREFIX) ||
-            key.startsWith('antigravity_critic_v6_') ||
-            key.startsWith('antigravity_critic_v5_') ||
-            key.startsWith(LEGACY_STORAGE_PREFIX))
-        ) {
+        if (key && (key.startsWith(STORAGE_PREFIX) || isLegacyCriticStorageKey(key))) {
           const val = localStorage.getItem(key);
           if (!val || val === 'null' || val === 'undefined') {
             keysToRemove.push(key);
@@ -2109,24 +810,26 @@ export class CriticScoreService {
         if (k.startsWith(STORAGE_PREFIX)) {
           const rawKey = k.slice(STORAGE_PREFIX.length);
           this.inMemoryCache.delete(rawKey);
+          this.tier0OverrideKeys.delete(rawKey);
           this.attemptedDynamicResolutions.delete(rawKey);
         }
       }
       if (!schemaUpgraded && keysToRemove.length > 0) {
         this.inMemoryCache.clear();
+        this.tier0OverrideKeys.clear();
         this.attemptedDynamicResolutions.clear();
       }
     } catch {}
   }
 
-  /**
-   * Clears memory cache and resets attempted resolution state.
-   */
   clearCache(): void {
+    this.cacheEpoch += 1;
+    this.keyEpochs.clear();
     this.cancelLazyMigrationTimer();
-    this.clearPendingVaultWrites();
+    this.vaultWriteThrough.clear();
     this.pendingStorageTasks.clear();
     this.inMemoryCache.clear();
+    this.tier0OverrideKeys.clear();
     this.stubPinnedKeys.clear();
     this.transientFailureCounts.clear();
     this.inFlightResolutions.clear();
@@ -2141,16 +844,13 @@ export class CriticScoreService {
     this.purgeStaleNullScores();
   }
 
-  /**
-   * Non-destructive refresh preparation: clears negative, transient, and attempted resolution
-   * sets plus negative sub-resolver misses WITHOUT wiping verified Metacritic/OpenCritic scores.
-   */
   public prepareForIncrementalRefresh(): void {
     this.attemptedDynamicResolutions.clear();
     this.transientFailureCounts.clear();
     this.stubPinnedKeys.clear();
     for (const [key, value] of this.inMemoryCache.entries()) {
-      if (value === null) {
+      if (value === null && !this.tier0OverrideKeys.has(key)) {
+        this.keyEpochs.set(key, (this.keyEpochs.get(key) ?? 0) + 1);
         this.inMemoryCache.delete(key);
       }
     }
@@ -2161,41 +861,9 @@ export class CriticScoreService {
     storefrontStarResolver.clearCache();
     storefrontReviewHarvester.clearCache();
     clearExpiredStagedCache({ onlyNegativeAndTransient: true });
-    if (typeof localStorage !== 'undefined') {
-      try {
-        const negativeKeysToClear: string[] = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          if (!key || !key.startsWith(STORAGE_PREFIX)) continue;
-          const raw = localStorage.getItem(key);
-          if (!raw) continue;
-          try {
-            const parsed = JSON.parse(raw) as { tier?: string; data?: unknown };
-            if (
-              parsed &&
-              typeof parsed === 'object' &&
-              (parsed.tier === MutabilityTier.TIER_4B_NEGATIVE_CACHE ||
-                parsed.tier === MutabilityTier.TIER_4C_TRANSIENT_ERROR ||
-                parsed.tier === 'negative' ||
-                parsed.tier === 'transient_error') &&
-              parsed.data === null
-            ) {
-              negativeKeysToClear.push(key);
-            }
-          } catch {}
-        }
-        for (const k of negativeKeysToClear) {
-          evictStagedCache(k);
-          localStorage.removeItem(k);
-        }
-      } catch {}
-    }
+    purgeNegativeCriticKeysFromStorage();
   }
 
-  /**
-   * Returns true when the game already holds an unexpired, semantically valid verified press-critic
-   * score (`metacritic` or `opencritic`, or `metacritic`-only when `context?.metacriticOnly === true`).
-   */
   public hasFreshVerifiedPressCriticScore(
     title: string,
     context?: CriticScoreContext & { steamAppId?: number | null; metacriticOnly?: boolean }
@@ -2257,7 +925,10 @@ export class CriticScoreService {
     }
     const rawTitle = (title || '').trim();
     const userOverride = this.findMatchingUserOverride(steamAppId, rawTitle);
-    if (userOverride && (userOverride.reviewScoreOverride !== undefined || userOverride.reviewRoute !== undefined)) {
+    if (
+      userOverride &&
+      (userOverride.reviewScoreOverride !== undefined || userOverride.reviewRoute !== undefined)
+    ) {
       const route = inferReviewRouteFromOverride(userOverride);
       if (route?.mode === 'unrated' || route?.mode === 'static') {
         return true;
@@ -2356,11 +1027,6 @@ export class CriticScoreService {
     return false;
   }
 
-  /**
-   * Seeds an authoritative critic score hydrated from the Electron SQLite vault when no
-   * equal-or-higher-authority valid staged cache entry or user override already exists.
-   * Returns true if the cache was seeded or monotonically upgraded.
-   */
   public seedFromVaultIfMissing(
     steamAppId: number | null | undefined,
     title: string | undefined,
@@ -2421,9 +1087,9 @@ export class CriticScoreService {
   }
 
   /**
-   * Retrieves verified critic consensus data for a game, or derives a synthetic score from Steam reviews
-   * if no verified critic consensus exists, while deferring storage writes and dynamic resolution
-   * onto a deduplicated microtask scheduler outside synchronous React render (H7).
+   * Retrieves verified critic consensus data for a game, checking in-memory cache + Tier-0
+   * memory state BEFORE touching synchronous `localStorage.getItem` (`P0-11`), while deferring
+   * storage writes and dynamic resolution onto a deduplicated microtask scheduler (H7).
    */
   getCriticScore(
     steamAppId?: number | null,
@@ -2443,9 +1109,10 @@ export class CriticScoreService {
     let cachedStrippedKey: string | undefined;
     const getAposStrippedTitle = (): string => {
       if (cachedAposStripped === undefined) {
-        cachedAposStripped = lowerTitle.includes("'") || /[’ʼ`]/.test(lowerTitle)
-          ? lowerTitle.replace(/['’ʼ`]/g, '')
-          : lowerTitle;
+        cachedAposStripped =
+          lowerTitle.includes("'") || /[’ʼ`]/.test(lowerTitle)
+            ? lowerTitle.replace(/['’ʼ`]/g, '')
+            : lowerTitle;
       }
       return cachedAposStripped;
     };
@@ -2489,7 +1156,9 @@ export class CriticScoreService {
             resolveOptions
           ).catch(() => {});
         } else if (resolveAnchor !== undefined) {
-          this.resolveDynamicScore(resolveTitle, resolveSteamId, resolveYear, resolveAnchor).catch(() => {});
+          this.resolveDynamicScore(resolveTitle, resolveSteamId, resolveYear, resolveAnchor).catch(
+            () => {}
+          );
         } else if (resolveYear !== undefined && resolveYear !== null) {
           this.resolveDynamicScore(resolveTitle, resolveSteamId, resolveYear).catch(() => {});
         } else {
@@ -2506,12 +1175,16 @@ export class CriticScoreService {
       context?.gameId,
       context?.platforms
     );
-    if (userOverride && (userOverride.reviewScoreOverride !== undefined || userOverride.reviewRoute !== undefined)) {
+    if (
+      userOverride &&
+      (userOverride.reviewScoreOverride !== undefined || userOverride.reviewRoute !== undefined)
+    ) {
       const route = inferReviewRouteFromOverride(userOverride);
       if (route?.mode === 'unrated') {
         this.attemptedDynamicResolutions.add(cacheKey);
         if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
         this.setInMemoryCache(cacheKey, null);
+        this.tier0OverrideKeys.add(cacheKey);
         this.scheduleDeferredStorageTask(`save:${stagedKey}`, () => {
           saveStagedCache<CriticScoreData>(stagedKey, null, MutabilityTier.TIER_0_USER_OVERRIDE);
         });
@@ -2522,8 +1195,13 @@ export class CriticScoreService {
         if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
         const staticScore = userOverride.reviewScoreOverride ?? null;
         this.setInMemoryCache(cacheKey, staticScore);
+        this.tier0OverrideKeys.add(cacheKey);
         this.scheduleDeferredStorageTask(`save:${stagedKey}`, () => {
-          saveStagedCache<CriticScoreData>(stagedKey, staticScore, MutabilityTier.TIER_0_USER_OVERRIDE);
+          saveStagedCache<CriticScoreData>(
+            stagedKey,
+            staticScore,
+            MutabilityTier.TIER_0_USER_OVERRIDE
+          );
         });
         return staticScore;
       }
@@ -2562,28 +1240,17 @@ export class CriticScoreService {
       }
     }
 
-    // 0. Check Tier 0 User Override (Absolute human authority, skips network/heuristic tiers)
-    const stagedTier0 = loadStagedCache<CriticScoreData>(stagedKey, false);
-    if (
-      stagedTier0.entry &&
-      (stagedTier0.entry.tier === MutabilityTier.TIER_0_USER_OVERRIDE || stagedTier0.entry.tier === 'override')
-    ) {
+    // 0a. Fast in-memory Tier-0 override hit (ZERO synchronous localStorage reads!)
+    if (this.tier0OverrideKeys.has(cacheKey) && this.inMemoryCache.has(cacheKey)) {
       this.attemptedDynamicResolutions.add(cacheKey);
       if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
-      if (stagedTier0.entry.data === null) {
-        this.setInMemoryCache(cacheKey, null);
-        return null;
-      }
-      if (stagedTier0.entry.data) {
-        this.setInMemoryCache(cacheKey, stagedTier0.entry.data);
-        return stagedTier0.entry.data;
-      }
+      return this.inMemoryCache.get(cacheKey) ?? null;
     }
 
     let year = releaseYear;
     let enrichedReleaseDate: string | undefined;
     let enrichedGenres: string[] | undefined;
-    if (steamAppId) {
+    if (steamAppId && hasAnySteamEnrichedCriticEntry()) {
       const enriched = STEAM_ENRICHED_CRITIC_MAP[String(steamAppId)];
       enrichedReleaseDate = enriched?.releaseDate || enriched?.release_date;
       enrichedGenres = enriched?.genres;
@@ -2618,7 +1285,7 @@ export class CriticScoreService {
       if (lowerTitle) this.attemptedDynamicResolutions.delete(`title:${lowerTitle}`);
     }
 
-    // 1. Check in-memory cache across primary and normalized title keys (monotonically preferring highest authority)
+    // 1. P0-11: Check in-memory cache BEFORE any synchronous `loadStagedCache` / `localStorage.getItem`!
     if (!bypassTTL) {
       const readValidMemKey = (mKey: string): CriticScoreData | null | undefined => {
         if (!this.inMemoryCache.has(mKey)) return undefined;
@@ -2683,9 +1350,29 @@ export class CriticScoreService {
       }
     }
 
-    // 2. Direct lookup in master verified dataset (Authoritative compiled data takes precedence over unverified localStorage)
+    // 0b. Cold-miss Tier 0 staged override check (only reached on inMemoryCache miss or bypassTTL)
+    const stagedTier0 = loadStagedCache<CriticScoreData>(stagedKey, false);
+    if (
+      stagedTier0.entry &&
+      (stagedTier0.entry.tier === MutabilityTier.TIER_0_USER_OVERRIDE ||
+        stagedTier0.entry.tier === 'override')
+    ) {
+      this.attemptedDynamicResolutions.add(cacheKey);
+      if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
+      this.tier0OverrideKeys.add(cacheKey);
+      if (stagedTier0.entry.data === null) {
+        this.setInMemoryCache(cacheKey, null);
+        return null;
+      }
+      if (stagedTier0.entry.data) {
+        this.setInMemoryCache(cacheKey, stagedTier0.entry.data);
+        return stagedTier0.entry.data;
+      }
+    }
+
+    // 2. Direct lookup in master verified dataset (O(1) short-circuit when empty)
     let verifiedMatch: CriticScoreData | undefined;
-    if (!isNonGameAddonOrBeta) {
+    if (!isNonGameAddonOrBeta && hasAnyKnownCriticScore()) {
       if (steamAppId && KNOWN_CRITIC_SCORES[steamAppId]) {
         verifiedMatch = KNOWN_CRITIC_SCORES[steamAppId];
       } else if (lowerTitle && KNOWN_CRITIC_SCORES[lowerTitle]) {
@@ -2704,7 +1391,9 @@ export class CriticScoreService {
     }
 
     if (verifiedMatch && isScoreSemanticallyCompatible(verifiedMatch)) {
-      const existingStaged = !bypassTTL ? stagedTier0 : loadStagedCache<CriticScoreData>(stagedKey, bypassTTL);
+      const existingStaged = !bypassTTL
+        ? stagedTier0
+        : loadStagedCache<CriticScoreData>(stagedKey, bypassTTL);
       if (existingStaged.valid && !bypassTTL && existingStaged.entry?.dynamicResolved) {
         this.attemptedDynamicResolutions.add(cacheKey);
         if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
@@ -2750,8 +1439,7 @@ export class CriticScoreService {
       staged = { valid: false, data: null, entry: undefined };
     }
 
-    let bestStagedRank =
-      staged.entry && staged.data ? getReviewSourceAuthorityRank(staged.data) : 0;
+    let bestStagedRank = staged.entry && staged.data ? getReviewSourceAuthorityRank(staged.data) : 0;
     let promotedFromSibling = false;
 
     const considerSiblingStagedKey = (fallbackKey: string) => {
@@ -2856,7 +1544,6 @@ export class CriticScoreService {
             this.setInMemoryCache(cacheKey, staged.data);
           }
           if (staged.data.isSynthetic && !staged.entry.dynamicResolved) {
-            // Synchronous pre-resolution synthetic score that hasn't completed dynamic cascade yet
             triggerDynamicResolution();
             return staged.data;
           } else {
@@ -2878,17 +1565,18 @@ export class CriticScoreService {
       }
     }
 
-    // Early explicit unrated check (betas, editors, demos, unrated classics)
+    // Early explicit unrated check (O(1) short-circuit when KNOWN_UNRATED_TITLES is empty)
     const isExplicitlyUnrated =
       isNonGameAddonOrBeta ||
-      KNOWN_UNRATED_TITLES.has(lowerTitle) ||
-      (Boolean(getNormalizedKey()) && KNOWN_UNRATED_TITLES.has(getNormalizedKey()));
+      (KNOWN_UNRATED_TITLES.size > 0 &&
+        (KNOWN_UNRATED_TITLES.has(lowerTitle) ||
+          (Boolean(getNormalizedKey()) && KNOWN_UNRATED_TITLES.has(getNormalizedKey()))));
     if (isExplicitlyUnrated) {
       this.attemptedDynamicResolutions.add(cacheKey);
       if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
       let positive = steamAppId ? steamPositivePercent : undefined;
       let totalReviews: number | undefined;
-      if (positive === undefined && steamAppId) {
+      if (positive === undefined && steamAppId && hasAnySteamEnrichedCriticEntry()) {
         const enriched = STEAM_ENRICHED_CRITIC_MAP[String(steamAppId)];
         if (enriched?.reviewSummary?.positivePercent !== undefined) {
           positive = enriched.reviewSummary.positivePercent;
@@ -2939,11 +1627,10 @@ export class CriticScoreService {
     triggerDynamicResolution();
 
     // 5. Look for authentic Steam review sentiment to construct immediate synthetic score
-    // IMPORTANT: Only use review percentages if tied to a legitimate Steam App ID to avoid GOG star-rating contamination!
     let positive = steamAppId ? steamPositivePercent : undefined;
     let totalReviews: number | undefined;
 
-    if (positive === undefined && steamAppId) {
+    if (positive === undefined && steamAppId && hasAnySteamEnrichedCriticEntry()) {
       const enriched = STEAM_ENRICHED_CRITIC_MAP[String(steamAppId)];
       if (enriched?.reviewSummary?.positivePercent !== undefined) {
         positive = enriched.reviewSummary.positivePercent;
@@ -2980,43 +1667,15 @@ export class CriticScoreService {
       return syntheticData;
     }
 
-    // 6. Explicit unrated exclusion check (strictly null when no Steam reviews exist)
-    if (KNOWN_UNRATED_TITLES.has(lowerTitle) || KNOWN_UNRATED_TITLES.has(getNormalizedKey())) {
-      this.attemptedDynamicResolutions.add(cacheKey);
-      if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
-      if (!skipBackgroundTrigger && isStagedVaultHydrationComplete()) {
-        this.scheduleDeferredStorageTask(`save:${stagedKey}`, () => {
-          this.cacheResult(cacheKey, null, effectiveReleaseDate, enrichedGenres, {
-            dynamicResolved: true,
-            aliasTitle: rawTitle || undefined,
-          });
-        });
-      }
-      return null;
-    }
-
-    // Non-blocking initial return: null until dynamic resolution completes
     return null;
   }
 
-  /**
-   * Dynamically resolves an authentic score via the 3-tier cascade:
-   * Tier 1: Metacritic Live JSON-LD Scraper (verified press consensus, >= 4 reviews)
-   * Tier 2: OpenCritic Live API (verified press consensus, >= 4 reviews)
-   * Tier 3: Steam Live Community Reviews (authentic player sentiment, >= 10 reviews)
-   */
   async resolveDynamicScore(
     rawTitle: string,
     steamAppId?: number | null,
     releaseYear?: number | string | null,
     storefrontAnchor?: StorefrontReviewAnchor | null,
-    options?: {
-      bypassAttempted?: boolean;
-      platforms?: CriticEntitlementPlatform[];
-      gameId?: string;
-      genres?: string[];
-      steamPositivePercent?: number;
-    }
+    options?: DynamicCascadeOptions
   ): Promise<CriticScoreData | null> {
     if (this.isPassiveRenderTrigger) {
       const deferredTitle = (rawTitle || '').trim();
@@ -3028,8 +1687,11 @@ export class CriticScoreService {
       if (this.pendingPassiveTriggers.has(deferredKey)) {
         return this.pendingPassiveTriggers.get(deferredKey)!;
       }
-      const scheduled = Promise.resolve().then(() => {
-        this.pendingPassiveTriggers.delete(deferredKey);
+      let scheduled!: Promise<CriticScoreData | null>;
+      scheduled = Promise.resolve().then(() => {
+        if (this.pendingPassiveTriggers.get(deferredKey) === scheduled) {
+          this.pendingPassiveTriggers.delete(deferredKey);
+        }
         return this.executeDynamicScoreResolution(
           rawTitle,
           steamAppId,
@@ -3050,39 +1712,12 @@ export class CriticScoreService {
     );
   }
 
-  private extractGogSlugFromContext(
-    platforms?: CriticEntitlementPlatform[],
-    anchor?: StorefrontReviewAnchor | null
-  ): string | undefined {
-    if (anchor?.storefront === 'gog' && anchor.rawStoreUrl) {
-      const fromAnchor = normalizeWikidataGogSlug(anchor.rawStoreUrl);
-      if (fromAnchor) return fromAnchor;
-    }
-    if (Array.isArray(platforms)) {
-      for (const p of platforms) {
-        if (p?.platformId?.toLowerCase() === 'gog') {
-          const fromPlat =
-            normalizeWikidataGogSlug(p.platformGameId) ||
-            normalizeWikidataGogSlug(p.storefrontAppId);
-          if (fromPlat) return fromPlat;
-        }
-      }
-    }
-    return undefined;
-  }
-
   private async executeDynamicScoreResolution(
     rawTitle: string,
     steamAppId?: number | null,
     releaseYear?: number | string | null,
     storefrontAnchor?: StorefrontReviewAnchor | null,
-    options?: {
-      bypassAttempted?: boolean;
-      platforms?: CriticEntitlementPlatform[];
-      gameId?: string;
-      genres?: string[];
-      steamPositivePercent?: number;
-    }
+    options?: DynamicCascadeOptions
   ): Promise<CriticScoreData | null> {
     this.ensureHydrated();
     const title = (rawTitle || '').trim();
@@ -3091,7 +1726,7 @@ export class CriticScoreService {
     let year = releaseYear;
     let enrichedReleaseDate: string | undefined;
     let enrichedGenres: string[] | undefined = options?.genres;
-    if (steamAppId) {
+    if (steamAppId && hasAnySteamEnrichedCriticEntry()) {
       const enriched = STEAM_ENRICHED_CRITIC_MAP[String(steamAppId)];
       enrichedReleaseDate = enriched?.releaseDate || enriched?.release_date;
       enrichedGenres = enriched?.genres || enrichedGenres;
@@ -3120,16 +1755,21 @@ export class CriticScoreService {
       options?.gameId,
       options?.platforms
     );
-    if (userOverride && (userOverride.reviewScoreOverride !== undefined || userOverride.reviewRoute !== undefined)) {
+    if (
+      userOverride &&
+      (userOverride.reviewScoreOverride !== undefined || userOverride.reviewRoute !== undefined)
+    ) {
       const route = inferReviewRouteFromOverride(userOverride);
       if (route?.mode === 'unrated') {
         this.setInMemoryCache(cacheKey, null);
+        this.tier0OverrideKeys.add(cacheKey);
         saveStagedCache<CriticScoreData>(stagedKey, null, MutabilityTier.TIER_0_USER_OVERRIDE);
         return null;
       }
       if (route?.mode === 'static') {
         const staticScore = userOverride.reviewScoreOverride ?? null;
         this.setInMemoryCache(cacheKey, staticScore);
+        this.tier0OverrideKeys.add(cacheKey);
         saveStagedCache<CriticScoreData>(stagedKey, staticScore, MutabilityTier.TIER_0_USER_OVERRIDE);
         return staticScore;
       }
@@ -3142,9 +1782,19 @@ export class CriticScoreService {
           }
           return fallbackVal;
         }
+        const capturedEpoch = this.cacheEpoch;
+        const capturedKeyEpoch = this.keyEpochs.get(cacheKey) ?? 0;
         this.attemptedDynamicResolutions.add(cacheKey);
         if (title) this.attemptedDynamicResolutions.add(`title:${title.toLowerCase()}`);
-        const refreshed = await this.resolveRoutedScore(route, title, year, userOverride.reviewScoreOverride);
+        const refreshed = await this.resolveRoutedScore(
+          route,
+          title,
+          year,
+          userOverride.reviewScoreOverride
+        );
+        if (!this.isEpochCurrent(capturedEpoch, cacheKey, capturedKeyEpoch)) {
+          return null;
+        }
         if (refreshed) {
           const dynamicTier = determineGameMutabilityTier({
             releaseDate: userOverride.releaseDate || effectiveReleaseDate,
@@ -3159,13 +1809,18 @@ export class CriticScoreService {
           const lower = title.toLowerCase();
           if (lower && cacheKey !== `title:${lower}`) {
             this.setInMemoryCache(`title:${lower}`, refreshed);
-            saveStagedCache<CriticScoreData>(`${STORAGE_PREFIX}title:${lower}`, refreshed, dynamicTier, {
-              source: refreshed.source,
-              isVerified: refreshed.isVerified,
-              dynamicResolved: true,
-              cachedAt: savedRouted.cachedAt,
-              customTtlMs: savedRouted.ttlMs,
-            });
+            saveStagedCache<CriticScoreData>(
+              `${STORAGE_PREFIX}title:${lower}`,
+              refreshed,
+              dynamicTier,
+              {
+                source: refreshed.source,
+                isVerified: refreshed.isVerified,
+                dynamicResolved: true,
+                cachedAt: savedRouted.cachedAt,
+                customTtlMs: savedRouted.ttlMs,
+              }
+            );
           }
           try {
             const overrideLookupKey =
@@ -3183,14 +1838,14 @@ export class CriticScoreService {
             typeof window !== 'undefined' &&
             typeof window.electronAPI?.offlineVault?.saveGameDetail === 'function'
           ) {
-            this.pendingVaultCriticWrites.delete(routedVaultGameId);
+            this.vaultWriteThrough.delete(routedVaultGameId);
             try {
               void window.electronAPI.offlineVault
                 .saveGameDetail({
                   gameId: routedVaultGameId,
                   ...(typeof steamAppId === 'number' && steamAppId > 0 ? { steamAppId } : {}),
                   ...(title ? { canonicalTitle: title } : {}),
-                  criticScore: { ...refreshed } as unknown as Record<string, unknown>,
+                  criticScore: { ...refreshed },
                   forceCriticScore: true,
                 })
                 ?.catch?.(() => {});
@@ -3213,12 +1868,18 @@ export class CriticScoreService {
       }
     }
 
-    // 0. Check Tier 0 User Override (Absolute human authority, skips dynamic resolution)
+    // 0. Check Tier 0 User Override (in-memory first, then staged fallback)
+    if (this.tier0OverrideKeys.has(cacheKey) && this.inMemoryCache.has(cacheKey)) {
+      return this.inMemoryCache.get(cacheKey) ?? null;
+    }
+
     const stagedTier0 = loadStagedCache<CriticScoreData>(stagedKey, false);
     if (
       stagedTier0.entry &&
-      (stagedTier0.entry.tier === MutabilityTier.TIER_0_USER_OVERRIDE || stagedTier0.entry.tier === 'override')
+      (stagedTier0.entry.tier === MutabilityTier.TIER_0_USER_OVERRIDE ||
+        stagedTier0.entry.tier === 'override')
     ) {
+      this.tier0OverrideKeys.add(cacheKey);
       if (stagedTier0.entry.data === null) {
         this.setInMemoryCache(cacheKey, null);
         return null;
@@ -3230,11 +1891,13 @@ export class CriticScoreService {
     }
 
     const lowerTitleKey = title ? `title:${title.toLowerCase()}` : '';
-    if (this.inMemoryCache.has(cacheKey) || (lowerTitleKey && this.inMemoryCache.has(lowerTitleKey))) {
+    if (
+      this.inMemoryCache.has(cacheKey) ||
+      (lowerTitleKey && this.inMemoryCache.has(lowerTitleKey))
+    ) {
       const existing =
         this.inMemoryCache.get(cacheKey) ??
         (lowerTitleKey ? this.inMemoryCache.get(lowerTitleKey) : undefined);
-      // Only short-circuit if already verified Tier 1 Metacritic AND not stale/forced; if OpenCritic or stale, allow dynamic refresh/upgrade
       if (
         !options?.bypassAttempted &&
         !stagedTier0.stale &&
@@ -3242,11 +1905,14 @@ export class CriticScoreService {
         existing.source === 'metacritic'
       ) {
         if (this.validateScoreSemanticCompatibility(title, existing, steamAppId)) {
-          this.cacheResult(cacheKey, existing, effectiveReleaseDate, enrichedGenres, {
-            dynamicResolved: true,
-            aliasTitle: title,
-          });
-          if (lowerTitleKey && lowerTitleKey !== cacheKey) {
+          // Stop redundant disk writes on fresh verified memory hits when staged cache is already current
+          if (!stagedTier0.valid || !stagedTier0.entry?.dynamicResolved) {
+            this.cacheResult(cacheKey, existing, effectiveReleaseDate, enrichedGenres, {
+              dynamicResolved: true,
+              aliasTitle: title,
+            });
+          }
+          if (lowerTitleKey && lowerTitleKey !== cacheKey && !this.inMemoryCache.has(lowerTitleKey)) {
             this.setInMemoryCache(lowerTitleKey, existing);
           }
           return existing;
@@ -3290,692 +1956,49 @@ export class CriticScoreService {
     this.attemptedDynamicResolutions.add(cacheKey);
     if (title) this.attemptedDynamicResolutions.add(`title:${title.toLowerCase()}`);
 
-    const promise = (async (): Promise<CriticScoreData | null> => {
+    const capturedEpoch = this.cacheEpoch;
+    const capturedKeyEpoch = this.keyEpochs.get(cacheKey) ?? 0;
+
+    let promise!: Promise<CriticScoreData | null>;
+    promise = (async (): Promise<CriticScoreData | null> => {
       try {
-        const cleanTitle =
-          normalizeTitleForStoreSearch(title, { stripEditions: true }) ||
-          normalizeTitleForStoreSearch(title);
-
-        const lower = title.toLowerCase();
-        const normKey = normalizeCriticTitleKey(title);
-
-        const isCandidateValid = (
-          candidate: CriticScoreData | null | undefined,
-          verifiedAnchorSlug?: string | null
-        ): candidate is CriticScoreData =>
-          candidate
-            ? this.validateScoreSemanticCompatibility(
-                title,
-                candidate,
-                steamAppId,
-                verifiedAnchorSlug
-              )
-            : false;
-
-        let priorPositiveScore: CriticScoreData | null = null;
-        let priorPositiveIsFresh = false;
-        const priorKeys = [stagedKey];
-        if (lower && stagedKey !== `${STORAGE_PREFIX}title:${lower}`) {
-          priorKeys.push(`${STORAGE_PREFIX}title:${lower}`);
-        }
-        if (normKey && stagedKey !== `${STORAGE_PREFIX}title:${normKey}`) {
-          priorKeys.push(`${STORAGE_PREFIX}title:${normKey}`);
-        }
-        for (const pKey of priorKeys) {
-          const priorStaged = loadStagedCache<CriticScoreData>(pKey, false);
-          if (
-            priorStaged.data &&
-            typeof priorStaged.data.score === 'number' &&
-            priorStaged.data.score > 0 &&
-            isCandidateValid(priorStaged.data, storefrontAnchor?.metacriticSlug)
-          ) {
-            const candRank = getReviewSourceAuthorityRank(priorStaged.data);
-            const curRank = getReviewSourceAuthorityRank(priorPositiveScore);
-            if (!priorPositiveScore || candRank > curRank || (candRank === curRank && priorStaged.valid && !priorPositiveIsFresh)) {
-              priorPositiveScore = priorStaged.data;
-              priorPositiveIsFresh = priorStaged.valid;
-            }
-          }
-        }
-        if (!priorPositiveScore) {
-          const memExisting = this.inMemoryCache.get(cacheKey);
-          if (
-            memExisting &&
-            typeof memExisting.score === 'number' &&
-            memExisting.score > 0 &&
-            isCandidateValid(memExisting, storefrontAnchor?.metacriticSlug)
-          ) {
-            priorPositiveScore = memExisting;
-          } else if (
-            steamAppId &&
-            typeof options?.steamPositivePercent === 'number' &&
-            options.steamPositivePercent > 0
-          ) {
-            const synthetic = calculateSyntheticSteamScore(options.steamPositivePercent);
-            priorPositiveScore = {
-              id: `steam-${steamAppId}`,
-              source: 'steam',
-              score: synthetic.score,
-              percentRecommended: synthetic.percentRecommended,
-              tier: synthetic.tier,
-              numReviews: 50,
-              url: `https://store.steampowered.com/app/${steamAppId}`,
-              summary: `Based on Steam community player reviews (${options.steamPositivePercent}% positive).`,
-              isVerified: false,
-              isSynthetic: true,
-            };
-          }
-        }
-
-        const retainExplicitUnrated = () => {
-          const current = this.inMemoryCache.get(cacheKey);
-          if (current?.isSynthetic && isCandidateValid(current)) {
-            this.cacheResult(cacheKey, current, effectiveReleaseDate, enrichedGenres, {
-              dynamicResolved: true,
-              aliasTitle: title,
-              titleForValidation: title,
-              steamAppIdForValidation: steamAppId,
-            });
-            if (lower && cacheKey !== `title:${lower}`) {
-              this.setInMemoryCache(`title:${lower}`, current);
-            }
-            if (normKey && cacheKey !== `title:${normKey}`) {
-              this.setInMemoryCache(`title:${normKey}`, current);
-            }
-            return current;
-          }
-          this.cacheResult(cacheKey, null, effectiveReleaseDate, enrichedGenres, {
-            dynamicResolved: true,
-            allowOverwritePositive: true,
-            allowAuthorityDowngrade: true,
-            aliasTitle: title,
-            titleForValidation: title,
-            steamAppIdForValidation: steamAppId,
-          });
-          if (lower && cacheKey !== `title:${lower}`) {
-            this.setInMemoryCache(`title:${lower}`, null);
-          }
-          if (normKey && cacheKey !== `title:${normKey}`) {
-            this.setInMemoryCache(`title:${normKey}`, null);
-          }
-          return null;
-        };
-
-        if (
-          KNOWN_UNRATED_TITLES.has(lower) ||
-          (Boolean(normKey) && KNOWN_UNRATED_TITLES.has(normKey)) ||
-          NON_GAME_ADDON_OR_BETA_REGEX.test(title)
-        ) {
-          return retainExplicitUnrated();
-        }
-
-        if (!onlineLifecycleManager.isOnline()) {
-          this.attemptedDynamicResolutions.delete(cacheKey);
-          if (lower) this.attemptedDynamicResolutions.delete(`title:${lower}`);
-          if (priorPositiveScore) {
-            this.setInMemoryCache(cacheKey, priorPositiveScore);
-            if (lower && cacheKey !== `title:${lower}`) {
-              this.setInMemoryCache(`title:${lower}`, priorPositiveScore);
-            }
-            if (normKey && cacheKey !== `title:${normKey}`) {
-              this.setInMemoryCache(`title:${normKey}`, priorPositiveScore);
-            }
-            return priorPositiveScore;
-          }
-          const current = this.inMemoryCache.get(cacheKey);
-          if (current && isCandidateValid(current)) {
-            return current;
-          }
-          return null;
-        }
-
-        let hadTransientError = false;
-
-        const retainSyntheticOrNull = () => {
-          if (priorPositiveScore) {
-            if (priorPositiveScore.isSynthetic && onlineLifecycleManager.isOnline()) {
-              this.cacheResult(cacheKey, priorPositiveScore, effectiveReleaseDate, enrichedGenres, {
-                dynamicResolved: true,
-                aliasTitle: title,
-                hadTransientError,
-                titleForValidation: title,
-                steamAppIdForValidation: steamAppId,
-              });
-            }
-            this.setInMemoryCache(cacheKey, priorPositiveScore);
-            if (lower && cacheKey !== `title:${lower}`) {
-              this.setInMemoryCache(`title:${lower}`, priorPositiveScore);
-            }
-            if (normKey && cacheKey !== `title:${normKey}`) {
-              this.setInMemoryCache(`title:${normKey}`, priorPositiveScore);
-            }
-            return priorPositiveScore;
-          }
-
-          const current = this.inMemoryCache.get(cacheKey);
-          if (current?.isSynthetic && isCandidateValid(current)) {
-            if (onlineLifecycleManager.isOnline()) {
-              this.cacheResult(cacheKey, current, effectiveReleaseDate, enrichedGenres, {
-                dynamicResolved: true,
-                aliasTitle: title,
-                hadTransientError,
-                titleForValidation: title,
-                steamAppIdForValidation: steamAppId,
-              });
-            }
-            if (lower && cacheKey !== `title:${lower}`) {
-              this.setInMemoryCache(`title:${lower}`, current);
-            }
-            if (normKey && cacheKey !== `title:${normKey}`) {
-              this.setInMemoryCache(`title:${normKey}`, current);
-            }
-            return current;
-          }
-
-          if (!onlineLifecycleManager.isOnline()) {
-            this.attemptedDynamicResolutions.delete(cacheKey);
-            if (lower) this.attemptedDynamicResolutions.delete(`title:${lower}`);
-            return null;
-          }
-
-          if (hadTransientError) {
-            const prevFailures = this.transientFailureCounts.get(cacheKey) || 0;
-            const nextFailures = prevFailures + 1;
-            this.transientFailureCounts.set(cacheKey, nextFailures);
-            const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-            const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
-            const backoffTtlMs = Math.min(
-              TWENTY_FOUR_HOURS_MS,
-              TWO_HOURS_MS * Math.pow(2, nextFailures - 1)
-            );
-            const savedTransient = saveStagedCache<CriticScoreData>(
-              stagedKey,
-              null,
-              'transient_error',
-              {
-                failureReason: 'network_error',
-                dynamicResolved: true,
-                customTtlMs: backoffTtlMs,
-              }
-            );
-            if (lower && stagedKey !== `${STORAGE_PREFIX}title:${lower}`) {
-              const titleStagedKey = `${STORAGE_PREFIX}title:${lower}`;
-              const existingTitleStaged = loadStagedCache<CriticScoreData>(titleStagedKey, false);
-              if (
-                !existingTitleStaged.entry ||
-                (existingTitleStaged.entry.tier !== MutabilityTier.TIER_0_USER_OVERRIDE &&
-                  existingTitleStaged.entry.tier !== 'override')
-              ) {
-                const hasPositiveTitle =
-                  existingTitleStaged.valid &&
-                  existingTitleStaged.data &&
-                  typeof existingTitleStaged.data.score === 'number' &&
-                  existingTitleStaged.data.score > 0;
-                if (!hasPositiveTitle) {
-                  saveStagedCache<CriticScoreData>(titleStagedKey, null, 'transient_error', {
-                    failureReason: 'network_error',
-                    dynamicResolved: true,
-                    cachedAt: savedTransient.cachedAt,
-                    customTtlMs: backoffTtlMs,
-                  });
-                }
-              }
-            }
-            return null;
-          }
-
-          this.transientFailureCounts.delete(cacheKey);
-          this.cacheResult(cacheKey, null, effectiveReleaseDate, enrichedGenres, {
-            dynamicResolved: true,
-            aliasTitle: title,
-            titleForValidation: title,
-            steamAppIdForValidation: steamAppId,
-          });
-          if (lower && cacheKey !== `title:${lower}`) {
-            this.setInMemoryCache(`title:${lower}`, null);
-          }
-          if (normKey && cacheKey !== `title:${normKey}`) {
-            this.setInMemoryCache(`title:${normKey}`, null);
-          }
-          return null;
-        };
-
-        // Harvest storefront ground truth anchor if not passed in
-        let anchor = storefrontAnchor;
-        if (!anchor) {
-          try {
-            anchor = await storefrontReviewHarvester.getStorefrontAnchor({
-              title,
-              steamAppId,
-              platforms: options?.platforms,
-              id: options?.gameId,
-            });
-          } catch (anchorErr: unknown) {
-            if (classifyNetworkError(anchorErr).status === 'transient_error') {
-              hadTransientError = true;
-            }
-            anchor = null;
-          }
-        }
-
-        const gogSlug = this.extractGogSlugFromContext(options?.platforms, anchor);
-        const buildAnchorWithWikidataSlug = (
-          baseAnchor: StorefrontReviewAnchor | null | undefined,
-          mcSlug: string
-        ): StorefrontReviewAnchor => ({
-          ...(baseAnchor ?? { storefront: gogSlug ? 'gog' : 'steam' }),
-          metacriticSlug: mcSlug,
-          metacriticUrl:
-            baseAnchor?.metacriticUrl ||
-            `https://www.metacritic.com/game/${mcSlug}/critic-reviews/`,
-          isVerifiedGroundTruth: true,
-        });
-
-        // Pre-check cached Wikidata links (populated by Stage 1 batch SPARQL pre-pass or prior lookups)
-        let wdLinks = wikidataBridge.getCachedLinks({
+        return await runDynamicCriticCascade({
+          cacheKey,
+          stagedKey,
+          title,
           steamAppId,
-          gogSlug,
-          title: cleanTitle || title,
+          year,
+          effectiveReleaseDate,
+          enrichedGenres,
+          storefrontAnchor,
+          options,
+          isEpochCurrent: () => this.isEpochCurrent(capturedEpoch, cacheKey, capturedKeyEpoch),
+          validateSemantic: (rawT, scoreD, appId, anchorSlug) =>
+            this.validateScoreSemanticCompatibility(rawT, scoreD, appId, anchorSlug),
+          findMatchingUserOverride: (appId, t, gId, plats) =>
+            this.findMatchingUserOverride(appId, t, gId, plats),
+          getInMemoryCache: (k) => this.inMemoryCache.get(k),
+          setInMemoryCache: (k, v) => this.setInMemoryCache(k, v),
+          deleteAttempted: (k) => {
+            this.attemptedDynamicResolutions.delete(k);
+          },
+          getTransientFailureCount: (k) => this.transientFailureCounts.get(k) || 0,
+          setTransientFailureCount: (k, count) => {
+            this.transientFailureCounts.set(k, count);
+          },
+          deleteTransientFailureCount: (k) => {
+            this.transientFailureCounts.delete(k);
+          },
+          cacheResult: (k, d, rel, gen, opts) => this.cacheResult(k, d, rel, gen, opts),
+          scheduleVaultWriteThrough: (gId, score, appId, canonTitle) =>
+            this.vaultWriteThrough.schedule(gId, score, appId, canonTitle),
         });
-
-        const broadcastUpdate = (
-          data: CriticScoreData,
-          verifiedAnchorSlug?: string | null
-        ): CriticScoreData => {
-          if (!isCandidateValid(data, verifiedAnchorSlug)) {
-            return priorPositiveScore ?? data;
-          }
-          const userOverride = this.findMatchingUserOverride(
-            steamAppId,
-            title,
-            options?.gameId,
-            options?.platforms
-          );
-          if (userOverride && userOverride.reviewScoreOverride !== undefined) {
-            return userOverride.reviewScoreOverride ?? data;
-          }
-
-          // Monotonic Source-Authority Lattice guard: never overwrite an existing non-expired,
-          // semantically valid cached score with a lower-authority source.
-          const incomingRank = getReviewSourceAuthorityRank(data);
-          let highestExisting: CriticScoreData | null = null;
-          let highestExistingRank = 0;
-
-          const considerExisting = (cand: CriticScoreData | null | undefined) => {
-            if (!cand || typeof cand.score !== 'number' || cand.score <= 0) return;
-            if (!isCandidateValid(cand, verifiedAnchorSlug)) return;
-            const rank = getReviewSourceAuthorityRank(cand);
-            if (rank > highestExistingRank) {
-              highestExistingRank = rank;
-              highestExisting = cand;
-            }
-          };
-
-          for (const pKey of priorKeys) {
-            const existingStaged = loadStagedCache<CriticScoreData>(pKey, false);
-            if (existingStaged.valid && existingStaged.data) {
-              considerExisting(existingStaged.data);
-            }
-          }
-          if (priorPositiveScore && (priorPositiveIsFresh || hadTransientError)) {
-            considerExisting(priorPositiveScore);
-          }
-          const memCandidate = this.inMemoryCache.get(cacheKey);
-          const stagedForMem = loadStagedCache<CriticScoreData>(stagedKey, false);
-          if (memCandidate && !stagedForMem.stale) {
-            considerExisting(memCandidate);
-          }
-
-          if (highestExisting && incomingRank < highestExistingRank) {
-            this.setInMemoryCache(cacheKey, highestExisting);
-            if (lower && cacheKey !== `title:${lower}`) {
-              this.setInMemoryCache(`title:${lower}`, highestExisting);
-            }
-            if (normKey && cacheKey !== `title:${normKey}`) {
-              this.setInMemoryCache(`title:${normKey}`, highestExisting);
-            }
-            return highestExisting;
-          }
-
-          this.transientFailureCounts.delete(cacheKey);
-          const wrote = this.cacheResult(cacheKey, data, effectiveReleaseDate, enrichedGenres, {
-            dynamicResolved: true,
-            aliasTitle: title,
-            hadTransientError,
-            titleForValidation: title,
-            steamAppIdForValidation: steamAppId,
-          });
-          if (!wrote && highestExisting) {
-            return highestExisting;
-          }
-          if (lower && cacheKey !== `title:${lower}`) {
-            this.setInMemoryCache(`title:${lower}`, data);
-          }
-          if (normKey && cacheKey !== `title:${normKey}`) {
-            this.setInMemoryCache(`title:${normKey}`, data);
-          }
-          const baseKey = stripEditionSuffix(title);
-          if (baseKey && baseKey !== normKey && cacheKey !== `title:${baseKey}`) {
-            this.setInMemoryCache(`title:${baseKey}`, data);
-          }
-          if (options?.gameId) {
-            this.scheduleVaultCriticWriteThrough(options.gameId, data, steamAppId, title);
-          }
-          if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-            window.dispatchEvent(
-              new CustomEvent('antigravity_critic_updated', {
-                detail: { cacheKey, title, steamAppId, data },
-              })
-            );
-          }
-          return data;
-        };
-
-        // ==========================================
-        // TIER 1: Metacritic Live Composer / HTML Resolution
-        // ==========================================
-        const tier1Anchor =
-          !anchor?.metacriticSlug && wdLinks?.metacriticSlug
-            ? buildAnchorWithWikidataSlug(anchor, wdLinks.metacriticSlug)
-            : anchor;
-        let mcBundle: import('./metacriticResolver').MetacriticBundle | null = null;
-        try {
-          mcBundle = await metacriticResolver.resolveMetacritic(
-            title,
-            year,
-            tier1Anchor,
-            Priority.P1_VIEWPORT
-          );
-          if (metacriticResolver.hadRecentTransientFailure(title)) {
-            hadTransientError = true;
-          }
-          if (
-            mcBundle?.critic &&
-            mcBundle.critic.isVerified &&
-            mcBundle.critic.score > 0 &&
-            isCandidateValid(mcBundle.critic, tier1Anchor?.metacriticSlug)
-          ) {
-            return broadcastUpdate(mcBundle.critic, tier1Anchor?.metacriticSlug);
-          }
-        } catch (mcErr: unknown) {
-          if (classifyNetworkError(mcErr).status === 'transient_error') {
-            hadTransientError = true;
-          }
-          console.warn(
-            `[CriticScoreService] Metacritic check warning for "${title}":`,
-            mcErr instanceof Error ? mcErr.message : String(mcErr)
-          );
-        }
-
-        // Wikidata CC0 Bridge lookup when Tier 1 produced no critic score:
-        // Discovers canonical P12054 Metacritic slug and/or P2864 OpenCritic ID.
-        if (!wdLinks) {
-          try {
-            wdLinks = await wikidataBridge.resolveForGame({
-              steamAppId,
-              gogSlug,
-              title: cleanTitle || title,
-              releaseYear: year,
-              priority: Priority.P1_VIEWPORT,
-            });
-            const wdFailKeys = [
-              steamAppId ? `steam:${steamAppId}` : '',
-              gogSlug ? `gog:${gogSlug}` : '',
-              normKey ? `title:${normKey}` : '',
-            ].filter(Boolean);
-            if (wdFailKeys.some((k) => wikidataBridge.hadRecentTransientFailure(k))) {
-              hadTransientError = true;
-            }
-          } catch (wdErr: unknown) {
-            if (classifyNetworkError(wdErr).status === 'transient_error') {
-              hadTransientError = true;
-            }
-          }
-        }
-
-        if (
-          wdLinks?.metacriticSlug &&
-          wdLinks.metacriticSlug !== tier1Anchor?.metacriticSlug
-        ) {
-          const wdMcAnchor = buildAnchorWithWikidataSlug(anchor, wdLinks.metacriticSlug);
-          try {
-            const wdMcBundle = await metacriticResolver.resolveMetacritic(
-              cleanTitle || title,
-              year,
-              wdMcAnchor,
-              Priority.P1_VIEWPORT
-            );
-            if (metacriticResolver.hadRecentTransientFailure(cleanTitle || title)) {
-              hadTransientError = true;
-            }
-            if (
-              wdMcBundle?.critic &&
-              wdMcBundle.critic.isVerified &&
-              wdMcBundle.critic.score > 0 &&
-              isCandidateValid(wdMcBundle.critic, wdLinks.metacriticSlug)
-            ) {
-              return broadcastUpdate(wdMcBundle.critic, wdLinks.metacriticSlug);
-            }
-            if (!mcBundle?.user && wdMcBundle?.user) {
-              mcBundle = wdMcBundle;
-            }
-          } catch (wdMcErr: unknown) {
-            if (classifyNetworkError(wdMcErr).status === 'transient_error') {
-              hadTransientError = true;
-            }
-          }
-        }
-
-        // Rule 1 Fallback: If Metacritic scrape failed or was blocked, but storefrontAnchor contains verified metacriticScore
-        if (anchor?.metacriticScore !== undefined && typeof anchor.metacriticScore === 'number' && anchor.metacriticScore > 0) {
-          const mcSlug =
-            anchor.metacriticSlug ||
-            cleanTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-          if (isAnchorSlugCompatible(title, mcSlug)) {
-            const mcUrl =
-              anchor.metacriticUrl ||
-              `https://www.metacritic.com/game/${mcSlug}/critic-reviews/`;
-            const anchorMcResult: CriticScoreData = {
-              id: `mc-${mcSlug}`,
-              source: 'metacritic',
-              score: anchor.metacriticScore,
-              tier: calculateTier(anchor.metacriticScore),
-              numReviews: 20,
-              url: mcUrl,
-              summary: `Verified by official ${anchor.storefront.toUpperCase()} store review anchor.`,
-              isVerified: true,
-              isSynthetic: false,
-            };
-            if (isCandidateValid(anchorMcResult, mcSlug)) {
-              return broadcastUpdate(anchorMcResult, mcSlug);
-            }
-          }
-        }
-
-        // If we already have a verified OpenCritic score, and Metacritic didn't produce a Tier 1 score,
-        // PRESERVE the verified OpenCritic score! DO NOT downgrade to Tier 3 user score or Tier 4 Steam!
-        const existingPreSeeded =
-          this.inMemoryCache.get(cacheKey) ||
-          (steamAppId ? KNOWN_CRITIC_SCORES[steamAppId] : undefined) ||
-          KNOWN_CRITIC_SCORES[title.toLowerCase()] ||
-          (normKey ? KNOWN_CRITIC_SCORES[normKey] : undefined);
-
-        if (existingPreSeeded?.isVerified && existingPreSeeded.source === 'opencritic' && isCandidateValid(existingPreSeeded)) {
-          this.cacheResult(cacheKey, existingPreSeeded, effectiveReleaseDate, enrichedGenres, {
-            dynamicResolved: true,
-            aliasTitle: title,
-            titleForValidation: title,
-            steamAppIdForValidation: steamAppId,
-          });
-          if (lower && cacheKey !== `title:${lower}`) {
-            this.setInMemoryCache(`title:${lower}`, existingPreSeeded);
-          }
-          if (normKey && cacheKey !== `title:${normKey}`) {
-            this.setInMemoryCache(`title:${normKey}`, existingPreSeeded);
-          }
-          return existingPreSeeded;
-        }
-
-        // ==========================================
-        // TIER 2: OpenCritic SSR Resolution (via Wikidata P2864 / Storefront Anchor)
-        // ==========================================
-        try {
-          const resolvedOcId = anchor?.openCriticId ?? wdLinks?.openCriticId ?? null;
-          const ocResult = await openCriticResolver.resolveForGame({
-            title: cleanTitle || title,
-            steamAppId,
-            gogSlug,
-            releaseYear: year,
-            openCriticId: resolvedOcId,
-            storefrontAnchor: anchor,
-            priority: Priority.P1_VIEWPORT,
-          });
-
-          const ocTransient =
-            openCriticResolver.hadRecentTransientFailure(cleanTitle || title) ||
-            openCriticResolver.hadRecentTransientFailure(title) ||
-            (steamAppId ? openCriticResolver.hadRecentTransientFailure(String(steamAppId)) : false) ||
-            (resolvedOcId ? openCriticResolver.hadRecentTransientFailure(String(resolvedOcId)) : false);
-          if (ocTransient) {
-            hadTransientError = true;
-          }
-
-          if (ocResult && ocResult.score > 0) {
-            const isVerifiedStorefrontOcAnchor = Boolean(
-              !steamAppId &&
-                anchor?.isVerifiedGroundTruth &&
-                ocResult.summary?.includes('store review anchor')
-            );
-            const isDisallowedGogOcOnSteam = Boolean(
-              steamAppId &&
-                anchor?.storefront === 'gog' &&
-                !anchor.openCriticId &&
-                isUrlHostMatching(ocResult.url, 'gog.com')
-            );
-            if (!isDisallowedGogOcOnSteam && (isCandidateValid(ocResult) || isVerifiedStorefrontOcAnchor)) {
-              return broadcastUpdate(ocResult);
-            }
-          }
-        } catch (ocErr: unknown) {
-          if (classifyNetworkError(ocErr).status === 'transient_error') {
-            hadTransientError = true;
-          }
-          console.warn(
-            `[CriticScoreService] OpenCritic check warning for "${title}":`,
-            ocErr instanceof Error ? ocErr.message : String(ocErr)
-          );
-        }
-
-        // ==========================================
-        // TIER 3 & 4: Metacritic User Score & Steam Live Community Reviews
-        // Sample-Size Weighting: High-sample verified Steam consensus beats tiny (<25) Metacritic user ratings
-        // ==========================================
-        if (mcBundle?.user && mcBundle.user.score > 0 && isCandidateValid(mcBundle.user)) {
-          const mcUserCount = mcBundle.user.numReviews || 0;
-          if (mcUserCount >= 25 || !steamAppId) {
-            return broadcastUpdate(mcBundle.user);
-          }
-
-          try {
-            const steamResult = await steamReviewResolver.resolveScore(title, steamAppId);
-            if (
-              steamResult &&
-              steamResult.score > 0 &&
-              isCandidateValid(steamResult) &&
-              (steamResult.numReviews || 0) >= Math.max(100, mcUserCount * 5)
-            ) {
-              return broadcastUpdate(steamResult);
-            }
-          } catch (steamErr: unknown) {
-            console.warn(
-              `[CriticScoreService] Steam live reviews check warning for "${title}":`,
-              steamErr instanceof Error ? steamErr.message : String(steamErr)
-            );
-          }
-
-          return broadcastUpdate(mcBundle.user);
-        }
-
-        // ==========================================
-        // TIER 4: Steam Live Community Reviews Resolver
-        // ==========================================
-        try {
-          const steamResult = await steamReviewResolver.resolveScore(title, steamAppId);
-          if (steamReviewResolver.hadTransientError(title, steamAppId)) {
-            hadTransientError = true;
-          }
-          if (steamResult && steamResult.isSynthetic && steamResult.score > 0 && isCandidateValid(steamResult)) {
-            return broadcastUpdate(steamResult);
-          }
-        } catch (steamErr: unknown) {
-          if (classifyNetworkError(steamErr).status === 'transient_error') {
-            hadTransientError = true;
-          }
-          console.warn(
-            `[CriticScoreService] Steam live reviews check warning for "${title}":`,
-            steamErr instanceof Error ? steamErr.message : String(steamErr)
-          );
-        }
-
-        // ==========================================
-        // TIER 5: Storefront Star Rating (GOG / Epic / Xbox, >= 4 reviews)
-        // ==========================================
-        try {
-          const starTitle = cleanTitle || title;
-          const gogPlat = options?.platforms?.find((p) => p.platformId === 'gog');
-          const gogIdFromGameId = options?.gameId?.match(/^gog[:_-](\d+)$/i)?.[1];
-          const gogId = gogPlat?.platformGameId?.trim() || gogIdFromGameId || undefined;
-          const epicPlat = options?.platforms?.find((p) => p.platformId === 'epic');
-          const epicId = epicPlat?.platformGameId?.trim() || undefined;
-          const xboxPlat = options?.platforms?.find((p) => p.platformId === 'xbox') as
-            | { platformId: string; platformGameId?: string; xboxProductId?: string }
-            | undefined;
-          const xboxProductId =
-            xboxPlat?.xboxProductId?.trim() ||
-            (/^[A-Z0-9]{12}$/i.test(String(xboxPlat?.platformGameId || '').trim())
-              ? String(xboxPlat?.platformGameId).trim()
-              : undefined);
-          const storefrontContext: CriticScoreContext | undefined =
-            options?.gameId || (options?.platforms && options.platforms.length > 0)
-              ? { gameId: options?.gameId, platforms: options?.platforms }
-              : undefined;
-          const storefrontResult = await storefrontStarResolver.resolveStorefrontScore(
-            {
-              title: starTitle,
-              ...(gogId ? { gogId } : {}),
-              ...(epicId ? { epicId } : {}),
-              ...(xboxProductId ? { xboxProductId } : {}),
-              ...(storefrontContext ? { context: storefrontContext } : {}),
-            },
-            storefrontContext
-          );
-          if (
-            storefrontStarResolver.hadRecentTransientFailure(starTitle) ||
-            (starTitle !== title && storefrontStarResolver.hadRecentTransientFailure(title))
-          ) {
-            hadTransientError = true;
-          }
-          if (storefrontResult && storefrontResult.score > 0 && isCandidateValid(storefrontResult)) {
-            return broadcastUpdate(storefrontResult);
-          }
-        } catch (sfErr: unknown) {
-          if (classifyNetworkError(sfErr).status === 'transient_error') {
-            hadTransientError = true;
-          }
-          console.warn(
-            `[CriticScoreService] Storefront star check warning for "${title}":`,
-            sfErr instanceof Error ? sfErr.message : String(sfErr)
-          );
-        }
-
-        // ==========================================
-        // TIER 6: Truly Unrated
-        // ==========================================
-        return retainSyntheticOrNull();
       } catch {
         return this.inMemoryCache.get(cacheKey) ?? null;
       } finally {
-        this.inFlightResolutions.delete(cacheKey);
+        if (this.inFlightResolutions.get(cacheKey) === promise) {
+          this.inFlightResolutions.delete(cacheKey);
+        }
       }
     })();
 
@@ -4004,7 +2027,8 @@ export class CriticScoreService {
     const existingStaged = loadStagedCache<CriticScoreData>(stagedKey, false);
     if (
       existingStaged.entry &&
-      (existingStaged.entry.tier === MutabilityTier.TIER_0_USER_OVERRIDE || existingStaged.entry.tier === 'override')
+      (existingStaged.entry.tier === MutabilityTier.TIER_0_USER_OVERRIDE ||
+        existingStaged.entry.tier === 'override')
     ) {
       return false;
     }
@@ -4022,7 +2046,12 @@ export class CriticScoreService {
       incoming: CriticScoreData | null
     ): boolean => {
       if (options?.allowAuthorityDowngrade) return false;
-      if (!existing.valid || !existing.data || typeof existing.data.score !== 'number' || existing.data.score <= 0) {
+      if (
+        !existing.valid ||
+        !existing.data ||
+        typeof existing.data.score !== 'number' ||
+        existing.data.score <= 0
+      ) {
         return false;
       }
       if (
@@ -4070,6 +2099,10 @@ export class CriticScoreService {
             tier = MutabilityTier.TIER_2_MATURE;
           }
         }
+      }
+
+      if (tier === MutabilityTier.TIER_0_USER_OVERRIDE) {
+        this.tier0OverrideKeys.add(rawKey);
       }
 
       const savedEntry = saveStagedCache<CriticScoreData>(stagedKey, data, tier, {

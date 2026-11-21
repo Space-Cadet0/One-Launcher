@@ -2,11 +2,12 @@ import type { CriticScoreData, StorefrontReviewAnchor } from '../../contracts/cr
 import type { CanonicalGame } from '../../contracts/game';
 import type { UserGameOverride } from '../../contracts/override';
 import type { SteamEnrichedMetadata, SteamReviewSummary } from '../../contracts/steam';
+import { isValidMetacriticHostUrl } from '../common/storeUrlUtils';
 import * as openCriticModule from '../opencritic/openCritic';
 import { steamMatcher } from '../steam/steamMatcher';
 import { inferReviewRouteFromOverride } from '../storage/userOverrideStorage';
 import { criticScoreService, type CriticScoreContext } from './criticScoreService';
-import { isAnchorSlugCompatible } from './metacriticResolver';
+import { isAnchorSlugCompatible } from './metacritic/metacriticTitleMatching';
 import { extractMetacriticSlugFromUrl } from './storefrontReviewHarvester';
 
 export interface ResolveGameReviewScoreOptions {
@@ -20,22 +21,6 @@ export interface ResolveGameReviewScoreOptions {
 type CanonicalGameWithVaultCritic = CanonicalGame & {
   criticScore?: CriticScoreData | null;
 };
-
-function isValidMetacriticHostUrl(url?: string): boolean {
-  if (!url || typeof url !== 'string') return false;
-  const trimmed = url.trim();
-  if (!trimmed) return false;
-  try {
-    const parsed = new URL(trimmed);
-    const host = parsed.hostname.toLowerCase();
-    return (
-      (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
-      (host === 'metacritic.com' || host.endsWith('.metacritic.com'))
-    );
-  } catch {
-    return /^https?:\/\/(?:www\.)?metacritic\.com\/game\//i.test(trimmed);
-  }
-}
 
 function extractVerifiedAnchorFromMetadata(
   game: CanonicalGame,
@@ -114,14 +99,23 @@ export function buildVerifiedSteamMetacriticAnchor(
 
 /**
  * Single unified review-score resolver across Library Grid, Hover Popout, Filters, Sorting,
- * and Game Detail pages. Delegates through `openCriticModule.getOpenCriticData` (Trap T10)
- * with full entitlement context (`{ gameId, platforms }`) and verified Steam anchor extraction.
+ * and Game Detail pages. Handles explicit `unrated` overrides upfront (zero wasted background
+ * trigger), delegates non-unrated lookups through `openCriticModule.getOpenCriticData` (Trap T10)
+ * with full entitlement context (`{ gameId, platforms }`), and gives `static` overrides strict
+ * precedence over stale cached scores.
  */
 export function resolveGameReviewScore(
   game: CanonicalGame,
   options?: ResolveGameReviewScoreOptions
 ): CriticScoreData | null {
   if (!game) return null;
+
+  const explicitOverrideRoute = options?.userOverride
+    ? inferReviewRouteFromOverride(options.userOverride)
+    : undefined;
+  if (explicitOverrideRoute?.mode === 'unrated') {
+    return null;
+  }
 
   const effectiveSteamAppId = steamMatcher.getEffectiveSteamAppId(game);
   const positivePercent =
@@ -135,14 +129,15 @@ export function resolveGameReviewScore(
     game.enrichedMetadata?.releaseDate;
   const anchor = buildVerifiedSteamMetacriticAnchor(game, options?.liveMetadata);
   const bypassTTL = options?.bypassTTL ?? false;
-  const skipBackgroundTrigger = options?.skipBackgroundTrigger ?? false;
+  const skipBackgroundTrigger =
+    (options?.skipBackgroundTrigger ?? false) || explicitOverrideRoute?.mode === 'static';
   const context: CriticScoreContext = {
     gameId: game.id,
     platforms: game.platforms,
   };
 
-  // CRITICAL TRAP T10: Always delegate through openCriticModule.getOpenCriticData with
-  // skipBackgroundTrigger as arg 7 and entitlement context as arg 8 so existing spies record calls.
+  // CRITICAL TRAP T10: Always delegate non-unrated calls through openCriticModule.getOpenCriticData
+  // with skipBackgroundTrigger as arg 7 and entitlement context as arg 8 so existing spies record calls.
   const resolved = openCriticModule.getOpenCriticData(
     effectiveSteamAppId || undefined,
     game.title,
@@ -154,24 +149,19 @@ export function resolveGameReviewScore(
     context
   );
 
-  const explicitOverrideRoute = options?.userOverride
-    ? inferReviewRouteFromOverride(options.userOverride)
-    : undefined;
-  if (explicitOverrideRoute?.mode === 'unrated') {
-    return null;
+  // Explicit static override takes strict precedence over any stale cached score
+  if (explicitOverrideRoute?.mode === 'static') {
+    return options?.userOverride?.reviewScoreOverride ?? null;
   }
 
   if (
     resolved &&
     typeof resolved.score === 'number' &&
     Number.isFinite(resolved.score) &&
-    resolved.score > 0
+    resolved.score > 0 &&
+    resolved.score <= 100
   ) {
     return resolved;
-  }
-
-  if (explicitOverrideRoute?.mode === 'static') {
-    return options?.userOverride?.reviewScoreOverride ?? null;
   }
 
   // Fallback to vault-hydrated game.criticScore when semantically valid and no review override/route is active
@@ -180,7 +170,8 @@ export function resolveGameReviewScore(
     embeddedCriticScore &&
     typeof embeddedCriticScore.score === 'number' &&
     Number.isFinite(embeddedCriticScore.score) &&
-    embeddedCriticScore.score > 0
+    embeddedCriticScore.score > 0 &&
+    embeddedCriticScore.score <= 100
   ) {
     const activeOverride =
       options?.userOverride ??

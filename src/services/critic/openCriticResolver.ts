@@ -6,6 +6,7 @@ import {
   alignCompoundWordTokens,
   decodeTitleHtmlEntities,
   extractParentheticalReleaseYear,
+  extractTrailingDelimitedReleaseYear,
   foldLatinLigaturesAndDiacritics,
   isIntermediateNumeralSubtitleMatch,
   isSequelMismatch,
@@ -13,18 +14,26 @@ import {
   normalizeTitleKey,
   stripPackagingEditionPhrases,
   stripTrademarkSymbols,
+  stripTrailingDelimitedReleaseYear,
   stripYearEditionPhrases,
 } from '../common/titleUtils';
+import { getDevProxyBaseForRoute } from '../network/browserDevProxy';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 import { Priority, requestScheduler } from '../network/requestScheduler';
-import {
-  TIER_TTLS,
-  evictStagedCache,
-  loadStagedCache,
-  saveStagedCache,
-} from '../storage/stagedCacheService';
+import { TIER_TTLS } from '../storage/stagedCacheService';
 import { calculateTier } from './criticUtils';
+import {
+  StagedResolverCache,
+  createTimeoutSignal,
+  parseValidReleaseYear,
+} from './stagedResolverCache';
 import { wikidataBridge } from './wikidataBridge';
+
+export type OpenCriticExplicitRejectionReason =
+  | 'score_divergence'
+  | 'year_mismatch'
+  | 'sequel_mismatch'
+  | 'title_mismatch';
 
 export interface OpenCriticResolveByIdOptions {
   expectedTitle?: string;
@@ -35,6 +44,7 @@ export interface OpenCriticResolveByIdOptions {
   anchorStorefront?: string;
   anchorUrl?: string;
   bypassCache?: boolean;
+  onExplicitRejection?: (reason: OpenCriticExplicitRejectionReason) => void;
 }
 
 export interface OpenCriticResolveForGameParams {
@@ -58,12 +68,6 @@ export interface ParsedOpenCriticRecord {
   releaseYear?: number;
   url?: string;
   summary?: string;
-}
-
-interface OpenCriticCacheEntry {
-  value: ParsedOpenCriticRecord | null;
-  expiresAt: number;
-  mirroredInStorage: boolean;
 }
 
 const STAGED_PREFIX = 'antigravity_staged_opencritic_v1_';
@@ -93,74 +97,11 @@ const TITLE_STOP_WORDS = new Set<string>([
 const REMASTER_OR_EDITION_RE =
   /\b(remastered|remaster|definitive|enhanced|anniversary|complete|goty|director'?s\s+cut|redux|remake)\b/i;
 
-function isViteBrowserDev(): boolean {
-  const metaEnv = (
-    import.meta as ImportMeta & { env?: { DEV?: boolean; VITEST?: string | boolean } }
-  ).env;
-  if (!metaEnv?.DEV) return false;
-  if (metaEnv.VITEST) return false;
-  if (typeof process !== 'undefined' && Boolean(process.env?.VITEST)) return false;
-  if (typeof window === 'undefined' || typeof window.location === 'undefined') return false;
-  if (window.electronAPI) return false;
-  const protocol = window.location.protocol || '';
-  const port = window.location.port || '';
-  if (!protocol.startsWith('http') || (port !== '3000' && port !== '5173')) {
-    return false;
-  }
-  if (
-    typeof navigator !== 'undefined' &&
-    (navigator.userAgent?.includes('jsdom') || navigator.userAgent?.includes('Node'))
-  ) {
-    return false;
-  }
-  return true;
-}
-
 function getOpenCriticWebBaseUrl(): string {
-  return isViteBrowserDev() ? '/api/opencritic-web' : 'https://opencritic.com';
+  return getDevProxyBaseForRoute('openCriticWeb');
 }
 
-function getStorageSafe(): Storage | null {
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      return window.localStorage;
-    }
-    if (typeof localStorage !== 'undefined') {
-      return localStorage;
-    }
-  } catch {
-    // Ignore restricted storage environments
-  }
-  return null;
-}
-
-function createTimeoutSignal(ms: number): AbortSignal | undefined {
-  if (typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal) {
-    return AbortSignal.timeout(ms);
-  }
-  return undefined;
-}
-
-function parseValidYear(raw?: number | string | null): number | null {
-  if (raw === null || raw === undefined) return null;
-  const maxYear = new Date().getFullYear() + 2;
-  if (typeof raw === 'number') {
-    return Number.isInteger(raw) && raw >= 1975 && raw <= maxYear ? raw : null;
-  }
-  const str = String(raw).trim();
-  if (!str) return null;
-  const isoMatch = str.match(/^[+-]?((?:19|20)\d{2})(?:[-T/]|$)/);
-  if (isoMatch) {
-    const yr = Number.parseInt(isoMatch[1], 10);
-    return yr >= 1975 && yr <= maxYear ? yr : null;
-  }
-  const anyMatch = str.match(/\b((?:19|20)\d{2})\b/);
-  if (anyMatch) {
-    const yr = Number.parseInt(anyMatch[1], 10);
-    return yr >= 1975 && yr <= maxYear ? yr : null;
-  }
-  return null;
-}
+const parseValidYear = parseValidReleaseYear;
 
 function buildOpenCriticSlug(name: string): string {
   if (!name) return 'game';
@@ -475,7 +416,11 @@ export function parseOpenCriticResponsePayload(
 function tokenizeTitleForOpenCriticValidation(raw: string): string[] {
   const parenYr = extractParentheticalReleaseYear(raw);
   const parenYrStr = parenYr !== null ? String(parenYr) : null;
-  let cleaned = stripPackagingEditionPhrases(stripYearEditionPhrases(raw));
+  const trailingYr = extractTrailingDelimitedReleaseYear(raw);
+  const trailingYrStr = trailingYr !== null ? String(trailingYr) : null;
+  let cleaned = stripPackagingEditionPhrases(
+    stripYearEditionPhrases(stripTrailingDelimitedReleaseYear(raw))
+  );
   cleaned = cleaned.replace(/[\(\[]\s*(?:[^)\]]*?[,\s-])?(?:19|20)\d{2}\s*[\)\]]/g, ' ');
   const normalized = normalizeTitleKey(cleaned);
   if (!normalized) return [];
@@ -487,6 +432,7 @@ function tokenizeTitleForOpenCriticValidation(raw: string): string[] {
         !TITLE_STOP_WORDS.has(t) &&
         !EDITION_TOKENS.has(t) &&
         t !== parenYrStr &&
+        t !== trailingYrStr &&
         !isYearEditionToken(raw, t)
     );
   return filtered.length > 0 ? filtered : rawTokens.map((t) => ROMAN_TO_ARABIC[t] || t);
@@ -536,7 +482,11 @@ function isOpenCriticTitleCompatible(
 
     const rawQ = tokenizeTitleForOpenCriticValidation(q);
     const rawC = tokenizeTitleForOpenCriticValidation(c);
-    if (rawQ.length === 0 || rawC.length === 0) return true;
+    if (rawQ.length === 0 || rawC.length === 0) {
+      const normQ = normalizeTitleKey(q);
+      const normC = normalizeTitleKey(c);
+      return Boolean(normQ && normC && normQ === normC);
+    }
 
     const [qTokens, cTokens] = alignCompoundWordTokens(rawQ, rawC);
     const qSet = new Set(qTokens);
@@ -608,112 +558,54 @@ function isOpenCriticYearValid(
 }
 
 export class OpenCriticResolver {
-  private readonly inMemoryCache = new Map<number, OpenCriticCacheEntry>();
-  private readonly trackedStagedKeys = new Set<string>();
+  private readonly cache = new StagedResolverCache<number, ParsedOpenCriticRecord>({
+    stagedPrefix: STAGED_PREFIX,
+    sourceLabel: 'opencritic',
+    maxInMemoryEntries: MAX_IN_MEMORY_ENTRIES,
+    transientFailureWindowMs: TRANSIENT_FAILURE_WINDOW_MS,
+    defaultPositiveTtlMs: POSITIVE_MATURE_TTL_MS,
+    negativeTtlMs: NEGATIVE_TTL_MS,
+  });
   private readonly inFlightById = new Map<number, Promise<ParsedOpenCriticRecord | null>>();
-  private readonly transientFailures = new Map<string, number>();
-  private lastGlobalTransientFailureAt = 0;
-
-  private makeStagedKey(openCriticId: number): string {
-    return `${STAGED_PREFIX}${openCriticId}`;
-  }
-
-  private setMemoryEntry(
-    openCriticId: number,
-    value: ParsedOpenCriticRecord | null,
-    ttlMs: number,
-    mirroredInStorage: boolean
-  ): void {
-    if (this.inMemoryCache.has(openCriticId)) {
-      this.inMemoryCache.delete(openCriticId);
-    }
-    this.inMemoryCache.set(openCriticId, {
-      value,
-      expiresAt: Date.now() + ttlMs,
-      mirroredInStorage,
-    });
-    while (this.inMemoryCache.size > MAX_IN_MEMORY_ENTRIES) {
-      const oldest = this.inMemoryCache.keys().next().value;
-      if (oldest === undefined) break;
-      this.inMemoryCache.delete(oldest);
-    }
-  }
 
   private readCacheEntry(
     openCriticId: number
   ): { hit: boolean; value: ParsedOpenCriticRecord | null } {
-    const stagedKey = this.makeStagedKey(openCriticId);
-    const mem = this.inMemoryCache.get(openCriticId);
-    if (mem) {
-      if (mem.mirroredInStorage) {
-        const storage = getStorageSafe();
-        if (storage && storage.getItem(stagedKey) === null) {
-          this.inMemoryCache.delete(openCriticId);
-        } else if (Date.now() < mem.expiresAt) {
-          return { hit: true, value: mem.value };
-        } else {
-          this.inMemoryCache.delete(openCriticId);
-        }
-      } else if (Date.now() < mem.expiresAt) {
-        return { hit: true, value: mem.value };
-      } else {
-        this.inMemoryCache.delete(openCriticId);
-      }
-    }
-
-    const staged = loadStagedCache<ParsedOpenCriticRecord>(stagedKey, false);
-    if (staged.valid) {
-      const remainingMs =
-        staged.entry &&
-        typeof staged.entry.cachedAt === 'number' &&
-        typeof staged.entry.ttlMs === 'number'
-          ? Math.max(1000, staged.entry.cachedAt + staged.entry.ttlMs - Date.now())
-          : staged.data
-          ? POSITIVE_MATURE_TTL_MS
-          : NEGATIVE_TTL_MS;
-      const storage = getStorageSafe();
-      const mirrored = Boolean(storage && storage.getItem(stagedKey) !== null);
-      this.setMemoryEntry(openCriticId, staged.data, remainingMs, mirrored);
-      this.trackedStagedKeys.add(stagedKey);
-      return { hit: true, value: staged.data };
-    }
-
-    return { hit: false, value: null };
+    return this.cache.read(openCriticId);
   }
 
-  private writePositiveCache(openCriticId: number, record: ParsedOpenCriticRecord): void {
-    const stagedKey = this.makeStagedKey(openCriticId);
+  private writePositiveCache(
+    openCriticId: number,
+    record: ParsedOpenCriticRecord,
+    capturedGlobalEpoch?: number,
+    capturedKeyEpoch?: number
+  ): void {
     const currentYear = new Date().getFullYear();
     const isFreshRelease =
       record.releaseYear !== undefined && record.releaseYear >= currentYear;
     const ttlMs = isFreshRelease ? POSITIVE_FRESH_TTL_MS : POSITIVE_MATURE_TTL_MS;
     const tier = isFreshRelease ? 'fresh' : 'mature';
 
-    this.trackedStagedKeys.add(stagedKey);
-    saveStagedCache<ParsedOpenCriticRecord>(stagedKey, record, tier, {
-      source: 'opencritic',
-      isVerified: true,
-      customTtlMs: ttlMs,
-      dynamicResolved: true,
+    this.cache.writePositive(openCriticId, record, {
+      tier,
+      ttlMs,
+      meta: { isVerified: true },
+      clearTransientKeys: [`id:${openCriticId}`, String(openCriticId)],
+      capturedGlobalEpoch,
+      capturedKeyEpoch,
     });
-    const storage = getStorageSafe();
-    const mirrored = Boolean(storage && storage.getItem(stagedKey) !== null);
-    this.setMemoryEntry(openCriticId, record, ttlMs, mirrored);
-    this.clearTransientFailureForKeys([`id:${openCriticId}`, String(openCriticId)]);
   }
 
-  private writeNegativeCache(openCriticId: number): void {
-    const stagedKey = this.makeStagedKey(openCriticId);
-    this.trackedStagedKeys.add(stagedKey);
-    saveStagedCache<ParsedOpenCriticRecord>(stagedKey, null, 'negative', {
-      source: 'opencritic',
-      failureReason: 'not_found',
-      customTtlMs: NEGATIVE_TTL_MS,
-      dynamicResolved: true,
+  private writeNegativeCache(
+    openCriticId: number,
+    capturedGlobalEpoch?: number,
+    capturedKeyEpoch?: number
+  ): void {
+    this.cache.writeNegative(openCriticId, {
+      ttlMs: NEGATIVE_TTL_MS,
+      capturedGlobalEpoch,
+      capturedKeyEpoch,
     });
-    const storage = getStorageSafe();
-    const mirrored = Boolean(storage && storage.getItem(stagedKey) !== null);
-    this.setMemoryEntry(openCriticId, null, NEGATIVE_TTL_MS, mirrored);
   }
 
   private buildFailureKeys(params: {
@@ -740,32 +632,16 @@ export class OpenCriticResolver {
   }
 
   private markTransientFailure(keys: string[]): void {
-    const now = Date.now();
-    this.lastGlobalTransientFailureAt = now;
-    for (const key of keys) {
-      if (key) {
-        this.transientFailures.set(key, now);
-      }
-    }
-    while (this.transientFailures.size > MAX_IN_MEMORY_ENTRIES) {
-      const oldest = this.transientFailures.keys().next().value;
-      if (oldest === undefined) break;
-      this.transientFailures.delete(oldest);
-    }
+    this.cache.markTransientFailure(keys);
   }
 
   private clearTransientFailureForKeys(keys: string[]): void {
-    for (const key of keys) {
-      if (key) {
-        this.transientFailures.delete(key);
-      }
-    }
+    this.cache.clearTransientFailures(keys);
   }
 
   public hadRecentTransientFailure(key?: string): boolean {
-    const now = Date.now();
     if (!key) {
-      return now - this.lastGlobalTransientFailureAt < TRANSIENT_FAILURE_WINDOW_MS;
+      return this.cache.hadRecentTransientFailure();
     }
 
     const trimmed = key.trim();
@@ -779,43 +655,20 @@ export class OpenCriticResolver {
       `title:${lower}`,
       ...(norm ? [norm, `title:${norm}`] : []),
     ];
+    return this.cache.hadRecentTransientFailure(probes);
+  }
 
-    for (const probe of probes) {
-      const ts = this.transientFailures.get(probe);
-      if (ts !== undefined) {
-        if (now - ts < TRANSIENT_FAILURE_WINDOW_MS) {
-          return true;
-        }
-        this.transientFailures.delete(probe);
-      }
-    }
-
-    return false;
+  public evictId(openCriticId: number): void {
+    if (!Number.isSafeInteger(openCriticId) || openCriticId <= 0) return;
+    this.cache.evictKey(openCriticId);
+    this.inFlightById.delete(openCriticId);
   }
 
   public clearCache(options?: { negativesOnly?: boolean }): void {
-    const negativesOnly = Boolean(options?.negativesOnly);
-    this.transientFailures.clear();
-    this.lastGlobalTransientFailureAt = 0;
-
-    if (negativesOnly) {
-      for (const [id, entry] of this.inMemoryCache.entries()) {
-        if (entry.value === null) {
-          this.inMemoryCache.delete(id);
-          const stagedKey = this.makeStagedKey(id);
-          evictStagedCache(stagedKey);
-          this.trackedStagedKeys.delete(stagedKey);
-        }
-      }
-      return;
+    this.cache.clear(options);
+    if (!options?.negativesOnly) {
+      this.inFlightById.clear();
     }
-
-    this.inMemoryCache.clear();
-    this.inFlightById.clear();
-    for (const stagedKey of this.trackedStagedKeys) {
-      evictStagedCache(stagedKey);
-    }
-    this.trackedStagedKeys.clear();
   }
 
   private async fetchRawRecordById(
@@ -836,6 +689,7 @@ export class OpenCriticResolver {
       return existingInFlight;
     }
 
+    const epoch = this.cache.captureEpoch(openCriticId);
     const run = (async (): Promise<ParsedOpenCriticRecord | null> => {
       if (!onlineLifecycleManager.isOnline()) {
         this.markTransientFailure(failureKeys);
@@ -863,7 +717,7 @@ export class OpenCriticResolver {
 
         if (!response.ok) {
           if (response.status === 404) {
-            this.writeNegativeCache(openCriticId);
+            this.writeNegativeCache(openCriticId, epoch.globalEpoch, epoch.keyEpoch);
             this.clearTransientFailureForKeys(failureKeys);
             return null;
           }
@@ -904,12 +758,12 @@ export class OpenCriticResolver {
         }
 
         if (!Number.isFinite(parsed.topCriticScore) || parsed.topCriticScore <= 0) {
-          this.writeNegativeCache(openCriticId);
+          this.writeNegativeCache(openCriticId, epoch.globalEpoch, epoch.keyEpoch);
           this.clearTransientFailureForKeys(failureKeys);
           return null;
         }
 
-        this.writePositiveCache(openCriticId, parsed);
+        this.writePositiveCache(openCriticId, parsed, epoch.globalEpoch, epoch.keyEpoch);
         this.clearTransientFailureForKeys(failureKeys);
         return parsed;
       } catch (err: unknown) {
@@ -964,17 +818,25 @@ export class OpenCriticResolver {
       return null;
     }
 
-    if (options?.expectedTitle) {
-      if (
-        !isOpenCriticTitleCompatible(
-          options.expectedTitle,
-          record.name,
-          record.url,
-          isVerifiedAnchor
-        )
-      ) {
+    // Check hard incompatibility signals (score divergence, year mismatch, sequel mismatch)
+    // BEFORE generic title mismatch so poisoned anchors NEVER bypass validation via fallback.
+    let finalScore = rawScore;
+    if (
+      typeof options?.anchorScore === 'number' &&
+      Number.isFinite(options.anchorScore) &&
+      options.anchorScore > 0
+    ) {
+      const anchorScoreRounded = Math.round(options.anchorScore);
+      if (Math.abs(rawScore - anchorScoreRounded) > 5) {
+        options.onExplicitRejection?.('score_divergence');
         return null;
       }
+      if (isVerifiedAnchor) {
+        finalScore = anchorScoreRounded;
+      }
+    }
+
+    if (options?.expectedTitle) {
       if (
         !isOpenCriticYearValid(
           options.expectedTitle,
@@ -984,22 +846,23 @@ export class OpenCriticResolver {
           isVerifiedAnchor
         )
       ) {
+        options.onExplicitRejection?.('year_mismatch');
         return null;
       }
-    }
-
-    let finalScore = rawScore;
-    if (
-      typeof options?.anchorScore === 'number' &&
-      Number.isFinite(options.anchorScore) &&
-      options.anchorScore > 0
-    ) {
-      const anchorScoreRounded = Math.round(options.anchorScore);
-      if (Math.abs(rawScore - anchorScoreRounded) > 5) {
+      if (record.name && isSequelMismatch(options.expectedTitle, record.name)) {
+        options.onExplicitRejection?.('sequel_mismatch');
         return null;
       }
-      if (isVerifiedAnchor) {
-        finalScore = anchorScoreRounded;
+      if (
+        !isOpenCriticTitleCompatible(
+          options.expectedTitle,
+          record.name,
+          record.url,
+          isVerifiedAnchor
+        )
+      ) {
+        options.onExplicitRejection?.('title_mismatch');
+        return null;
       }
     }
 
@@ -1084,6 +947,7 @@ export class OpenCriticResolver {
       }
     }
 
+    let explicitRejectionReason: OpenCriticExplicitRejectionReason | null = null;
     if (openCriticId !== undefined) {
       const resolved = await this.resolveById(openCriticId, {
         expectedTitle: params.title,
@@ -1094,10 +958,25 @@ export class OpenCriticResolver {
         anchorStorefront: anchor?.storefront,
         anchorUrl: anchor?.openCriticUrl,
         bypassCache: params.bypassCache,
+        onExplicitRejection: (reason) => {
+          explicitRejectionReason = reason;
+        },
       });
       if (resolved) {
         return resolved;
       }
+    }
+
+    // Never fall back to anchor.openCriticScore when live verification explicitly rejected the
+    // anchor on score divergence, release-year mismatch, sequel mismatch, or unverified title mismatch.
+    const blockAnchorFallback =
+      explicitRejectionReason === 'score_divergence' ||
+      explicitRejectionReason === 'year_mismatch' ||
+      explicitRejectionReason === 'sequel_mismatch' ||
+      (explicitRejectionReason === 'title_mismatch' && !anchor?.isVerifiedGroundTruth);
+
+    if (blockAnchorFallback) {
+      return null;
     }
 
     // Authoritative storefront OpenCritic anchor fallback (e.g. GOG/Epic embedded OpenCritic score)
@@ -1105,7 +984,8 @@ export class OpenCriticResolver {
       anchor &&
       typeof anchor.openCriticScore === 'number' &&
       Number.isFinite(anchor.openCriticScore) &&
-      anchor.openCriticScore > 0
+      anchor.openCriticScore > 0 &&
+      anchor.openCriticScore <= 100
     ) {
       const score = Math.round(anchor.openCriticScore);
       const storeLabel = anchor.storefront.toUpperCase();

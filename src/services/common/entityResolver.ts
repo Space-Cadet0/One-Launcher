@@ -1,10 +1,13 @@
 import {
+  CURRENT_YEAR,
   normalizeTitleKey,
   stripEditionSuffix,
+  stripTrailingDelimitedReleaseYear,
   stripYearEditionPhrases,
   alignCompoundWordTokens,
   extractSequelIdentifier,
   extractParentheticalReleaseYear,
+  extractTrailingDelimitedReleaseYear,
   isIntermediateNumeralSubtitleMatch,
   isSequelMismatch,
   ROMAN_TO_ARABIC,
@@ -59,15 +62,25 @@ const CORPORATE_STOP_WORDS = new Set<string>([
   'and',
 ]);
 
+const MAX_ALLOWED_RELEASE_YEAR = CURRENT_YEAR + 10;
+
+const PAREN_QUALIFIED_YEAR_RE =
+  /\s*[\(\[]\s*(?:[^()\[\]]*?[,\s-])?(?:19|20)\d{2}\s*[\)\]]/g;
+
+function stripDisambiguationYears(title: string): string {
+  const withoutParenYears = title.replace(PAREN_QUALIFIED_YEAR_RE, '');
+  const withoutDelimYear = stripTrailingDelimitedReleaseYear(withoutParenYears);
+  return stripYearEditionPhrases(withoutDelimYear).trim();
+}
+
 /**
  * Extracts a valid 4-digit release year (1975 to currentYear+10) from a number or date/title string,
  * rejecting storefront sentinel years (e.g. 0001, 1900, 2099, 2799, 9998).
  */
 export function parseReleaseYear(val?: number | string | null): number | null {
   if (val === undefined || val === null) return null;
-  const maxAllowedYear = new Date().getFullYear() + 10;
   if (typeof val === 'number') {
-    if (Number.isFinite(val) && val >= 1975 && val <= maxAllowedYear) {
+    if (Number.isFinite(val) && val >= 1975 && val <= MAX_ALLOWED_RELEASE_YEAR) {
       return Math.floor(val);
     }
     return null;
@@ -77,12 +90,12 @@ export function parseReleaseYear(val?: number | string | null): number | null {
   const isoLead = str.match(/^(\d{4})-\d{2}-\d{2}/);
   if (isoLead) {
     const yr = parseInt(isoLead[1], 10);
-    return Number.isFinite(yr) && yr >= 1975 && yr <= maxAllowedYear ? yr : null;
+    return Number.isFinite(yr) && yr >= 1975 && yr <= MAX_ALLOWED_RELEASE_YEAR ? yr : null;
   }
   const match = str.match(/\b(19\d\d|20\d\d)\b/);
   if (match) {
     const yr = parseInt(match[1], 10);
-    return yr >= 1975 && yr <= maxAllowedYear ? yr : null;
+    return yr >= 1975 && yr <= MAX_ALLOWED_RELEASE_YEAR ? yr : null;
   }
   return null;
 }
@@ -299,9 +312,10 @@ function evaluateSingleTitlePair(
     isAccepted: false,
   };
 
-  // Strip parenthetical release years (e.g. "(2016)", "[2023]", "(1993)") and Year Pass suffixes for title token comparison
-  const cleanSrcTitle = stripYearEditionPhrases(srcTitle.replace(/\s*[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]/g, '')).trim();
-  const cleanCandTitle = stripYearEditionPhrases(candTitle.replace(/\s*[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]/g, '')).trim();
+  // Strip parenthetical qualifier/release years (e.g. "(2016)", "[2023]", "(Classic, 2005)"),
+  // trailing delimited years (e.g. "– 2009"), and Year Pass suffixes before sequel & similarity checks
+  const cleanSrcTitle = stripDisambiguationYears(srcTitle);
+  const cleanCandTitle = stripDisambiguationYears(candTitle);
 
   if (!cleanSrcTitle || !cleanCandTitle) {
     return zeroResult;
@@ -350,8 +364,7 @@ function evaluateSingleTitlePair(
   // Release Year Proximity
   if (srcYear !== null && candYear !== null) {
     const diff = Math.abs(srcYear - candYear);
-    const isLaterSameDeveloperPort =
-      srcYear > candYear &&
+    const isSameDeveloperPort =
       diff <= 16 &&
       developerBonus > 0 &&
       srcParenYear === null &&
@@ -361,7 +374,7 @@ function evaluateSingleTitlePair(
       yearAdjustment = 12;
     } else if (diff <= 2) {
       yearAdjustment = 6;
-    } else if (diff >= 4 && !isRemaster && !isLaterSameDeveloperPort) {
+    } else if (diff >= 4 && !isRemaster && !isSameDeveloperPort) {
       yearAdjustment = -35;
       isRebootCollision = true;
     }
@@ -411,8 +424,10 @@ export function computeEntityMatchConfidence(
 
   const srcParenYear = extractParentheticalYear(source.title);
   const candParenYear = extractParentheticalYear(candidate.title);
-  const srcYear = parseReleaseYear(source.releaseYear) ?? srcParenYear;
-  const candYear = parseReleaseYear(candidate.releaseYear) ?? candParenYear;
+  const srcDelimYear = extractTrailingDelimitedReleaseYear(source.title);
+  const candDelimYear = extractTrailingDelimitedReleaseYear(candidate.title);
+  const srcYear = parseReleaseYear(source.releaseYear) ?? srcParenYear ?? srcDelimYear;
+  const candYear = parseReleaseYear(candidate.releaseYear) ?? candParenYear ?? candDelimYear;
 
   const srcVariants = extractBilingualTitleVariants(source.title);
   const candVariants = extractBilingualTitleVariants(candidate.title);
