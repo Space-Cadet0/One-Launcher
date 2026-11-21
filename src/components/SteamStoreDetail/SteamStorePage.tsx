@@ -15,7 +15,7 @@ import { SteamHeroDetails } from './SteamHeroDetails';
 import { SteamLibraryActionBar } from './SteamLibraryActionBar';
 import { HowLongToBeatCard } from './HowLongToBeatCard';
 import { OpenCriticCard } from './OpenCriticCard';
-import { SystemRequirements } from './SystemRequirements';
+import { SystemRequirements, hasMeaningfulRequirementSpec } from './SystemRequirements';
 import { PlatformBadges } from './PlatformBadges';
 import { NativeOsBadges } from '../Common/NativeOsBadges';
 import {
@@ -171,9 +171,15 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     () => currentGame.platforms?.find((p) => p.platformId === activePlatformId),
     [currentGame.platforms, activePlatformId]
   );
+  const hasMacReq = hasMeaningfulRequirementSpec(metadata?.macRequirements);
   const activeStoreSupportsMac =
-    activeStoreNativePlatforms.includes('mac') ||
-    (activePlatformId === 'steam' && metadata?.platforms?.mac === true);
+    activePlatformId === 'steam' &&
+    metadata?.platforms?.mac === false &&
+    activePlatformEntry?.platforms?.mac !== true &&
+    !hasMacReq
+      ? false
+      : activeStoreNativePlatforms.includes('mac') ||
+        (activePlatformId === 'steam' && metadata?.platforms?.mac === true);
   activeStoreSupportsMacRef.current = activeStoreSupportsMac;
 
   const activeStoreSupportsLinux = useMemo(() => {
@@ -181,17 +187,20 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     if (typeof activePlatformEntry?.platforms?.linux === 'boolean') {
       return activePlatformEntry.platforms.linux;
     }
-    const hasLinuxReq = Boolean(
-      metadata?.linuxRequirements?.minimum?.trim() ||
-        metadata?.linuxRequirements?.recommended?.trim()
-    );
+    const hasLinuxReq = hasMeaningfulRequirementSpec(metadata?.linuxRequirements);
     if (activePlatformId === 'steam') {
+      if (metadata?.platforms?.linux === false && !hasLinuxReq) {
+        return false;
+      }
       return metadata?.platforms?.linux === true || hasLinuxReq;
     }
     if (activePlatformId === 'gog' || activePlatformId === 'epic') {
       const metadataMatchesActiveStore =
         metadata?.enrichedSource === activePlatformId ||
         (activePlatformId === 'gog' && Boolean(currentGame.worksOn?.linux));
+      if (metadataMatchesActiveStore && metadata?.platforms?.linux === false && !hasLinuxReq) {
+        return false;
+      }
       return Boolean(
         metadataMatchesActiveStore && (metadata?.platforms?.linux === true || hasLinuxReq)
       );
@@ -203,8 +212,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     currentGame.worksOn?.linux,
     metadata?.enrichedSource,
     metadata?.platforms?.linux,
-    metadata?.linuxRequirements?.minimum,
-    metadata?.linuxRequirements?.recommended,
+    metadata?.linuxRequirements,
   ]);
 
   // Only re-render page header status on session/install/storefront transitions (NOT 1Hz download progress ticks!)

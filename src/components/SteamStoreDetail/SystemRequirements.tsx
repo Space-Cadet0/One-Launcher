@@ -15,8 +15,31 @@ export interface SystemRequirementsProps {
 
 type OsTabKey = 'windows' | 'mac' | 'linux';
 
-function hasRequirementContent(req?: SteamSystemRequirements | null): req is SteamSystemRequirements {
-  return Boolean(req && (req.minimum?.trim() || req.recommended?.trim()));
+const BOILERPLATE_REQUIREMENT_HEADER_RE =
+  /\b(?:minimum|recommended|additional\s+notes)\s*:?/gi;
+
+export function hasMeaningfulRequirementText(raw?: string | null): boolean {
+  if (typeof raw !== 'string') return false;
+  const plainText = raw
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;|&#0*160;|&#x0*a0;/gi, ' ')
+    .replace(/[\s\u00a0\u200b\ufeff]+/g, ' ')
+    .trim();
+  if (!plainText) return false;
+  const withoutBoilerplate = plainText
+    .replace(BOILERPLATE_REQUIREMENT_HEADER_RE, ' ')
+    .replace(/[\s:•\-–—|,/]+/g, ' ')
+    .trim();
+  return withoutBoilerplate.length > 0;
+}
+
+export function hasMeaningfulRequirementSpec(
+  req?: SteamSystemRequirements | null
+): req is SteamSystemRequirements {
+  return Boolean(
+    req &&
+      (hasMeaningfulRequirementText(req.minimum) || hasMeaningfulRequirementText(req.recommended))
+  );
 }
 
 const OS_TAB_LABELS: Record<OsTabKey, string> = {
@@ -32,12 +55,12 @@ function computePreferredOsTab(
 ): OsTabKey {
   const isDarwinHost =
     typeof window !== 'undefined' && window.electronAPI?.platform === 'darwin';
-  if (isDarwinHost && hasRequirementContent(macRequirements)) {
+  if (isDarwinHost && hasMeaningfulRequirementSpec(macRequirements)) {
     return 'mac';
   }
-  if (hasRequirementContent(requirements)) return 'windows';
-  if (hasRequirementContent(macRequirements)) return 'mac';
-  if (hasRequirementContent(linuxRequirements)) return 'linux';
+  if (hasMeaningfulRequirementSpec(requirements)) return 'windows';
+  if (hasMeaningfulRequirementSpec(macRequirements)) return 'mac';
+  if (hasMeaningfulRequirementSpec(linuxRequirements)) return 'linux';
   return 'windows';
 }
 
@@ -54,13 +77,13 @@ const SystemRequirementsImpl: React.FC<SystemRequirementsProps> = ({
 
   const availableTabs = useMemo(() => {
     const list: Array<{ key: OsTabKey; label: string; specs: SteamSystemRequirements }> = [];
-    if (hasRequirementContent(requirements)) {
+    if (hasMeaningfulRequirementSpec(requirements)) {
       list.push({ key: 'windows', label: OS_TAB_LABELS.windows, specs: requirements });
     }
-    if (hasRequirementContent(macRequirements)) {
+    if (hasMeaningfulRequirementSpec(macRequirements)) {
       list.push({ key: 'mac', label: OS_TAB_LABELS.mac, specs: macRequirements });
     }
-    if (hasRequirementContent(linuxRequirements)) {
+    if (hasMeaningfulRequirementSpec(linuxRequirements)) {
       list.push({ key: 'linux', label: OS_TAB_LABELS.linux, specs: linuxRequirements });
     }
     return list;
@@ -104,6 +127,8 @@ const SystemRequirementsImpl: React.FC<SystemRequirementsProps> = ({
   const activeEntry =
     availableTabs.find((t) => t.key === selectedTab) || availableTabs[0];
   const activeSpecs = activeEntry.specs;
+  const showMinimum = hasMeaningfulRequirementText(activeSpecs.minimum);
+  const showRecommended = hasMeaningfulRequirementText(activeSpecs.recommended);
 
   const handleTabKeyDown = (
     e: React.KeyboardEvent<HTMLButtonElement>,
@@ -214,18 +239,18 @@ const SystemRequirementsImpl: React.FC<SystemRequirementsProps> = ({
           availableTabs.length > 1 ? `sysreq-tab-${activeEntry.key}` : undefined
         }
         className={`grid grid-cols-1 ${
-          activeSpecs.minimum && activeSpecs.recommended ? 'md:grid-cols-2' : ''
+          showMinimum && showRecommended ? 'md:grid-cols-2' : ''
         } gap-6`}
       >
         {/* Minimum Specs */}
-        {activeSpecs.minimum && (
+        {showMinimum && activeSpecs.minimum && (
           <div className="bg-[#101720]/80 p-4 rounded border border-steam-border/40">
             {renderCleanHtml(activeSpecs.minimum)}
           </div>
         )}
 
         {/* Recommended Specs */}
-        {activeSpecs.recommended && (
+        {showRecommended && activeSpecs.recommended && (
           <div className="bg-[#101720]/80 p-4 rounded border border-steam-border/40">
             {renderCleanHtml(activeSpecs.recommended)}
           </div>

@@ -79,6 +79,8 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const manageMenuRef = useRef<HTMLDivElement | null>(null);
   const manageTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const manageDropdownRef = useRef<HTMLDivElement | null>(null);
+  const pendingManageFocusRef = useRef<'first' | 'last' | null>(null);
   const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const resetUiStateForNewGame = useCallback(() => {
@@ -145,8 +147,130 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
     ocMeta,
   } = useActionBarAchievementsAndCritic(game, metadata, openCriticData, targetSteamAppId);
 
+  const getEnabledManageMenuItems = useCallback(
+    (root?: HTMLElement | null): HTMLButtonElement[] => {
+      const container =
+        root ||
+        manageDropdownRef.current ||
+        (manageMenuRef.current?.querySelector?.('#manage-game-dropdown') as HTMLElement | null) ||
+        null;
+      if (!container || typeof container.querySelectorAll !== 'function') return [];
+      return Array.from(
+        container.querySelectorAll<HTMLButtonElement>(
+          '[role="menuitem"]:not(:disabled):not([aria-disabled="true"])'
+        )
+      ).filter((item) => !item.disabled && item.getAttribute('aria-disabled') !== 'true');
+    },
+    []
+  );
+
+  const focusManageMenuItem = useCallback(
+    (target: 'first' | 'last', root?: HTMLElement | null): boolean => {
+      const items = getEnabledManageMenuItems(root);
+      if (items.length === 0) return false;
+      const targetEl = target === 'last' ? items[items.length - 1] : items[0];
+      targetEl?.focus?.({ preventScroll: true });
+      return true;
+    },
+    [getEnabledManageMenuItems]
+  );
+
+  const handleManageTriggerKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLButtonElement>) => {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (isManageMenuOpen) {
+          focusManageMenuItem('first');
+        } else {
+          pendingManageFocusRef.current = 'first';
+          setIsManageMenuOpen(true);
+        }
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (isManageMenuOpen) {
+          focusManageMenuItem('last');
+        } else {
+          pendingManageFocusRef.current = 'last';
+          setIsManageMenuOpen(true);
+        }
+        return;
+      }
+      if (isManageMenuOpen && e.key === 'Home') {
+        e.preventDefault();
+        focusManageMenuItem('first');
+        return;
+      }
+      if (isManageMenuOpen && e.key === 'End') {
+        e.preventDefault();
+        focusManageMenuItem('last');
+        return;
+      }
+      if (isManageMenuOpen && e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsManageMenuOpen(false);
+        manageTriggerRef.current?.focus?.();
+        return;
+      }
+      if (isManageMenuOpen && e.key === 'Tab') {
+        setIsManageMenuOpen(false);
+      }
+    },
+    [isManageMenuOpen, focusManageMenuItem]
+  );
+
+  const handleManageMenuKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsManageMenuOpen(false);
+        manageTriggerRef.current?.focus?.();
+        return;
+      }
+      if (e.key === 'Tab') {
+        setIsManageMenuOpen(false);
+        return;
+      }
+      if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) {
+        return;
+      }
+      const items = getEnabledManageMenuItems(e.currentTarget);
+      if (items.length === 0) return;
+      const activeEl = typeof document !== 'undefined' ? document.activeElement : null;
+      const currentIdx = items.indexOf(activeEl as HTMLButtonElement);
+      const nextIdx =
+        e.key === 'Home'
+          ? 0
+          : e.key === 'End'
+            ? items.length - 1
+            : currentIdx < 0
+              ? e.key === 'ArrowUp'
+                ? items.length - 1
+                : 0
+              : (currentIdx + (e.key === 'ArrowUp' ? -1 : 1) + items.length) % items.length;
+      e.preventDefault();
+      e.stopPropagation();
+      items[nextIdx]?.focus?.({ preventScroll: true });
+    },
+    [getEnabledManageMenuItems]
+  );
+
   useEffect(() => {
-    if (!isManageMenuOpen || typeof document === 'undefined') return undefined;
+    if (!isManageMenuOpen) {
+      pendingManageFocusRef.current = null;
+      return undefined;
+    }
+
+    const pendingTarget = pendingManageFocusRef.current;
+    if (pendingTarget) {
+      pendingManageFocusRef.current = null;
+      focusManageMenuItem(pendingTarget);
+    }
+
+    if (typeof document === 'undefined') return undefined;
 
     function handleOutsideClick(e: MouseEvent) {
       if (manageMenuRef.current && !manageMenuRef.current.contains(e.target as Node)) {
@@ -158,7 +282,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       if (e.key === 'Escape') {
         e.preventDefault();
         setIsManageMenuOpen(false);
-        manageTriggerRef.current?.focus();
+        manageTriggerRef.current?.focus?.();
       }
     }
 
@@ -168,7 +292,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       document.removeEventListener('mousedown', handleOutsideClick);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [isManageMenuOpen]);
+  }, [isManageMenuOpen, focusManageMenuItem]);
 
   const showTempFeedback = useCallback((msg: string, durationMs = 4000) => {
     if (feedbackTimerRef.current) {
@@ -592,8 +716,17 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
               <button
                 ref={manageTriggerRef}
                 type="button"
-                onClick={() => setIsManageMenuOpen((prev) => !prev)}
+                onClick={(e) => {
+                  const isKeyboardActivation = !e || e.detail === 0;
+                  setIsManageMenuOpen((prev) => {
+                    const next = !prev;
+                    pendingManageFocusRef.current = next && isKeyboardActivation ? 'first' : null;
+                    return next;
+                  });
+                }}
+                onKeyDown={handleManageTriggerKeyDown}
                 aria-label="Manage Game"
+                aria-haspopup="menu"
                 aria-expanded={isManageMenuOpen}
                 aria-controls={isManageMenuOpen ? 'manage-game-dropdown' : undefined}
                 title="Manage Game (Files, Launch Settings, Verify, Uninstall)"
@@ -614,6 +747,8 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                   isWindowsHost,
                   hasLocalFilesPath,
                   activeDownload,
+                  dropdownRef: manageDropdownRef,
+                  onMenuKeyDown: handleManageMenuKeyDown,
                   onCloseMenu: () => setIsManageMenuOpen(false),
                   onOpenInstallModal: () => setIsInstallModalOpen(true),
                   onPrefetchInstallModal: prefetchGameInstallModal,

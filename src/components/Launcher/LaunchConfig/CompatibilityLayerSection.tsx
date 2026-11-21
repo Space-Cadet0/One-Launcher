@@ -457,7 +457,16 @@ function CompatibilityLayerSectionImpl(
       normalizedExecArch === 'amd64' ||
       normalizedExecArch === 'x86_64' ||
       normalizedExecArch === 'pe32+' ||
-      normalizedExecArch === 'arm64');
+      normalizedExecArch === 'win64' ||
+      normalizedExecArch === '64-bit' ||
+      normalizedExecArch === '64bit' ||
+      normalizedExecArch === 'arm64' ||
+      normalizedExecArch === 'aarch64' ||
+      normalizedExecArch === 'arm64ec' ||
+      (normalizedExecArch === '' &&
+        preview.is32BitExecutable === false &&
+        (preview.detectedBuildType === 'windows_exe_on_mac' ||
+          preview.detectedBuildType === 'windows_native')));
   const isLaaNotNeededAndOff = isConfirmed64BitBinary && !effectiveForceLargeAddressAware;
 
   const isPreviewBranch =
