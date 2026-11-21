@@ -12,7 +12,8 @@ import { StorefrontId } from '../../../contracts/platform';
 import { toOlMediaUrl } from '../../../contracts/network';
 import { steamMatcher } from '../../../services/steam/steamMatcher';
 import { steamApi } from '../../../services/steam/steamApi';
-import { getOpenCriticData, getTierColor } from '../../../services/opencritic/openCritic';
+import { getReviewSourceDisplayMeta, getTierColor } from '../../../services/critic/criticUtils';
+import { resolveGameReviewScore } from '../../../services/critic/reviewScoreResolver';
 import {
   fetchAndCacheHltb,
   getHowLongToBeat,
@@ -119,12 +120,38 @@ const GameHoverPopoutContent: React.FC<RenderGameHoverPopoutArgs> = ({
       })
     : '';
 
+  const [hoverCriticTick, setHoverCriticTick] = useState(0);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return undefined;
+    }
+    const handleCriticOrOverrideUpdated = () => {
+      setHoverCriticTick((t) => t + 1);
+    };
+    window.addEventListener('antigravity_critic_updated', handleCriticOrOverrideUpdated);
+    window.addEventListener('antigravity:user-override-updated', handleCriticOrOverrideUpdated);
+    window.addEventListener('antigravity:user-override-removed', handleCriticOrOverrideUpdated);
+    window.addEventListener('antigravity_user_overrides_updated', handleCriticOrOverrideUpdated);
+    return () => {
+      window.removeEventListener('antigravity_critic_updated', handleCriticOrOverrideUpdated);
+      window.removeEventListener('antigravity:user-override-updated', handleCriticOrOverrideUpdated);
+      window.removeEventListener('antigravity:user-override-removed', handleCriticOrOverrideUpdated);
+      window.removeEventListener(
+        'antigravity_user_overrides_updated',
+        handleCriticOrOverrideUpdated
+      );
+    };
+  }, []);
+
+  void hoverCriticTick;
   const playtimeLabel = formatPlaytime(hoveredGame);
-  const oc = getOpenCriticData(
-    targetAppId,
-    hoveredGame.title,
-    hoveredGame.reviewSummary?.positivePercent
-  );
+  const effectiveReviewSummary =
+    hoveredGame.reviewSummary || hoveredGame.enrichedMetadata?.reviewSummary;
+  const oc = resolveGameReviewScore(hoveredGame, {
+    skipBackgroundTrigger: true,
+    userOverride: hoveredOverride,
+  });
   const syncHltb = getHowLongToBeat(
     hoveredGame.title,
     targetAppId,
@@ -270,15 +297,17 @@ const GameHoverPopoutContent: React.FC<RenderGameHoverPopoutArgs> = ({
       <div className="p-3.5 space-y-3 text-xs">
         {/* Review Sentiment & Playtime Row */}
         <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
-          {hoveredGame.reviewSummary ? (
+          {effectiveReviewSummary?.reviewScoreDesc ? (
             <div className="flex items-center gap-1.5">
               <ThumbsUp aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
               <span className="text-steam-accent font-semibold text-[11px]">
-                {hoveredGame.reviewSummary.reviewScoreDesc}
+                {effectiveReviewSummary.reviewScoreDesc}
               </span>
-              <span className="text-steam-subtext text-[10px]">
-                ({hoveredGame.reviewSummary.positivePercent}%)
-              </span>
+              {typeof effectiveReviewSummary.positivePercent === 'number' && (
+                <span className="text-steam-subtext text-[10px]">
+                  ({effectiveReviewSummary.positivePercent}%)
+                </span>
+              )}
             </div>
           ) : (
             <span className="text-steam-subtext text-[11px] italic">Verified in Library</span>
@@ -303,64 +332,43 @@ const GameHoverPopoutContent: React.FC<RenderGameHoverPopoutArgs> = ({
         {oc &&
           (() => {
             const ocColors = getTierColor(oc.tier);
-            const isMetacritic = oc.source === 'metacritic';
-            const isMetacriticUser = oc.source === 'metacritic_user';
-            const isSteam = oc.source === 'steam';
-            const isGog = oc.source === 'gog';
-            const isEpic = oc.source === 'epic';
-            const isXbox =
-              String(oc.id || '').startsWith('xbox-') ||
-              Boolean(oc.url && oc.url.includes('xbox.com'));
-            const sourceTag = isMetacritic
-              ? 'MC'
-              : isMetacriticUser
-                ? 'MCU'
-                : isSteam
-                  ? 'STM'
-                  : isGog
-                    ? 'GOG'
-                    : isEpic
-                      ? 'EGS'
-                      : isXbox
-                        ? 'XBX'
-                        : 'OC';
-            const sourceName = isMetacritic
-              ? 'Metacritic'
-              : isMetacriticUser
-                ? 'MC User Score'
-                : isSteam
-                  ? 'Steam Rating'
-                  : isGog
-                    ? 'GOG Rating'
-                    : isEpic
-                      ? 'Epic Rating'
-                      : isXbox
-                        ? 'Xbox Rating'
-                        : 'OpenCritic';
+            const sourceMeta = getReviewSourceDisplayMeta(oc);
+            const tagBadgeClass = (() => {
+              switch (sourceMeta.shortTag) {
+                case 'MC':
+                  return 'bg-amber-400 text-black font-extrabold';
+                case 'MCU':
+                  return 'bg-emerald-400 text-black font-extrabold';
+                case 'STM':
+                  return 'bg-sky-700 text-white font-extrabold';
+                case 'GOG':
+                  return 'bg-purple-700 text-white font-extrabold';
+                case 'EGS':
+                  return 'bg-zinc-700 text-white font-extrabold';
+                case 'XBX':
+                  return 'bg-emerald-700 text-white font-extrabold';
+                case 'CST':
+                  return 'bg-indigo-600 text-white font-extrabold';
+                case 'OC':
+                default:
+                  return `${ocColors.scoreBg} text-white`;
+              }
+            })();
             return (
-              <div className="flex items-center justify-between bg-black/40 px-2.5 py-1.5 rounded border border-white/10 text-[10px]">
+              <div
+                role="group"
+                aria-label={sourceMeta.ariaLabel}
+                className="flex items-center justify-between bg-black/40 px-2.5 py-1.5 rounded border border-white/10 text-[10px]"
+              >
                 <div className="flex items-center gap-1.5 text-slate-200">
                   <span
-                    className={`w-3.5 h-3.5 rounded text-[8px] font-black flex items-center justify-center shrink-0 ${
-                      isMetacritic
-                        ? 'bg-amber-400 text-black font-extrabold'
-                        : isMetacriticUser
-                          ? 'bg-emerald-400 text-black font-extrabold'
-                          : isSteam
-                            ? 'bg-sky-700 text-white font-extrabold'
-                            : isGog
-                              ? 'bg-purple-700 text-white font-extrabold'
-                              : isEpic
-                                ? 'bg-zinc-700 text-white font-extrabold'
-                                : isXbox
-                                  ? 'bg-emerald-700 text-white font-extrabold'
-                                  : `${ocColors.scoreBg} text-white`
-                    }`}
+                    aria-hidden="true"
+                    className={`min-w-4 h-3.5 px-0.5 rounded text-[8px] font-black flex items-center justify-center shrink-0 ${tagBadgeClass}`}
                   >
-                    {sourceTag}
+                    {sourceMeta.shortTag}
                   </span>
                   <span className="font-semibold uppercase tracking-wider text-[9px] text-slate-300">
-                    {sourceName}
+                    {sourceMeta.shortLabel}
                   </span>
                 </div>
                 <div className="flex items-center gap-2">

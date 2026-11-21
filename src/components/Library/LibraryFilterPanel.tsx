@@ -63,19 +63,19 @@ const CRITIC_TIER_OPTIONS: {
   {
     id: 'strong',
     label: 'Strong',
-    range: '75–83',
+    range: '74–83',
     badgeClass: 'border-purple-500/50 text-purple-300 bg-purple-500/10',
   },
   {
     id: 'fair',
     label: 'Fair',
-    range: '60–74',
+    range: '66–73',
     badgeClass: 'border-sky-500/50 text-sky-300 bg-sky-500/10',
   },
   {
     id: 'weak',
     label: 'Weak',
-    range: '<60',
+    range: '<66',
     badgeClass: 'border-emerald-500/50 text-emerald-300 bg-emerald-500/10',
   },
 ];
@@ -366,7 +366,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
             disabled={activeCriteriaCount === 0}
             className="min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#1e2b3c] hover:bg-[#28394f] disabled:opacity-40 disabled:pointer-events-none text-steam-text hover:text-white border border-steam-border/70 font-semibold text-[11px] transition-colors cursor-pointer"
           >
-            <RotateCcw className="w-3 h-3 text-steam-accent" />
+            <RotateCcw aria-hidden="true" className="w-3 h-3 text-steam-accent" />
             <span>Reset All</span>
           </button>
           {onClose && (
@@ -377,7 +377,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
               title="Close filter panel"
               aria-label="Close filter panel"
             >
-              <X className="w-4 h-4" />
+              <X aria-hidden="true" className="w-4 h-4" />
             </button>
           )}
         </div>
@@ -392,7 +392,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
         >
           <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
             <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Monitor className="w-3.5 h-3.5 text-steam-accent" />
+              <Monitor aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
               <span>
                 {supportsWindowsTranslation ? '1. OS & Compatibility' : '1. Operating System'}
               </span>
@@ -429,7 +429,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
                           : 'border-steam-border bg-black/40'
                       }`}
                     >
-                      {isSelected && <Check className="w-2.5 h-2.5 stroke-[3]" />}
+                      {isSelected && <Check aria-hidden="true" className="w-2.5 h-2.5 stroke-[3]" />}
                     </div>
                     <div className="truncate">
                       <div className="text-xs leading-tight">{opt.label}</div>
@@ -452,7 +452,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
         >
           <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
             <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Award className="w-3.5 h-3.5 text-steam-accent" />
+              <Award aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
               <span>2. Rating &amp; Reviews</span>
             </div>
           </div>
@@ -460,7 +460,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
           {/* Critic Tier Pills */}
           <div className="space-y-1.5">
             <div className="text-[10px] font-semibold uppercase tracking-wider text-steam-subtext">
-              OpenCritic Tier
+              Critic Tier
             </div>
             <div className="grid grid-cols-2 gap-1.5">
               {CRITIC_TIER_OPTIONS.map((tier) => {
@@ -558,7 +558,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
         >
           <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
             <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Tags className="w-3.5 h-3.5 text-steam-accent" />
+              <Tags aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
               <span>3. Genres</span>
             </div>
             {/* ANY / ALL Match Mode Toggle */}
@@ -599,7 +599,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
             <label htmlFor={genreSearchInputId} className="sr-only">
               Search genres
             </label>
-            <Search className="w-3 h-3 text-steam-subtext absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <Search aria-hidden="true" className="w-3 h-3 text-steam-subtext absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
             <input
               id={genreSearchInputId}
               type="text"
@@ -651,7 +651,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
         >
           <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
             <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Sparkles className="w-3.5 h-3.5 text-steam-accent" />
+              <Sparkles aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
               <span>4. Features &amp; Capabilities</span>
             </div>
             {filterState.features.length > 0 && (
@@ -693,7 +693,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
         >
           <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
             <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Calendar className="w-3.5 h-3.5 text-steam-accent" />
+              <Calendar aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
               <span>5. Release Date</span>
             </div>
             <span
@@ -828,7 +828,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
         >
           <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
             <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Building2 className="w-3.5 h-3.5 text-steam-accent" />
+              <Building2 aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
               <span>6. Creator</span>
             </div>
             {filterState.creators.length > 0 && (
@@ -843,7 +843,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
             <label htmlFor={creatorSearchInputId} className="sr-only">
               Search developers or publishers
             </label>
-            <Search className="w-3 h-3 text-steam-subtext absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <Search aria-hidden="true" className="w-3 h-3 text-steam-subtext absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
             <input
               id={creatorSearchInputId}
               type="text"
@@ -887,7 +887,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
         >
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-steam-border/40 pb-2">
             <div className="flex items-center gap-2 font-bold text-white uppercase tracking-wider text-[11px]">
-              <Tag className="w-3.5 h-3.5 text-steam-accent" />
+              <Tag aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
               <span>7. Tags</span>
               {selectedTags.length > 0 && (
                 <span className="text-[10px] text-steam-accent font-semibold normal-case tracking-normal">
@@ -933,7 +933,7 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
             <label htmlFor={tagSearchInputId} className="sr-only">
               Search tags
             </label>
-            <Search className="w-3 h-3 text-steam-subtext absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <Search aria-hidden="true" className="w-3 h-3 text-steam-subtext absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
             <input
               id={tagSearchInputId}
               type="text"

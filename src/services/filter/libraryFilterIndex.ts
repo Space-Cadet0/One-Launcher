@@ -13,7 +13,7 @@ import {
 } from '../../contracts/filter';
 import type { TagFacetCount } from '../../contracts/tags';
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
-import { getOpenCriticData } from '../opencritic/openCritic';
+import { resolveGameReviewScore } from '../critic/reviewScoreResolver';
 import { steamMatcher } from '../steam/steamMatcher';
 import {
   getEffectiveCategories,
@@ -114,9 +114,9 @@ const OS_LABELS: Record<OsCompatibilityFilterOption, string> = {
 
 const CRITIC_TIER_LABELS: Record<CriticTierFilterOption, string> = {
   mighty: 'Mighty (84+)',
-  strong: 'Strong (75–83)',
-  fair: 'Fair (60–74)',
-  weak: 'Weak (<60)',
+  strong: 'Strong (74–83)',
+  fair: 'Fair (66–73)',
+  weak: 'Weak (<66)',
 };
 
 const REVIEW_SENTIMENT_LABELS: Record<ReviewSentimentFilterOption, string> = {
@@ -411,15 +411,7 @@ export function buildLibraryFilterIndex(
 
     // Category 2: Rating (Critic Tier, Score & Review Sentiment)
     const effectiveSteamAppId = steamMatcher.getEffectiveSteamAppId(game);
-    const oc = getOpenCriticData(
-      effectiveSteamAppId,
-      game.title,
-      game.reviewSummary?.positivePercent ?? game.enrichedMetadata?.reviewSummary?.positivePercent,
-      game.releaseDate,
-      undefined,
-      false,
-      true
-    );
+    const oc = resolveGameReviewScore(game, { skipBackgroundTrigger: true });
     const criticScore =
       oc && typeof oc.score === 'number' && oc.score > 0 ? Math.round(oc.score) : null;
     const criticPercentRecommended =

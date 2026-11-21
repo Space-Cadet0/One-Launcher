@@ -2,7 +2,7 @@ import { CanonicalGame } from '../../contracts/game';
 import { SteamCategory } from '../../contracts/steam';
 import { ActiveGameFilter } from '../../contracts/filter';
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
-import { getOpenCriticData } from '../opencritic/openCritic';
+import { resolveGameReviewScore } from '../critic/reviewScoreResolver';
 import {
   isGameOwnedOnSteam,
   isSteamExclusiveFeature,
@@ -106,15 +106,7 @@ export function matchesGameFilter(game: CanonicalGame, filter: ActiveGameFilter)
   }
 
   if (filter.type === 'opencritic' || filter.type === 'rating' || filter.type === 'critic') {
-    const oc = getOpenCriticData(
-      game.steamAppId,
-      game.title,
-      game.reviewSummary?.positivePercent,
-      game.releaseDate,
-      undefined,
-      false,
-      true
-    );
+    const oc = resolveGameReviewScore(game, { skipBackgroundTrigger: true });
     if (!oc) return false;
     const tier = oc.tier.toLowerCase();
     return tier === target || target.includes(tier) || tier.includes(target);

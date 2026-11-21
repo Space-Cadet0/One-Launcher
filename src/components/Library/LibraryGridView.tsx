@@ -17,7 +17,8 @@ import {
   describeActiveFilterChips,
 } from '../../services/filter/libraryFilterIndex';
 import { VirtualGridRows } from '../Common/VirtualContainers';
-import { getOpenCriticData } from '../../services/opencritic/openCritic';
+import { getReviewSourceAuthorityRank } from '../../services/critic/criticUtils';
+import { resolveGameReviewScore } from '../../services/critic/reviewScoreResolver';
 import { steamMatcher } from '../../services/steam/steamMatcher';
 import { steamApi } from '../../services/steam/steamApi';
 import { isUserActivelyScrolling } from '../../utils/scrollActivityTracker';
@@ -124,6 +125,7 @@ interface IgdbCoverUpdatedDetail {
 interface CriticUpdatedDetail {
   refreshedAll?: boolean;
   immediate?: boolean;
+  hydratedFromVault?: boolean;
 }
 
 export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
@@ -178,7 +180,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     const handleUpdate = (e?: Event) => {
       const detail = (e as CustomEvent<CriticUpdatedDetail | undefined> | undefined)?.detail;
       const isImmediate =
-        Boolean(detail?.refreshedAll || detail?.immediate) ||
+        Boolean(detail?.refreshedAll || detail?.immediate || detail?.hydratedFromVault) ||
         Boolean(typeof process !== 'undefined' && process.env?.VITEST);
       if (isImmediate) {
         if (criticThrottleTimer) {
@@ -413,7 +415,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const effectiveFilterState = libraryFilterState ?? internalFilterState;
   const fallbackFilterIndex = useMemo(
     () => (libraryFilterIndex ? null : buildLibraryFilterIndex(games)),
-    [libraryFilterIndex, games]
+    [libraryFilterIndex, games, criticUpdateTick, overrideVersion]
   );
   const effectiveFilterIndex = libraryFilterIndex ?? fallbackFilterIndex!;
 
@@ -697,26 +699,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       if (liveCriticMemoMap.has(game.id)) {
         return liveCriticMemoMap.get(game.id) ?? null;
       }
-      const indexedEntry = effectiveFilterIndex.entriesById.get(game.id);
-      if (criticUpdateTick === 0 && overrideVersion === 0 && indexedEntry) {
-        liveCriticMemoMap.set(game.id, indexedEntry.criticData);
-        return indexedEntry.criticData;
-      }
-      const targetSteamId =
-        indexedEntry?.effectiveSteamAppId ?? steamMatcher.getEffectiveSteamAppId(game);
-      const oc = getOpenCriticData(
-        targetSteamId || undefined,
-        game.title,
-        game.reviewSummary?.positivePercent,
-        undefined,
-        undefined,
-        false,
-        true
-      );
+      const oc = resolveGameReviewScore(game, { skipBackgroundTrigger: true });
       liveCriticMemoMap.set(game.id, oc);
       return oc;
     },
-    [effectiveFilterIndex, criticUpdateTick, overrideVersion, liveCriticMemoMap]
+    [liveCriticMemoMap]
   );
 
   const effectiveIgnoreLeadingThe =
@@ -753,6 +740,8 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       const decorated = new Array<{
         game: CanonicalGame;
         score: number;
+        authorityRank: number;
+        numReviews: number;
         rec: number;
         sortKey: string;
         rawTitle: string;
@@ -764,6 +753,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         decorated[i] = {
           game: g,
           score: oc?.score ?? -1,
+          authorityRank: getReviewSourceAuthorityRank(oc),
+          numReviews:
+            typeof oc?.numReviews === 'number' && Number.isFinite(oc.numReviews)
+              ? oc.numReviews
+              : 0,
           rec: oc?.percentRecommended ?? -1,
           sortKey: getAlphabeticalTitleSortKey(rawTitle, effectiveIgnoreLeadingThe),
           rawTitle,
@@ -771,6 +765,8 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       }
       decorated.sort((a, b) => {
         if (b.score !== a.score) return b.score - a.score;
+        if (b.authorityRank !== a.authorityRank) return b.authorityRank - a.authorityRank;
+        if (b.numReviews !== a.numReviews) return b.numReviews - a.numReviews;
         if (b.rec !== a.rec) return b.rec - a.rec;
         return compareDecoratedTitleTie(a, b);
       });

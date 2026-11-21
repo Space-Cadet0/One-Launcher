@@ -7,7 +7,8 @@ import { StorefrontId } from '../../../contracts/platform';
 import { LibraryFilterIndex } from '../../../services/filter/libraryFilterIndex';
 import { launcherService } from '../../../services/launcher/launcherService';
 import { steamMatcher } from '../../../services/steam/steamMatcher';
-import { getTierColor } from '../../../services/opencritic/openCritic';
+import { getReviewSourceDisplayMeta, getTierColor } from '../../../services/critic/criticUtils';
+import { resolveGameReviewScore } from '../../../services/critic/reviewScoreResolver';
 import { getNativeOsPlatforms } from '../../../services/platform/nativeOsService';
 import { getUserOverrideForGame } from '../../../services/storage/userOverrideStorage';
 import { StorefrontIcon, getStorefrontDisplayName } from '../../Common/StorefrontIcon';
@@ -35,7 +36,7 @@ export interface RenderLibraryGridCardArgs {
   onMouseEnter: (game: CanonicalGame, e: React.MouseEvent<HTMLDivElement>) => void;
   onMouseLeave: (e: React.MouseEvent<HTMLDivElement>) => void;
   onContextMenu: (game: CanonicalGame, e: React.MouseEvent) => void;
-  resolveGameCriticData: (game: CanonicalGame) => OpenCriticData | null;
+  resolveGameCriticData?: (game: CanonicalGame) => OpenCriticData | null;
 }
 
 export function renderLibraryGridCard({
@@ -80,7 +81,12 @@ export function renderLibraryGridCard({
   const hasTopLeftBadge =
     isRunning || isInstalled || isXboxExpiredUnplayable || isXboxLeavingSoon;
 
-  const oc = resolveGameCriticData(game);
+  const oc = resolveGameCriticData
+    ? resolveGameCriticData(game)
+    : resolveGameReviewScore(game, {
+        skipBackgroundTrigger: true,
+        userOverride: cardUserOverride,
+      });
   const cardReleaseYear =
     effectiveFilterIndex.entriesById.get(game.id)?.releaseYear ||
     getReleaseYear(game, steamMatcher.getEffectiveSteamAppId(game));
@@ -172,42 +178,11 @@ export function renderLibraryGridCard({
         {oc &&
           (() => {
             const ocColors = getTierColor(oc.tier);
-            const isMetacritic = oc.source === 'metacritic';
-            const isMetacriticUser = oc.source === 'metacritic_user';
-            const isSteam = oc.source === 'steam';
-            const isGog = oc.source === 'gog';
-            const isEpic = oc.source === 'epic';
-            const isXbox =
-              String(oc.id || '').startsWith('xbox-') ||
-              Boolean(oc.url && oc.url.includes('xbox.com'));
-            const sourceTag = isMetacritic
-              ? 'MC'
-              : isMetacriticUser
-                ? 'MCU'
-                : isSteam
-                  ? 'STM'
-                  : isGog
-                    ? 'GOG'
-                    : isEpic
-                      ? 'EGS'
-                      : isXbox
-                        ? 'XBX'
-                        : 'OC';
-            const sourceName = isMetacritic
-              ? 'Metacritic Metascore'
-              : isMetacriticUser
-                ? 'Metacritic User Score'
-                : isSteam
-                  ? 'Steam Community'
-                  : isGog
-                    ? 'GOG Player Rating'
-                    : isEpic
-                      ? 'Epic Store Rating'
-                      : isXbox
-                        ? 'Xbox Store Rating'
-                        : 'OpenCritic';
+            const sourceMeta = getReviewSourceDisplayMeta(oc);
             return (
               <div
+                role="img"
+                aria-label={sourceMeta.ariaLabel}
                 className={`absolute top-2 right-2 z-10 flex items-center gap-1 text-[10px] font-extrabold px-1.5 py-0.5 rounded border shadow-md pointer-events-none ${
                   ocColors.badgeBg
                 } ${ocColors.badgeBorder} ${ocColors.badgeText} ${
@@ -215,10 +190,11 @@ export function renderLibraryGridCard({
                     ? 'ring-2 ring-purple-400 shadow-[0_0_10px_rgba(168,85,247,0.55)] scale-105'
                     : ''
                 }`}
-                title={`${sourceName}: ${oc.score}/100 • ${oc.tier}${oc.starRatingRaw !== undefined ? ` (${oc.starRatingRaw}★)` : ''}${oc.userScoreRaw ? ` (${oc.userScoreRaw}/10 user rating)` : ''}${oc.percentRecommended !== undefined ? ` (${oc.percentRecommended}% recommended)` : ''}`}
               >
-                <span className="text-[9px] opacity-85">{sourceTag}</span>
-                <span>{oc.score}</span>
+                <span aria-hidden="true" className="text-[9px] opacity-85">
+                  {sourceMeta.shortTag}
+                </span>
+                <span aria-hidden="true">{oc.score}</span>
               </div>
             );
           })()}

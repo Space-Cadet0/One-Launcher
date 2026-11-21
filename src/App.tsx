@@ -451,6 +451,7 @@ export function App() {
   const [isSyncingAllMedia, setIsSyncingAllMedia] = useState(false);
   const [gameRefreshKey, setGameRefreshKey] = useState(0);
   const [tagOverridesVersion, setTagOverridesVersion] = useState(0);
+  const [criticIndexRevision, setCriticIndexRevision] = useState(0);
   const [ignoreLeadingTheWhenSorting, setIgnoreLeadingTheWhenSorting] = useState<boolean>(
     () => launcherService.getPerformanceSettings?.()?.ignoreLeadingTheWhenSorting ?? true
   );
@@ -465,6 +466,69 @@ export function App() {
     window.addEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagOverridesUpdated);
     return () => {
       window.removeEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagOverridesUpdated);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return undefined;
+    }
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleCriticIndexRevision = (event?: Event) => {
+      const detail = (
+        event as CustomEvent<{
+          refreshedAll?: boolean;
+          immediate?: boolean;
+          hydratedFromVault?: boolean;
+        }> | undefined
+      )?.detail;
+      const isImmediate = Boolean(
+        detail?.refreshedAll || detail?.immediate || detail?.hydratedFromVault
+      );
+      if (debounceTimer !== null) {
+        clearTimeout(debounceTimer);
+        debounceTimer = null;
+      }
+      if (isImmediate) {
+        setCriticIndexRevision((v) => v + 1);
+        return;
+      }
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        setCriticIndexRevision((v) => v + 1);
+      }, 150);
+    };
+
+    const handleOverrideIndexRevision = (event?: Event) => {
+      const detail = (event as CustomEvent<Record<string, unknown> | undefined> | undefined)
+        ?.detail;
+      const eventType = typeof detail?.type === 'string' ? detail.type : undefined;
+      if (
+        eventType === 'confirmed-non-game' ||
+        eventType === 'confirmed-non-game-batch' ||
+        eventType === 'batch-confirmed-non-game' ||
+        eventType === 'unconfirmed-non-game'
+      ) {
+        return;
+      }
+      scheduleCriticIndexRevision(event);
+    };
+
+    window.addEventListener('antigravity_critic_updated', scheduleCriticIndexRevision);
+    window.addEventListener('antigravity:user-override-updated', handleOverrideIndexRevision);
+    window.addEventListener('antigravity:user-override-removed', handleOverrideIndexRevision);
+    window.addEventListener('antigravity_user_overrides_updated', handleOverrideIndexRevision);
+    window.addEventListener('antigravity:staged-vault-hydrated', scheduleCriticIndexRevision);
+    return () => {
+      if (debounceTimer !== null) {
+        clearTimeout(debounceTimer);
+        debounceTimer = null;
+      }
+      window.removeEventListener('antigravity_critic_updated', scheduleCriticIndexRevision);
+      window.removeEventListener('antigravity:user-override-updated', handleOverrideIndexRevision);
+      window.removeEventListener('antigravity:user-override-removed', handleOverrideIndexRevision);
+      window.removeEventListener('antigravity_user_overrides_updated', handleOverrideIndexRevision);
+      window.removeEventListener('antigravity:staged-vault-hydrated', scheduleCriticIndexRevision);
     };
   }, []);
 
@@ -894,7 +958,7 @@ export function App() {
 
   const libraryFilterIndex = useMemo(
     () => buildLibraryFilterIndex(games),
-    [games, gameRefreshKey, tagOverridesVersion]
+    [games, gameRefreshKey, tagOverridesVersion, criticIndexRevision]
   );
 
   const filteredGames = useMemo(() => {
