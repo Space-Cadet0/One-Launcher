@@ -1,10 +1,16 @@
+// @ts-check
 'use strict';
 
 const { spawn, execFile } = require('node:child_process');
+const { StringDecoder } = require('node:string_decoder');
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
 
 /**
  * Single source of truth for non-destructive process liveness checks.
+ *
+ * @param {number} pid
+ * @param {((pid: number, signal?: string | number) => void) | null} [killImpl]
+ * @returns {boolean}
  */
 function isProcessAlive(pid, killImpl = null) {
   if (!pid || typeof pid !== 'number' || pid <= 0) return false;
@@ -13,46 +19,113 @@ function isProcessAlive(pid, killImpl = null) {
     killer(pid, 0);
     return true;
   } catch (err) {
-    return Boolean(err && err.code === 'EPERM');
+    return Boolean(err && /** @type {any} */ (err).code === 'EPERM');
   }
 }
 
+/**
+ * Wait deterministically for a child process / PID to exit, cleaning up all poll & timeout
+ * timers and child event listeners immediately on exit or timeout.
+ *
+ * @param {any} child
+ * @param {number} pid
+ * @param {number} [timeoutMs=400]
+ * @param {((pid: number, signal?: string | number) => void) | null} [killImpl]
+ * @returns {Promise<boolean>}
+ */
 async function waitForProcessExit(child, pid, timeoutMs = 400, killImpl = null) {
   if (!pid || !isProcessAlive(pid, killImpl)) return true;
+  const boundedTimeoutMs = Math.max(10, Number(timeoutMs) || 400);
   return new Promise((resolve) => {
     let done = false;
+    /** @type {ReturnType<typeof setInterval> | null} */
     let pollTimer = null;
+    /** @type {ReturnType<typeof setTimeout> | null} */
     let timeoutTimer = null;
+
+    /**
+     * @param {boolean} exited
+     */
     const finish = (exited) => {
       if (done) return;
       done = true;
-      if (pollTimer) clearInterval(pollTimer);
-      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
       if (child && typeof child.removeListener === 'function') {
         child.removeListener('exit', onExit);
+        child.removeListener('close', onExit);
       }
       resolve(exited);
     };
+
     const onExit = () => finish(true);
     if (child && typeof child.once === 'function') {
       child.once('exit', onExit);
+      child.once('close', onExit);
     }
+
     pollTimer = setInterval(() => {
       if (!isProcessAlive(pid, killImpl)) {
         finish(true);
       }
     }, 25);
     if (typeof pollTimer.unref === 'function') pollTimer.unref();
+
     timeoutTimer = setTimeout(() => {
       finish(!isProcessAlive(pid, killImpl));
-    }, timeoutMs);
+    }, boundedTimeoutMs);
     if (typeof timeoutTimer.unref === 'function') timeoutTimer.unref();
   });
 }
 
 /**
- * Parse `ps -ax -o pid=,command=` (macOS/Linux) or `tasklist.exe /FO CSV /NH` (Windows)
- * output and return the numeric PID of the first running process matching `exeHints`, or `0`.
+ * @param {string} value
+ * @returns {string}
+ */
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Build boundary-anchored regex matchers for POSIX process command lines so short hints
+ * (e.g. `jk`, `run`, `app`) match executable basenames, `.app` bundles, or path segments
+ * without false-matching unrelated substrings (`openjdk`, `runner`, `appleeventsd`).
+ *
+ * @param {string[]} hints
+ * @returns {RegExp[]}
+ */
+function buildPosixHintMatchers(hints) {
+  /** @type {RegExp[]} */
+  const matchers = [];
+  for (const hint of hints) {
+    if (!hint) continue;
+    const escapedHint = escapeRegExp(hint);
+    if (hint.includes('/') || hint.includes('\\') || /\.(?:exe|app)$/i.test(hint)) {
+      matchers.push(new RegExp(`(?:^|[\\s"'/\\\\:])${escapedHint}(?=$|[\\s"'/\\\\])`, 'i'));
+    } else {
+      matchers.push(
+        new RegExp(`(?:^|[\\s"'/\\\\:])${escapedHint}(?:\\.exe|\\.app)?(?=$|[\\s"'/\\\\])`, 'i')
+      );
+    }
+  }
+  return matchers;
+}
+
+/**
+ * Parse `ps -ax -o pid=,command=` (or `ps -ax -o pid=,ppid=,command=`) on macOS/Linux,
+ * or `tasklist.exe /FO CSV /NH` on Windows, and return the numeric PID of the first
+ * running process matching `exeHints`, or `0`.
+ *
+ * @param {string} stdout
+ * @param {string | string[]} [exeHints]
+ * @param {string} [platform]
+ * @returns {number}
  */
 function extractMatchedPidFromProcessOutput(stdout, exeHints = [], platform = process.platform) {
   if (!stdout || typeof stdout !== 'string') return 0;
@@ -92,34 +165,35 @@ function extractMatchedPidFromProcessOutput(stdout, exeHints = [], platform = pr
         }
         continue;
       }
-      const tokens = line
-        .toLowerCase()
-        .split(/\s+/)
-        .map((t) => t.replace(/^"+|"+$/g, ''));
-      const firstToken = tokens[0] || '';
-      const firstBase = firstToken.replace(/\.exe$/i, '');
-      if (
-        firstToken &&
-        hintsWithAndWithoutExe.some((h) => firstToken === h || firstBase === h)
-      ) {
-        const numMatch = line.match(/\b(\d{2,10})\b/);
-        if (numMatch && Number(numMatch[1]) > 0) {
-          return Number(numMatch[1]);
+      // Anchored tabular tasklist fallback: <imageName> <PID> ...
+      const tableMatch = line.match(/^"?([^\s"]+)"?\s+(\d+)\b/);
+      if (tableMatch) {
+        const firstToken = tableMatch[1].toLowerCase();
+        const firstBase = firstToken.replace(/\.exe$/i, '');
+        const pid = Number(tableMatch[2]);
+        if (
+          pid > 0 &&
+          hintsWithAndWithoutExe.some((h) => firstToken === h || firstBase === h)
+        ) {
+          return pid;
         }
       }
     }
     return 0;
   }
 
+  const hintMatchers = buildPosixHintMatchers(hints);
   for (const rawLine of lines) {
-    const match = rawLine.match(/^\s*(\d+)\s+(.+)$/);
+    // Support both `ps -o pid=,ppid=,command=` and `ps -o pid=,command=` with anchored PID columns
+    const pidPpidCmdMatch = rawLine.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+    const pidCmdMatch = pidPpidCmdMatch ? null : rawLine.match(/^\s*(\d+)\s+(.+)$/);
+    const match = pidPpidCmdMatch || pidCmdMatch;
     if (!match) continue;
     const pid = Number(match[1]);
-    const cmd = match[2].trim();
+    const cmd = (pidPpidCmdMatch ? match[3] : match[2]).trim();
     if (!pid || pid <= 0 || !cmd) continue;
     if (/^(?:\/bin\/|\/usr\/bin\/)?ps(?:\s|$)/i.test(cmd)) continue;
-    const cmdLower = cmd.toLowerCase();
-    if (hints.some((h) => cmdLower.includes(h))) {
+    if (hintMatchers.some((re) => re.test(cmd))) {
       return pid;
     }
   }
@@ -127,9 +201,60 @@ function extractMatchedPidFromProcessOutput(stdout, exeHints = [], platform = pr
 }
 
 /**
+ * Parse anchored `ps -ax -o pid=,ppid=` output and collect all descendant PIDs of `rootPid`.
+ *
+ * @param {string} psOutput
+ * @param {number} rootPid
+ * @returns {number[]}
+ */
+function collectPosixDescendantPids(psOutput, rootPid) {
+  if (!psOutput || !rootPid || rootPid <= 0) return [];
+  /** @type {Map<number, number[]>} */
+  const childrenByPpid = new Map();
+  for (const rawLine of psOutput.split(/\r?\n/)) {
+    const m = rawLine.match(/^\s*(\d+)\s+(\d+)\s*$/);
+    if (!m) continue;
+    const childPid = Number(m[1]);
+    const ppid = Number(m[2]);
+    if (childPid <= 0 || ppid <= 0 || childPid === ppid) continue;
+    let list = childrenByPpid.get(ppid);
+    if (!list) {
+      list = [];
+      childrenByPpid.set(ppid, list);
+    }
+    list.push(childPid);
+  }
+
+  /** @type {number[]} */
+  const descendants = [];
+  /** @type {Set<number>} */
+  const visited = new Set([rootPid]);
+  /** @type {number[]} */
+  const queue = [rootPid];
+  while (queue.length > 0) {
+    const curr = /** @type {number} */ (queue.shift());
+    const kids = childrenByPpid.get(curr);
+    if (!kids) continue;
+    for (const k of kids) {
+      if (visited.has(k)) continue;
+      visited.add(k);
+      descendants.push(k);
+      queue.push(k);
+    }
+  }
+  return descendants;
+}
+
+/**
  * Signal an entire subprocess tree across macOS/Linux process groups (`-pid` when spawned
- * with `detached: true`) and Windows process trees (`taskkill /PID <pid> /T /F`), ensuring
+ * with `detached: true`, or descendant PID walk via anchored `ps -ax -o pid=,ppid=` when
+ * `detached: false`) and Windows process trees (`taskkill /PID <pid> /T /F`), ensuring
  * two-process PyInstaller helpers (`legendary`, `gogdl`) never leave orphan worker children.
+ *
+ * @param {number | any} proc
+ * @param {string} [signal='SIGTERM']
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ signaled: boolean, method: string, pid: number, signal?: string }>}
  */
 function signalSubprocessTree(proc, signal = 'SIGTERM', options = {}) {
   const targetPlatform = options.platform || process.platform;
@@ -155,6 +280,7 @@ function signalSubprocessTree(proc, signal = 'SIGTERM', options = {}) {
     if (pid > 0) {
       return new Promise((resolve) => {
         let settled = false;
+        /** @param {boolean} ok */
         const done = (ok) => {
           if (settled) return;
           settled = true;
@@ -165,7 +291,7 @@ function signalSubprocessTree(proc, signal = 'SIGTERM', options = {}) {
             'taskkill',
             ['/PID', String(pid), '/T', '/F'],
             { timeout: 2500, windowsHide: true },
-            (err) => {
+            (/** @type {any} */ err) => {
               if (err) {
                 diagLog.debug('processTree.taskkill', err, { pid, signal });
               }
@@ -203,7 +329,53 @@ function signalSubprocessTree(proc, signal = 'SIGTERM', options = {}) {
     return Promise.resolve({ signaled: false, method: 'none', pid: 0, signal });
   }
 
-  // POSIX (darwin / linux): signal negative PGID first, falling back to single PID
+  // POSIX (darwin / linux)
+  const isExplicitlyNonDetached =
+    options.detached === false ||
+    (proc && typeof proc === 'object' && proc.detached === false);
+
+  if (pid > 0 && isExplicitlyNonDetached) {
+    return new Promise((resolve) => {
+      const signalTargets = (/** @type {number[]} */ descendants) => {
+        let anySignaled = false;
+        // Signal deepest descendants first, then root PID
+        for (let i = descendants.length - 1; i >= 0; i -= 1) {
+          try {
+            killImpl(descendants[i], signal);
+            anySignaled = true;
+          } catch {}
+        }
+        try {
+          killImpl(pid, signal);
+          anySignaled = true;
+        } catch (pidErr) {
+          diagLog.debug('processTree.nonDetachedPidKill', pidErr, { pid, signal });
+        }
+        resolve({
+          signaled: anySignaled,
+          method: descendants.length > 0 ? 'descendant_walk' : 'pid',
+          pid,
+          signal,
+        });
+      };
+
+      try {
+        execFileImpl(
+          'ps',
+          ['-ax', '-o', 'pid=,ppid='],
+          { encoding: 'utf8', timeout: 1500 },
+          (/** @type {any} */ err, /** @type {string | Buffer} */ stdout) => {
+            const descendants = !err && stdout ? collectPosixDescendantPids(String(stdout), pid) : [];
+            signalTargets(descendants);
+          }
+        );
+      } catch {
+        signalTargets([]);
+      }
+    });
+  }
+
+  // POSIX detached process group: signal negative PGID first, falling back to single PID
   if (pid > 0) {
     try {
       killImpl(-pid, signal);
@@ -235,8 +407,15 @@ function signalSubprocessTree(proc, signal = 'SIGTERM', options = {}) {
 /**
  * Execute a CLI helper (`gogdl`, `legendary`, etc.) with a strict wall-clock timeout
  * that kills the ENTIRE subprocess tree (`-pid` on POSIX, `taskkill /T /F` on Windows)
- * if the command hangs or times out. Seamlessly supports `options.execFileImpl` / `options.execFileFn`
- * mocks in unit tests.
+ * if the command hangs or times out. Uses `StringDecoder('utf8')` with exact `maxBuffer`
+ * byte slicing so multi-byte UTF-8 paths never corrupt at chunk boundaries, and cleans up
+ * all kill/poll timers deterministically.
+ *
+ * @param {string} bin
+ * @param {string[]} [args]
+ * @param {Record<string, any>} [execOpts]
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ err: any, stdout: string, stderr: string, timedOut: boolean }>}
  */
 async function execCliWithTreeTimeout(bin, args = [], execOpts = {}, options = {}) {
   const targetPlatform = options.platform || process.platform;
@@ -253,26 +432,37 @@ async function execCliWithTreeTimeout(bin, args = [], execOpts = {}, options = {
   if (customExecFile && options.useSpawnForCliTimeout !== true) {
     return new Promise((resolve) => {
       let finished = false;
+      /** @type {any} */
       let childHandle = null;
+      /** @type {ReturnType<typeof setTimeout> | null} */
       let timer = null;
 
-      const finish = (payload) => {
-        if (finished) return;
-        finished = true;
-        if (timer) clearTimeout(timer);
+      /**
+       * @param {{ err: any, stdout: string, stderr: string, timedOut: boolean }} payload
+       */
+      const resolveOnce = (payload) => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
         resolve(payload);
       };
 
       timer = setTimeout(async () => {
         if (finished) return;
+        // Mark finished synchronously BEFORE awaiting tree kill to prevent double-resolve race
+        finished = true;
+        timer = null;
         if (childHandle && childHandle.pid) {
-          await signalSubprocessTree(childHandle, 'SIGKILL', options);
+          try {
+            await signalSubprocessTree(childHandle, 'SIGKILL', options);
+          } catch {}
         }
         const timeoutErr = Object.assign(
           new Error(`Command timed out after ${timeoutMs}ms: ${bin}`),
           { code: 'ETIMEDOUT', killed: true, timedOut: true }
         );
-        finish({ err: timeoutErr, stdout: '', stderr: '', timedOut: true });
+        resolveOnce({ err: timeoutErr, stdout: '', stderr: '', timedOut: true });
       }, timeoutMs);
       if (typeof timer.unref === 'function') timer.unref();
 
@@ -281,8 +471,13 @@ async function execCliWithTreeTimeout(bin, args = [], execOpts = {}, options = {
           bin,
           args,
           { ...execOpts, timeout: timeoutMs },
-          async (err, stdout = '', stderr = '') => {
+          async (/** @type {any} */ err, /** @type {any} */ stdout = '', /** @type {any} */ stderr = '') => {
             if (finished) return;
+            finished = true;
+            if (timer) {
+              clearTimeout(timer);
+              timer = null;
+            }
             const isTimeout = Boolean(
               err &&
                 (err.killed ||
@@ -290,18 +485,22 @@ async function execCliWithTreeTimeout(bin, args = [], execOpts = {}, options = {
                   /timed?\s*out/i.test(String(err.message || '')))
             );
             if (isTimeout && childHandle && childHandle.pid) {
-              await signalSubprocessTree(childHandle, 'SIGKILL', options);
+              try {
+                await signalSubprocessTree(childHandle, 'SIGKILL', options);
+              } catch {}
             }
-            finish({
+            resolveOnce({
               err: err || null,
-              stdout: String(stdout || ''),
-              stderr: String(stderr || ''),
+              stdout: Buffer.isBuffer(stdout) ? stdout.toString('utf8') : String(stdout || ''),
+              stderr: Buffer.isBuffer(stderr) ? stderr.toString('utf8') : String(stderr || ''),
               timedOut: isTimeout,
             });
           }
         );
       } catch (syncErr) {
-        finish({ err: syncErr, stdout: '', stderr: '', timedOut: false });
+        if (finished) return;
+        finished = true;
+        resolveOnce({ err: syncErr, stdout: '', stderr: '', timedOut: false });
       }
     });
   }
@@ -310,21 +509,65 @@ async function execCliWithTreeTimeout(bin, args = [], execOpts = {}, options = {
 
   return new Promise((resolve) => {
     let finished = false;
+    let timedOut = false;
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
     let stdout = '';
     let stderr = '';
-    let timedOut = false;
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    /** @type {any} */
     let child = null;
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    let timer = null;
 
+    /**
+     * @param {{ err: any, stdout: string, stderr: string, timedOut: boolean }} payload
+     */
     const finish = (payload) => {
       if (finished) return;
       finished = true;
-      if (timer) clearTimeout(timer);
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
       resolve(payload);
     };
 
-    const timer = setTimeout(async () => {
+    const flushDecoders = () => {
+      const tailOut = stdoutDecoder.end();
+      if (tailOut) stdout += tailOut;
+      const tailErr = stderrDecoder.end();
+      if (tailErr) stderr += tailErr;
+    };
+
+    /**
+     * @param {Buffer | string | Uint8Array} chunk
+     * @param {boolean} isStderr
+     */
+    const appendDecodedChunk = (chunk, isStderr) => {
+      const currentBytes = isStderr ? stderrBytes : stdoutBytes;
+      if (currentBytes >= maxBuffer) return;
+      const buf = Buffer.isBuffer(chunk)
+        ? chunk
+        : typeof chunk === 'string'
+          ? Buffer.from(chunk, 'utf8')
+          : Buffer.from(chunk);
+      const remaining = maxBuffer - currentBytes;
+      const slice = buf.length > remaining ? buf.subarray(0, remaining) : buf;
+      if (isStderr) {
+        stderrBytes += slice.length;
+        stderr += stderrDecoder.write(slice);
+      } else {
+        stdoutBytes += slice.length;
+        stdout += stdoutDecoder.write(slice);
+      }
+    };
+
+    timer = setTimeout(async () => {
       if (finished) return;
       timedOut = true;
+      timer = null;
       diagLog.warn('processTree.cliTimeout', `CLI helper timed out after ${timeoutMs}ms`, {
         bin,
         args,
@@ -335,15 +578,18 @@ async function execCliWithTreeTimeout(bin, args = [], execOpts = {}, options = {
         } else {
           await signalSubprocessTree(child, 'SIGTERM', options);
           const graceMs = Math.max(25, Number(options.killGraceMs ?? 500));
-          await new Promise((r) => {
-            const gt = setTimeout(r, graceMs);
-            if (typeof gt.unref === 'function') gt.unref();
-          });
-          if (child.pid && isProcessAlive(child.pid, options.killImpl)) {
+          const exitedEarly = await waitForProcessExit(
+            child,
+            child.pid,
+            graceMs,
+            options.killImpl || null
+          );
+          if (!exitedEarly && child.pid && isProcessAlive(child.pid, options.killImpl || null)) {
             await signalSubprocessTree(child, 'SIGKILL', options);
           }
         }
       }
+      flushDecoders();
       const timeoutErr = Object.assign(
         new Error(`Command timed out after ${timeoutMs}ms`),
         { code: 'ETIMEDOUT', killed: true, timedOut: true }
@@ -366,26 +612,25 @@ async function execCliWithTreeTimeout(bin, args = [], execOpts = {}, options = {
     }
 
     if (child.stdout && typeof child.stdout.on === 'function') {
-      child.stdout.on('data', (chunk) => {
-        if (stdout.length < maxBuffer) {
-          stdout += String(chunk);
-        }
+      child.stdout.on('data', (/** @type {Buffer | string} */ chunk) => {
+        appendDecodedChunk(chunk, false);
       });
     }
     if (child.stderr && typeof child.stderr.on === 'function') {
-      child.stderr.on('data', (chunk) => {
-        if (stderr.length < maxBuffer) {
-          stderr += String(chunk);
-        }
+      child.stderr.on('data', (/** @type {Buffer | string} */ chunk) => {
+        appendDecodedChunk(chunk, true);
       });
     }
 
-    child.on('error', (err) => {
-      finish({ err, stdout, stderr, timedOut });
+    child.on('error', (/** @type {any} */ err) => {
+      if (timedOut || finished) return;
+      flushDecoders();
+      finish({ err, stdout, stderr, timedOut: false });
     });
 
-    child.on('close', (code, sig) => {
-      if (timedOut) return;
+    child.on('close', (/** @type {number | null} */ code, /** @type {string | null} */ sig) => {
+      if (timedOut || finished) return;
+      flushDecoders();
       if (code === 0) {
         finish({ err: null, stdout, stderr, timedOut: false });
       } else {
@@ -407,6 +652,7 @@ module.exports = {
   isProcessAlive,
   waitForProcessExit,
   extractMatchedPidFromProcessOutput,
+  collectPosixDescendantPids,
   signalSubprocessTree,
   execCliWithTreeTimeout,
 };

@@ -5,6 +5,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const MAX_MANAGED_SENTINEL_BYTES = 8192;
+const TRANSIENT_FS_RETRY_CODES = new Set(['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY', 'EMFILE']);
+const TRANSIENT_FS_RETRY_DELAYS_MS = [15, 30, 60, 120];
+
 /**
  * Leaf directory names (lowercased) that represent OS roots, Known Folders, Wine prefix
  * roots, or shared multi-game storefront/library container directories and must NEVER be
@@ -168,7 +172,6 @@ function stripFileProtocol(rawPath) {
 function normalizeWin32DevicePrefix(rawPath) {
   if (!rawPath || typeof rawPath !== 'string') return '';
   let cleaned = stripFileProtocol(rawPath.trim());
-  // Loop in case multiple redundant device prefixes were stacked
   for (let i = 0; i < 4; i += 1) {
     const uncMatch = cleaned.match(/^(?:\\\\\?\\|\\\\\.\\|\\\?\?\\|\/\/\?\/|\/\/\.\/)UNC[\\/](.+)$/i);
     if (uncMatch && uncMatch[1]) {
@@ -218,6 +221,17 @@ function isSafeNumericAppId(id) {
 }
 
 /**
+ * Check whether a `path.relative` segment escapes upward (`..`, `../...`, or `..\...`)
+ * without falsely rejecting legitimate filenames starting with `..` (e.g., `..config`).
+ *
+ * @param {string} rel
+ * @returns {boolean}
+ */
+function isRelativePathEscaping(rel) {
+  return rel === '..' || rel.startsWith('../') || rel.startsWith('..\\');
+}
+
+/**
  * Cross-platform containment check without external circular dependencies.
  * @param {string} anchorRoot
  * @param {string} candidatePath
@@ -233,17 +247,120 @@ function isPathContainedInRoot(anchorRoot, candidatePath, isWinStyle, strict = f
     const normCand = path.win32.resolve(normalizeWin32DevicePrefix(candidatePath)).toLowerCase();
     const rel = path.win32.relative(normAnchor, normCand);
     if (strict) {
-      return rel !== '' && !rel.startsWith('..') && !path.win32.isAbsolute(rel);
+      return rel !== '' && !isRelativePathEscaping(rel) && !path.win32.isAbsolute(rel);
     }
-    return rel === '' || (!rel.startsWith('..') && !path.win32.isAbsolute(rel));
+    return rel === '' || (!isRelativePathEscaping(rel) && !path.win32.isAbsolute(rel));
   }
   const normAnchor = path.posix.resolve(anchorRoot.replace(/\\/g, '/'));
   const normCand = path.posix.resolve(candidatePath.replace(/\\/g, '/'));
   const rel = path.posix.relative(normAnchor, normCand);
   if (strict) {
-    return rel !== '' && !rel.startsWith('..') && !path.posix.isAbsolute(rel);
+    return rel !== '' && !isRelativePathEscaping(rel) && !path.posix.isAbsolute(rel);
   }
-  return rel === '' || (!rel.startsWith('..') && !path.posix.isAbsolute(rel));
+  return rel === '' || (!isRelativePathEscaping(rel) && !path.posix.isAbsolute(rel));
+}
+
+/**
+ * Validate `.one_launcher_managed` JSON sentinel content so 0-byte files or arbitrary junk
+ * cannot weaken uninstall containment guards.
+ * Accepts both the canonical `engineStateRegistry.cjs` schema (`schemaVersion >= 1` + `store` +
+ * `installKind`/`createdAt`/`gameId`) and `{ managedBy: 'one-launcher', createdAt }`.
+ *
+ * @param {unknown} rawContent
+ * @returns {boolean}
+ */
+function validateManagedSentinelContent(rawContent) {
+  if (typeof rawContent !== 'string') return false;
+  if (rawContent.length === 0 || rawContent.length > MAX_MANAGED_SENTINEL_BYTES) return false;
+  const trimmed = rawContent.trim();
+  if (!trimmed || !trimmed.startsWith('{')) return false;
+
+  /** @type {any} */
+  let parsed = null;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return false;
+  }
+
+  if (parsed.createdAt !== undefined) {
+    if (typeof parsed.createdAt === 'string') {
+      if (!parsed.createdAt.trim() || Number.isNaN(Date.parse(parsed.createdAt))) {
+        return false;
+      }
+    } else if (typeof parsed.createdAt === 'number') {
+      if (!Number.isFinite(parsed.createdAt) || parsed.createdAt <= 0) {
+        return false;
+      }
+    } else {
+      return false;
+    }
+  }
+
+  const hasValidCanonicalSchema =
+    typeof parsed.schemaVersion === 'number' &&
+    Number.isInteger(parsed.schemaVersion) &&
+    parsed.schemaVersion >= 1 &&
+    typeof parsed.store === 'string' &&
+    parsed.store.trim().length > 0 &&
+    parsed.store.trim().length <= 64 &&
+    (typeof parsed.installKind === 'string' ||
+      parsed.createdAt !== undefined ||
+      typeof parsed.gameId === 'string');
+
+  const hasValidManagedBySchema =
+    parsed.managedBy === 'one-launcher' &&
+    (parsed.createdAt !== undefined ||
+      (typeof parsed.schemaVersion === 'number' && parsed.schemaVersion >= 1));
+
+  return hasValidCanonicalSchema || hasValidManagedBySchema;
+}
+
+/**
+ * Check whether an fs error represents a benign missing path (`ENOENT`).
+ * Any other error (`ELOOP`, `EACCES`, `EPERM`, `EIO`, `EBUSY`, `ENAMETOOLONG`) MUST fail closed!
+ *
+ * @param {any} err
+ * @returns {boolean}
+ */
+function isMissingPathError(err) {
+  return String(err?.code || '').toUpperCase() === 'ENOENT';
+}
+
+/**
+ * Synchronously probe and validate a `.one_launcher_managed` sentinel file (rejecting symlinks,
+ * 0-byte files, oversized files, and invalid JSON schemas).
+ *
+ * @param {string} sentinelPath
+ * @param {any} fsImpl
+ * @returns {{ valid: boolean, fatalError: boolean }}
+ */
+function probeManagedSentinelSync(sentinelPath, fsImpl) {
+  try {
+    const sentStat = fsImpl.lstatSync(sentinelPath);
+    if (!sentStat || sentStat.isSymbolicLink?.() || !sentStat.isFile?.()) {
+      return { valid: false, fatalError: false };
+    }
+    if (
+      typeof sentStat.size === 'number' &&
+      (sentStat.size <= 0 || sentStat.size > MAX_MANAGED_SENTINEL_BYTES)
+    ) {
+      return { valid: false, fatalError: false };
+    }
+    if (typeof fsImpl.readFileSync !== 'function') {
+      return { valid: false, fatalError: false };
+    }
+    const raw = fsImpl.readFileSync(sentinelPath, 'utf8');
+    return { valid: validateManagedSentinelContent(raw), fatalError: false };
+  } catch (sentErr) {
+    if (isMissingPathError(sentErr)) {
+      return { valid: false, fatalError: false };
+    }
+    return { valid: false, fatalError: true };
+  }
 }
 
 /**
@@ -377,7 +494,6 @@ function evaluateLexicalPathSafety(candidatePath, options, protectedTrees, hasMa
   if (!isWinStyle && segments[0].toLowerCase() === 'users' && segments.length <= 2) {
     return { safe: false, resolved, isWinStyle };
   }
-  // Block `/Users/<username>/<KnownFolder>` when depth is 3 on macOS/Linux (handled by BLOCKED_CONTAINER_LEAF_NAMES below, plus `/Users/<username>` at length 2 above)
 
   // Block `C:/Users/<username>` directly (3 segments on Windows: ['c:', 'users', '<name>'])
   if (
@@ -394,9 +510,6 @@ function evaluateLexicalPathSafety(candidatePath, options, protectedTrees, hasMa
     return { safe: false, resolved, isWinStyle };
   }
 
-  // Block 3-segment & nested Steam library roots (`D:\Games\Steam`, `D:\SteamLibrary`, `/Volumes/SSD/SteamLibrary`, `.../steamapps/shadercache/...`),
-  // while scoping container checks after `drive_c` when inside a Wine/CrossOver bottle so a bottle named
-  // `Bottles/Steam` never false-blocks `Bottles/Steam/drive_c/GOG Games/<Game>`.
   const lowerSegments = segments.map((s) => s.toLowerCase());
   const bottlesIdx = lowerSegments.findIndex((s) => s === 'bottles' || s === 'prefixes');
   const driveCIdx = lowerSegments.lastIndexOf('drive_c');
@@ -434,7 +547,7 @@ function evaluateLexicalPathSafety(candidatePath, options, protectedTrees, hasMa
     }
   }
 
-  // Block top-level shared Xbox / Microsoft Store containers (`C:\XboxGames`, `D:\XboxGames`, `D:\Program Files\ModifiableWindowsApps`, `.../WindowsApps`)
+  // Block top-level shared Xbox / Microsoft Store containers (`C:\XboxGames`, `D:\XboxGames`, `.../WindowsApps`)
   const windowsAppsIdx = lowerSegments.findIndex(
     (s) => s === 'windowsapps' || s === 'wpsystem'
   );
@@ -463,17 +576,6 @@ function evaluateLexicalPathSafety(candidatePath, options, protectedTrees, hasMa
   }
 
   return { safe: true, resolved, isWinStyle };
-}
-
-/**
- * Check whether an fs error represents a benign missing path (`ENOENT`).
- * Any other error (`ELOOP`, `EACCES`, `EPERM`, `EIO`, `EBUSY`, `ENAMETOOLONG`) MUST fail closed!
- *
- * @param {any} err
- * @returns {boolean}
- */
-function isMissingPathError(err) {
-  return String(err?.code || '').toUpperCase() === 'ENOENT';
 }
 
 /**
@@ -512,7 +614,11 @@ function verifyNoEscapingSymlinksInTree(realInstallRoot, fsImpl, isWinStyle) {
 
       let isSymlink = false;
       let isDirectory = false;
-      if (entry && typeof entry.isSymbolicLink === 'function') {
+      const hasKnownType =
+        entry &&
+        typeof entry.isSymbolicLink === 'function' &&
+        (entry.isSymbolicLink() || entry.isDirectory?.() || entry.isFile?.());
+      if (hasKnownType) {
         isSymlink = Boolean(entry.isSymbolicLink());
         isDirectory = !isSymlink && Boolean(entry.isDirectory?.());
       } else {
@@ -538,7 +644,6 @@ function verifyNoEscapingSymlinksInTree(realInstallRoot, fsImpl, isWinStyle) {
           if (!isMissingPathError(realErr)) {
             return false;
           }
-          // Dangling link (`ENOENT`): fall back to lexical resolution of `readlinkSync` target
         }
         if (!linkTargetResolved) {
           try {
@@ -568,11 +673,115 @@ function verifyNoEscapingSymlinksInTree(realInstallRoot, fsImpl, isWinStyle) {
 }
 
 /**
+ * Non-blocking asynchronous counterpart to `verifyNoEscapingSymlinksInTree` using `fs.promises`.
+ * Walks the entire directory tree (yielding periodically to the event loop) and verifies that NO
+ * symlink or NTFS junction resolves outside `realInstallRoot`, failing closed on non-`ENOENT` errors.
+ *
+ * @param {string} realInstallRoot
+ * @param {any} [fsPromisesImpl]
+ * @param {boolean} [isWinStyle]
+ * @returns {Promise<boolean>}
+ */
+async function verifyNoEscapingSymlinksInTreeAsync(
+  realInstallRoot,
+  fsPromisesImpl = fs.promises,
+  isWinStyle = process.platform === 'win32'
+) {
+  /** @type {string[]} */
+  const stack = [realInstallRoot];
+  let processed = 0;
+
+  while (stack.length > 0) {
+    const currentDir = /** @type {string} */ (stack.pop());
+    /** @type {any[]} */
+    let entries = [];
+    try {
+      entries = await fsPromisesImpl.readdir(currentDir, { withFileTypes: true });
+    } catch (readErr) {
+      if (isMissingPathError(readErr)) {
+        continue;
+      }
+      return false;
+    }
+
+    for (const entry of entries) {
+      processed += 1;
+      if (processed % 256 === 0) {
+        await new Promise((r) => setImmediate(r));
+      }
+
+      const entryName = typeof entry === 'string' ? entry : entry?.name;
+      if (!entryName || entryName === '.' || entryName === '..') continue;
+      const entryPath = isWinStyle
+        ? path.win32.join(currentDir, entryName)
+        : path.posix.join(currentDir, entryName);
+
+      let isSymlink = false;
+      let isDirectory = false;
+      const hasKnownType =
+        entry &&
+        typeof entry.isSymbolicLink === 'function' &&
+        (entry.isSymbolicLink() || entry.isDirectory?.() || entry.isFile?.());
+      if (hasKnownType) {
+        isSymlink = Boolean(entry.isSymbolicLink());
+        isDirectory = !isSymlink && Boolean(entry.isDirectory?.());
+      } else {
+        try {
+          const st = await fsPromisesImpl.lstat(entryPath);
+          isSymlink = Boolean(st?.isSymbolicLink?.());
+          isDirectory = !isSymlink && Boolean(st?.isDirectory?.());
+        } catch (statErr) {
+          if (isMissingPathError(statErr)) {
+            continue;
+          }
+          return false;
+        }
+      }
+
+      if (isSymlink) {
+        let linkTargetResolved = '';
+        try {
+          if (typeof fsPromisesImpl.realpath === 'function') {
+            linkTargetResolved = await fsPromisesImpl.realpath(entryPath);
+          }
+        } catch (realErr) {
+          if (!isMissingPathError(realErr)) {
+            return false;
+          }
+        }
+        if (!linkTargetResolved) {
+          try {
+            if (typeof fsPromisesImpl.readlink === 'function') {
+              const rawLink = String((await fsPromisesImpl.readlink(entryPath)) || '');
+              if (!rawLink) return false;
+              linkTargetResolved = isWinStyle
+                ? path.win32.resolve(currentDir, normalizeWin32DevicePrefix(rawLink))
+                : path.posix.resolve(currentDir, rawLink);
+            } else {
+              return false;
+            }
+          } catch {
+            return false;
+          }
+        }
+        if (!isPathContainedInRoot(realInstallRoot, linkTargetResolved, isWinStyle)) {
+          return false;
+        }
+      } else if (isDirectory) {
+        stack.push(entryPath);
+      }
+    }
+  }
+
+  return true;
+}
+
+/**
  * Positive-containment safety validator for game uninstallation directory removal.
  * Enforces Win32 device-prefix stripping (`\\?\`, `\\.\`, `\??\`, `\\?\UNC\`), case-insensitive
  * path comparisons across Windows (`C:\`, `D:\`, UNC) and macOS (`/`, `/Volumes/<Drive>`, Wine/CrossOver
- * bottles), `.GamingRoot` / Steam / Xbox shared container guards, and `lstatSync` + `realpathSync`
- * symlink/junction containment verification.
+ * bottles), `.GamingRoot` / Steam / Xbox shared container guards, validated `.one_launcher_managed`
+ * JSON schema verification, and `lstatSync` + `realpathSync` symlink/junction containment verification.
  *
  * @param {unknown} targetPath
  * @param {Record<string, any>} [options]
@@ -617,7 +826,7 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
     }
   }
 
-  // Probe whether `.one_launcher_managed` sentinel exists on target (only when target is a real non-symlink directory)
+  // Probe whether a valid `.one_launcher_managed` JSON sentinel exists on target (only when target is a real non-symlink directory)
   const preliminaryClean = normalizeWin32DevicePrefix(targetPath);
   const prelimIsWin =
     /^[a-zA-Z]:(?:[\\/]|$)/.test(preliminaryClean) ||
@@ -645,15 +854,12 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
           const sentinelPath = prelimIsWin
             ? path.win32.join(prelimResolved, '.one_launcher_managed')
             : path.posix.join(prelimResolved, '.one_launcher_managed');
-          try {
-            const sentStat = fsImpl.lstatSync(sentinelPath);
-            if (sentStat && !sentStat.isSymbolicLink?.() && sentStat.isFile?.()) {
-              hasManagedSentinel = true;
-            }
-          } catch (sentErr) {
-            if (!isMissingPathError(sentErr)) {
-              return false;
-            }
+          const probe = probeManagedSentinelSync(sentinelPath, fsImpl);
+          if (probe.fatalError) {
+            return false;
+          }
+          if (probe.valid) {
+            hasManagedSentinel = true;
           }
         }
       }
@@ -687,7 +893,7 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
   if (canProbeHostFs) {
     try {
       const joinImpl = isWinStyle ? path.win32.join : path.posix.join;
-      // Block directories containing multi-game library/drive/bottle root sentinels (`.GamingRoot`, `libraryfolders.vdf`, `cxbottle.conf`, `drive_c/windows`, `steamapps`)
+      // Block directories containing multi-game library/drive/bottle root sentinels
       for (const sentinel of MULTI_GAME_CONTAINER_SENTINEL_FILES) {
         if (fsImpl.existsSync?.(joinImpl(resolved, sentinel))) {
           return false;
@@ -723,7 +929,7 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
         const realTarget = fsImpl.realpathSync(resolved);
         if (!realTarget) return false;
 
-        // Re-verify lexical/protected rules on canonical `realTarget` so symlinked parent dirs cannot mask `/Users/Alice` or `C:\XboxGames`
+        // Re-verify lexical/protected rules on canonical `realTarget`
         if (realTarget !== resolved) {
           const realCheck = evaluateLexicalPathSafety(
             realTarget,
@@ -736,11 +942,11 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
           }
         }
 
-        // Verify parent-directory realpath containment
+        // Verify strict parent-directory realpath containment (target strictly nested inside parent)
         const parentDir = isWinStyle ? path.win32.dirname(resolved) : path.posix.dirname(resolved);
         if (parentDir && parentDir !== resolved) {
           const realParent = fsImpl.realpathSync(parentDir);
-          if (!isPathContainedInRoot(realParent, realTarget, isWinStyle)) {
+          if (!isPathContainedInRoot(realParent, realTarget, isWinStyle, true)) {
             return false;
           }
         }
@@ -756,7 +962,10 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
         }
 
         // Verify no symlink or NTFS junction inside the install directory points outside `realTarget`
-        if (!verifyNoEscapingSymlinksInTree(realTarget, fsImpl, isWinStyle)) {
+        if (
+          options.skipSyncTreeWalk !== true &&
+          !verifyNoEscapingSymlinksInTree(realTarget, fsImpl, isWinStyle)
+        ) {
           return false;
         }
       } else if (!targetExists && typeof fsImpl.realpathSync === 'function') {
@@ -785,7 +994,7 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
             const realAllowedRoot = fsImpl.existsSync?.(allowedRoot)
               ? fsImpl.realpathSync(allowedRoot)
               : allowedRoot;
-            if (!isPathContainedInRoot(realAllowedRoot, projectedRealTarget, isWinStyle)) {
+            if (!isPathContainedInRoot(realAllowedRoot, projectedRealTarget, isWinStyle, true)) {
               return false;
             }
           }
@@ -803,7 +1012,7 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
 
 /**
  * Fail-closed assertion wrapper over `isSafeToDeleteInstallPath` that throws a structured
- * `UNSAFE_UNINSTALL_PATH` / `UNSAFE_UNINSTALL_STAT_ERROR` error on any containment or stat failure.
+ * `UNSAFE_UNINSTALL_PATH` error on any containment or stat failure.
  *
  * @param {unknown} targetPath
  * @param {Record<string, any>} [options]
@@ -828,53 +1037,134 @@ function assertSafeGameUninstallDirectory(targetPath, options = {}) {
 }
 
 /**
+ * @param {number} delayMs
+ * @returns {Promise<void>}
+ */
+function sleepUnrefAsync(delayMs) {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, delayMs);
+    if (typeof t.unref === 'function') t.unref();
+  });
+}
+
+/**
+ * Bounded exponential backoff retry wrapper for transient Windows `EBUSY`/`EPERM`/`EACCES`/`ENOTEMPTY`
+ * filesystem locks (antivirus scanners, Explorer handles, indexers).
+ *
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+async function withTransientFsRetryAsync(fn) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      const code = String(/** @type {any} */ (err)?.code || '').toUpperCase();
+      if (
+        !TRANSIENT_FS_RETRY_CODES.has(code) ||
+        attempt >= TRANSIENT_FS_RETRY_DELAYS_MS.length
+      ) {
+        throw err;
+      }
+      await sleepUnrefAsync(TRANSIENT_FS_RETRY_DELAYS_MS[attempt]);
+      attempt += 1;
+    }
+  }
+}
+
+/**
  * Unlink a single file, symlink, or Windows NTFS directory junction without recursing into
- * any external link target.
+ * any external link target, with bounded exponential backoff on transient `EBUSY`/`EPERM` locks.
  *
  * @param {string} entryPath
  * @param {boolean} isLink
  */
 async function unlinkFileOrReparsePointAsync(entryPath, isLink) {
-  try {
-    await fs.promises.unlink(entryPath);
-    return;
-  } catch (err) {
-    const code = String(/** @type {any} */ (err)?.code || '').toUpperCase();
-    if (code === 'ENOENT') return;
-    // On Windows NTFS, directory junctions (`IO_REPARSE_TAG_MOUNT_POINT`) require `rmdir`
-    if (isLink && (code === 'EPERM' || code === 'EISDIR' || code === 'EACCES')) {
-      try {
-        await fs.promises.rmdir(entryPath);
-        return;
-      } catch (rmDirErr) {
-        if (String(/** @type {any} */ (rmDirErr)?.code || '').toUpperCase() === 'ENOENT') return;
+  await withTransientFsRetryAsync(async () => {
+    try {
+      await fs.promises.unlink(entryPath);
+      return;
+    } catch (err) {
+      const code = String(/** @type {any} */ (err)?.code || '').toUpperCase();
+      if (code === 'ENOENT') return;
+      // On Windows NTFS, directory junctions (`IO_REPARSE_TAG_MOUNT_POINT`) require `rmdir`
+      if (isLink && (code === 'EPERM' || code === 'EISDIR' || code === 'EACCES')) {
+        try {
+          await fs.promises.rmdir(entryPath);
+          return;
+        } catch (rmDirErr) {
+          if (String(/** @type {any} */ (rmDirErr)?.code || '').toUpperCase() === 'ENOENT') return;
+          throw rmDirErr;
+        }
       }
+      if (!isLink && (code === 'EPERM' || code === 'EACCES')) {
+        try {
+          await fs.promises.chmod(entryPath, 0o666);
+          await fs.promises.unlink(entryPath);
+          return;
+        } catch (chmodRetryErr) {
+          if (String(/** @type {any} */ (chmodRetryErr)?.code || '').toUpperCase() === 'ENOENT') {
+            return;
+          }
+          throw chmodRetryErr;
+        }
+      }
+      throw err;
     }
-    if (!isLink && (code === 'EPERM' || code === 'EACCES')) {
-      try {
-        await fs.promises.chmod(entryPath, 0o666);
-        await fs.promises.unlink(entryPath);
-        return;
-      } catch {}
+  });
+}
+
+/**
+ * Remove an empty directory with read-only chmod fallback and bounded `EBUSY`/`EPERM`/`ENOTEMPTY` backoff.
+ *
+ * @param {string} dirPath
+ */
+async function removeEmptyDirWithRetryAsync(dirPath) {
+  await withTransientFsRetryAsync(async () => {
+    try {
+      await fs.promises.rmdir(dirPath);
+      return;
+    } catch (rmErr) {
+      const code = String(/** @type {any} */ (rmErr)?.code || '').toUpperCase();
+      if (code === 'ENOENT') return;
+      if (code === 'EPERM' || code === 'EACCES') {
+        try {
+          await fs.promises.chmod(dirPath, 0o777);
+          await fs.promises.rmdir(dirPath);
+          return;
+        } catch (retryErr) {
+          if (String(/** @type {any} */ (retryErr)?.code || '').toUpperCase() === 'ENOENT') return;
+          throw retryErr;
+        }
+      }
+      throw rmErr;
     }
-    throw err;
-  }
+  });
 }
 
 /**
  * Symlink- and NTFS-junction-safe bottom-up asynchronous directory remover for game uninstalls.
- * Validates `rootDir` via `assertSafeGameUninstallDirectory` (unless `options.skipSafetyAssertion`
- * is explicitly set after an already-verified parent check) and unlinks symlinks/reparse points
- * themselves WITHOUT ever recursing into external targets.
+ * Validates `rootDir` via `assertSafeGameUninstallDirectory` + async escaping-symlink tree
+ * verification (unless `options.skipSafetyAssertion` is explicitly set), performs pre-`opendir`
+ * `lstat` + `(dev, ino)` + `realpath` containment verification to prevent TOCTOU symlink-swap
+ * attacks, and unlinks symlinks/reparse points themselves WITHOUT ever recursing into targets.
  *
  * @param {string} rootDir
  * @param {Record<string, any>} [options]
  * @returns {Promise<boolean>}
  */
 async function safeRemoveGameDirectoryAsync(rootDir, options = {}) {
-  const resolvedRoot = options.skipSafetyAssertion
+  const skipSafetyAssertion = Boolean(options.skipSafetyAssertion);
+  const resolvedRoot = skipSafetyAssertion
     ? path.resolve(normalizeWin32DevicePrefix(String(rootDir || '')))
-    : assertSafeGameUninstallDirectory(rootDir, options);
+    : assertSafeGameUninstallDirectory(rootDir, { ...options, skipSyncTreeWalk: true });
+
+  const isWinStyle =
+    /^[a-zA-Z]:(?:[\\/]|$)/.test(resolvedRoot) ||
+    /^\\\\[^\\]+\\[^\\]+/.test(resolvedRoot) ||
+    options.platform === 'win32';
 
   let rootStat;
   try {
@@ -897,13 +1187,101 @@ async function safeRemoveGameDirectoryAsync(rootDir, options = {}) {
     return true;
   }
 
-  /** @type {Array<{ dirPath: string, visitedChildren: boolean }>} */
-  const stack = [{ dirPath: resolvedRoot, visitedChildren: false }];
+  const realResolvedRoot = await fs.promises.realpath(resolvedRoot);
+
+  // Async non-blocking escaping-symlink verification before any deletion begins
+  if (!skipSafetyAssertion) {
+    const treeSafe = await verifyNoEscapingSymlinksInTreeAsync(
+      realResolvedRoot,
+      fs.promises,
+      isWinStyle
+    );
+    if (!treeSafe) {
+      const err = /** @type {Error & { code?: string }} */ (
+        new Error(`Refusing unsafe game uninstall path (escaping symlink detected): ${resolvedRoot}`)
+      );
+      err.code = 'UNSAFE_UNINSTALL_PATH';
+      throw err;
+    }
+  }
+
+  /** @type {Array<{ dirPath: string, visitedChildren: boolean, expectedDev?: number | bigint, expectedIno?: number | bigint }>} */
+  const stack = [
+    {
+      dirPath: resolvedRoot,
+      visitedChildren: false,
+      expectedDev: rootStat.dev,
+      expectedIno: rootStat.ino,
+    },
+  ];
 
   while (stack.length > 0) {
-    const current = /** @type {{ dirPath: string, visitedChildren: boolean }} */ (stack[stack.length - 1]);
+    const current = stack[stack.length - 1];
     if (!current.visitedChildren) {
       current.visitedChildren = true;
+
+      // Pre-opendir lstat + identity + realpath containment verification (closes TOCTOU symlink-swap race)
+      let preOpenStat;
+      try {
+        preOpenStat = await fs.promises.lstat(current.dirPath);
+      } catch (statErr) {
+        if (isMissingPathError(statErr)) {
+          stack.pop();
+          continue;
+        }
+        throw statErr;
+      }
+
+      if (preOpenStat.isSymbolicLink()) {
+        if (current.dirPath === resolvedRoot) {
+          const err = /** @type {Error & { code?: string }} */ (
+            new Error(`Refusing to traverse symlinked install root: ${current.dirPath}`)
+          );
+          err.code = 'UNSAFE_UNINSTALL_SYMLINK_ROOT';
+          throw err;
+        }
+        // Directory was swapped to a symlink between discovery and open — unlink the symlink ONLY, never descend!
+        await unlinkFileOrReparsePointAsync(current.dirPath, true);
+        stack.pop();
+        continue;
+      }
+
+      if (!preOpenStat.isDirectory()) {
+        await unlinkFileOrReparsePointAsync(current.dirPath, false);
+        stack.pop();
+        continue;
+      }
+
+      if (
+        current.expectedDev !== undefined &&
+        current.expectedIno !== undefined &&
+        (preOpenStat.dev !== current.expectedDev || preOpenStat.ino !== current.expectedIno)
+      ) {
+        const err = /** @type {Error & { code?: string }} */ (
+          new Error(`Directory identity changed mid-uninstall (TOCTOU abort): ${current.dirPath}`)
+        );
+        err.code = 'UNSAFE_UNINSTALL_TOCTOU';
+        throw err;
+      }
+
+      let realCurrentDir = '';
+      try {
+        realCurrentDir = await fs.promises.realpath(current.dirPath);
+      } catch (realErr) {
+        if (isMissingPathError(realErr)) {
+          stack.pop();
+          continue;
+        }
+        throw realErr;
+      }
+      if (!isPathContainedInRoot(realResolvedRoot, realCurrentDir, isWinStyle)) {
+        const err = /** @type {Error & { code?: string }} */ (
+          new Error(`Refusing to descend outside install root: ${current.dirPath}`)
+        );
+        err.code = 'UNSAFE_UNINSTALL_PATH';
+        throw err;
+      }
+
       let dirHandle;
       try {
         dirHandle = await fs.promises.opendir(current.dirPath);
@@ -927,28 +1305,19 @@ async function safeRemoveGameDirectoryAsync(rootDir, options = {}) {
         if (entryStat.isSymbolicLink()) {
           await unlinkFileOrReparsePointAsync(fullPath, true);
         } else if (entryStat.isDirectory()) {
-          stack.push({ dirPath: fullPath, visitedChildren: false });
+          stack.push({
+            dirPath: fullPath,
+            visitedChildren: false,
+            expectedDev: entryStat.dev,
+            expectedIno: entryStat.ino,
+          });
         } else {
           await unlinkFileOrReparsePointAsync(fullPath, false);
         }
       }
     } else {
       stack.pop();
-      try {
-        await fs.promises.rmdir(current.dirPath);
-      } catch (rmErr) {
-        const code = String(/** @type {any} */ (rmErr)?.code || '').toUpperCase();
-        if (code !== 'ENOENT') {
-          try {
-            await fs.promises.chmod(current.dirPath, 0o777);
-            await fs.promises.rmdir(current.dirPath);
-          } catch (retryErr) {
-            if (String(/** @type {any} */ (retryErr)?.code || '').toUpperCase() !== 'ENOENT') {
-              throw retryErr;
-            }
-          }
-        }
-      }
+      await removeEmptyDirWithRetryAsync(current.dirPath);
     }
   }
 
@@ -959,6 +1328,8 @@ module.exports = {
   isSafeToDeleteInstallPath,
   assertSafeGameUninstallDirectory,
   safeRemoveGameDirectoryAsync,
+  verifyNoEscapingSymlinksInTreeAsync,
+  validateManagedSentinelContent,
   normalizeWin32DevicePrefix,
   isSafeBottleSlug,
   isSafeNumericAppId,
