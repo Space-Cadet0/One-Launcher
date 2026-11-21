@@ -31,13 +31,16 @@ const {
 const {
   isHostGogGalaxyRunning,
   reapOrphanedGogOverlayProcesses,
+  lineMatchesBottlePrefix,
   isBottleWinExeRunning,
+  inspectRunningBottleSteam,
   probeLocalTcpPort,
   resolveGogCommunicationLogPath,
   waitForGogCommunicationServiceReady,
   waitForBottleEpicPortalReady,
   extractTrackedPidFromSteamGameProcessLog,
 } = require('../storefrontReadinessBarrier.cjs');
+const { hasBottleSteamAppManifest } = require('../mac/compatLayerRegistryAndDetection.cjs');
 const {
   inspectWindowsExecutableHeader,
   hasMalformedBackslashExportForwarder,
@@ -165,7 +168,10 @@ const {
   liveBottleDaemonEnvContractByPrefix,
   normalizeBottlePrefixContractKey,
   deleteBottleDaemonEnvContract,
+  getLiveBottleSteamUiMode,
+  setLiveBottleSteamUiMode,
   computeBottleGraphicsEnvContract,
+  stripDisplayScalerEnvFromClientEnv,
   stageBottleDisplayScalerBinaries,
   shouldWrapBottleSessionWithDisplayLauncher,
   formatDisplayScalerControlIni,
@@ -206,6 +212,116 @@ const {
   findLiveBottleGameChildPid,
   launchChainedPublisherGame,
 } = require('./chainedPublisherLauncher.cjs');
+
+/**
+ * Compare two directory/bottle paths for equivalence (case-insensitive POSIX + realpath).
+ *
+ * @param {string | null | undefined} pathA
+ * @param {string | null | undefined} pathB
+ * @returns {boolean}
+ */
+function areSameBottleDirPath(pathA, pathB) {
+  if (!pathA || !pathB) return false;
+  const norm = (/** @type {string} */ p) =>
+    path.resolve(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  if (norm(pathA) === norm(pathB)) return true;
+  try {
+    if (fs.existsSync(pathA) && fs.existsSync(pathB)) {
+      return norm(fs.realpathSync(pathA)) === norm(fs.realpathSync(pathB));
+    }
+  } catch {}
+  return false;
+}
+
+/**
+ * Check whether an installed compatibility layer supports `targetArch` on `hostArch`.
+ *
+ * @param {any} layer
+ * @param {'win64' | 'arm64' | string} targetArch
+ * @param {string} hostArch
+ * @returns {boolean}
+ */
+function layerSupportsBottleArch(layer, targetArch, hostArch) {
+  if (!layer || layer.available === false) return false;
+  if (layer.type === 'crossover_preview_arm64' && hostArch !== 'arm64') return false;
+  const reqArch = String(targetArch || 'win64').toLowerCase();
+  if (Array.isArray(layer.supportedBottleArches) && layer.supportedBottleArches.length > 0) {
+    return layer.supportedBottleArches.some(
+      (/** @type {any} */ a) => String(a || '').toLowerCase() === reqArch
+    );
+  }
+  return reqArch === 'arm64'
+    ? layer.type === 'crossover_preview_arm64'
+    : layer.type !== 'crossover_preview_arm64';
+}
+
+/**
+ * Select the best installed, host-supported compatibility layer for `bottlePath` based on its
+ * `cxbottle.conf` architecture (`arm64` vs `win64`) and matching `bottlesDir`.
+ *
+ * @param {any[]} layers
+ * @param {string} bottlePath
+ * @param {string} hostArch
+ * @returns {any | null}
+ */
+function selectRecommendedLayerForBottle(layers, bottlePath, hostArch) {
+  if (!bottlePath || !Array.isArray(layers) || layers.length === 0) return null;
+  const confMeta = inspectBottleConfMetadata(bottlePath);
+  const targetArch = confMeta.wineArch || 'win64';
+  const bottleParentDir = path.dirname(path.resolve(bottlePath));
+  const preferredOrder =
+    targetArch === 'arm64'
+      ? ['crossover_preview_arm64']
+      : ['crossover_preview', 'crossover', 'gptk', 'wine'];
+
+  const archCompatible = layers.filter((l) => layerSupportsBottleArch(l, targetArch, hostArch));
+  if (archCompatible.length === 0) return null;
+
+  const pickByPreferredOrder = (/** @type {any[]} */ pool) => {
+    for (const prefType of preferredOrder) {
+      const hit = pool.find((l) => l && l.type === prefType);
+      if (hit) return hit;
+    }
+    return pool[0] || null;
+  };
+
+  const dirMatched = archCompatible.filter(
+    (l) => l && l.bottlesDir && areSameBottleDirPath(l.bottlesDir, bottleParentDir)
+  );
+  if (dirMatched.length > 0) {
+    return pickByPreferredOrder(dirMatched);
+  }
+  return pickByPreferredOrder(archCompatible);
+}
+
+/**
+ * Scan initialized bottles across detected layers for one that has both Windows `steam.exe`
+ * and an `appmanifest_<appId>.acf` (directly or via `libraryfolders.vdf`).
+ *
+ * @param {any[]} layers
+ * @param {string} steamAppId
+ * @returns {string}
+ */
+function findBottleWithSteamAppManifest(layers, steamAppId) {
+  if (!steamAppId || !Array.isArray(layers) || layers.length === 0) return '';
+  /** @type {Set<string>} */
+  const seenBottleKeys = new Set();
+  for (const layer of layers) {
+    if (!layer || !layer.bottlesDir || !Array.isArray(layer.availableBottles)) continue;
+    for (const bName of layer.availableBottles) {
+      if (!bName) continue;
+      const bPath = path.resolve(path.join(layer.bottlesDir, bName));
+      const key = bPath.replace(/\\/g, '/').toLowerCase();
+      if (seenBottleKeys.has(key)) continue;
+      seenBottleKeys.add(key);
+      if (!fs.existsSync(bPath)) continue;
+      if (resolveBottleSteamExe(bPath) && hasBottleSteamAppManifest(bPath, steamAppId)) {
+        return bPath;
+      }
+    }
+  }
+  return '';
+}
 
 async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ options = {}) {
   const gameId = String(
@@ -1343,17 +1459,33 @@ async function launchGameInternal(
       launchConfig.storefrontClientLifecycle = 'fast_direct_bypass';
     }
 
-    const isFastMinimalBypass =
-      !isSteamStorefrontDepotUri &&
-      (effectivePerfPolicy.storefrontClientLifecycle === 'fast_direct_bypass' ||
-        (payload.platformId === 'steam' && launchMethod === 'direct'));
-
     const effectiveSteamAppId =
       payload.platformId === 'steam'
         ? String(payload.steamAppId || payload.platformGameId || '')
             .replace(/^steam[-_]/i, '')
             .trim()
         : '';
+
+    const routeBottledWindowsUriToBottle = Boolean(
+      useCompatLayer &&
+        platform === 'darwin' &&
+        launchMethod === 'storefront_uri' &&
+        payload.platformId === 'steam' &&
+        effectiveSteamAppId
+    );
+    const isBottledWindowsGogStorefrontUri = Boolean(
+      useCompatLayer &&
+        platform === 'darwin' &&
+        launchMethod === 'storefront_uri' &&
+        payload.platformId === 'gog'
+    );
+
+    const isFastMinimalBypass =
+      !isSteamStorefrontDepotUri &&
+      !routeBottledWindowsUriToBottle &&
+      !isBottledWindowsGogStorefrontUri &&
+      (effectivePerfPolicy.storefrontClientLifecycle === 'fast_direct_bypass' ||
+        (payload.platformId === 'steam' && launchMethod === 'direct'));
 
     if (
       isSteamStorefrontDepotUri &&
@@ -1384,9 +1516,11 @@ async function launchGameInternal(
 
     // 1. Direct or Compatibility Layer execution when executable is available
     if (
-      resolvedExePath &&
+      (resolvedExePath || routeBottledWindowsUriToBottle || isBottledWindowsGogStorefrontUri) &&
       !isSteamAutoUriPreferred &&
-      launchMethod !== 'storefront_uri' &&
+      (launchMethod !== 'storefront_uri' ||
+        routeBottledWindowsUriToBottle ||
+        isBottledWindowsGogStorefrontUri) &&
       (launchMethod === 'direct' ||
         isAutoLikeMethod ||
         launchMethod === 'compatibility_layer' ||
@@ -1424,6 +1558,10 @@ async function launchGameInternal(
       let bottleSteamExe = null;
       let shouldLaunchViaBottleSteam = false;
       let wasBottleSteamRunning = false;
+      let shouldPingWarmBottleSteamOpenMain = false;
+      /** @type {number | undefined} */
+      let bottleSteamCloudLogSessionStartOffset;
+      let bottleSteamGameProcessLogStartOffset = 0;
       let wasBottleSteamPublisherRunning = false;
       let wokeBottleSteamPublisherByLauncher = false;
       /** @type {string | null} */
@@ -1456,6 +1594,7 @@ async function launchGameInternal(
       /** @type {any} */
       let xboxLoopbackServer = null;
       let wasXboxAppRunningAtStart = false;
+      let wokeXboxAppByLauncher = false;
       let launchedViaXboxActivationLatch = false;
       let activatedXboxPid = 0;
       let isXboxAppxRegisteredOnWin32 = false;
@@ -1511,6 +1650,19 @@ async function launchGameInternal(
           ...options,
           ...(effectiveCaps?.isLegacy32BitOpenGl ? { preferLegacy32BitOpenGlWine: true } : {}),
         });
+        const rawInstallBottleRoot = extractBottleRootFromPath(
+          localInstallDir || resolvedExePath || ''
+        );
+        const installBottlePath =
+          rawInstallBottleRoot && fs.existsSync(rawInstallBottleRoot)
+            ? path.resolve(rawInstallBottleRoot)
+            : '';
+        const steamLibraryAffinityBottlePath =
+          !installBottlePath && payload.platformId === 'steam' && effectiveSteamAppId
+            ? findBottleWithSteamAppManifest(layers, effectiveSteamAppId)
+            : '';
+        const affinityBottlePath = installBottlePath || steamLibraryAffinityBottlePath;
+
         const rawPreferredType = launchConfig.compatibilityLayer || payload.compatibilityLayer;
         const preferredType = normalizeRequestedCompatibilityLayerType(rawPreferredType);
         if (
@@ -1549,9 +1701,14 @@ async function launchGameInternal(
             };
           }
         }
+        const affinityMatchedLayer =
+          !preferredType && affinityBottlePath
+            ? selectRecommendedLayerForBottle(layers, affinityBottlePath, effectiveHostArch)
+            : null;
         let chosenLayer = preferredType
           ? explicitMatchedLayer
-          : layers.find(
+          : affinityMatchedLayer ||
+            layers.find(
               (l) =>
                 l &&
                 l.available !== false &&
@@ -1563,7 +1720,12 @@ async function launchGameInternal(
             layers[0];
 
         if (!chosenLayer) {
-          if (isAutoLikeMethod && options.allowStorefrontFallbackOnMissingCompat) {
+          if (
+            isAutoLikeMethod &&
+            !routeBottledWindowsUriToBottle &&
+            !isBottledWindowsGogStorefrontUri &&
+            options.allowStorefrontFallbackOnMissingCompat
+          ) {
             resolvedExePath = undefined;
           } else {
             return {
@@ -1585,6 +1747,27 @@ async function launchGameInternal(
             };
           }
           let effectiveCompatLaunchConfig = launchConfig;
+          if (
+            !installBottlePath &&
+            steamLibraryAffinityBottlePath &&
+            !effectiveCompatLaunchConfig?.wineBottleName &&
+            !effectiveCompatLaunchConfig?.winePrefixPath &&
+            chosenLayer.bottlesDir &&
+            areSameBottleDirPath(
+              path.dirname(steamLibraryAffinityBottlePath),
+              chosenLayer.bottlesDir
+            ) &&
+            layerSupportsBottleArch(
+              chosenLayer,
+              inspectBottleConfMetadata(steamLibraryAffinityBottlePath).wineArch || 'win64',
+              effectiveHostArch
+            )
+          ) {
+            effectiveCompatLaunchConfig = {
+              ...effectiveCompatLaunchConfig,
+              wineBottleName: path.basename(steamLibraryAffinityBottlePath),
+            };
+          }
           if (
             (effectiveCaps?.isLegacy32BitOpenGl ||
               effectiveCaps?.needsLegacyDisplayModeSynthesis) &&
@@ -1655,12 +1838,10 @@ async function launchGameInternal(
             effectiveCaps?.effectiveMachine || 'unknown',
             options
           );
-          if (initialAppLocalProxyInfo.hasOverrides) {
-            env.WINEDLLOVERRIDES = mergeWineDllOverrides(
-              env.WINEDLLOVERRIDES,
-              initialAppLocalProxyInfo.envOverrideSpec
-            );
-          }
+          // Do NOT merge `initialAppLocalProxyInfo.envOverrideSpec` globally into `env.WINEDLLOVERRIDES`
+          // here: for Bottle Steam launches, Wine `AppDefaults\<tExe>\DllOverrides` scopes proxy DLLs
+          // strictly per game `.exe` without polluting `steam.exe` / `steamwebhelper.exe` or leaking to
+          // subsequent games. Direct (`!shouldLaunchViaBottleSteam`) launches still merge it below.
           mergedCompatTargetExeNames = Array.from(
             new Set([
               ...(effectiveCaps?.targetExeBasenamesLower || []),
@@ -1698,6 +1879,7 @@ async function launchGameInternal(
               ? { appLocalDllOverrides: initialAppLocalProxyInfo.appDefaultsMap }
               : {}),
             ...(localInstallDir ? { installDir: localInstallDir } : {}),
+            ...(resolvedExePath ? { executablePath: resolvedExePath } : {}),
           };
           outerCompatLayerCapOptions = compatLayerCapOptions;
           outerEffectiveCompatLaunchConfig = effectiveCompatLaunchConfig;
@@ -1735,6 +1917,10 @@ async function launchGameInternal(
                   path.resolve(activeEntry.winePrefix) === prefixKey
               ));
 
+          const hasCustomExecutable = Boolean(
+            launchConfig?.customExecutablePath || payload.customExecutablePath
+          );
+
           const computeNeedBottleClientsForPrefix = (/** @type {string | null} */ prefixDir) => {
             if (!prefixDir || isUnmockedHostBottleInVitest) {
               return { needSteam: false, needGog: false, needEpic: false };
@@ -1748,6 +1934,7 @@ async function launchGameInternal(
                 bSteam &&
                   effectiveSteamAppId &&
                   !isFastMinimalBypass &&
+                  !hasCustomExecutable &&
                   !options.disableBottleSteamLaunch &&
                   !options.disableBottleStorefrontLaunch
               );
@@ -1897,15 +2084,142 @@ async function launchGameInternal(
             syncCxEnv: true,
           });
 
-          if (payload.platformId === 'steam' && targetWinePrefix && !isUnmockedHostBottleInVitest) {
-            bottleSteamExe = resolveBottleSteamExe(targetWinePrefix);
+          if (payload.platformId === 'steam' && targetWinePrefix) {
+            const bottleSteamRequired = Boolean(
+              payload.platformId === 'steam' &&
+                targetWinePrefix &&
+                effectiveSteamAppId &&
+                !isFastMinimalBypass &&
+                !hasCustomExecutable &&
+                !isUnmockedHostBottleInVitest &&
+                !options.disableBottleSteamLaunch &&
+                !options.disableBottleStorefrontLaunch
+            );
+            bottleSteamExe = !isUnmockedHostBottleInVitest || routeBottledWindowsUriToBottle
+              ? resolveBottleSteamExe(targetWinePrefix)
+              : null;
+            const installBottleSteamExe = installBottlePath
+              ? resolveBottleSteamExe(installBottlePath)
+              : null;
+            const recommendedLayerForGuard = affinityBottlePath
+              ? selectRecommendedLayerForBottle(layers, affinityBottlePath, effectiveHostArch)
+              : null;
+            const recommendedCompatRunnerType = recommendedLayerForGuard?.type || '';
+            const targetBottleName = path.basename(targetWinePrefix);
+            const installBottleName = installBottlePath
+              ? path.basename(installBottlePath)
+              : undefined;
+
+            // Guard 2A: Target bottle lacks `steam.exe` when Steam Client launch is required
+            if ((bottleSteamRequired || routeBottledWindowsUriToBottle) && !bottleSteamExe) {
+              const hasAnyBottleSteamOnHost =
+                Boolean(installBottleSteamExe) ||
+                (Array.isArray(layers) &&
+                  layers.some((l) => {
+                    if (!l) return false;
+                    if (l.bottleDetails && typeof l.bottleDetails === 'object') {
+                      if (
+                        Object.values(l.bottleDetails).some((/** @type {any} */ d) =>
+                          Boolean(d && d.hasSteam)
+                        )
+                      ) {
+                        return true;
+                      }
+                    }
+                    if (l.bottlesDir && Array.isArray(l.availableBottles)) {
+                      return l.availableBottles.some((/** @type {string} */ bName) =>
+                        Boolean(resolveBottleSteamExe(path.join(l.bottlesDir, bName)))
+                      );
+                    }
+                    return false;
+                  }));
+              const shouldEnforceBottleSteamGuard =
+                options.allowDirectFallbackWhenBottleSteamMissing !== true &&
+                (Boolean(installBottlePath) ||
+                  hasAnyBottleSteamOnHost ||
+                  routeBottledWindowsUriToBottle ||
+                  !isTestEnvironment(options) ||
+                  options.enforceBottleSteamGuard === true);
+              if (shouldEnforceBottleSteamGuard) {
+                cleanupPendingLaunchResources();
+                releasePendingBottleLock();
+                releasePendingPlatformLock();
+                return {
+                  success: false,
+                  errorCode: 'BOTTLE_STEAM_NOT_INSTALLED',
+                  targetBottleName,
+                  targetBottlePath: targetWinePrefix,
+                  ...(installBottleName ? { installBottleName } : {}),
+                  installBottleHasSteam: Boolean(installBottleSteamExe),
+                  ...(recommendedCompatRunnerType
+                    ? { recommendedRunnerType: recommendedCompatRunnerType }
+                    : {}),
+                  error:
+                    installBottleName && installBottleSteamExe
+                      ? `Cannot launch "${payload.title || gameId}" via Steam Client: bottle "${targetBottleName}" (${chosenLayer.name || chosenLayer.type}) does not have Windows Steam installed. This game and its Steam Cloud setup are installed in bottle "${installBottleName}". Open Launch Config to switch to a compatible runner for "${installBottleName}", install Steam into "${targetBottleName}", or choose Fast Bottle Launch (disables Steam Cloud).`
+                      : `Cannot launch "${payload.title || gameId}" via Steam Client: bottle "${targetBottleName}" (${chosenLayer.name || chosenLayer.type}) does not have Windows Steam installed. Install Windows Steam into "${targetBottleName}" or choose Fast Bottle Launch (disables Steam Cloud) in Launch Config.`,
+                };
+              }
+            }
+
+            // Guard 2B: Target bottle has `steam.exe`, but differs from `installBottlePath` and
+            // target Steam does not recognize `appmanifest_<appId>.acf` (read-only VDF check)
+            if (
+              bottleSteamRequired &&
+              bottleSteamExe &&
+              installBottlePath &&
+              !areSameBottleDirPath(installBottlePath, targetWinePrefix) &&
+              options.allowCrossBottleSteamWithoutManifest !== true &&
+              !hasBottleSteamAppManifest(targetWinePrefix, effectiveSteamAppId)
+            ) {
+              cleanupPendingLaunchResources();
+              releasePendingBottleLock();
+              releasePendingPlatformLock();
+              return {
+                success: false,
+                errorCode: 'BOTTLE_STEAM_APP_NOT_IN_TARGET_BOTTLE',
+                targetBottleName,
+                targetBottlePath: targetWinePrefix,
+                installBottleName,
+                installBottleHasSteam: Boolean(installBottleSteamExe),
+                ...(recommendedCompatRunnerType
+                  ? { recommendedRunnerType: recommendedCompatRunnerType }
+                  : {}),
+                error: `Cannot launch "${payload.title || gameId}" via Steam Client: Steam in bottle "${targetBottleName}" (${chosenLayer.name || chosenLayer.type}) does not recognize Steam AppID ${effectiveSteamAppId} as installed (launching via -applaunch would open the Steam Install dialog). This game is installed in bottle "${installBottleName}". Open Launch Config to switch to a compatible runner for "${installBottleName}" or choose Fast Bottle Launch (disables Steam Cloud).`,
+              };
+            }
+
             shouldLaunchViaBottleSteam = Boolean(
               bottleSteamExe &&
                 effectiveSteamAppId &&
                 !isFastMinimalBypass &&
+                !hasCustomExecutable &&
+                !isUnmockedHostBottleInVitest &&
                 !options.disableBottleSteamLaunch &&
                 !options.disableBottleStorefrontLaunch
             );
+            if (routeBottledWindowsUriToBottle) {
+              if (!resolvedExePath && bottleSteamExe) {
+                resolvedExePath = bottleSteamExe;
+              }
+              if (!shouldLaunchViaBottleSteam && !resolvedExePath) {
+                cleanupPendingLaunchResources();
+                releasePendingBottleLock();
+                releasePendingPlatformLock();
+                return {
+                  success: false,
+                  errorCode: 'BOTTLE_STEAM_NOT_INSTALLED',
+                  targetBottleName,
+                  targetBottlePath: targetWinePrefix,
+                  ...(installBottleName ? { installBottleName } : {}),
+                  installBottleHasSteam: Boolean(installBottleSteamExe),
+                  ...(recommendedCompatRunnerType
+                    ? { recommendedRunnerType: recommendedCompatRunnerType }
+                    : {}),
+                  error: `Cannot launch "${payload.title || gameId}" via Steam Client in bottle "${targetBottleName}": Windows Steam launch is unavailable for this bottle.`,
+                };
+              }
+            }
             if (shouldLaunchViaBottleSteam && steamChainedPublisherHandoff) {
               wasBottleSteamPublisherRunning = await checkBottlePublisherUiRunningAsync(
                 targetWinePrefix,
@@ -1963,24 +2277,53 @@ async function launchGameInternal(
               }
               wokeBottleSteamPublisherByLauncher = !wasBottleSteamPublisherRunning;
             }
-          } else if (
-            payload.platformId === 'gog' &&
-            targetWinePrefix &&
-            !isUnmockedHostBottleInVitest
-          ) {
-            bottleGogExe = resolveBottleGogGalaxyExe(targetWinePrefix);
-            const gogInstallUsesSdk =
-              options.strictGalaxySdkCheck === true
-                ? doesGogInstallUseGalaxySdk(localInstallDir, resolvedExePath)
-                : true;
-            shouldWakeBottleGog = Boolean(
-              bottleGogExe &&
-                !isFastMinimalBypass &&
-                options.usesGalaxySdk !== false &&
-                gogInstallUsesSdk &&
-                !options.disableBottleGogLaunch &&
-                !options.disableBottleStorefrontLaunch
-            );
+          } else if (payload.platformId === 'gog' && targetWinePrefix) {
+            bottleGogExe =
+              !isUnmockedHostBottleInVitest || isBottledWindowsGogStorefrontUri
+                ? resolveBottleGogGalaxyExe(targetWinePrefix)
+                : null;
+            if (isBottledWindowsGogStorefrontUri && !bottleGogExe) {
+              const gogTargetBottleName = path.basename(targetWinePrefix);
+              cleanupPendingLaunchResources();
+              releasePendingBottleLock();
+              releasePendingPlatformLock();
+              return {
+                success: false,
+                errorCode: 'BOTTLE_GOG_GALAXY_NOT_INSTALLED',
+                targetBottleName: gogTargetBottleName,
+                targetBottlePath: targetWinePrefix,
+                error: `Cannot launch "${payload.title || gameId}" via GOG Galaxy URI on macOS: bottle "${gogTargetBottleName}" (${chosenLayer.name || chosenLayer.type}) does not have Windows GOG Galaxy installed, and host macOS GOG Galaxy cannot launch Windows bottle games. Install Windows GOG Galaxy in "${gogTargetBottleName}" or switch Launch Method to Direct / Compatibility Layer in Launch Config.`,
+              };
+            }
+            if (isBottledWindowsGogStorefrontUri && bottleGogExe && !resolvedExePath) {
+              resolvedExePath = bottleGogExe;
+              const cleanBottleGogId = String(payload.platformGameId || gameId || '')
+                .trim()
+                .replace(/^gog[-_]/i, '');
+              if (cleanBottleGogId) {
+                args.push('/command=runGame', `/gameId=${cleanBottleGogId}`);
+                if (localInstallDir) {
+                  const winGogInstallDir = toWineWindowsPath(localInstallDir, targetWinePrefix);
+                  if (winGogInstallDir) {
+                    args.push(`/path=${winGogInstallDir}`);
+                  }
+                }
+              }
+            }
+            if (!isUnmockedHostBottleInVitest) {
+              const gogInstallUsesSdk =
+                options.strictGalaxySdkCheck === true
+                  ? doesGogInstallUseGalaxySdk(localInstallDir, resolvedExePath)
+                  : true;
+              shouldWakeBottleGog = Boolean(
+                bottleGogExe &&
+                  !isFastMinimalBypass &&
+                  options.usesGalaxySdk !== false &&
+                  gogInstallUsesSdk &&
+                  !options.disableBottleGogLaunch &&
+                  !options.disableBottleStorefrontLaunch
+              );
+            }
           } else if (
             payload.platformId === 'epic' &&
             targetWinePrefix &&
@@ -2491,7 +2834,7 @@ async function launchGameInternal(
               xboxAppNotifyBridgeDllPath: options.xboxAppNotifyBridgeDllPath,
             });
 
-            await runXboxPreLaunchSync({
+            const xboxPreLaunchSyncRes = await runXboxPreLaunchSync({
               xboxAuthProvider,
               xboxSession,
             });
@@ -2520,6 +2863,7 @@ async function launchGameInternal(
                     locale: payload.locale || options.locale || undefined,
                     storeProvider: options.xboxStoreProvider || undefined,
                     enableCloudSaveSync: true,
+                    initialPreLaunchSync: xboxPreLaunchSyncRes || null,
                     fetchImpl: options.fetchImpl,
                   });
                 pendingLaunchResources.xboxLoopbackServer = xboxLoopbackServer;
@@ -2623,7 +2967,7 @@ async function launchGameInternal(
                 }
               } catch {}
 
-              await runXboxPreLaunchSync({
+              const winXboxPreLaunchSyncRes = await runXboxPreLaunchSync({
                 xboxAuthProvider,
                 xboxSession,
                 isClientlessXboxGdk: true,
@@ -2654,6 +2998,7 @@ async function launchGameInternal(
                       locale: payload.locale || options.locale || undefined,
                       storeProvider: options.xboxStoreProvider || undefined,
                       enableCloudSaveSync: true,
+                      initialPreLaunchSync: winXboxPreLaunchSyncRes || null,
                       fetchImpl: options.fetchImpl,
                     });
                   pendingLaunchResources.xboxLoopbackServer = xboxLoopbackServer;
@@ -2720,8 +3065,40 @@ async function launchGameInternal(
               });
 
               wasXboxAppRunningAtStart = await isWindowsXboxAppRunning(options);
+              if (
+                effectivePerfPolicy.storefrontClientLifecycle === 'default_client' &&
+                !wasXboxAppRunningAtStart &&
+                (!isTestEnvironment(options) ||
+                  options.enableWindowsXboxDefaultClientLaunchInTest === true)
+              ) {
+                try {
+                  const xboxAppSpawnImpl =
+                    typeof options.xboxAppSpawnFn === 'function'
+                      ? options.xboxAppSpawnFn
+                      : typeof options.spawnFn === 'function'
+                        ? options.spawnFn
+                        : spawn;
+                  const xboxAppChild = xboxAppSpawnImpl(
+                    'explorer.exe',
+                    ['shell:AppsFolder\\Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App'],
+                    {
+                      detached: true,
+                      stdio: 'ignore',
+                      windowsHide: false,
+                    }
+                  );
+                  if (xboxAppChild && typeof xboxAppChild.unref === 'function') {
+                    xboxAppChild.unref();
+                  }
+                  wokeXboxAppByLauncher = true;
+                } catch (xboxAppWakeErr) {
+                  diagLog.warn('launchGame.win32XboxDefaultClientWake', xboxAppWakeErr, { gameId });
+                }
+              }
+
               const canUseAumidActivation =
                 Boolean(resolvedXboxAumid) &&
+                !isFastMinimalBypass &&
                 !launchConfig.customExecutablePath &&
                 options.disableXboxAumidActivation !== true &&
                 (!isTestEnvironment(options) ||
@@ -2901,100 +3278,27 @@ async function launchGameInternal(
                 : typeof options.execFileFn === 'function'
                   ? options.execFileFn
                   : execFile;
-            const normTargetPrefix = targetWinePrefix
-              ? path.resolve(targetWinePrefix).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
-              : '';
-            const normRealTargetPrefix = targetWinePrefix
-              ? normalizeBottlePrefixContractKey(targetWinePrefix)
-              : '';
-            let observedSteamBackend = '';
-            const checkBottleSteamRunning = (/** @type {any} */ outStr) => {
-              observedSteamBackend = '';
-              const lines = String(outStr || '').split(/\r?\n/);
-              for (const line of lines) {
-                if (!/(?:^|[\\/\s"'])steam\.exe(?:\s|["']|$)/i.test(line)) continue;
-                if (normTargetPrefix) {
-                  const lowerLine = line.replace(/\\/g, '/').toLowerCase();
-                  const envMatch = lowerLine.match(/wineprefix=(?:"([^"]+)"|'([^']+)'|(\S+))/i);
-                  if (envMatch) {
-                    const linePrefix = (envMatch[1] || envMatch[2] || envMatch[3] || '').replace(
-                      /\/+$/,
-                      ''
-                    );
-                    if (
-                      linePrefix &&
-                      linePrefix !== normTargetPrefix &&
-                      (!normRealTargetPrefix || linePrefix !== normRealTargetPrefix)
-                    ) {
-                      continue;
-                    }
-                  }
-                  const bottleMatch = lowerLine.match(
-                    /((?:[a-z]:)?\/[^\s"']*\/bottles\/[^/\s"']+)/i
-                  );
-                  if (bottleMatch && bottleMatch[1]) {
-                    const lineBottle = bottleMatch[1].replace(/\/+$/, '');
-                    const matchesRaw =
-                      normTargetPrefix.startsWith(lineBottle) ||
-                      lineBottle.startsWith(normTargetPrefix);
-                    const matchesReal = Boolean(
-                      normRealTargetPrefix &&
-                        (normRealTargetPrefix.startsWith(lineBottle) ||
-                          lineBottle.startsWith(normRealTargetPrefix))
-                    );
-                    if (!matchesRaw && !matchesReal) {
-                      continue;
-                    }
-                  }
-                }
-                const backendMatch = line.match(
-                  /\bCX_GRAPHICS_BACKEND=(?:"([^"]+)"|'([^']+)'|([^\s"']+))/i
-                );
-                if (backendMatch) {
-                  observedSteamBackend = String(
-                    backendMatch[1] || backendMatch[2] || backendMatch[3] || ''
-                  )
-                    .trim()
-                    .toLowerCase();
-                }
-                return true;
-              }
-              return false;
-            };
-
-            if (typeof options.mockProcessListOutput === 'string') {
-              wasBottleSteamRunning = checkBottleSteamRunning(options.mockProcessListOutput);
-            } else if (typeof options.getProcessListOutput === 'function') {
-              try {
-                wasBottleSteamRunning = checkBottleSteamRunning(
-                  await options.getProcessListOutput()
-                );
-              } catch {}
-            } else if (
-              !options.homedir ||
-              typeof options.execFileImpl === 'function' ||
-              typeof options.execFileFn === 'function'
-            ) {
-              try {
-                const psArgs =
-                  platform === 'darwin' && execFileImpl === execFile
-                    ? ['eww', '-ax', '-o', 'command=']
-                    : ['-ax', '-o', 'command='];
-                wasBottleSteamRunning = await new Promise((resolve) => {
-                  execFileImpl('ps', psArgs, { timeout: 1500 }, (/** @type {any} */ err, /** @type {any} */ stdout) => {
-                    resolve(!err && checkBottleSteamRunning(stdout));
-                  });
-                });
-              } catch {
-                wasBottleSteamRunning = false;
-              }
-            }
+            const steamProbe = await inspectRunningBottleSteam(targetWinePrefix || '', {
+              ...options,
+              platform,
+            });
+            wasBottleSteamRunning = Boolean(steamProbe.running);
+            const observedSteamBackend = String(steamProbe.observedBackend || '');
+            const observedSteamLaunchedSilent = Boolean(steamProbe.launchedSilent);
 
             const prefixContractKey = normalizeBottlePrefixContractKey(targetWinePrefix);
-            const targetGraphicsContract = computeBottleGraphicsEnvContract(env);
+            const targetGraphicsContract = computeBottleGraphicsEnvContract(
+              env,
+              launchConfig?.environmentVariables
+            );
             const desiredBackendLower = String(env.CX_GRAPHICS_BACKEND || 'auto')
               .trim()
               .toLowerCase();
+            /** @type {'silent' | 'standard'} */
+            const desiredBottleSteamUiMode =
+              effectivePerfPolicy.storefrontClientLifecycle === 'default_client'
+                ? 'standard'
+                : 'silent';
 
             if (
               wasBottleSteamRunning &&
@@ -3027,6 +3331,7 @@ async function launchGameInternal(
                     ...env,
                     WINEPREFIX: targetWinePrefix,
                   };
+                  stripDisplayScalerEnvFromClientEnv(shutdownSteamEnv);
                   const alignedSteamShutdown = prepareAlignedAuxBottleWineCommand({
                     wineBinary: chosenCompatLayer.binaryPath,
                     bottlePath: targetWinePrefix,
@@ -3051,10 +3356,38 @@ async function launchGameInternal(
                       resolve(undefined);
                     }
                   });
+                  const maxSteamExitWaitMs =
+                    options.bottleSteamShutdownWaitMs !== undefined
+                      ? Math.max(0, Number(options.bottleSteamShutdownWaitMs))
+                      : !isTestEnvironment(options) || options.awaitBottleSteamExitInTest === true
+                        ? 10000
+                        : 0;
+                  if (maxSteamExitWaitMs > 0) {
+                    const steamExitPollMs = Math.max(
+                      20,
+                      Number(options.bottleSteamShutdownPollMs || 300)
+                    );
+                    const steamExitDeadline = Date.now() + maxSteamExitWaitMs;
+                    while (Date.now() < steamExitDeadline) {
+                      const stillRunning = await isBottleWinExeRunning(
+                        'steam.exe',
+                        targetWinePrefix,
+                        { ...options, platform }
+                      );
+                      if (!stillRunning) break;
+                      const remainingMs = steamExitDeadline - Date.now();
+                      if (remainingMs <= 0) break;
+                      await new Promise((r) => {
+                        const t = setTimeout(r, Math.min(steamExitPollMs, remainingMs));
+                        if (typeof t.unref === 'function') t.unref();
+                      });
+                    }
+                  }
                 } catch {}
                 deleteBottleDaemonEnvContract(targetWinePrefix);
                 await shutdownWinePrefix(chosenCompatLayer.binaryPath, targetWinePrefix, 3000, {
                   bottleName: String(env.CX_BOTTLE || ''),
+                  layerType: chosenCompatLayer.type,
                   execFileFn: execFileImpl,
                 });
                 if (fs.existsSync(targetWinePrefix)) {
@@ -3078,13 +3411,30 @@ async function launchGameInternal(
               await recycleIdleBottleWineserverBeforeClientWake();
             }
 
-            if (!wasBottleSteamRunning && prefixContractKey) {
-              setBoundedMapEntry(
-                liveBottleDaemonEnvContractByPrefix,
-                prefixContractKey,
-                targetGraphicsContract,
-                128
+            if (!wasBottleSteamRunning) {
+              if (prefixContractKey) {
+                setBoundedMapEntry(
+                  liveBottleDaemonEnvContractByPrefix,
+                  prefixContractKey,
+                  targetGraphicsContract,
+                  128
+                );
+              }
+              if (targetWinePrefix) {
+                setLiveBottleSteamUiMode(targetWinePrefix, desiredBottleSteamUiMode);
+              }
+            } else if (targetWinePrefix) {
+              const recordedSteamUiMode = getLiveBottleSteamUiMode(targetWinePrefix);
+              const isWarmSteamSilent = Boolean(
+                observedSteamLaunchedSilent || recordedSteamUiMode === 'silent'
               );
+              if (desiredBottleSteamUiMode === 'standard' && isWarmSteamSilent) {
+                shouldPingWarmBottleSteamOpenMain = true;
+              } else if (desiredBottleSteamUiMode === 'standard') {
+                setLiveBottleSteamUiMode(targetWinePrefix, 'standard');
+              } else if (observedSteamLaunchedSilent && !recordedSteamUiMode) {
+                setLiveBottleSteamUiMode(targetWinePrefix, 'silent');
+              }
             }
 
             spawnCmd = chosenCompatLayer.binaryPath;
@@ -3499,6 +3849,7 @@ async function launchGameInternal(
               );
 
               const stage1Env = { ...env };
+              stripDisplayScalerEnvFromClientEnv(stage1Env);
               const isArm64Stage1 =
                 chosenCompatLayer.type === 'crossover_preview_arm64' ||
                 compatResult?.wineArch === 'arm64';
@@ -3528,7 +3879,7 @@ async function launchGameInternal(
                   setBoundedMapEntry(
                     liveBottleDaemonEnvContractByPrefix,
                     stage1PrefixKey,
-                    computeBottleGraphicsEnvContract(stage1Env),
+                    computeBottleGraphicsEnvContract(stage1Env, launchConfig?.environmentVariables),
                     128
                   );
                 }
@@ -3540,6 +3891,7 @@ async function launchGameInternal(
                 suppressGuiDialogs: false,
                 layerType: chosenCompatLayer.type,
               });
+              stripDisplayScalerEnvFromClientEnv(alignedStage1.env);
               const stage1Dll =
                 typeof alignedStage1.env.WINEDLLOVERRIDES === 'string'
                   ? alignedStage1.env.WINEDLLOVERRIDES.trim()
@@ -3573,6 +3925,29 @@ async function launchGameInternal(
                 preBootLogOffset,
                 steamRootStrict: true,
                 isBottleSteam: true,
+                onStatusUpdate: (/** @type {string} */ statusMessage) => {
+                  emitSessionUpdated(
+                    {
+                      gameId,
+                      platformId: payload.platformId || 'steam',
+                      status: 'starting',
+                      event: 'starting',
+                      statusMessage,
+                    },
+                    options
+                  );
+                },
+                ...(typeof options.isSteamAliveFn === 'function'
+                  ? { isSteamAliveFn: options.isSteamAliveFn }
+                  : !isTestEnvironment(options) && targetWinePrefix
+                    ? {
+                        isSteamAliveFn: () =>
+                          isBottleWinExeRunning('steam.exe', targetWinePrefix, {
+                            ...options,
+                            platform,
+                          }),
+                      }
+                    : {}),
               });
             } catch (coldStartErr) {
               diagLog.warn('launchGame.bottleSteamColdStartSync', coldStartErr, {
@@ -3580,6 +3955,84 @@ async function launchGameInternal(
                 appId: effectiveSteamAppId,
               });
             }
+          } else if (
+            shouldLaunchViaBottleSteam &&
+            bottleSteamExe &&
+            chosenCompatLayer &&
+            chosenCompatLayer.binaryPath &&
+            wasBottleSteamRunning &&
+            shouldPingWarmBottleSteamOpenMain &&
+            targetWinePrefix
+          ) {
+            try {
+              const execFileForOpenMain =
+                typeof options.execFileImpl === 'function'
+                  ? options.execFileImpl
+                  : typeof options.execFileFn === 'function'
+                    ? options.execFileFn
+                    : execFile;
+              const openMainEnv = {
+                ...env,
+                WINEPREFIX: targetWinePrefix,
+              };
+              stripDisplayScalerEnvFromClientEnv(openMainEnv);
+              const alignedStage2 = prepareAlignedAuxBottleWineCommand({
+                wineBinary: chosenCompatLayer.binaryPath,
+                bottlePath: targetWinePrefix,
+                env: openMainEnv,
+                suppressGuiDialogs: false,
+                layerType: chosenCompatLayer.type,
+              });
+              stripDisplayScalerEnvFromClientEnv(alignedStage2.env);
+              await new Promise((resolve) => {
+                try {
+                  execFileForOpenMain(
+                    alignedStage2.binaryPath,
+                    [bottleSteamExe, 'steam://open/main'],
+                    {
+                      cwd: path.dirname(bottleSteamExe),
+                      env: alignedStage2.env,
+                      timeout: 3000,
+                    },
+                    () => resolve(undefined)
+                  );
+                } catch {
+                  resolve(undefined);
+                }
+              });
+              setLiveBottleSteamUiMode(targetWinePrefix, 'standard');
+            } catch (openMainErr) {
+              diagLog.warn('launchGame.bottleSteamWarmOpenMain', openMainErr, {
+                gameId,
+                appId: effectiveSteamAppId,
+              });
+            }
+          }
+
+          if (shouldLaunchViaBottleSteam && bottleSteamExe) {
+            const bottleSteamRootForOffsets = path.dirname(bottleSteamExe);
+            const bottleCloudLogForSession = path.join(
+              bottleSteamRootForOffsets,
+              'logs',
+              'cloud_log.txt'
+            );
+            try {
+              bottleSteamCloudLogSessionStartOffset = fs.existsSync(bottleCloudLogForSession)
+                ? fs.statSync(bottleCloudLogForSession).size
+                : 0;
+            } catch {
+              bottleSteamCloudLogSessionStartOffset = 0;
+            }
+            const bottleGameProcessLogPath = path.join(
+              bottleSteamRootForOffsets,
+              'logs',
+              'gameprocess_log.txt'
+            );
+            try {
+              if (fs.existsSync(bottleGameProcessLogPath)) {
+                bottleSteamGameProcessLogStartOffset = fs.statSync(bottleGameProcessLogPath).size;
+              }
+            } catch {}
           }
 
           if (
@@ -3811,6 +4264,8 @@ async function launchGameInternal(
 
           /** @type {Record<string, any>} */
           let spawnEnv = env;
+          /** @type {Record<string, any>} */
+          let watcherSpawnEnv = env;
           if (platform === 'darwin' && spawnEnv) {
             if (useCompatLayer && !isTestEnvironment(options)) {
               spawnEnv = { ...env };
@@ -3822,11 +4277,19 @@ async function launchGameInternal(
                 // and injects it into non-SIP wineloader; strip outer DYLD_INSERT_LIBRARIES on SIP Perl.
                 delete spawnEnv.DYLD_INSERT_LIBRARIES;
               }
+              watcherSpawnEnv = { ...spawnEnv };
+              if (shouldLaunchViaBottleSteam) {
+                stripDisplayScalerEnvFromClientEnv(spawnEnv);
+              }
             } else if (useCompatLayer) {
               spawnEnv = { ...env };
               prepareCrossOverWineSpawnEnv(spawnCmd, spawnEnv, {
                 layerType: chosenCompatLayer?.type,
               });
+              watcherSpawnEnv = { ...spawnEnv };
+              if (shouldLaunchViaBottleSteam) {
+                stripDisplayScalerEnvFromClientEnv(spawnEnv);
+              }
             } else if (
               spawnEnv.DYLD_INSERT_LIBRARIES &&
               !isTestEnvironment(options) &&
@@ -3834,7 +4297,12 @@ async function launchGameInternal(
             ) {
               spawnEnv = { ...env };
               delete spawnEnv.DYLD_INSERT_LIBRARIES;
+              watcherSpawnEnv = spawnEnv;
             }
+          } else if (shouldLaunchViaBottleSteam && spawnEnv) {
+            watcherSpawnEnv = { ...spawnEnv };
+            spawnEnv = { ...spawnEnv };
+            stripDisplayScalerEnvFromClientEnv(spawnEnv);
           }
 
           // L-08: Await any late `upsertWineUserRegKey` / live `reg.exe import` immediately before spawning
@@ -3952,12 +4420,29 @@ async function launchGameInternal(
             ) {
               try {
                 const winWatchDir = toWineWindowsPath(localInstallDir, targetWinePrefix);
-                const bottleWatchLauncherPosix =
-                  (effectiveCaps?.is64Bit
-                    ? bottleDisplayStagedInfo.launcherX64Posix
-                    : bottleDisplayStagedInfo.launcherX86Posix) ||
-                  bottleDisplayStagedInfo.launcherX64Posix ||
-                  bottleDisplayStagedInfo.launcherX86Posix;
+                const rawWatchBottleArch = String(
+                  compatResult?.wineArch ||
+                    (targetWinePrefix ? inspectBottleConfMetadata(targetWinePrefix).wineArch : '') ||
+                    (chosenCompatLayer?.type === 'crossover_preview_arm64' ? 'arm64' : '')
+                )
+                  .trim()
+                  .toLowerCase();
+                const is64BitWatchBottle =
+                  rawWatchBottleArch === 'win64' ||
+                  rawWatchBottleArch === 'arm64' ||
+                  (rawWatchBottleArch !== 'win32' &&
+                    (chosenCompatLayer?.type === 'crossover' ||
+                      chosenCompatLayer?.type === 'crossover_preview' ||
+                      chosenCompatLayer?.type === 'crossover_preview_arm64' ||
+                      Boolean(effectiveCaps?.is64Bit)));
+                const bottleWatchLauncherPosix = is64BitWatchBottle
+                  ? bottleDisplayStagedInfo.launcherX64Posix ||
+                    bottleDisplayStagedInfo.launcherX86Posix
+                  : (effectiveCaps?.is64Bit
+                      ? bottleDisplayStagedInfo.launcherX64Posix
+                      : bottleDisplayStagedInfo.launcherX86Posix) ||
+                    bottleDisplayStagedInfo.launcherX64Posix ||
+                    bottleDisplayStagedInfo.launcherX86Posix;
                 if (winWatchDir && bottleWatchLauncherPosix) {
                   bottleDisplayWatcherChild = gameSpawnImpl(
                     spawnCmd,
@@ -3975,7 +4460,7 @@ async function launchGameInternal(
                     ],
                     {
                       cwd: effectiveCwd,
-                      env: spawnEnv,
+                      env: watcherSpawnEnv,
                       stdio: 'ignore',
                       detached: true,
                     }
@@ -4012,6 +4497,15 @@ async function launchGameInternal(
               ])
             ).filter(Boolean);
 
+            const resolvedWineBinary =
+              useCompatLayer && chosenCompatLayer ? chosenCompatLayer.binaryPath || null : null;
+            const resolvedWineserverBinary = resolvedWineBinary
+              ? resolveWineserverBinary(resolvedWineBinary)
+              : null;
+            const resolvedWinePrefix = useCompatLayer
+              ? compatResult?.winePrefix || env.WINEPREFIX || null
+              : null;
+
             const session = {
               sessionId: preGeneratedSessionId,
               gameId,
@@ -4026,6 +4520,7 @@ async function launchGameInternal(
               isBottledSession: isBottledMacSession,
               ...(isBottledMacSession
                 ? {
+                    ...(resolvedWinePrefix ? { winePrefix: resolvedWinePrefix } : {}),
                     fullscreenActive: initialBottleFullscreen,
                     displayScalingMode: effectiveDisplayScalingMode,
                     displayAspectRatio: effectiveDisplayAspectRatio,
@@ -4033,15 +4528,6 @@ async function launchGameInternal(
                   }
                 : {}),
             };
-
-            const resolvedWineBinary =
-              useCompatLayer && chosenCompatLayer ? chosenCompatLayer.binaryPath || null : null;
-            const resolvedWineserverBinary = resolvedWineBinary
-              ? resolveWineserverBinary(resolvedWineBinary)
-              : null;
-            const resolvedWinePrefix = useCompatLayer
-              ? compatResult?.winePrefix || env.WINEPREFIX || null
-              : null;
 
             // CP-04: Snapshot CommunicationService.log byte offset right before session starts so
             // post-exit `waitForGogPostExitFlush` ignores stale prior-session destructor markers.
@@ -4103,6 +4589,10 @@ async function launchGameInternal(
               launchOptions: options,
               launchConfig,
               effectiveStorefrontLifecycle: effectivePerfPolicy.storefrontClientLifecycle,
+              isFastDirectBypass: Boolean(isFastMinimalBypass),
+              ...(typeof bottleSteamCloudLogSessionStartOffset === 'number'
+                ? { steamCloudLogSessionStartOffset: bottleSteamCloudLogSessionStartOffset }
+                : {}),
               wokeGogGalaxyByLauncher: Boolean(gogWakeResult && gogWakeResult.started),
               gogGalaxyClientPath: gogWakeResult ? gogWakeResult.clientPath || null : null,
               ...(typeof gogCommLogPreExitOffset === 'number'
@@ -4137,7 +4627,7 @@ async function launchGameInternal(
               xboxProductId: resolvedXboxProductId || undefined,
               appUserModelId: resolvedXboxAumid || undefined,
               wasXboxAppRunningAtStart,
-              wokeXboxAppByLauncher: false,
+              wokeXboxAppByLauncher,
               lastPreLaunchCloudSyncAt,
               displayStatusTimer: null,
               lastObservedDisplayStatusMtimeMs: 0,
@@ -4202,12 +4692,14 @@ async function launchGameInternal(
               if (!options.disableBottleSteamPolling) {
                 const candidateGameExeNames = new Set();
                 const addBottleHintIfValid = (/** @type {any} */ exeCandidate) => {
-                  if (!exeCandidate) return;
-                  const baseLower = path.basename(String(exeCandidate)).toLowerCase();
-                  if (!baseLower || !baseLower.endsWith('.exe')) return;
-                  if (BOTTLE_SYSTEM_DAEMON_EXE_SET.has(baseLower)) return;
-                  if (isExcludedExecutable(baseLower)) return;
+                  if (!exeCandidate) return false;
+                  const baseLower = path.win32.basename(String(exeCandidate)).trim().toLowerCase();
+                  if (!baseLower || !baseLower.endsWith('.exe')) return false;
+                  if (BOTTLE_SYSTEM_DAEMON_EXE_SET.has(baseLower)) return false;
+                  if (isExcludedExecutable(baseLower)) return false;
+                  if (candidateGameExeNames.has(baseLower)) return false;
                   candidateGameExeNames.add(baseLower);
+                  return true;
                 };
                 addBottleHintIfValid(resolvedExePath);
                 addBottleHintIfValid(payload.executablePath);
@@ -4234,7 +4726,115 @@ async function launchGameInternal(
                   typeof options.execFileImpl === 'function' ||
                   typeof options.execFileFn === 'function' ||
                   typeof options.bottleSteamProcessListFn === 'function';
+                const hasAnyMockPsInput =
+                  hasMockProcessSource || typeof options.mockProcessListOutput === 'string';
+                const exitMissThreshold =
+                  options.bottleSteamExitMissThreshold !== undefined
+                    ? Math.max(1, Number(options.bottleSteamExitMissThreshold))
+                    : isTestEnvironment(options) && hasAnyMockPsInput
+                      ? 1
+                      : 3;
+                const trackedWin32HardFallbackMissThreshold = Math.max(
+                  exitMissThreshold * 2,
+                  isTestEnvironment(options) && hasAnyMockPsInput ? 2 : 6
+                );
+                const pollerNormTargetPrefix = resolvedWinePrefix
+                  ? path
+                      .resolve(resolvedWinePrefix)
+                      .replace(/\\/g, '/')
+                      .replace(/\/+$/, '')
+                      .toLowerCase()
+                  : '';
+                const pollerNormRealTargetPrefix = resolvedWinePrefix
+                  ? normalizeBottlePrefixContractKey(resolvedWinePrefix)
+                  : '';
+                const bottleGameProcLogFile =
+                  entry.bottleSteamRoot && effectiveSteamAppId
+                    ? path.join(entry.bottleSteamRoot, 'logs', 'gameprocess_log.txt')
+                    : '';
+                const escapedBottleAppId = String(effectiveSteamAppId || '').replace(
+                  /[.*+?^${}()|[\]\\]/g,
+                  '\\$&'
+                );
+                const bottleLogAddPidRegex = escapedBottleAppId
+                  ? new RegExp(
+                      `AppID\\s+${escapedBottleAppId}\\s+adding\\s+PID\\s+(\\d+)\\s+as\\s+a\\s+tracked\\s+process\\s+"([^"]+)"`,
+                      'i'
+                    )
+                  : null;
+                const bottleLogRemovePidRegex = escapedBottleAppId
+                  ? new RegExp(
+                      `(?:AppID\\s+${escapedBottleAppId}\\s+removing\\s+PID\\s+(\\d+)|No\\s+longer\\s+tracking\\s+PID\\s+(\\d+))`,
+                      'i'
+                    )
+                  : null;
+                /** @type {Set<string>} */
+                const trackedWin32Pids = new Set();
                 let seenGameRunning = false;
+                let consecutiveMisses = 0;
+                let lastEmittedLatchedPid = 0;
+
+                const refreshBottleGameProcessLog = () => {
+                  if (!bottleGameProcLogFile || !bottleLogAddPidRegex || !bottleLogRemovePidRegex) {
+                    return;
+                  }
+                  let fd = null;
+                  try {
+                    if (!fs.existsSync(bottleGameProcLogFile)) return;
+                    const gpSt = fs.statSync(bottleGameProcLogFile);
+                    if (!gpSt.isFile() || gpSt.size <= 0) return;
+                    const effectiveStart =
+                      gpSt.size < bottleSteamGameProcessLogStartOffset
+                        ? 0
+                        : Math.max(bottleSteamGameProcessLogStartOffset, gpSt.size - 131072);
+                    const readLen = gpSt.size - effectiveStart;
+                    if (readLen <= 0) return;
+                    fd = fs.openSync(bottleGameProcLogFile, 'r');
+                    const buf = Buffer.alloc(readLen);
+                    const bytesRead = fs.readSync(fd, buf, 0, readLen, effectiveStart);
+                    const sliceText = buf.subarray(0, bytesRead).toString('utf8');
+                    trackedWin32Pids.clear();
+                    for (const rawLogLine of sliceText.split(/\r?\n/)) {
+                      const addMatch = bottleLogAddPidRegex.exec(rawLogLine);
+                      if (addMatch) {
+                        // Track Win32 PID purely as an opaque state count; NEVER pass to POSIX kill()
+                        const winPidToken = addMatch[1];
+                        const winExePath = addMatch[2];
+                        if (winPidToken) trackedWin32Pids.add(winPidToken);
+                        if (addBottleHintIfValid(winExePath)) {
+                          const newBase = path.win32.basename(winExePath).trim().toLowerCase();
+                          bottleExeHints.push(newBase);
+                          if (
+                            Array.isArray(entry.targetExeBasenamesLower) &&
+                            !entry.targetExeBasenamesLower.includes(newBase)
+                          ) {
+                            entry.targetExeBasenamesLower.push(newBase);
+                          }
+                          if (
+                            entry.session &&
+                            Array.isArray(entry.session.targetExeBasenamesLower) &&
+                            !entry.session.targetExeBasenamesLower.includes(newBase)
+                          ) {
+                            entry.session.targetExeBasenamesLower.push(newBase);
+                          }
+                        }
+                        continue;
+                      }
+                      const remMatch = bottleLogRemovePidRegex.exec(rawLogLine);
+                      if (remMatch) {
+                        const remPidToken = remMatch[1] || remMatch[2];
+                        if (remPidToken) trackedWin32Pids.delete(remPidToken);
+                      }
+                    }
+                  } catch {
+                  } finally {
+                    if (fd !== null) {
+                      try {
+                        fs.closeSync(fd);
+                      } catch {}
+                    }
+                  }
+                };
 
                 const pollTimer = createGuardedSessionPoller({
                   intervalMs: bottlePollMs,
@@ -4245,6 +4845,8 @@ async function launchGameInternal(
                     entry.pollTimer = null;
                   },
                   onTick: async ({ timedOutStartup }) => {
+                    refreshBottleGameProcessLog();
+
                     const trackedPid = Number(entry.pid || entry.session?.pid || 0);
                     if (
                       trackedPid > 0 &&
@@ -4260,6 +4862,7 @@ async function launchGameInternal(
                       }
                       if (trackedAlive) {
                         seenGameRunning = true;
+                        consecutiveMisses = 0;
                         return;
                       }
                       entry.pid = 0;
@@ -4270,24 +4873,58 @@ async function launchGameInternal(
 
                     const handleBottleProcessList = (/** @type {any} */ err, /** @type {any} */ stdout) => {
                       if (err || entry.finalized || entry.stopping) return;
-                      const outStr = String(stdout || '');
+                      const scopedOutStr = String(stdout || '')
+                        .split(/\r?\n/)
+                        .filter((rawLine) => {
+                          const trimmed = rawLine.trim();
+                          if (!trimmed) return false;
+                          return lineMatchesBottlePrefix(
+                            trimmed,
+                            pollerNormTargetPrefix,
+                            pollerNormRealTargetPrefix
+                          );
+                        })
+                        .join('\n');
                       const matchedPid = extractMatchedPidFromProcessOutput(
-                        outStr,
+                        scopedOutStr,
                         bottleExeHints,
                         'darwin'
                       );
-                      const lowerOut = outStr.toLowerCase();
+                      const lowerOut = scopedOutStr.toLowerCase();
                       const isPresent =
                         matchedPid > 0 || bottleExeHints.some((h) => h && lowerOut.includes(h));
                       if (isPresent) {
                         seenGameRunning = true;
+                        consecutiveMisses = 0;
                         if (matchedPid > 0) {
                           entry.pid = matchedPid;
                           if (entry.session) {
                             entry.session.pid = matchedPid;
                           }
+                          if (matchedPid !== lastEmittedLatchedPid) {
+                            lastEmittedLatchedPid = matchedPid;
+                            emitSessionUpdated(
+                              {
+                                gameId,
+                                platformId: entry.platformId,
+                                session: { ...entry.session },
+                                status: 'running',
+                                event: 'session_updated',
+                              },
+                              options
+                            );
+                          }
                         }
-                      } else if (seenGameRunning || timedOutStartup) {
+                      } else if (seenGameRunning) {
+                        consecutiveMisses += 1;
+                        const canFinalizeForTrackedWin32 =
+                          trackedWin32Pids.size === 0 ||
+                          consecutiveMisses >= trackedWin32HardFallbackMissThreshold;
+                        if (consecutiveMisses >= exitMissThreshold && canFinalizeForTrackedWin32) {
+                          entry.exitCode = 0;
+                          finalizeGameSession(gameId, options);
+                        }
+                      } else if (timedOutStartup) {
                         entry.exitCode = 0;
                         finalizeGameSession(gameId, options);
                       }
@@ -4308,10 +4945,14 @@ async function launchGameInternal(
                       typeof options.execFileFn === 'function' ||
                       !options.homedir
                     ) {
+                      const bottlePsArgs =
+                        platform === 'darwin'
+                          ? ['eww', '-ax', '-o', 'pid=,command=']
+                          : ['-ax', '-o', 'pid=,command='];
                       await new Promise((resolve) => {
                         execFileImpl(
                           'ps',
-                          ['-ax', '-o', 'pid=,command='],
+                          bottlePsArgs,
                           { timeout: 2500 },
                           (/** @type {any} */ err, /** @type {any} */ stdout) => {
                             handleBottleProcessList(err, stdout);
@@ -4770,6 +5411,19 @@ async function launchGameInternal(
 
     let uriHostSteamRoot = '';
     let steamGameProcessLogOffset = 0;
+    /** @type {number | undefined} */
+    let uriSteamCloudLogSessionStartOffset;
+    const snapshotUriSteamCloudLogOffset = () => {
+      if (payload.platformId !== 'steam' || !uriHostSteamRoot) return;
+      const hostCloudLogForSession = path.join(uriHostSteamRoot, 'logs', 'cloud_log.txt');
+      try {
+        uriSteamCloudLogSessionStartOffset = fs.existsSync(hostCloudLogForSession)
+          ? fs.statSync(hostCloudLogForSession).size
+          : 0;
+      } catch {
+        uriSteamCloudLogSessionStartOffset = 0;
+      }
+    };
     if (payload.platformId === 'steam') {
       uriHostSteamRoot =
         options.steamRoot ||
@@ -4813,6 +5467,9 @@ async function launchGameInternal(
           launchConfig,
           storefrontClientLifecycle: effectivePerfPolicy.storefrontClientLifecycle,
         });
+        const hasCustomOpenExternal =
+          typeof options.openExternalFn === 'function' ||
+          typeof options.onOpenExternal === 'function';
         if (
           steamLaunchSpec &&
           !steamLaunchSpec.alreadyRunning &&
@@ -4855,22 +5512,18 @@ async function launchGameInternal(
           );
 
           const macSteamAppMatch =
-            platform === 'darwin' && typeof options.spawnFn !== 'function'
+            platform === 'darwin' &&
+            (typeof options.spawnFn !== 'function' || options.forceMacOpenSteamInTest === true)
               ? String(steamLaunchSpec.binaryPath).match(/^(.*?\.app)(?:\/|$)/i)
               : null;
           if (macSteamAppMatch && macSteamAppMatch[1] && steamLaunchSpec.useMinimalBinarySpawn) {
+            const macStage1SteamArgs =
+              effectivePerfPolicy.storefrontClientLifecycle === 'fast_direct_bypass'
+                ? ['-silent', '-nofriendsui', '-nochatui', '-nobrowser']
+                : ['-silent'];
             const stage1Child = spawnImpl(
               '/usr/bin/open',
-              [
-                '-g',
-                '-j',
-                '-a',
-                macSteamAppMatch[1],
-                '--args',
-                '-silent',
-                '-nofriendsui',
-                '-nochatui',
-              ],
+              ['-g', '-j', '-a', macSteamAppMatch[1], '--args', ...macStage1SteamArgs],
               {
                 detached: true,
                 stdio: 'ignore',
@@ -4894,12 +5547,23 @@ async function launchGameInternal(
           await waitForSteamColdStartupCloudReady(hostSteamRoot, steamAppIdVal, {
             ...options,
             preBootLogOffset,
+            onStatusUpdate: (/** @type {string} */ statusMessage) => {
+              emitSessionUpdated(
+                {
+                  gameId,
+                  platformId: payload.platformId || 'steam',
+                  status: 'starting',
+                  event: 'starting',
+                  statusMessage,
+                },
+                options
+              );
+            },
           });
 
+          snapshotUriSteamCloudLogOffset();
+
           if (steamLaunchSpec.useMinimalBinarySpawn) {
-            const hasCustomOpenExternal =
-              typeof options.openExternalFn === 'function' ||
-              typeof options.onOpenExternal === 'function';
             if (platform === 'win32' || (!hasCustomOpenExternal && steamLaunchSpec.binaryPath)) {
               const stage2Child = spawnImpl(steamLaunchSpec.binaryPath, steamLaunchSpec.args, {
                 detached: true,
@@ -4913,12 +5577,32 @@ async function launchGameInternal(
               await openExternalUri(uri, options);
             }
             steamMinimalSpawnedResult = steamLaunchSpec;
+          } else if (
+            effectivePerfPolicy.storefrontClientLifecycle === 'default_client' &&
+            args.length > 0 &&
+            steamLaunchSpec.binaryPath &&
+            !hasCustomOpenExternal
+          ) {
+            const stage2Child = spawnImpl(
+              steamLaunchSpec.binaryPath,
+              ['-applaunch', steamAppIdVal, ...args],
+              {
+                detached: true,
+                stdio: 'ignore',
+                windowsHide: true,
+              }
+            );
+            if (stage2Child && typeof stage2Child.unref === 'function') {
+              stage2Child.unref();
+            }
+            steamMinimalSpawnedResult = steamLaunchSpec;
           }
         } else if (
           steamLaunchSpec &&
           steamLaunchSpec.useMinimalBinarySpawn &&
           steamLaunchSpec.binaryPath
         ) {
+          snapshotUriSteamCloudLogOffset();
           const spawnImpl = typeof options.spawnFn === 'function' ? options.spawnFn : spawn;
           const steamChild = spawnImpl(steamLaunchSpec.binaryPath, steamLaunchSpec.args, {
             detached: true,
@@ -4929,14 +5613,53 @@ async function launchGameInternal(
             steamChild.unref();
           }
           steamMinimalSpawnedResult = steamLaunchSpec;
+        } else if (
+          steamLaunchSpec &&
+          effectivePerfPolicy.storefrontClientLifecycle === 'default_client' &&
+          args.length > 0 &&
+          steamLaunchSpec.binaryPath &&
+          !hasCustomOpenExternal
+        ) {
+          snapshotUriSteamCloudLogOffset();
+          const spawnImpl = typeof options.spawnFn === 'function' ? options.spawnFn : spawn;
+          const stage2Child = spawnImpl(
+            steamLaunchSpec.binaryPath,
+            ['-applaunch', steamAppIdVal, ...args],
+            {
+              detached: true,
+              stdio: 'ignore',
+              windowsHide: true,
+            }
+          );
+          if (stage2Child && typeof stage2Child.unref === 'function') {
+            stage2Child.unref();
+          }
+          steamMinimalSpawnedResult = steamLaunchSpec;
         }
       } catch {}
     }
 
     let wokeEpicByLauncher = false;
     if (payload.platformId === 'epic') {
-      const checkEpicOut = (/** @type {any} */ outStr) =>
-        /(?:EpicGamesLauncher|Epic Games Launcher)/i.test(String(outStr || ''));
+      const checkEpicOut = (/** @type {any} */ outStr) => {
+        for (const rawLine of String(outStr || '').split(/\r?\n/)) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          if (platform === 'darwin') {
+            if (/\.exe\b|\/Bottles\/|WINEPREFIX=/i.test(line)) continue;
+            if (
+              /(?:Epic Games Launcher\.app\/Contents\/MacOS\/EpicGamesLauncher|(?:^|\/)EpicGamesLauncher(?:\s|$))/i.test(
+                line
+              )
+            ) {
+              return true;
+            }
+          } else if (/(?:EpicGamesLauncher|Epic Games Launcher)/i.test(line)) {
+            return true;
+          }
+        }
+        return false;
+      };
       /** @type {boolean | null} */
       let wasHostEpicRunning = null;
       if (typeof options.mockProcessListOutput === 'string') {
@@ -5106,6 +5829,9 @@ async function launchGameInternal(
       return abortedLaunchResult();
     }
     if (!steamMinimalSpawnedResult && !gogCliSpawned) {
+      if (uriSteamCloudLogSessionStartOffset === undefined) {
+        snapshotUriSteamCloudLogOffset();
+      }
       const shouldBackgroundUriOpen =
         payload.platformId === 'gog' &&
         platform === 'darwin' &&
@@ -5168,6 +5894,10 @@ async function launchGameInternal(
       launchOptions: options,
       launchConfig,
       effectiveStorefrontLifecycle: effectivePerfPolicy.storefrontClientLifecycle,
+      isFastDirectBypass: Boolean(isFastMinimalBypass),
+      ...(typeof uriSteamCloudLogSessionStartOffset === 'number'
+        ? { steamCloudLogSessionStartOffset: uriSteamCloudLogSessionStartOffset }
+        : {}),
       wokeGogGalaxyByLauncher: Boolean(gogWakeResult && gogWakeResult.started),
       gogGalaxyClientPath: gogWakeResult ? gogWakeResult.clientPath || null : null,
       ...(typeof uriGogCommLogPreExitOffset === 'number'
