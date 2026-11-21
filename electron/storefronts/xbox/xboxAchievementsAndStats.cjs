@@ -21,6 +21,8 @@ const ACHIEVEMENTS_BASE_URL = 'https://achievements.xboxlive.com';
 const USERSTATS_BATCH_URL = 'https://userstats.xboxlive.com/batch';
 const USERPRESENCE_BASE_URL = 'https://userpresence.xboxlive.com';
 const XBOX_PRESENCE_TIMEOUT_MS = 5_000;
+const MAX_TITLE_HISTORY_PAGES = 20;
+const STORE_PRODUCT_ID_RE = /^[A-Z0-9]{12}$/;
 
 function isValidNonSentinelTimestamp(rawTs) {
   if (!rawTs || typeof rawTs !== 'string') return false;
@@ -84,10 +86,12 @@ function parseTitleHubEntry(entry, syncedAt = new Date().toISOString()) {
   if (!entry || typeof entry !== 'object') return null;
 
   const titleId = normalizeTitleIdString(entry.titleId);
+  const modernTitleId = normalizeTitleIdString(entry.modernTitleId);
   const pfn = String(entry.pfn || entry.packageFamilyName || '').trim();
-  const productId = String(entry.modernTitleId || entry.productId || entry.bingId || '')
-    .trim()
-    .toUpperCase();
+  const productIdCandidates = [entry.productId, entry.modernTitleId, entry.bingId]
+    .map((candidate) => String(candidate || '').trim().toUpperCase())
+    .filter(Boolean);
+  const productId = productIdCandidates.find((candidate) => STORE_PRODUCT_ID_RE.test(candidate)) || '';
   const scid = String(entry.serviceConfigId || '').trim() || undefined;
   const name = String(entry.name || '').trim();
 
@@ -135,8 +139,9 @@ function parseTitleHubEntry(entry, syncedAt = new Date().toISOString()) {
 
   return {
     titleId,
+    modernTitleId,
     pfn,
-    productId: /^[A-Z0-9]{12}$/.test(productId) ? productId : '',
+    productId,
     scid,
     name,
     lastTimePlayed,
@@ -203,10 +208,18 @@ async function fetchXboxTitleHubSummaries(params = /** @type {any} */ ({})) {
 
   const registerParsed = (parsed, fromHistory = false) => {
     if (!parsed) return;
+    const distinctModernTitleId =
+      parsed.modernTitleId &&
+      /^\d+$/.test(parsed.modernTitleId) &&
+      parsed.modernTitleId !== parsed.titleId
+        ? parsed.modernTitleId
+        : '';
+
     if (fromHistory || parsed.wasPlayed) {
       if (parsed.productId) playedProductIds.add(parsed.productId);
       if (parsed.pfn) playedPfns.add(parsed.pfn.toLowerCase());
       if (parsed.titleId) playedTitleIds.add(parsed.titleId);
+      if (distinctModernTitleId) playedTitleIds.add(distinctModernTitleId);
     }
 
     if (parsed.titleId) {
@@ -214,6 +227,13 @@ async function fetchXboxTitleHubSummaries(params = /** @type {any} */ ({})) {
         ...(byTitleId[parsed.titleId] || {}),
         ...parsed,
         summary: parsed.summary || byTitleId[parsed.titleId]?.summary,
+      };
+    }
+    if (distinctModernTitleId) {
+      byTitleId[distinctModernTitleId] = {
+        ...(byTitleId[distinctModernTitleId] || {}),
+        ...parsed,
+        summary: parsed.summary || byTitleId[distinctModernTitleId]?.summary,
       };
     }
     if (parsed.pfn) {
@@ -241,6 +261,9 @@ async function fetchXboxTitleHubSummaries(params = /** @type {any} */ ({})) {
       if (parsed.titleId) {
         achievementsMap[parsed.titleId] = parsed.summary;
       }
+      if (distinctModernTitleId) {
+        achievementsMap[distinctModernTitleId] = parsed.summary;
+      }
       if (parsed.pfn) {
         achievementsMap[parsed.pfn.toLowerCase()] = parsed.summary;
       }
@@ -251,21 +274,32 @@ async function fetchXboxTitleHubSummaries(params = /** @type {any} */ ({})) {
     }
   };
 
-  // 1. Played history (`titlehistory`)
+  // 1. Played history (`titlehistory`) with continuationToken pagination, page cap & seen-cursor guard
   if (!skipHistory) {
     try {
-      const historyUrl = `${TITLEHUB_BASE_URL}/users/xuid(${encodeURIComponent(xuid)})/titles/titlehistory/decoration/achievement,scid,image,detail,productId?maxItems=1000`;
-      const res = await fetchImpl(historyUrl, {
-        method: 'GET',
-        headers,
-        signal: buildXboxFetchSignal(params.signal),
-      });
-      if (res.ok) {
+      let continuationToken = '';
+      const seenCursors = new Set();
+      for (let page = 0; page < MAX_TITLE_HISTORY_PAGES; page += 1) {
+        const historyUrl =
+          `${TITLEHUB_BASE_URL}/users/xuid(${encodeURIComponent(xuid)})/titles/titlehistory/decoration/achievement,scid,image,detail,productId?maxItems=1000` +
+          (continuationToken ? `&continuationToken=${encodeURIComponent(continuationToken)}` : '');
+        const res = await fetchImpl(historyUrl, {
+          method: 'GET',
+          headers,
+          signal: buildXboxFetchSignal(params.signal),
+        });
+        if (!res.ok) break;
         const json = await res.json();
         const titles = Array.isArray(json?.titles) ? json.titles : [];
         for (const item of titles) {
           registerParsed(parseTitleHubEntry(item, syncedAt), true);
         }
+        const nextCt = String(
+          json?.pagingInfo?.continuationToken || json?.continuationToken || ''
+        ).trim();
+        if (!nextCt || seenCursors.has(nextCt) || titles.length === 0) break;
+        seenCursors.add(nextCt);
+        continuationToken = nextCt;
       }
     } catch {}
   }
@@ -596,9 +630,25 @@ function mapXboxV1Achievement(ach, titleId = '') {
   const gamerscore = Number(ach?.gamerscore || 0) || 0;
 
   let iconUrl = normalizeHttpsUrl(ach?.imageUnlockedUrl || ach?.mediaAssets?.[0]?.url || '');
-  if (!iconUrl && cleanTitleId && /^\d+$/.test(cleanTitleId) && ach?.imageId !== undefined) {
-    const titleHex8 = (Number(cleanTitleId) >>> 0).toString(16).padStart(8, '0');
-    const imgHex = (Number(ach.imageId) >>> 0).toString(16);
+  const rawImageId = ach?.imageId;
+  const parsedImageId =
+    typeof rawImageId === 'number'
+      ? rawImageId
+      : typeof rawImageId === 'string' && /^\d+$/.test(rawImageId.trim())
+        ? Number(rawImageId.trim())
+        : NaN;
+  const parsedTitleIdNum = cleanTitleId && /^\d+$/.test(cleanTitleId) ? Number(cleanTitleId) : NaN;
+  if (
+    !iconUrl &&
+    Number.isInteger(parsedTitleIdNum) &&
+    parsedTitleIdNum > 0 &&
+    parsedTitleIdNum <= 0xffffffff &&
+    Number.isInteger(parsedImageId) &&
+    parsedImageId > 0 &&
+    parsedImageId <= 0xffffffff
+  ) {
+    const titleHex8 = (parsedTitleIdNum >>> 0).toString(16).padStart(8, '0');
+    const imgHex = (parsedImageId >>> 0).toString(16);
     iconUrl = `https://image-ssl.xboxlive.com/global/t.${titleHex8}/ach/0/${imgHex}`;
   }
 
@@ -692,6 +742,7 @@ async function fetchXboxDetailedAchievements(params = /** @type {any} */ ({})) {
   try {
     const v2Raw = [];
     let ct = '';
+    const seenCursors = new Set();
     for (let page = 0; page < 5; page++) {
       const url = `${ACHIEVEMENTS_BASE_URL}/users/xuid(${encodeURIComponent(xuid)})/achievements?titleId=${encodeURIComponent(cleanTitleId)}&maxItems=1000${ct ? `&continuationToken=${encodeURIComponent(ct)}` : ''}`;
       const res = await fetchImpl(url, {
@@ -708,8 +759,9 @@ async function fetchXboxDetailedAchievements(params = /** @type {any} */ ({})) {
       const json = await res.json();
       const items = Array.isArray(json?.achievements) ? json.achievements : [];
       v2Raw.push(...items);
-      const nextCt = json?.pagingInfo?.continuationToken || '';
-      if (!nextCt || nextCt === ct || items.length === 0) break;
+      const nextCt = String(json?.pagingInfo?.continuationToken || '').trim();
+      if (!nextCt || seenCursors.has(nextCt) || items.length === 0) break;
+      seenCursors.add(nextCt);
       ct = nextCt;
     }
 
