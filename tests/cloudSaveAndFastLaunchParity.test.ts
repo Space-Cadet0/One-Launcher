@@ -764,10 +764,10 @@ describe('Cloud Save Parity, Fast Direct Bypass & Cross-Platform Footprint Coexi
 
       writeTempFile(bottleSteamExe, createMockPe64Buffer());
       writeTempFile(gameExePath, createMockPe64Buffer());
-      // Initially write an active Cloud upload line for AppID 620
+      // Pre-launch baseline cloud_log.txt (post-launch / post-exit upload lines arrive after launchGame snapshots sessionStartOffset)
       writeTempFile(
         cloudLogPath,
-        '[2026-10-23 10:00:00] [AppID 620] Uploading 2 save files to Steam Cloud...\n'
+        '[2026-10-23 09:55:00] Steam Cloud log initialized\n'
       );
 
       const spawnedCommands: Array<{ cmd: string; args: string[] }> = [];
@@ -856,7 +856,12 @@ describe('Cloud Save Parity, Fast Direct Bypass & Cross-Platform Footprint Coexi
       const running = launcherEngine.getRunningGames();
       expect(running.find((s: any) => s.gameId === 'steam-620-bottle')?.pid).toBe(52345);
 
-      // Now simulate game exiting while Steam Cloud is finishing upload after 90ms
+      // Now simulate game exiting while Steam Cloud begins and finishes post-exit upload after launch
+      fs.appendFileSync(
+        cloudLogPath,
+        '[2026-10-23 10:00:00] [AppID 620] Starting sync (up,AC Exit,)\n' +
+          '[2026-10-23 10:00:00] [AppID 620] Uploading 2 save files to Steam Cloud...\n'
+      );
       setTimeout(() => {
         timelineEvents.push(`cloud_upload_complete:${Date.now()}`);
         fs.appendFileSync(
@@ -1520,7 +1525,8 @@ describe('Cloud Save Parity, Fast Direct Bypass & Cross-Platform Footprint Coexi
         (el) => el.props?.['data-testid'] === 'storefront-client-lifecycle-select'
       )[0];
       expect(lifecycleSelect).toBeDefined();
-      expect(lifecycleSelect.props.value).toBe('minimal_and_close_if_started');
+      expect(lifecycleSelect.props.value).toBe('default');
+      expect(initialRender.html).toContain('Use Global Default (Silent &amp; Auto-Close)');
 
       // Select fast_direct_bypass -> displays orange warning info box with fast-minimal-launch-warning
       lifecycleSelect.props.onChange({ target: { value: 'fast_direct_bypass' } });

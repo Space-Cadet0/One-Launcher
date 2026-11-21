@@ -434,7 +434,12 @@ static int classify_wine_helper_process(int *out_is_leaf_daemon) {
     static const char k_leaf_storefront_daemons_msz[] =
         ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ
         "gameoverlayui64.exe\0"
-        "cefprocess.exe\0";
+        "cefprocess.exe\0"
+        "eacefsubprocess.exe\0"
+        "uplaywebcore.exe\0"
+        "blizzardbrowser.exe\0"
+        "socialclubhelper.exe\0"
+        "riotclientuxrender.exe\0";
 
     static const char k_helper_exes_msz[] =
         ONE_DENYLIST_UNIX_WINE_MSZ
@@ -443,8 +448,18 @@ static int classify_wine_helper_process(int *out_is_leaf_daemon) {
         ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ
         "gameoverlayui64.exe\0"
         "cefprocess.exe\0"
+        "eacefsubprocess.exe\0"
+        "uplaywebcore.exe\0"
+        "blizzardbrowser.exe\0"
+        "socialclubhelper.exe\0"
+        "riotclientuxrender.exe\0"
         ONE_DENYLIST_GALAXY_CHAIN_MSZ
         ONE_DENYLIST_STOREFRONT_CLIENTS_MSZ
+        "battle.net.exe\0"
+        "battle.net launcher.exe\0"
+        "ealauncher.exe\0"
+        "launcherpatcher.exe\0"
+        "riotclientservices.exe\0"
         ONE_DENYLIST_INSTALLERS_MSZ;
 
     const int argc = *argc_ptr < 32 ? *argc_ptr : 32;

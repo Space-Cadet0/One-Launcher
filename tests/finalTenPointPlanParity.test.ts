@@ -2058,7 +2058,7 @@ describe('10-Dimension Codebase Hardening Plan — Final Parity Suite (T1–T13)
         tree.findByProp((p) => p['data-testid'] === 'storefront-policy-info-box')[0];
 
       expect(findPolicySelect()).toBeDefined();
-      expect(findPolicySelect().props.value).toBe('fast_direct_bypass');
+      expect(findPolicySelect().props.value).toBe('default');
       expect(findPolicyInfoBox()?.props['data-policy-severity']).toBe('warning');
 
       // Selecting minimal_and_close_if_started when global is fast_direct_bypass overrides per-game policy without mutating global perfSettings

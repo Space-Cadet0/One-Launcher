@@ -383,10 +383,17 @@ function normalizeBottlePrefixMatchPair(bottlePath) {
  * @param {string} rawLine
  * @param {string | null | undefined} normTargetPrefix
  * @param {string | null | undefined} [normRealTargetPrefix]
+ * @param {{ allowUnscopedFallback?: boolean }} [opts]
  * @returns {boolean}
  */
-function lineMatchesBottlePrefix(rawLine, normTargetPrefix, normRealTargetPrefix = '') {
+function lineMatchesBottlePrefix(
+  rawLine,
+  normTargetPrefix,
+  normRealTargetPrefix = '',
+  opts = { allowUnscopedFallback: true }
+) {
   if (!rawLine || typeof rawLine !== 'string') return false;
+  const allowUnscopedFallback = !opts || opts.allowUnscopedFallback !== false;
   const candidatePrefixes = Array.from(
     new Set(
       [normTargetPrefix, normRealTargetPrefix]
@@ -401,7 +408,7 @@ function lineMatchesBottlePrefix(rawLine, normTargetPrefix, normRealTargetPrefix
     )
   );
   if (candidatePrefixes.length === 0) {
-    return true;
+    return allowUnscopedFallback;
   }
 
   const lowerLine = rawLine.replace(/\\/g, '/').toLowerCase();
@@ -411,7 +418,7 @@ function lineMatchesBottlePrefix(rawLine, normTargetPrefix, normRealTargetPrefix
     for (const pfx of candidatePrefixes) {
       const escapedPfx = pfx.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const exactWinePrefixEnvRegex = new RegExp(
-        `\\bwineprefix=(?:["']${escapedPfx}\\/?["']|${escapedPfx}\\/?(?=\\s+[a-z_][a-z0-9_]*=|\\s+["'/]|["'](?:\\s|$)|$))`,
+        `\\bwineprefix=(?:["']${escapedPfx}\\/?["']|${escapedPfx}\\/?(?=\\s+[a-z_][a-z0-9_]*=|\\s+[a-z]:\\/|\\s+["'/]|["'](?:\\s|$)|$))`,
         'i'
       );
       if (exactWinePrefixEnvRegex.test(lowerLine)) {
@@ -436,7 +443,7 @@ function lineMatchesBottlePrefix(rawLine, normTargetPrefix, normRealTargetPrefix
     return false;
   }
 
-  return true;
+  return allowUnscopedFallback;
 }
 
 /**

@@ -156,7 +156,7 @@ function hasSignedInSteamUserInLoginUsersVdf(steamRoot) {
     const text = readBoundedUtf8FileSync(vdfPath, MAX_LOGINUSERS_VDF_BYTES);
     if (!text) continue;
     if (
-      /"[^"\r\n]+"[ \t\r\n]*\{[^{}]*"(?:MostRecent|RememberPassword|AllowAutoLogin)"\s*"1"/i.test(
+      /"[^"\r\n]+"[ \t\r\n]*\{[^{}]*"(?:RememberPassword|AllowAutoLogin|AutoLogin)"\s*"1"/i.test(
         text
       )
     ) {

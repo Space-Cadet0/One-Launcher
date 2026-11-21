@@ -18,9 +18,43 @@ const xboxRuntimeLoopbackServer = nodeRequire(
   '../electron/storefronts/xbox/xboxRuntimeLoopbackServer.cjs'
 );
 
-function createMockSteamRunner(isTestEnvFn: (opts?: Record<string, any>) => boolean = () => true) {
+type ExecFileCallback = (err: Error | null, stdout: string, stderr: string) => void;
+type ExecFileOptionsOrCallback = Record<string, unknown> | ExecFileCallback | undefined;
+
+interface RunnerOptionsBag {
+  homedir?: string;
+  userDataDir?: string;
+  legendaryConfigDir?: string;
+  [key: string]: unknown;
+}
+
+interface ScannedGameLike {
+  platformId?: string;
+  platformGameId?: string | number;
+  clientId?: string;
+  gogClientId?: string;
+}
+
+interface WgsContainerStub {
+  name: string;
+  blobs: Map<string, unknown>;
+}
+
+interface LoopbackRpcResponse {
+  id?: number;
+  ok?: boolean;
+  result?: {
+    synced?: boolean;
+    quotaBytes?: number;
+    remainingQuotaBytes?: number;
+    [key: string]: unknown;
+  };
+  error?: string;
+}
+
+function createMockSteamRunner(isTestEnvFn: (opts?: RunnerOptionsBag) => boolean = () => true) {
   return cloudSaveEngine.createCloudSaveRunner({
-    resolveIsolatedHomedirAndUserData: (opts: Record<string, any> = {}) => ({
+    resolveIsolatedHomedirAndUserData: (opts: RunnerOptionsBag = {}) => ({
       homedir: opts.homedir || os.tmpdir(),
       userDataDir: opts.userDataDir || os.tmpdir(),
     }),
@@ -30,7 +64,7 @@ function createMockSteamRunner(isTestEnvFn: (opts?: Record<string, any>) => bool
     ensureGogdlAuthConfig: async () => ({ authenticated: false }),
     resolveEpicAppAndPlatforms: () => null,
     ensureLegendaryConfigAndAuth: async () => ({ authenticated: false }),
-    getLegendaryConfigDir: (opts: Record<string, any> = {}) => opts.legendaryConfigDir || '',
+    getLegendaryConfigDir: (opts: RunnerOptionsBag = {}) => opts.legendaryConfigDir || '',
     collectLocalEpicMetadataAndSupport: () => ({ configDirs: [] }),
     findLegendaryBinary: () => 'legendary',
   });
@@ -337,6 +371,65 @@ describe('Phase 2 W4: Steam, GOG, Epic & Xbox Cloud Save Engines', () => {
       expect(bottleGraceEarlyRes.reason).toBe('cloud_sync_completed');
       expect(bottleGraceEarlyRes.waitedMs).toBeLessThan(1500);
     });
+
+    it('1.5 P1-1: completed AC Launch upload after sessionStartOffset does NOT skip postExitGraceMs before AC Exit starts', async () => {
+      const steamRoot = path.join(tmpRoot, 'SteamAcLaunchUpload');
+      const logsDir = path.join(steamRoot, 'logs');
+      fs.mkdirSync(logsDir, { recursive: true });
+      const cloudLog = path.join(logsDir, 'cloud_log.txt');
+
+      fs.writeFileSync(cloudLog, '[2026-11-21 09:50:00] Prior session log\n', 'utf8');
+      const sessionStartOffset = fs.statSync(cloudLog).size;
+
+      // Simulate a launch-time AutoCloud upload (AC Launch) + completion occurring AFTER sessionStartOffset
+      fs.appendFileSync(
+        cloudLog,
+        [
+          '[2026-11-21 10:00:00] [AppID 9006] Starting sync (init,AC Launch,up,down,)',
+          "[2026-11-21 10:00:00] [AppID 9006] Need to upload file 'offline.sav'",
+          '[2026-11-21 10:00:00] [AppID 9006] HTTP upload for file "offline.sav" beginning',
+          '[2026-11-21 10:00:01] [AppID 9006] Upload complete',
+          '[2026-11-21 10:00:01] [AppID 9006] Sync complete',
+          '',
+        ].join('\n'),
+        'utf8'
+      );
+
+      // Simulate genuine post-exit AC Exit upload starting 80ms after post-exit wait begins, finishing at 160ms
+      let acExitCompleted = false;
+      setTimeout(() => {
+        fs.appendFileSync(
+          cloudLog,
+          '[2026-11-21 10:30:00] [AppID 9006] Starting sync (up,AC Exit,)\n' +
+            '[2026-11-21 10:30:00] [AppID 9006] HTTP upload for file "new_save.sav" beginning\n',
+          'utf8'
+        );
+      }, 80);
+      setTimeout(() => {
+        acExitCompleted = true;
+        fs.appendFileSync(
+          cloudLog,
+          '[2026-11-21 10:30:01] [AppID 9006] Upload complete\n',
+          'utf8'
+        );
+      }, 160);
+
+      const prodRunner = createMockSteamRunner(() => false);
+      const res = await prodRunner.waitForSteamCloudSyncCompletion(steamRoot, '9006', {
+        mode: 'post_exit',
+        isBottleSteam: true,
+        steamRootStrict: true,
+        sessionStartOffset,
+        postExitGraceMs: 600,
+        pollIntervalMs: 20,
+        maxCloudWaitMs: 2500,
+      });
+
+      expect(acExitCompleted).toBe(true);
+      expect(res.completed).toBe(true);
+      expect(res.reason).toBe('cloud_sync_completed');
+      expect(res.waitedMs).toBeGreaterThanOrEqual(140);
+    });
   });
 
   // =========================================================================
@@ -390,16 +483,23 @@ describe('Phase 2 W4: Steam, GOG, Epic & Xbox Cloud Save Engines', () => {
       fs.writeFileSync(gogAuthPath, '{}', 'utf8');
 
       const seenTsByCall: Array<{ name: string; ts: string }> = [];
-      const execFileImpl = vi.fn((_cmd: string, args: string[], _opts: any, cb?: any) => {
-        const callback = typeof _opts === 'function' ? _opts : cb;
-        const nameIdx = args.indexOf('--name');
-        const tsIdx = args.indexOf('--ts');
-        seenTsByCall.push({
-          name: nameIdx >= 0 ? args[nameIdx + 1] : '__default',
-          ts: tsIdx >= 0 ? args[tsIdx + 1] : '',
-        });
-        callback?.(null, '1700000999\n', '');
-      });
+      const execFileImpl = vi.fn(
+        (
+          _cmd: string,
+          args: string[],
+          _opts: ExecFileOptionsOrCallback,
+          cb?: ExecFileCallback
+        ) => {
+          const callback = typeof _opts === 'function' ? _opts : cb;
+          const nameIdx = args.indexOf('--name');
+          const tsIdx = args.indexOf('--ts');
+          seenTsByCall.push({
+            name: nameIdx >= 0 ? args[nameIdx + 1] : '__default',
+            ts: tsIdx >= 0 ? args[tsIdx + 1] : '',
+          });
+          callback?.(null, '1700000999\n', '');
+        }
+      );
 
       const runner = createMockSteamRunner(() => true);
 
@@ -522,7 +622,7 @@ describe('Phase 2 W4: Steam, GOG, Epic & Xbox Cloud Save Engines', () => {
         appsDirs: [path.join(tmpRoot, 'Applications')],
       });
       const scannedRecord = (scanRes.installedGames || []).find(
-        (g: any) => g.platformId === 'gog' && String(g.platformGameId) === '1453370002'
+        (g: ScannedGameLike) => g.platformId === 'gog' && String(g.platformGameId) === '1453370002'
       );
       expect(scannedRecord).toBeTruthy();
       expect(scannedRecord.clientId).toBe('nested_client_42');
@@ -553,16 +653,27 @@ describe('Phase 2 W4: Steam, GOG, Epic & Xbox Cloud Save Engines', () => {
 
       // 4. Post-exit FileNotFoundError triggers 1x retry after re-purging OS junk
       let attempts = 0;
-      const execFileRetry = vi.fn((_cmd: string, _args: string[], _opts: any, cb?: any) => {
-        const callback = typeof _opts === 'function' ? _opts : cb;
-        attempts += 1;
-        if (attempts === 1) {
-          fs.writeFileSync(path.join(nestedSaveDir, '.DS_Store'), 'transient-junk', 'utf8');
-          callback?.(new Error('exit 1'), '', "FileNotFoundError: [Errno 2] No such file or directory: '.DS_Store'");
-          return;
+      const execFileRetry = vi.fn(
+        (
+          _cmd: string,
+          _args: string[],
+          _opts: ExecFileOptionsOrCallback,
+          cb?: ExecFileCallback
+        ) => {
+          const callback = typeof _opts === 'function' ? _opts : cb;
+          attempts += 1;
+          if (attempts === 1) {
+            fs.writeFileSync(path.join(nestedSaveDir, '.DS_Store'), 'transient-junk', 'utf8');
+            callback?.(
+              new Error('exit 1'),
+              '',
+              "FileNotFoundError: [Errno 2] No such file or directory: '.DS_Store'"
+            );
+            return;
+          }
+          callback?.(null, '1700001234\n', '');
         }
-        callback?.(null, '1700001234\n', '');
-      });
+      );
 
       const runner = createMockSteamRunner(() => true);
       const postRes = await runner.syncGogCloudSaves(
@@ -689,11 +800,18 @@ describe('Phase 2 W4: Steam, GOG, Epic & Xbox Cloud Save Engines', () => {
       );
 
       const recordedArgs: string[][] = [];
-      const execFileImpl = vi.fn((_cmd: string, args: string[], _opts: any, cb?: any) => {
-        const callback = typeof _opts === 'function' ? _opts : cb;
-        recordedArgs.push(args);
-        callback?.(null, 'Sync complete', '');
-      });
+      const execFileImpl = vi.fn(
+        (
+          _cmd: string,
+          args: string[],
+          _opts: ExecFileOptionsOrCallback,
+          cb?: ExecFileCallback
+        ) => {
+          const callback = typeof _opts === 'function' ? _opts : cb;
+          recordedArgs.push(args);
+          callback?.(null, 'Sync complete', '');
+        }
+      );
       const runner = createMockSteamRunner(() => true);
 
       // A. {InstallDir} WITHOUT CloudIncludeList -> skips rolling backup & full-tree purge
@@ -784,6 +902,29 @@ describe('Phase 2 W4: Steam, GOG, Epic & Xbox Cloud Save Engines', () => {
       expect(typeof withIncRes.backupPath).toBe('string');
       expect(fs.existsSync(path.join(withIncRes.backupPath, 'Profile.dat'))).toBe(true);
       expect(fs.existsSync(path.join(withIncRes.backupPath, 'data'))).toBe(false);
+
+      // B2. P2-6: explicit cloudSaveFolderTemplate + cloudExcludeList (without cloudIncludeList) STILL loads CloudIncludeList from metadata!
+      const withPartialFilterRes = await runner.syncEpicCloudSaves(
+        { appName: 'CaveApp', installPath: installDirWithInc },
+        'pre_launch',
+        {
+          platform: 'darwin',
+          useCompatLayer: false,
+          homedir: tmpRoot,
+          userDataDir,
+          legendaryConfigDir: legCfgDir,
+          legendaryBinaryPath: 'legendary',
+          skipAuthRefresh: true,
+          cloudSaveFolderTemplate: '{InstallDir}',
+          cloudExcludeList: ['*.tmp'],
+          maxBackupBytes: 4096,
+          execFileImpl,
+        }
+      );
+      expect(withPartialFilterRes.synced).toBe(true);
+      expect(typeof withPartialFilterRes.backupPath).toBe('string');
+      expect(fs.existsSync(path.join(withPartialFilterRes.backupPath, 'Profile.dat'))).toBe(true);
+      expect(fs.existsSync(path.join(withPartialFilterRes.backupPath, 'data'))).toBe(false);
 
       // C. Fail-closed --save-path on CrossOver when winePrefix is missing -> NEVER invokes legendary
       recordedArgs.length = 0;
@@ -884,7 +1025,7 @@ describe('Phase 2 W4: Steam, GOG, Epic & Xbox Cloud Save Engines', () => {
       expect(Array.from(discovered.keys())).toEqual(['RealContainer']);
 
       // 2. sanitizePoisonedWgsContainersMap strips PlayFabGameSaves from containersMap & pendingDeletionsSet
-      const cMap = new Map<string, any>([
+      const cMap = new Map<string, WgsContainerStub>([
         ['PlayFabGameSaves/slot0', { name: 'PlayFabGameSaves/slot0', blobs: new Map() }],
         ['playfabgamesaves/other', { name: 'playfabgamesaves/other', blobs: new Map() }],
         [`${folderName}/PlayFabGameSaves/nested`, { name: `${folderName}/PlayFabGameSaves/nested`, blobs: new Map() }],
@@ -980,8 +1121,13 @@ describe('Phase 2 W4: Steam, GOG, Epic & Xbox Cloud Save Engines', () => {
       const port = (server.address() as net.AddressInfo).port;
       const origin = `http://127.0.0.1:${port}`;
 
-      const sendRpc = (loopPort: number, key: string, method: string, params: Record<string, any>) =>
-        new Promise<any>((resolve, reject) => {
+      const sendRpc = (
+        loopPort: number,
+        key: string,
+        method: string,
+        params: Record<string, unknown>
+      ) =>
+        new Promise<LoopbackRpcResponse>((resolve, reject) => {
           const sock = net.createConnection({ host: '127.0.0.1', port: loopPort }, () => {
             sock.write(
               xboxRuntimeLoopbackServer.encodeRpcFrame({ id: 1, key, method, params })
@@ -993,7 +1139,9 @@ describe('Phase 2 W4: Steam, GOG, Epic & Xbox Cloud Save Engines', () => {
             if (buf.length >= 4) {
               const len = buf.readUInt32LE(0);
               if (buf.length >= 4 + len) {
-                const resp = JSON.parse(buf.subarray(4, 4 + len).toString('utf8'));
+                const resp = JSON.parse(
+                  buf.subarray(4, 4 + len).toString('utf8')
+                ) as LoopbackRpcResponse;
                 sock.end();
                 resolve(resp);
               }
@@ -1058,8 +1206,8 @@ describe('Phase 2 W4: Steam, GOG, Epic & Xbox Cloud Save Engines', () => {
             packageFamilyName: pfn,
           });
           expect(initResp.ok).toBe(true);
-          expect(initResp.result.synced).toBe(true);
-          expect(initResp.result.quotaBytes).toBe(128 * 1024 * 1024);
+          expect(initResp.result?.synced).toBe(true);
+          expect(initResp.result?.quotaBytes).toBe(128 * 1024 * 1024);
           expect(listContainerCalls).toBe(0);
           expect(acquireLockCalls).toBe(1);
 
@@ -1146,6 +1294,109 @@ describe('Phase 2 W4: Steam, GOG, Epic & Xbox Cloud Save Engines', () => {
       expect(fs.existsSync(path.join(backupsRoot, 'xbox', 'xbox-9P0000SYNTH4'))).toBe(false);
       expect(fs.existsSync(path.join(backupsRoot, 'xbox', 'xbox_9P0000SYNTH4'))).toBe(false);
       expect(fs.existsSync(siblingSnap)).toBe(true);
+    });
+
+    it('4.4 P1-5 & P2-7: retryWithCandidateScid releases original SCID lock & retries fallback with alreadyLocked:false, and releaseXboxTitleStorageSessionLock supports 2-arg call', async () => {
+      const xuid = '2533274790000042';
+      const primaryScid = '00000000-0000-0000-0000-000000009011';
+      const fallbackScid = '00000000-0000-0000-0000-000000009022';
+      const requests: Array<{ method: string; url: string }> = [];
+
+      const server = http.createServer((req, res) => {
+        const reqUrl = decodeURIComponent(req.url || '/');
+        requests.push({ method: req.method || 'GET', url: reqUrl });
+        req.resume();
+        req.on('end', () => {
+          if (reqUrl.includes(primaryScid) && reqUrl.includes('/lock') && req.method === 'DELETE') {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+          if (reqUrl.includes(primaryScid) && req.method === 'GET') {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ code: 1005 }));
+            return;
+          }
+          if (reqUrl.includes(fallbackScid) && reqUrl.includes('/lock') && req.method === 'PUT') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ quotaBytes: 64 * 1024 * 1024 }));
+            return;
+          }
+          if (reqUrl.includes(fallbackScid) && reqUrl.includes('/lock') && req.method === 'DELETE') {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+          if (reqUrl.includes(fallbackScid) && req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ blobs: [] }));
+            return;
+          }
+          res.writeHead(404);
+          res.end();
+        });
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+      const port = (server.address() as net.AddressInfo).port;
+      const origin = `http://127.0.0.1:${port}`;
+      const wgsDir = path.join(
+        tmpRoot,
+        'SystemAppData',
+        'wgs',
+        xboxTitleStorageSync.formatWgsUserScidFolderName(xuid, primaryScid)
+      );
+      fs.mkdirSync(wgsDir, { recursive: true });
+
+      try {
+        // When alreadyLocked: true on primaryScid and listContainers hits 404 -> MUST release primaryScid lock,
+        // then retry fallbackScid with alreadyLocked: false (issuing PUT /lock on fallbackScid, then DELETE /lock)!
+        const syncRes = await xboxTitleStorageSync.syncXboxTitleStorage({
+          mode: 'pre_launch',
+          wgsUserDir: wgsDir,
+          xuid,
+          scid: primaryScid,
+          fallbackScid,
+          authorizationHeader: `XBL3.0 x=${xuid};mock_token`,
+          titleStorageOrigin: origin,
+          allowLoopbackOrigin: true,
+          alreadyLocked: true,
+          keepLockHeld: false,
+        });
+
+        expect(syncRes.synced).toBe(true);
+        expect(syncRes.resolvedScid).toBe(fallbackScid);
+        expect(
+          requests.some((r) => r.method === 'DELETE' && r.url.includes(`${primaryScid}/lock`))
+        ).toBe(true);
+        expect(
+          requests.some((r) => r.method === 'PUT' && r.url.includes(`${fallbackScid}/lock`))
+        ).toBe(true);
+        expect(
+          requests.some((r) => r.method === 'DELETE' && r.url.includes(`${fallbackScid}/lock`))
+        ).toBe(true);
+
+        // Two-argument releaseXboxTitleStorageSessionLock(payload, options) cleanly releases consumed lock
+        requests.length = 0;
+        const released = await xboxTitleStorageSync.releaseXboxTitleStorageSessionLock(
+          { scid: primaryScid, packageFamilyName: 'SynthPub.Release_8wekyb3d8bbwe' },
+          {
+            resolvedScid: fallbackScid,
+            xuid,
+            authorizationHeader: `XBL3.0 x=${xuid};mock_token`,
+            titleStorageOrigin: origin,
+            allowLoopbackOrigin: true,
+            hadWrites: true,
+          }
+        );
+        expect(released).toBe(true);
+        expect(requests).toHaveLength(1);
+        expect(requests[0].method).toBe('DELETE');
+        expect(requests[0].url).toContain(`${fallbackScid}/lock`);
+        expect(requests[0].url).toContain('newSavesUploaded=true');
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     });
   });
 });
