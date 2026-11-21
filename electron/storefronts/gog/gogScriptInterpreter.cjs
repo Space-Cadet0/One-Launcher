@@ -1,3 +1,4 @@
+// @ts-check
 'use strict';
 
 const fs = require('node:fs');
@@ -26,6 +27,70 @@ const {
 const GOG_SCRIPT_STAMP_FILENAME = '.one_gog_script_applied.json';
 const GOG_SCRIPT_STAMP_VERSION = 1;
 
+const ALLOWED_REGISTRY_HIVES = new Set([
+  'HKLM',
+  'HKEY_LOCAL_MACHINE',
+  'HKCU',
+  'HKEY_CURRENT_USER',
+]);
+
+/**
+ * High-risk Windows / Wine persistence, shell, class, loader, and system registry segments that
+ * declarative game `.script` files MUST NEVER write to (`P0-02`).
+ */
+const DENIED_REGISTRY_SEGMENTS = new Set([
+  'run',
+  'runonce',
+  'runonceex',
+  'runservices',
+  'runservicesonce',
+  'winlogon',
+  'image file execution options',
+  'appinit_dlls',
+  'classes',
+  'explorer',
+  'policies',
+  'services',
+  'environment',
+  'volatile environment',
+  'command processor',
+  'active setup',
+  'aedebug',
+  'silentprocessexit',
+  'shell extensions',
+  'app paths',
+  'uninstall',
+  'currentcontrolset',
+  'controlset001',
+  'controlset002',
+]);
+
+const DENIED_REGISTRY_VALUE_NAMES = new Set([
+  'appinit_dlls',
+  'loadappinit_dlls',
+  'autorun',
+  'userinit',
+  'debugger',
+]);
+
+const DENIED_MICROSOFT_SUBTREES = new Set([
+  'windows',
+  'windows nt',
+  'command processor',
+  'active setup',
+  'internet explorer',
+  'office',
+  'cryptography',
+  'systemcertificates',
+  'wbem',
+  'powershell',
+  'dotnetframework',
+  'net framework setup',
+  'security',
+  'defender',
+]);
+
+/** @type {Record<string, string>} */
 const LANGUAGE_ISO_FALLBACK_MAP = {
   english: 'en-US',
   en: 'en-US',
@@ -73,6 +138,247 @@ function escapeRegExp(raw) {
 }
 
 /**
+ * Returns `true` if `raw` contains CR, LF, or NUL control characters.
+ *
+ * @param {string} raw
+ * @returns {boolean}
+ */
+function hasNewlineOrNull(raw) {
+  return /[\r\n\0]/.test(String(raw));
+}
+
+/**
+ * Returns `true` if `raw` contains an unescaped `[` or `]` (section-header injection risk).
+ *
+ * @param {string} raw
+ * @returns {boolean}
+ */
+function hasUnescapedSectionBracket(raw) {
+  const str = String(raw);
+  let backslashRun = 0;
+  for (let i = 0; i < str.length; i += 1) {
+    const ch = str[i];
+    if (ch === '\\') {
+      backslashRun += 1;
+      continue;
+    }
+    if ((ch === '[' || ch === ']') && backslashRun % 2 === 0) {
+      return true;
+    }
+    backslashRun = 0;
+  }
+  return false;
+}
+
+/**
+ * Returns `true` if `raw` contains CR, LF, NUL, `[` or `]`.
+ *
+ * @param {string} raw
+ * @returns {boolean}
+ */
+function hasForbiddenSectionOrControlChars(raw) {
+  return /[\r\n\0[\]]/.test(String(raw));
+}
+
+/**
+ * Validates that a GOG script `setRegistry` hive and subkey satisfy the strict allowlist/denylist
+ * (`P0-02`): only game-scoped subkeys under `HKCU\Software\...` or `HKLM\Software\...`
+ * (including `Software\GOG.com\Games\...`, `Software\Wow6432Node\GOG.com\Games\...`, and safe game
+ * vendor subkeys), explicitly blocking `HKCR`, `Run`, `RunOnce`, `Winlogon`,
+ * `Image File Execution Options`, `AppInit_DLLs`, `Classes`, `Explorer`, `Policies`, `Services`,
+ * `Environment`, `Command Processor`, and control/bracket injection characters.
+ *
+ * @param {string} rawRoot
+ * @param {string} rawSubKey
+ * @returns {{ allowed: boolean, normalizedRoot: string, normalizedSubKey: string, reason?: string }}
+ */
+function isAllowedGogRegistryTarget(rawRoot, rawSubKey) {
+  const normalizedRoot = String(rawRoot || 'HKLM')
+    .trim()
+    .toUpperCase();
+  if (!ALLOWED_REGISTRY_HIVES.has(normalizedRoot)) {
+    return {
+      allowed: false,
+      normalizedRoot,
+      normalizedSubKey: '',
+      reason: `disallowed_hive:${normalizedRoot}`,
+    };
+  }
+
+  if (typeof rawSubKey !== 'string' || !rawSubKey.trim() || rawSubKey.length > 512) {
+    return {
+      allowed: false,
+      normalizedRoot,
+      normalizedSubKey: '',
+      reason: 'empty_or_oversized_subkey',
+    };
+  }
+  if (hasForbiddenSectionOrControlChars(rawSubKey)) {
+    return {
+      allowed: false,
+      normalizedRoot,
+      normalizedSubKey: '',
+      reason: 'forbidden_chars_in_subkey',
+    };
+  }
+
+  const normalizedSubKey = rawSubKey
+    .trim()
+    .replace(/\//g, '\\')
+    .replace(/^\\+|\\+$/g, '')
+    .replace(/\\+/g, '\\');
+  if (!normalizedSubKey) {
+    return {
+      allowed: false,
+      normalizedRoot,
+      normalizedSubKey: '',
+      reason: 'empty_subkey',
+    };
+  }
+
+  const segments = normalizedSubKey.split('\\');
+  const lowerSegments = segments.map((s) => s.trim().toLowerCase());
+  if (
+    lowerSegments.length < 2 ||
+    lowerSegments[0] !== 'software' ||
+    lowerSegments.some((s) => !s || s === '.' || s === '..')
+  ) {
+    return {
+      allowed: false,
+      normalizedRoot,
+      normalizedSubKey,
+      reason: 'outside_software_allowlist',
+    };
+  }
+
+  // Strip leading `Software` and optional `Wow6432Node` to inspect the vendor/game scope.
+  const scopeSegments =
+    lowerSegments[1] === 'wow6432node' ? lowerSegments.slice(2) : lowerSegments.slice(1);
+  if (scopeSegments.length < 1) {
+    return {
+      allowed: false,
+      normalizedRoot,
+      normalizedSubKey,
+      reason: 'missing_vendor_scope',
+    };
+  }
+
+  // Explicit denylist check on every path segment (case-insensitive)
+  for (const seg of lowerSegments) {
+    if (DENIED_REGISTRY_SEGMENTS.has(seg)) {
+      return {
+        allowed: false,
+        normalizedRoot,
+        normalizedSubKey,
+        reason: `denied_segment:${seg}`,
+      };
+    }
+  }
+
+  // Block OS-owned subtrees under `Software\Microsoft\...` while still permitting game-scoped
+  // keys such as `Software\Microsoft\Microsoft Games\...` and `Software\Microsoft\DirectPlay\...`.
+  if (scopeSegments[0] === 'microsoft') {
+    const msSub = scopeSegments[1] || '';
+    if (!msSub || DENIED_MICROSOFT_SUBTREES.has(msSub)) {
+      return {
+        allowed: false,
+        normalizedRoot,
+        normalizedSubKey,
+        reason: `denied_microsoft_subtree:${msSub || 'root'}`,
+      };
+    }
+  }
+
+  // `Software\GOG.com\...` must stay scoped to `Games\...` (or explicit game product node)
+  if (scopeSegments[0] === 'gog.com' && scopeSegments.length >= 2) {
+    if (scopeSegments[1] !== 'games' && scopeSegments[1] !== 'galaxy') {
+      return {
+        allowed: false,
+        normalizedRoot,
+        normalizedSubKey,
+        reason: `disallowed_gog_subtree:${scopeSegments[1]}`,
+      };
+    }
+  }
+
+  return { allowed: true, normalizedRoot, normalizedSubKey };
+}
+
+/**
+ * Verifies BOTH lexical containment AND `lstat` / `realpath` symlink containment inside
+ * `hostInstallDir`, rejecting any symbolic link anywhere along the relative path from
+ * `hostInstallDir` to `targetPath` (blocking symlink escape and destination symlink overwrites).
+ *
+ * @param {string} hostInstallDir
+ * @param {string} targetPath
+ * @param {{ allowMissingLeaf?: boolean }} [opts]
+ * @returns {boolean}
+ */
+function isRealPathContainedWithinRoot(hostInstallDir, targetPath, opts = {}) {
+  if (!hostInstallDir || !targetPath) return false;
+  if (!isContainedWithinRoot(hostInstallDir, targetPath, process.platform)) {
+    return false;
+  }
+
+  let realRoot = '';
+  try {
+    const rootLstat = fs.lstatSync(hostInstallDir);
+    if (rootLstat.isSymbolicLink() || !rootLstat.isDirectory()) {
+      return false;
+    }
+    realRoot = fs.realpathSync(hostInstallDir);
+  } catch {
+    return false;
+  }
+
+  const resolvedRoot = path.resolve(hostInstallDir);
+  const resolvedTarget = path.resolve(targetPath);
+  const rel = path.relative(resolvedRoot, resolvedTarget);
+  if (rel === '') {
+    return true;
+  }
+  if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    return false;
+  }
+
+  const parts = rel.split(path.sep).filter(Boolean);
+  let cursor = resolvedRoot;
+  let deepestExisting = resolvedRoot;
+  let encounteredMissing = false;
+
+  for (let i = 0; i < parts.length; i += 1) {
+    cursor = path.join(cursor, parts[i]);
+    if (encounteredMissing) {
+      continue;
+    }
+    try {
+      const lst = fs.lstatSync(cursor);
+      if (lst.isSymbolicLink()) {
+        return false;
+      }
+      deepestExisting = cursor;
+    } catch (err) {
+      const code = /** @type {NodeJS.ErrnoException} */ (err)?.code;
+      if (code === 'ENOENT') {
+        if (!opts.allowMissingLeaf) {
+          return false;
+        }
+        encounteredMissing = true;
+      } else {
+        return false;
+      }
+    }
+  }
+
+  try {
+    const realExisting = fs.realpathSync(deepestExisting);
+    return isContainedWithinRoot(realRoot, realExisting, process.platform);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Discover `goggame-*.script` files inside `hostInstallDir` and bounded support subdirectories.
  *
  * @param {string} hostInstallDir
@@ -89,20 +395,29 @@ function discoverGogScriptFiles(hostInstallDir) {
     path.join(hostInstallDir, 'support'),
   ];
 
+  /** @param {string} dirPath */
   const scanSingleDir = (dirPath) => {
     try {
-      if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) return;
+      if (!isRealPathContainedWithinRoot(hostInstallDir, dirPath, { allowMissingLeaf: false })) {
+        return;
+      }
+      if (!fs.statSync(dirPath).isDirectory()) return;
       const entries = fs.readdirSync(dirPath, { withFileTypes: true }).slice(0, 96);
       for (const dirent of entries) {
+        if (dirent.isSymbolicLink()) continue;
         if (dirent.isFile()) {
           const m = dirent.name.match(/^goggame-(\d+)\.script$/i);
           if (!m) continue;
           const full = path.join(dirPath, dirent.name);
           const resolved = path.resolve(full);
           if (seenPaths.has(resolved)) continue;
-          if (!isContainedWithinRoot(hostInstallDir, resolved, process.platform)) continue;
-          const st = fs.statSync(resolved);
-          if (!st.isFile() || st.size <= 0 || st.size > 2 * 1024 * 1024) continue;
+          if (!isRealPathContainedWithinRoot(hostInstallDir, resolved, { allowMissingLeaf: false })) {
+            continue;
+          }
+          const st = fs.lstatSync(resolved);
+          if (st.isSymbolicLink() || !st.isFile() || st.size <= 0 || st.size > 2 * 1024 * 1024) {
+            continue;
+          }
           const rawContent = fs.readFileSync(resolved, 'utf8');
           seenPaths.add(resolved);
           found.push({ scriptPath: resolved, productId: m[1], rawContent });
@@ -115,9 +430,13 @@ function discoverGogScriptFiles(hostInstallDir) {
     scanSingleDir(dir);
     if (dir !== hostInstallDir) {
       try {
-        if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+        if (
+          isRealPathContainedWithinRoot(hostInstallDir, dir, { allowMissingLeaf: false }) &&
+          fs.statSync(dir).isDirectory()
+        ) {
           const subDirs = fs.readdirSync(dir, { withFileTypes: true }).slice(0, 32);
           for (const sub of subDirs) {
+            if (sub.isSymbolicLink()) continue;
             if (sub.isDirectory()) {
               scanSingleDir(path.join(dir, sub.name));
             }
@@ -167,7 +486,9 @@ function resolveGogScriptLanguageTokens(hostInstallDir, productId, explicitLangu
     } catch {}
     for (const infoPath of infoCandidates) {
       try {
-        if (!fs.existsSync(infoPath)) continue;
+        if (!isRealPathContainedWithinRoot(hostInstallDir, infoPath, { allowMissingLeaf: false })) {
+          continue;
+        }
         const parsed = JSON.parse(fs.readFileSync(infoPath, 'utf8'));
         if (typeof parsed?.language === 'string' && parsed.language.trim()) {
           languageName = parsed.language.trim();
@@ -193,6 +514,7 @@ function resolveGogScriptLanguageTokens(hostInstallDir, productId, explicitLangu
 /**
  * Expand `{app}`, `{support}`, `{supportDir}`, `{language}`, `{languageCode}`, and `{lang}`
  * inside a registry or INI value string using target Windows path conventions.
+ * Uses function replacers so `$` sequences in paths (e.g. `C:\Games\$Title`) are never corrupted.
  *
  * @param {string} rawTemplate
  * @param {{ winAppPath: string, winSupportPath: string, language: string, languageCode: string, lang: string, productId: string }} ctx
@@ -203,17 +525,18 @@ function expandGogValueStringTokens(rawTemplate, ctx) {
     return String(rawTemplate ?? '');
   }
   return rawTemplate
-    .replace(/\{app\}/gi, ctx.winAppPath)
-    .replace(/\{supportDir\}/gi, ctx.winSupportPath)
-    .replace(/\{support\}/gi, ctx.winSupportPath)
-    .replace(/\{productId\}/gi, ctx.productId || '')
-    .replace(/\{languageCode\}/gi, ctx.languageCode)
-    .replace(/\{language\}/gi, ctx.language)
-    .replace(/\{lang\}/gi, ctx.lang);
+    .replace(/\{app\}/gi, () => ctx.winAppPath)
+    .replace(/\{supportDir\}/gi, () => ctx.winSupportPath)
+    .replace(/\{support\}/gi, () => ctx.winSupportPath)
+    .replace(/\{productId\}/gi, () => ctx.productId || '')
+    .replace(/\{languageCode\}/gi, () => ctx.languageCode)
+    .replace(/\{language\}/gi, () => ctx.language)
+    .replace(/\{lang\}/gi, () => ctx.lang);
 }
 
 /**
- * Resolve a filesystem `{support}` / `{supportDir}` / `{app}` relative path strictly inside `hostInstallDir`.
+ * Resolve a filesystem `{support}` / `{supportDir}` / `{app}` relative path strictly inside `hostInstallDir`
+ * with both lexical and `lstat`/`realpath` symlink containment.
  *
  * @param {string} hostInstallDir
  * @param {string} rawPathExpr
@@ -222,7 +545,7 @@ function expandGogValueStringTokens(rawTemplate, ctx) {
  * @returns {string}
  */
 function resolveContainedGogFsPath(hostInstallDir, rawPathExpr, productId, mustExist) {
-  if (typeof rawPathExpr !== 'string' || !rawPathExpr.trim()) {
+  if (typeof rawPathExpr !== 'string' || !rawPathExpr.trim() || hasNewlineOrNull(rawPathExpr)) {
     return '';
   }
   const supportRoots = [
@@ -248,14 +571,16 @@ function resolveContainedGogFsPath(hostInstallDir, rawPathExpr, productId, mustE
     if (usesSupportToken) {
       for (const sr of supportRoots) {
         if (
-          isContainedWithinRoot(hostInstallDir, sr, process.platform) &&
+          isRealPathContainedWithinRoot(hostInstallDir, sr, { allowMissingLeaf: !mustExist }) &&
           (!mustExist || fs.existsSync(sr))
         ) {
           return sr;
         }
       }
     }
-    return hostInstallDir;
+    return isRealPathContainedWithinRoot(hostInstallDir, hostInstallDir, { allowMissingLeaf: false })
+      ? hostInstallDir
+      : '';
   }
 
   if (strippedRel.split('/').some((seg) => seg === '..')) {
@@ -264,22 +589,27 @@ function resolveContainedGogFsPath(hostInstallDir, rawPathExpr, productId, mustE
 
   const candidateBases = usesSupportToken ? supportRoots : [hostInstallDir, ...supportRoots];
   for (const base of candidateBases) {
-    if (!isContainedWithinRoot(hostInstallDir, base, process.platform)) continue;
+    if (!isRealPathContainedWithinRoot(hostInstallDir, base, { allowMissingLeaf: !mustExist })) {
+      continue;
+    }
     if (mustExist) {
       const existing = resolveCaseInsensitiveRelFile(base, strippedRel);
-      if (existing && isContainedWithinRoot(hostInstallDir, existing, process.platform)) {
+      if (
+        existing &&
+        isRealPathContainedWithinRoot(hostInstallDir, existing, { allowMissingLeaf: false })
+      ) {
         return existing;
       }
       const dirCand = path.resolve(base, ...strippedRel.split('/').filter(Boolean));
       if (
-        isContainedWithinRoot(hostInstallDir, dirCand, process.platform) &&
+        isRealPathContainedWithinRoot(hostInstallDir, dirCand, { allowMissingLeaf: false }) &&
         fs.existsSync(dirCand)
       ) {
         return dirCand;
       }
     } else {
       const targetCand = path.resolve(base, ...strippedRel.split('/').filter(Boolean));
-      if (isContainedWithinRoot(hostInstallDir, targetCand, process.platform)) {
+      if (isRealPathContainedWithinRoot(hostInstallDir, targetCand, { allowMissingLeaf: true })) {
         return targetCand;
       }
     }
@@ -316,51 +646,101 @@ function selectCompatibleWin10SiblingDll(srcFilePath) {
 }
 
 /**
- * Copy a single support file or directory tree strictly within `hostInstallDir`, automatically
- * substituting `<stem>_w10.dll` when staging `<stem>.dll` from a support folder.
+ * Copy a single support file or directory tree strictly within `hostInstallDir`, verifying
+ * `lstat` + `realpath` symlink containment on both source and destination entries and
+ * automatically substituting `<stem>_w10.dll` when staging `<stem>.dll` from a support folder.
  *
  * @param {string} hostInstallDir
  * @param {string} srcPath
  * @param {string} destPath
- * @param {boolean} overwrite
+ * @param {boolean} [overwrite]
  * @returns {number}
  */
 function copyContainedSupportEntry(hostInstallDir, srcPath, destPath, overwrite = true) {
   if (
     !srcPath ||
     !destPath ||
-    !isContainedWithinRoot(hostInstallDir, srcPath, process.platform) ||
-    !isContainedWithinRoot(hostInstallDir, destPath, process.platform) ||
-    !fs.existsSync(srcPath)
+    !isRealPathContainedWithinRoot(hostInstallDir, srcPath, { allowMissingLeaf: false }) ||
+    !isRealPathContainedWithinRoot(hostInstallDir, destPath, { allowMissingLeaf: true })
   ) {
     return 0;
   }
-  const srcStat = fs.statSync(srcPath);
+  let srcStat;
+  try {
+    srcStat = fs.lstatSync(srcPath);
+  } catch {
+    return 0;
+  }
+  if (srcStat.isSymbolicLink()) {
+    return 0;
+  }
   if (srcStat.isFile()) {
     let finalDest = destPath;
     try {
-      if (fs.existsSync(destPath) && fs.statSync(destPath).isDirectory()) {
+      const destLstat = fs.lstatSync(destPath);
+      if (destLstat.isSymbolicLink()) {
+        return 0;
+      }
+      if (destLstat.isDirectory()) {
         finalDest = path.join(destPath, path.basename(srcPath));
       }
-    } catch {}
-    if (!isContainedWithinRoot(hostInstallDir, finalDest, process.platform)) {
+    } catch (err) {
+      if (/** @type {NodeJS.ErrnoException} */ (err)?.code !== 'ENOENT') {
+        return 0;
+      }
+    }
+    if (!isRealPathContainedWithinRoot(hostInstallDir, finalDest, { allowMissingLeaf: true })) {
       return 0;
     }
-    if (!overwrite && fs.existsSync(finalDest) && !hasMalformedBackslashExportForwarder(finalDest)) {
-      return 0;
+    try {
+      const finalDestLstat = fs.lstatSync(finalDest);
+      if (finalDestLstat.isSymbolicLink()) {
+        return 0;
+      }
+      if (!overwrite && !hasMalformedBackslashExportForwarder(finalDest)) {
+        return 0;
+      }
+    } catch (err) {
+      if (/** @type {NodeJS.ErrnoException} */ (err)?.code !== 'ENOENT') {
+        return 0;
+      }
     }
     const effectiveSrc = selectCompatibleWin10SiblingDll(srcPath);
+    if (!isRealPathContainedWithinRoot(hostInstallDir, effectiveSrc, { allowMissingLeaf: false })) {
+      return 0;
+    }
+    try {
+      const effStat = fs.lstatSync(effectiveSrc);
+      if (effStat.isSymbolicLink() || !effStat.isFile()) {
+        return 0;
+      }
+    } catch {
+      return 0;
+    }
     if (path.resolve(effectiveSrc) === path.resolve(finalDest)) {
       return 0;
     }
-    fs.mkdirSync(path.dirname(finalDest), { recursive: true });
+    const destParent = path.dirname(finalDest);
+    if (!isRealPathContainedWithinRoot(hostInstallDir, destParent, { allowMissingLeaf: true })) {
+      return 0;
+    }
+    fs.mkdirSync(destParent, { recursive: true });
+    if (!isRealPathContainedWithinRoot(hostInstallDir, finalDest, { allowMissingLeaf: true })) {
+      return 0;
+    }
     fs.copyFileSync(effectiveSrc, finalDest);
     return 1;
   }
 
   if (srcStat.isDirectory()) {
     let copied = 0;
+    if (!isRealPathContainedWithinRoot(hostInstallDir, destPath, { allowMissingLeaf: true })) {
+      return 0;
+    }
     fs.mkdirSync(destPath, { recursive: true });
+    if (!isRealPathContainedWithinRoot(hostInstallDir, destPath, { allowMissingLeaf: false })) {
+      return 0;
+    }
     const entries = fs.readdirSync(srcPath, { withFileTypes: true }).slice(0, 256);
     for (const dirent of entries) {
       if (dirent.isSymbolicLink()) continue;
@@ -386,12 +766,16 @@ function copyContainedSupportEntry(hostInstallDir, srcPath, destPath, overwrite 
 /**
  * Self-heal any top-level proxy `.dll` in `hostInstallDir` that contains a malformed backslash
  * export forwarder when a clean `<stem>_w10.dll` / `<stem>_win10.dll` exists in `add/` or `__support/`.
+ * Enforces `lstat` + `realpath` symlink containment on both destination and donor DLLs.
  *
  * @param {string} hostInstallDir
  * @returns {number}
  */
 function healMalformedTopLevelProxyDlls(hostInstallDir) {
   let healed = 0;
+  if (!isRealPathContainedWithinRoot(hostInstallDir, hostInstallDir, { allowMissingLeaf: false })) {
+    return 0;
+  }
   const donorDirs = [
     path.join(hostInstallDir, 'add'),
     path.join(hostInstallDir, '__support', 'add'),
@@ -401,29 +785,53 @@ function healMalformedTopLevelProxyDlls(hostInstallDir) {
   try {
     const rootEntries = fs.readdirSync(hostInstallDir, { withFileTypes: true }).slice(0, 128);
     for (const dirent of rootEntries) {
-      if (!dirent.isFile() || !/\.dll$/i.test(dirent.name)) continue;
+      if (dirent.isSymbolicLink() || !dirent.isFile() || !/\.dll$/i.test(dirent.name)) continue;
       const topDllPath = path.join(hostInstallDir, dirent.name);
-      if (!isContainedWithinRoot(hostInstallDir, topDllPath, process.platform)) continue;
+      if (!isRealPathContainedWithinRoot(hostInstallDir, topDllPath, { allowMissingLeaf: false })) {
+        continue;
+      }
+      const topLstat = fs.lstatSync(topDllPath);
+      if (topLstat.isSymbolicLink() || !topLstat.isFile()) continue;
       if (!hasMalformedBackslashExportForwarder(topDllPath)) continue;
 
       const ext = path.extname(dirent.name);
       const stem = path.basename(dirent.name, ext);
       let replacement = selectCompatibleWin10SiblingDll(topDllPath);
+      if (
+        replacement !== topDllPath &&
+        !isRealPathContainedWithinRoot(hostInstallDir, replacement, { allowMissingLeaf: false })
+      ) {
+        replacement = topDllPath;
+      }
       if (replacement === topDllPath) {
         for (const dDir of donorDirs) {
-          if (!isContainedWithinRoot(hostInstallDir, dDir, process.platform)) continue;
+          if (!isRealPathContainedWithinRoot(hostInstallDir, dDir, { allowMissingLeaf: false })) {
+            continue;
+          }
           const candW10 =
             resolveCaseInsensitiveRelFile(dDir, `${stem}_w10${ext}`) ||
             resolveCaseInsensitiveRelFile(dDir, `${stem}_win10${ext}`);
-          if (candW10 && !hasMalformedBackslashExportForwarder(candW10)) {
+          if (
+            candW10 &&
+            isRealPathContainedWithinRoot(hostInstallDir, candW10, { allowMissingLeaf: false }) &&
+            !hasMalformedBackslashExportForwarder(candW10)
+          ) {
             replacement = candW10;
             break;
           }
         }
       }
-      if (replacement && replacement !== topDllPath) {
-        fs.copyFileSync(replacement, topDllPath);
-        healed += 1;
+      if (
+        replacement &&
+        replacement !== topDllPath &&
+        isRealPathContainedWithinRoot(hostInstallDir, replacement, { allowMissingLeaf: false }) &&
+        isRealPathContainedWithinRoot(hostInstallDir, topDllPath, { allowMissingLeaf: false })
+      ) {
+        const repLstat = fs.lstatSync(replacement);
+        if (!repLstat.isSymbolicLink() && repLstat.isFile()) {
+          fs.copyFileSync(replacement, topDllPath);
+          healed += 1;
+        }
       }
     }
   } catch {}
@@ -493,6 +901,7 @@ function parseSafeRegistryQwordBigInt(rawValueData) {
 
 /**
  * Pure helper that applies raw section entries (`@=...` or `hex:...`) to an in-memory Wine `.reg` string.
+ * Rejects CR/LF/NUL and section-header bracket injection in subkeys, value names, and RHS data.
  *
  * @param {string} content
  * @param {string} subKeyPath
@@ -501,7 +910,26 @@ function parseSafeRegistryQwordBigInt(rawValueData) {
  * @returns {{ content: string, normalizedSubKey: string, liveSyncPairs: Array<[string, any]> }}
  */
 function applyRawSectionPatchToContent(content, subKeyPath, rawEntries, unixSec) {
+  if (typeof subKeyPath !== 'string' || hasForbiddenSectionOrControlChars(subKeyPath)) {
+    return { content, normalizedSubKey: '', liveSyncPairs: [] };
+  }
   const normalizedSubKey = subKeyPath.trim().replace(/^\\+|\\+$/g, '').replace(/\\+/g, '\\');
+  if (!normalizedSubKey) {
+    return { content, normalizedSubKey: '', liveSyncPairs: [] };
+  }
+
+  const safeEntries = rawEntries.filter((item) => {
+    if (!item || typeof item !== 'object') return false;
+    const vName = item.valueName === undefined || item.valueName === null ? '' : String(item.valueName);
+    const rhs = item.rawRegRhs === undefined || item.rawRegRhs === null ? '' : String(item.rawRegRhs);
+    if (vName && hasForbiddenSectionOrControlChars(vName)) return false;
+    if (hasNewlineOrNull(rhs) || hasUnescapedSectionBracket(rhs)) return false;
+    return true;
+  });
+  if (safeEntries.length === 0) {
+    return { content, normalizedSubKey, liveSyncPairs: [] };
+  }
+
   const escapedSectionPath = normalizedSubKey.replace(/\\/g, '\\\\');
   const sectionHeaderRe = new RegExp(
     `^\\[${escapeRegExp(escapedSectionPath)}\\](?:\\s+\\d+)?[^\\r\\n]*$`,
@@ -516,13 +944,13 @@ function applyRawSectionPatchToContent(content, subKeyPath, rawEntries, unixSec)
   };
 
   /** @type {Array<[string, any]>} */
-  const liveSyncPairs = rawEntries.map((item) => [
+  const liveSyncPairs = safeEntries.map((item) => [
     !item.valueName || item.valueName === '@' ? '@' : String(item.valueName),
     { rawRegRhs: item.rawRegRhs },
   ]);
 
   if (!match) {
-    const lines = rawEntries.map(formatLine).join('\n');
+    const lines = safeEntries.map(formatLine).join('\n');
     const sep = content.endsWith('\n\n') ? '' : content.endsWith('\n') ? '\n' : '\n\n';
     return {
       content: `${content}${sep}[${escapedSectionPath}] ${unixSec}\n${lines}\n`,
@@ -538,7 +966,7 @@ function applyRawSectionPatchToContent(content, subKeyPath, rawEntries, unixSec)
   const rest = nextSectionMatch ? afterHeader.slice(nextSectionMatch.index) : '';
   const bodyLines = body.split(/\r?\n/);
 
-  for (const item of rawEntries) {
+  for (const item of safeEntries) {
     const formatted = formatLine(item);
     const isDefault = !item.valueName || item.valueName === '@';
     let replaced = false;
@@ -587,7 +1015,7 @@ function applyRawSectionPatchToContent(content, subKeyPath, rawEntries, unixSec)
 
 /**
  * Batches multiple raw Wine `.reg` section mutations into a single file read + single atomic write
- * (`Finding #17`).
+ * (`Finding #17`), enforcing registry allowlist/denylist & CR/LF/bracket injection rejection (`P0-02`).
  *
  * @param {string} regFilePath
  * @param {Array<{ subKeyPath: string, valueName: string, rawRegRhs: string }>} rawPatchItems
@@ -624,14 +1052,38 @@ function patchRawWineRegistrySectionsBatch(regFilePath, rawPatchItems, options =
   const groupedBySubKey = new Map();
   for (const patch of rawPatchItems) {
     if (!patch || !patch.subKeyPath) continue;
-    const normKey = patch.subKeyPath.trim().replace(/^\\+|\\+$/g, '').replace(/\\+/g, '\\');
-    if (!normKey) continue;
+    const verdict = isAllowedGogRegistryTarget(hiveName, patch.subKeyPath);
+    if (!verdict.allowed) {
+      diagLog.warn('gogScript.blockedRegistryRawPatch', {
+        hive: hiveName,
+        reason: verdict.reason,
+      });
+      continue;
+    }
+    const vName =
+      patch.valueName === undefined || patch.valueName === null ? '' : String(patch.valueName);
+    const rhs =
+      patch.rawRegRhs === undefined || patch.rawRegRhs === null ? '' : String(patch.rawRegRhs);
+    if (
+      (vName &&
+        (hasForbiddenSectionOrControlChars(vName) ||
+          DENIED_REGISTRY_VALUE_NAMES.has(vName.trim().toLowerCase()))) ||
+      hasNewlineOrNull(rhs) ||
+      hasUnescapedSectionBracket(rhs)
+    ) {
+      diagLog.warn('gogScript.blockedRegistryInjection', {
+        hive: hiveName,
+        reason: 'forbidden_value_or_rhs',
+      });
+      continue;
+    }
+    const normKey = verdict.normalizedSubKey;
     let bucket = groupedBySubKey.get(normKey);
     if (!bucket) {
       bucket = [];
       groupedBySubKey.set(normKey, bucket);
     }
-    bucket.push({ valueName: patch.valueName, rawRegRhs: patch.rawRegRhs });
+    bucket.push({ valueName: vName, rawRegRhs: rhs });
   }
   if (groupedBySubKey.size === 0) return;
 
@@ -641,6 +1093,7 @@ function patchRawWineRegistrySectionsBatch(regFilePath, rawPatchItems, options =
 
   for (const [subKeyPath, entries] of groupedBySubKey.entries()) {
     const applied = applyRawSectionPatchToContent(content, subKeyPath, entries, unixSec);
+    if (!applied.liveSyncPairs.length) continue;
     content = applied.content;
     liveBatch.push({
       hiveName,
@@ -648,6 +1101,7 @@ function patchRawWineRegistrySectionsBatch(regFilePath, rawPatchItems, options =
       entryPairsOrNullForDelete: applied.liveSyncPairs,
     });
   }
+  if (liveBatch.length === 0) return;
 
   atomicWriteFileSync(regFilePath, content);
 
@@ -714,7 +1168,7 @@ function runWindowsRegAddAsync(regArgs, options = {}) {
         'reg.exe',
         regArgs,
         { encoding: 'utf8', timeout: 4000, windowsHide: true },
-        (err) => {
+        (/** @type {Error | null} */ err) => {
           resolve(!err);
         }
       );
@@ -725,7 +1179,8 @@ function runWindowsRegAddAsync(regArgs, options = {}) {
 }
 
 /**
- * Upsert a single `[Section]` `key=value` entry inside an INI file contained within `hostInstallDir`.
+ * Upsert a single `[Section]` `key=value` entry inside an INI file strictly contained within
+ * `hostInstallDir` (enforcing `lstat`+`realpath` containment and rejecting CR/LF/NUL/bracket injection).
  *
  * @param {string} hostInstallDir
  * @param {string} targetIniPath
@@ -738,26 +1193,48 @@ function upsertContainedIniValue(hostInstallDir, targetIniPath, sectionName, key
   if (
     !targetIniPath ||
     !keyName ||
-    !isContainedWithinRoot(hostInstallDir, targetIniPath, process.platform)
+    !isRealPathContainedWithinRoot(hostInstallDir, targetIniPath, { allowMissingLeaf: true })
   ) {
     return false;
   }
+
+  const rawSection = String(sectionName ?? '');
+  const rawKey = String(keyName ?? '');
+  const rawValue = String(valueStr ?? '');
+  if (
+    hasForbiddenSectionOrControlChars(rawSection) ||
+    hasForbiddenSectionOrControlChars(rawKey) ||
+    rawKey.includes('=') ||
+    hasNewlineOrNull(rawValue) ||
+    hasUnescapedSectionBracket(rawValue)
+  ) {
+    diagLog.warn('gogScript.blockedIniInjection', { reason: 'forbidden_ini_chars' });
+    return false;
+  }
+
+  const cleanSection = rawSection.trim();
+  const cleanKey = rawKey.trim();
+  if (!cleanKey) {
+    return false;
+  }
+
   let existing = '';
   try {
-    if (fs.existsSync(targetIniPath)) {
-      const st = fs.statSync(targetIniPath);
-      if (st.size > 1024 * 1024) return false;
-      existing = fs.readFileSync(targetIniPath, 'utf8');
+    const lst = fs.lstatSync(targetIniPath);
+    if (lst.isSymbolicLink() || !lst.isFile() || lst.size > 1024 * 1024) {
+      return false;
     }
-  } catch {
+    existing = fs.readFileSync(targetIniPath, 'utf8');
+  } catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err)?.code !== 'ENOENT') {
+      return false;
+    }
     existing = '';
   }
 
   const eol = existing.includes('\r\n') ? '\r\n' : '\n';
   const lines = existing ? existing.split(/\r?\n/) : [];
-  const cleanSection = String(sectionName || '').trim();
-  const cleanKey = String(keyName || '').trim();
-  const newLine = `${cleanKey}=${valueStr}`;
+  const newLine = `${cleanKey}=${rawValue}`;
 
   if (!cleanSection) {
     const keyRe = new RegExp(`^\\s*${escapeRegExp(cleanKey)}\\s*=`, 'i');
@@ -813,8 +1290,9 @@ function upsertContainedIniValue(hostInstallDir, targetIniPath, sectionName, key
  * Execute declarative GOG `goggame-*.script` post-install actions (`setRegistry`, `supportData`,
  * `iniFile`) idempotently on both macOS (Bottled CrossOver/Preview/GPTK/Wine) and Windows (`win32` Native).
  *
- * Uses a SHA-256 stamp (`.one_gog_script_applied.json`) containing zero raw host paths so repeat
- * launches short-circuit in `< 1 ms` while automatically re-applying if the user switches bottles.
+ * Uses a SHA-256 stamp (`.one_gog_script_applied.json`) checked FIRST before any sync FS scans
+ * or proxy-DLL inspection so repeat warm launches short-circuit in `< 1 ms` while automatically
+ * re-applying if the user switches bottles or language.
  *
  * @param {string} installDir
  * @param {Record<string, any>} [options]
@@ -834,8 +1312,65 @@ async function executeGogGameScript(installDir, options = {}) {
   }
 
   const hostInstallDir = path.resolve(toHostFilesystemPath(installDir));
+  const rawBottleDir =
+    typeof opts.bottleDir === 'string' && opts.bottleDir.trim()
+      ? opts.bottleDir.trim()
+      : typeof opts.bottlePath === 'string' && opts.bottlePath.trim()
+        ? opts.bottlePath.trim()
+        : typeof opts.winePrefix === 'string' && opts.winePrefix.trim()
+          ? opts.winePrefix.trim()
+          : '';
+  const hostBottleDir = rawBottleDir ? path.resolve(toHostFilesystemPath(rawBottleDir)) : '';
+  const hasActiveBottle = Boolean(hostBottleDir && platform !== 'win32');
+  const normalizedLanguageScope =
+    typeof opts.language === 'string' ? opts.language.trim().toLowerCase() : '';
+
+  const targetScopeHash = sha256Hex(
+    `${platform}:${hasActiveBottle ? hostBottleDir : platform === 'win32' ? 'win32_native' : 'pending_bottle'}:${hostInstallDir}:${normalizedLanguageScope}`
+  );
+  const stampPath = path.join(hostInstallDir, GOG_SCRIPT_STAMP_FILENAME);
+
+  // Fast-path: check stamp cache FIRST (async, zero directory walks or proxy-DLL PE parsing)
+  // so warm launches return in < 1 ms.
+  if (opts.force !== true) {
+    try {
+      const stampLstat = await fs.promises.lstat(stampPath);
+      if (!stampLstat.isSymbolicLink() && stampLstat.isFile() && stampLstat.size <= 64 * 1024) {
+        const stampRaw = await fs.promises.readFile(stampPath, 'utf8');
+        const stamp = JSON.parse(stampRaw);
+        if (
+          stamp &&
+          stamp.version === GOG_SCRIPT_STAMP_VERSION &&
+          typeof stamp.scriptsHash === 'string' &&
+          stamp.scriptsHash.length === 64 &&
+          stamp.targetScopeHash === targetScopeHash
+        ) {
+          let bottleHivePresent = true;
+          if (hasActiveBottle) {
+            try {
+              await fs.promises.access(path.join(hostBottleDir, 'system.reg'));
+            } catch {
+              bottleHivePresent = false;
+            }
+          }
+          if (bottleHivePresent) {
+            return {
+              executed: false,
+              skippedCached: true,
+              scriptsProcessed: 0,
+              registryKeysApplied: 0,
+              supportFilesStaged: 0,
+              iniEntriesApplied: 0,
+            };
+          }
+        }
+      }
+    } catch {}
+  }
+
   try {
-    if (!fs.existsSync(hostInstallDir) || !fs.statSync(hostInstallDir).isDirectory()) {
+    const dirLstat = await fs.promises.lstat(hostInstallDir);
+    if (dirLstat.isSymbolicLink() || !dirLstat.isDirectory()) {
       return {
         executed: false,
         skippedCached: false,
@@ -856,7 +1391,7 @@ async function executeGogGameScript(installDir, options = {}) {
     };
   }
 
-  // Always heal any top-level proxy DLL whose PE export table has a malformed backslash forwarder
+  // Cold path: heal any top-level proxy DLL whose PE export table has a malformed backslash forwarder
   const healedDllCount = healMalformedTopLevelProxyDlls(hostInstallDir);
 
   const scriptFiles = discoverGogScriptFiles(hostInstallDir);
@@ -871,51 +1406,10 @@ async function executeGogGameScript(installDir, options = {}) {
     };
   }
 
-  const rawBottleDir =
-    typeof opts.bottleDir === 'string' && opts.bottleDir.trim()
-      ? opts.bottleDir.trim()
-      : typeof opts.bottlePath === 'string' && opts.bottlePath.trim()
-        ? opts.bottlePath.trim()
-        : typeof opts.winePrefix === 'string' && opts.winePrefix.trim()
-          ? opts.winePrefix.trim()
-          : '';
-  const hostBottleDir = rawBottleDir ? path.resolve(toHostFilesystemPath(rawBottleDir)) : '';
-  const hasActiveBottle = Boolean(hostBottleDir && platform !== 'win32');
-
   const scriptsDigestInput = scriptFiles
     .map((s) => `${path.basename(s.scriptPath)}:${sha256Hex(s.rawContent)}`)
     .join('|');
   const scriptsHash = sha256Hex(scriptsDigestInput);
-  const targetScopeHash = sha256Hex(
-    `${platform}:${hasActiveBottle ? hostBottleDir : platform === 'win32' ? 'win32_native' : 'pending_bottle'}:${hostInstallDir}`
-  );
-
-  const stampPath = path.join(hostInstallDir, GOG_SCRIPT_STAMP_FILENAME);
-  if (opts.force !== true && healedDllCount === 0) {
-    try {
-      if (fs.existsSync(stampPath)) {
-        const stamp = JSON.parse(fs.readFileSync(stampPath, 'utf8'));
-        const bottleHivePresent =
-          !hasActiveBottle || fs.existsSync(path.join(hostBottleDir, 'system.reg'));
-        if (
-          stamp &&
-          stamp.version === GOG_SCRIPT_STAMP_VERSION &&
-          stamp.scriptsHash === scriptsHash &&
-          stamp.targetScopeHash === targetScopeHash &&
-          bottleHivePresent
-        ) {
-          return {
-            executed: false,
-            skippedCached: true,
-            scriptsProcessed: scriptFiles.length,
-            registryKeysApplied: 0,
-            supportFilesStaged: 0,
-            iniEntriesApplied: 0,
-          };
-        }
-      }
-    } catch {}
-  }
 
   let registryKeysApplied = 0;
   let supportFilesStaged = healedDllCount;
@@ -929,9 +1423,15 @@ async function executeGogGameScript(installDir, options = {}) {
   const hkcuBatchMap = new Map();
   /** @type {Array<{ subKeyPath: string, valueName: string, rawRegRhs: string }>} */
   const hkcuRawPatches = [];
-  /** @type {Array<string[]>} */
+  /** @type {Array<{ args: string[], required: boolean }>} */
   const win32RegCommands = [];
 
+  /**
+   * @param {Map<string, Map<string, any>>} targetMap
+   * @param {string} subKeyPath
+   * @param {string | null | undefined} valueName
+   * @param {any} formattedVal
+   */
   const queueBottleMapEntry = (targetMap, subKeyPath, valueName, formattedVal) => {
     const normSub = String(subKeyPath || '')
       .trim()
@@ -989,13 +1489,17 @@ async function executeGogGameScript(installDir, options = {}) {
     for (const actionEntry of actions) {
       if (!actionEntry || typeof actionEntry !== 'object') continue;
       if (Array.isArray(actionEntry.languages) && actionEntry.languages.length > 0) {
-        const lowerAllowed = actionEntry.languages.map((l) => String(l || '').toLowerCase());
+        const lowerAllowed = actionEntry.languages.map((/** @type {any} */ l) =>
+          String(l || '').toLowerCase()
+        );
         const matchesLang =
           lowerAllowed.includes('*') ||
           lowerAllowed.includes(langTokens.languageCode.toLowerCase()) ||
           lowerAllowed.includes(langTokens.language.toLowerCase()) ||
           lowerAllowed.includes(langTokens.lang.toLowerCase()) ||
-          lowerAllowed.some((l) => l.startsWith(`${langTokens.lang.toLowerCase()}-`));
+          lowerAllowed.some((/** @type {string} */ l) =>
+            l.startsWith(`${langTokens.lang.toLowerCase()}-`)
+          );
         if (!matchesLang) {
           continue;
         }
@@ -1015,18 +1519,25 @@ async function executeGogGameScript(installDir, options = {}) {
         const rawRoot = String(actionArgs.root || actionArgs.hive || 'HKLM')
           .trim()
           .toUpperCase();
-        const rawSubKey = expandGogValueStringTokens(
+        const expandedSubKey = expandGogValueStringTokens(
           String(actionArgs.subkey || actionArgs.key || ''),
           tokenCtx
-        )
-          .trim()
-          .replace(/\//g, '\\')
-          .replace(/^\\+|\\+$/g, '')
-          .replace(/\\+/g, '\\');
-        if (!rawSubKey) continue;
+        );
 
-        const isHkcu = rawRoot === 'HKCU' || rawRoot === 'HKEY_CURRENT_USER';
-        const isHkcr = rawRoot === 'HKCR' || rawRoot === 'HKEY_CLASSES_ROOT';
+        const registryVerdict = isAllowedGogRegistryTarget(rawRoot, expandedSubKey);
+        if (!registryVerdict.allowed) {
+          diagLog.warn('gogScript.blockedRegistryWrite', {
+            productId: scriptItem.productId,
+            hive: rawRoot,
+            reason: registryVerdict.reason,
+          });
+          continue;
+        }
+
+        const rawSubKey = registryVerdict.normalizedSubKey;
+        const isHkcu =
+          registryVerdict.normalizedRoot === 'HKCU' ||
+          registryVerdict.normalizedRoot === 'HKEY_CURRENT_USER';
         const rawValueName =
           actionArgs.valueName !== undefined ? actionArgs.valueName : actionArgs.name;
         const rawValueData =
@@ -1035,18 +1546,56 @@ async function executeGogGameScript(installDir, options = {}) {
             : actionArgs.value !== undefined
               ? actionArgs.value
               : actionArgs.data;
-        const rawValueType = String(
-          actionArgs.valueType || actionArgs.type || 'string'
-        )
+        const rawValueType = String(actionArgs.valueType || actionArgs.type || 'string')
           .trim()
           .toLowerCase();
 
-        // Build target subkeys (including 32-bit Wow6432Node mirror for Software\...)
+        const valNameStr =
+          rawValueName === null || rawValueName === undefined ? '' : String(rawValueName);
+        if (
+          valNameStr &&
+          (hasForbiddenSectionOrControlChars(valNameStr) ||
+            DENIED_REGISTRY_VALUE_NAMES.has(valNameStr.trim().toLowerCase()))
+        ) {
+          diagLog.warn('gogScript.blockedRegistryValueName', {
+            productId: scriptItem.productId,
+            reason: 'forbidden_value_name',
+          });
+          continue;
+        }
+
+        const isKeyOnly =
+          (rawValueName === null || rawValueName === undefined || rawValueName === '') &&
+          (rawValueData === null || rawValueData === undefined);
+
+        // Validate expanded string value data against control-char & section-header injection
+        let validatedExpandedStr = '';
+        if (
+          !isKeyOnly &&
+          rawValueType !== 'dword' &&
+          rawValueType !== 'reg_dword' &&
+          rawValueType !== 'qword' &&
+          rawValueType !== 'reg_qword' &&
+          rawValueType !== 'binary' &&
+          rawValueType !== 'reg_binary'
+        ) {
+          validatedExpandedStr = expandGogValueStringTokens(String(rawValueData ?? ''), tokenCtx);
+          if (
+            hasNewlineOrNull(validatedExpandedStr) ||
+            hasUnescapedSectionBracket(validatedExpandedStr)
+          ) {
+            diagLog.warn('gogScript.blockedRegistryValueData', {
+              productId: scriptItem.productId,
+              reason: 'forbidden_value_data',
+            });
+            continue;
+          }
+        }
+
+        // Build target subkeys (including 32-bit Wow6432Node mirror for HKLM\Software\...)
         /** @type {string[]} */
         const targetSubKeys = [];
-        if (isHkcr) {
-          targetSubKeys.push(`Software\\Classes\\${rawSubKey}`);
-        } else if (!isHkcu && /^software\\/i.test(rawSubKey)) {
+        if (!isHkcu && /^software\\/i.test(rawSubKey)) {
           const afterSoftware = rawSubKey.replace(/^software\\/i, '');
           if (!/^wow6432node\\/i.test(afterSoftware)) {
             targetSubKeys.push(`Software\\Wow6432Node\\${afterSoftware}`);
@@ -1055,10 +1604,6 @@ async function executeGogGameScript(installDir, options = {}) {
         } else {
           targetSubKeys.push(rawSubKey);
         }
-
-        const isKeyOnly =
-          (rawValueName === null || rawValueName === undefined || rawValueName === '') &&
-          (rawValueData === null || rawValueData === undefined);
 
         if (hasActiveBottle) {
           const targetMap = isHkcu ? hkcuBatchMap : hklmBatchMap;
@@ -1070,8 +1615,6 @@ async function executeGogGameScript(installDir, options = {}) {
               registryKeysApplied += 1;
               continue;
             }
-            const valNameStr =
-              rawValueName === null || rawValueName === undefined ? '' : String(rawValueName);
             if (rawValueType === 'dword' || rawValueType === 'reg_dword') {
               const numVal =
                 typeof rawValueData === 'string' && /^0x/i.test(rawValueData.trim())
@@ -1107,18 +1650,17 @@ async function executeGogGameScript(installDir, options = {}) {
                 rawRegRhs: `hex:${hexPairs.join(',')}`,
               });
             } else {
-              const expandedStr = expandGogValueStringTokens(String(rawValueData ?? ''), tokenCtx);
               if (!valNameStr || valNameStr === '@') {
                 queueBottleMapEntry(targetMap, sk, null, null);
                 targetRawPatches.push({
                   subKeyPath: sk,
                   valueName: '@',
-                  rawRegRhs: `"${escapeWineRegString(expandedStr)}"`,
+                  rawRegRhs: `"${escapeWineRegString(validatedExpandedStr)}"`,
                 });
               } else {
                 queueBottleMapEntry(targetMap, sk, valNameStr, {
                   type: 'sz',
-                  value: expandedStr,
+                  value: validatedExpandedStr,
                 });
               }
             }
@@ -1143,54 +1685,58 @@ async function executeGogGameScript(installDir, options = {}) {
               regDataStr = parseRegistryBinaryHexPairs(rawValueData).join('');
             } else if (rawValueType === 'expandstring' || rawValueType === 'reg_expand_sz') {
               regTypeFlag = 'REG_EXPAND_SZ';
-              regDataStr = expandGogValueStringTokens(String(rawValueData ?? ''), tokenCtx);
+              regDataStr = validatedExpandedStr;
             } else {
               regTypeFlag = 'REG_SZ';
-              regDataStr = expandGogValueStringTokens(String(rawValueData ?? ''), tokenCtx);
+              regDataStr = validatedExpandedStr;
             }
           }
 
-          /** @type {string[]} */
+          /** @type {Array<{ fullKey: string, required: boolean }>} */
           const fullWinKeys = [];
-          if (isHkcu || isHkcr) {
+          if (isHkcu) {
             for (const sk of targetSubKeys) {
-              fullWinKeys.push(`HKCU\\${sk}`);
+              fullWinKeys.push({ fullKey: `HKCU\\${sk}`, required: true });
             }
-          } else if (/^software\\/i.test(rawSubKey)) {
-            const afterSoft = rawSubKey.replace(/^software\\/i, '').replace(/^wow6432node\\/i, '');
-            // 1. WOW64 UAC VirtualStore mirror so un-elevated 32-bit `RegOpenKeyExA(HKLM, "Software\\...")` reads it natively
-            fullWinKeys.push(
-              `HKCU\\Software\\Classes\\VirtualStore\\Machine\\SOFTWARE\\Wow6432Node\\${afterSoft}`
-            );
-            // 2. Per-user HKCU Software mirrors for dual-hive games
-            fullWinKeys.push(`HKCU\\Software\\Wow6432Node\\${afterSoft}`);
-            fullWinKeys.push(`HKCU\\Software\\${afterSoft}`);
-            // 3. Best-effort HKLM 32-bit + 64-bit writes when running in an already-elevated context (quietly ignored otherwise)
-            fullWinKeys.push(`HKLM\\Software\\Wow6432Node\\${afterSoft}`);
-            fullWinKeys.push(`HKLM\\Software\\${afterSoft}`);
           } else {
-            fullWinKeys.push(`HKCU\\Software\\Classes\\VirtualStore\\Machine\\${rawSubKey}`);
+            const afterSoft = rawSubKey
+              .replace(/^software\\/i, '')
+              .replace(/^wow6432node\\/i, '');
+            // 1. WOW64 UAC VirtualStore mirror so un-elevated 32-bit `RegOpenKeyExA(HKLM, "Software\\...")` reads it natively
+            fullWinKeys.push({
+              fullKey: `HKCU\\Software\\Classes\\VirtualStore\\Machine\\SOFTWARE\\Wow6432Node\\${afterSoft}`,
+              required: true,
+            });
+            // 2. Per-user HKCU Software mirrors for dual-hive games
+            fullWinKeys.push({
+              fullKey: `HKCU\\Software\\Wow6432Node\\${afterSoft}`,
+              required: true,
+            });
+            fullWinKeys.push({
+              fullKey: `HKCU\\Software\\${afterSoft}`,
+              required: true,
+            });
+            // 3. Best-effort HKLM 32-bit + 64-bit writes when running in an already-elevated context
+            fullWinKeys.push({
+              fullKey: `HKLM\\Software\\Wow6432Node\\${afterSoft}`,
+              required: false,
+            });
+            fullWinKeys.push({
+              fullKey: `HKLM\\Software\\${afterSoft}`,
+              required: false,
+            });
           }
 
-          for (const fullKey of fullWinKeys) {
+          for (const { fullKey, required } of fullWinKeys) {
             if (isKeyOnly) {
-              win32RegCommands.push(['add', fullKey, '/f']);
+              win32RegCommands.push({ args: ['add', fullKey, '/f'], required });
             } else {
-              const valNameStr =
-                rawValueName === null || rawValueName === undefined ? '' : String(rawValueName);
               const nameArgs = !valNameStr || valNameStr === '@' ? ['/ve'] : ['/v', valNameStr];
-              win32RegCommands.push([
-                'add',
-                fullKey,
-                ...nameArgs,
-                '/t',
-                regTypeFlag,
-                '/d',
-                regDataStr,
-                '/f',
-              ]);
+              win32RegCommands.push({
+                args: ['add', fullKey, ...nameArgs, '/t', regTypeFlag, '/d', regDataStr, '/f'],
+                required,
+              });
             }
-            registryKeysApplied += 1;
           }
         }
       } else if (/^(?:supportData|copy|filesystem|copyFile|moveFile)$/i.test(actionType)) {
@@ -1291,39 +1837,54 @@ async function executeGogGameScript(installDir, options = {}) {
   }
 
   // Flush async non-elevated Windows registry writes on win32 in bounded batches of 8
+  let hadWin32RegFailure = false;
   if (platform === 'win32' && win32RegCommands.length > 0) {
     const WIN32_REG_CONCURRENCY = 8;
+    let win32RegSucceeded = 0;
     for (let i = 0; i < win32RegCommands.length; i += WIN32_REG_CONCURRENCY) {
-      await Promise.all(
-        win32RegCommands
-          .slice(i, i + WIN32_REG_CONCURRENCY)
-          .map((cmdArgs) => runWindowsRegAddAsync(cmdArgs, opts))
+      const chunk = win32RegCommands.slice(i, i + WIN32_REG_CONCURRENCY);
+      const results = await Promise.all(
+        chunk.map((cmd) => runWindowsRegAddAsync(cmd.args, opts))
       );
+      for (let j = 0; j < results.length; j += 1) {
+        if (results[j]) {
+          win32RegSucceeded += 1;
+        } else if (chunk[j].required) {
+          hadWin32RegFailure = true;
+        }
+      }
+    }
+    registryKeysApplied += win32RegSucceeded;
+    if (win32RegSucceeded === 0) {
+      hadWin32RegFailure = true;
     }
   }
 
   // Re-verify top-level proxy DLLs in case a script staged a legacy DLL that has a Win10 sibling
   supportFilesStaged += healMalformedTopLevelProxyDlls(hostInstallDir);
 
-  try {
-    atomicWriteFileSync(
-      stampPath,
-      `${JSON.stringify(
-        {
-          version: GOG_SCRIPT_STAMP_VERSION,
-          scriptsHash,
-          targetScopeHash,
-        },
-        null,
-        2
-      )}\n`
-    );
-  } catch (err) {
-    diagLog.debug('gogScript.stampWriteFailed', err);
+  // Never write a success stamp when required `reg.exe` writes failed on win32
+  if (!hadWin32RegFailure) {
+    try {
+      atomicWriteFileSync(
+        stampPath,
+        `${JSON.stringify(
+          {
+            version: GOG_SCRIPT_STAMP_VERSION,
+            scriptsHash,
+            targetScopeHash,
+          },
+          null,
+          2
+        )}\n`
+      );
+    } catch (err) {
+      diagLog.debug('gogScript.stampWriteFailed', err);
+    }
   }
 
   return {
-    executed: true,
+    executed: !hadWin32RegFailure || supportFilesStaged > 0 || iniEntriesApplied > 0 || registryKeysApplied > 0,
     skippedCached: false,
     scriptsProcessed: scriptFiles.length,
     registryKeysApplied,
@@ -1334,6 +1895,8 @@ async function executeGogGameScript(installDir, options = {}) {
 
 module.exports = {
   GOG_SCRIPT_STAMP_FILENAME,
+  isAllowedGogRegistryTarget,
+  expandGogValueStringTokens,
   executeGogGameScript,
   parseSafeRegistryQwordBigInt,
   patchRawWineRegistrySectionsBatch,

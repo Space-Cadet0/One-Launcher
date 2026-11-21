@@ -1,6 +1,237 @@
 // @ts-check
 'use strict';
 
+const KNOWN_NON_GAME_CLIENT_RE =
+  /^(?:ea\s+app|ubisoft\s+connect|battle\.net|riot\s+client|gog\s+galaxy)$/i;
+
+const NON_LAUNCHER_GAME_NOUNS = new Set([
+  'rocket',
+  'grenade',
+  'missile',
+  'bomb',
+  'pumpkin',
+  'catapult',
+  'ball',
+  'sheep',
+  'cannon',
+  'torpedo',
+]);
+
+const EXPLICIT_CONTENT_MODIFIERS = new Set([
+  'bonus',
+  'digital',
+  'companion',
+  'additional',
+  'downloadable',
+  'dlc',
+  'extra',
+  'extras',
+  'preorder',
+  'pre-order',
+  'deluxe',
+  'collectors',
+  "collector's",
+  'season',
+  'pack',
+  'bundle',
+  'expansion',
+  'cosmetic',
+]);
+
+const NATURAL_CONTENT_PREDECESSORS = new Set([
+  'of',
+  'to',
+  'be',
+  'the',
+  'a',
+  'an',
+  'in',
+  'on',
+  'for',
+  'with',
+  'and',
+  'or',
+  'your',
+  'my',
+  'our',
+  'their',
+  'his',
+  'her',
+  'its',
+  "heart's",
+  'hearts',
+  'no',
+  'more',
+  'new',
+  'pure',
+  'true',
+  'full',
+]);
+
+const GENERIC_MULTIPLAYER_PREDECESSORS = new Set([
+  'local',
+  'couch',
+  'online',
+  'coop',
+  'co-op',
+  'cooperative',
+  'competitive',
+  'arcade',
+  'casual',
+  'classic',
+  'retro',
+  'party',
+  'free',
+  'vr',
+  '3d',
+  '2d',
+  'massive',
+  'massively',
+  'crossplay',
+  'cross-platform',
+  'splitscreen',
+  'split-screen',
+  'tactical',
+  'arena',
+  'action',
+  'racing',
+  'sports',
+  'puzzle',
+  'sandbox',
+  'survival',
+  'open-world',
+  'turn-based',
+  'real-time',
+  'asymmetric',
+  'social',
+  'mini',
+  'micro',
+  'mega',
+  'super',
+  'ultra',
+  'hyper',
+  'pixel',
+  'voxel',
+  'tabletop',
+  'board',
+  'card',
+  'chess',
+  'trivia',
+  'word',
+  'battle',
+  'multiplayer',
+  'of',
+  'the',
+  'a',
+  'an',
+  'for',
+  'with',
+  'and',
+  'or',
+  'in',
+  'on',
+  'to',
+]);
+
+/**
+ * Splits only the trailing segment of a title into lowercase words in O(1) bounded time so
+ * adversarial multi-kilobyte inputs cannot trigger super-linear scanning.
+ *
+ * @param {string} cleanTitle
+ * @returns {string[]}
+ */
+function extractTailWordsLower(cleanTitle) {
+  const tail = cleanTitle.length > 256 ? cleanTitle.slice(-256) : cleanTitle;
+  return tail
+    .toLowerCase()
+    .replace(/[™®©]/g, '')
+    .split(/\s+/)
+    .map((w) => w.replace(/^[^a-z0-9']+|[^a-z0-9']+$/g, ''))
+    .filter(Boolean);
+}
+
+/**
+ * Generic detector for standalone publisher/storefront launcher utilities (e.g.
+ * `<Publisher/Brand> Launcher`, `<Brand> Games Launcher`, `EA App`, `Ubisoft Connect`,
+ * `Battle.net`, `Riot Client`, `GOG Galaxy`) without hardcoding individual game franchise names.
+ *
+ * @param {string} cleanTitle
+ * @returns {boolean}
+ */
+function isStandaloneLauncherUtilityTitle(cleanTitle) {
+  if (!cleanTitle || cleanTitle.length > 96) return false;
+  if (KNOWN_NON_GAME_CLIENT_RE.test(cleanTitle)) {
+    return true;
+  }
+  if (cleanTitle.includes(':') || !/\s+launcher$/i.test(cleanTitle)) {
+    return false;
+  }
+  const words = extractTailWordsLower(cleanTitle);
+  if (words.length < 2 || words.length > 4 || words[words.length - 1] !== 'launcher') {
+    return false;
+  }
+  const prevWord = words[words.length - 2];
+  if (NON_LAUNCHER_GAME_NOUNS.has(prevWord)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Tightened detector for trailing `<Game Title> Content` companion/sub-package entries that avoids
+ * false-flagging natural English phrases like `"Heart's Content"` or `"Be Content"`.
+ *
+ * @param {string} cleanTitle
+ * @returns {boolean}
+ */
+function isTrailingCompanionContentTitle(cleanTitle) {
+  if (!cleanTitle || !/\s+content$/i.test(cleanTitle)) {
+    return false;
+  }
+  const words = extractTailWordsLower(cleanTitle);
+  if (words.length < 2 || words[words.length - 1] !== 'content') {
+    return false;
+  }
+  const prevWord = words[words.length - 2];
+  if (EXPLICIT_CONTENT_MODIFIERS.has(prevWord)) {
+    return true;
+  }
+  if (NATURAL_CONTENT_PREDECESSORS.has(prevWord)) {
+    return false;
+  }
+  // Require a multi-word franchise prefix (`>= 3` total words, e.g. `Death Stranding Content`,
+  // `LEGO Fortnite Content`) so short 2-word game titles aren't false-flagged.
+  return words.length >= 3;
+}
+
+/**
+ * Tightened detector for uninstalled `<Base Game> Multiplayer` sub-client entries that avoids
+ * false-flagging standalone multiplayer games (e.g. `"Couch Multiplayer"`, `"Survival Multiplayer"`,
+ * `"Ultimate Arena Multiplayer"`).
+ *
+ * @param {string} cleanTitle
+ * @returns {boolean}
+ */
+function isTrailingMultiplayerSubClientTitle(cleanTitle) {
+  if (!cleanTitle) return false;
+  const tail = cleanTitle.length > 256 ? cleanTitle.slice(-256) : cleanTitle;
+  if (/[:\-–—]\s*multiplayer$/i.test(tail) || /\(\s*multiplayer\s*\)$/i.test(tail)) {
+    return true;
+  }
+  if (!/\s+multiplayer$/i.test(tail)) {
+    return false;
+  }
+  const words = extractTailWordsLower(tail);
+  if (words.length < 3 || words[words.length - 1] !== 'multiplayer') {
+    return false;
+  }
+  const prevWord = words[words.length - 2];
+  if (GENERIC_MULTIPLAYER_PREDECESSORS.has(prevWord)) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * Classifies whether a storefront item is a non-game (beta, test branch, prologue,
  * tool/SDK/redistributable, soundtrack/artbook/bonus content, standalone multiplayer sub-client,
@@ -98,9 +329,7 @@ function classifyNonGameStorefrontItem({
     /\b(pre-game\s+editor|resource\s+archiver|dedicated\s+server|authoring\s+tools|mod\s+kit|modkit|sdk|redistributables?|common\s+redistributables|benchmark\s+tool)\b/i.test(
       cleanTitle
     ) ||
-    /^(?:minecraft\s+launcher|ea\s+app|ubisoft\s+connect|rockstar\s+games\s+launcher|battle\.net|riot\s+client|gog\s+galaxy|epic\s+games\s+launcher)$/i.test(
-      cleanTitle
-    )
+    isStandaloneLauncherUtilityTitle(cleanTitle)
   ) {
     return 'Filtered: Tool / Editor / Redistributable / Server';
   }
@@ -113,7 +342,7 @@ function classifyNonGameStorefrontItem({
     /\b(digital\s+soundtrack|original\s+soundtrack|official\s+soundtrack|soundtrack|ost|art\s*book|artbook|digital\s+goodies|goodies\s+pack|wallpaper|hd\s+wallpaper|hd\s+sound|hd\s+texture|voice\s+pack|bonus\s+content|digital\s+extras?|companion\s+content|additional\s+content)\b/i.test(
       cleanTitle
     ) ||
-    /\b\w+\s+content$/i.test(cleanTitle)
+    isTrailingCompanionContentTitle(cleanTitle)
   ) {
     return 'Filtered: Digital Soundtrack / Artbook / Bonus Content';
   }
@@ -131,10 +360,10 @@ function classifyNonGameStorefrontItem({
   // Uninstalled `* Multiplayer` sub-clients (e.g. `'<Title> Multiplayer'`) are suppressed by default
   // while installed `* Multiplayer` entries remain visible via the `isInstalled || installed` check above.
   if (
-    /\b(multiplayer\s+only|dedicated\s+multiplayer|standalone\s+multiplayer|multiplayer\s+client)\b/i.test(
+    /\b(multiplayer\s+only|dedicated\s+multiplayer|standalone\s+multiplayer|multiplayer\s+client|multiplayer\s+pack|multiplayer\s+component|multiplayer\s+module)\b/i.test(
       cleanTitle
     ) ||
-    /\S+\s+multiplayer$/i.test(cleanTitle)
+    isTrailingMultiplayerSubClientTitle(cleanTitle)
   ) {
     return 'Filtered: Beta / Test Branch / Legacy Client';
   }
@@ -182,7 +411,8 @@ function classifyNonGameStorefrontItem({
     mainGameItem && typeof mainGameItem === 'object'
       ? /** @type {Record<string, unknown>} */ (mainGameItem)
       : null;
-  const mainGameTargetId = mainGameObj && typeof mainGameObj.id === 'string' ? mainGameObj.id.trim() : '';
+  const mainGameTargetId =
+    mainGameObj && typeof mainGameObj.id === 'string' ? mainGameObj.id.trim() : '';
   const hasParentMainGame = Boolean(
     mainGameObj &&
       Object.keys(mainGameObj).length > 0 &&

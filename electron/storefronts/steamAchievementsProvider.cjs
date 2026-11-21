@@ -3,17 +3,28 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { isAllowedHttpsHost } = require('../launcher/securityAndPathUtils.cjs');
 const {
+  MAX_BINARY_VDF_FILE_BYTES: MAX_VDF_FILE_BYTES,
+  MAX_BINARY_VDF_RECURSION_DEPTH: MAX_VDF_RECURSION_DEPTH,
+  parseBinaryVdf,
+  steamId64ToAccountId32: steamId64ToAccountId32OrNull,
   resolveLocalSteamUserdataDirs,
   resolveActiveSteamAccountDirs,
   parseActiveAccountIdFromLoginUsersVdf,
 } = require('./steamLocalScanner.cjs');
 
 const STEAM_ACH_HTTP_TIMEOUT_MS = 12_000;
-const MAX_VDF_FILE_BYTES = 16 * 1024 * 1024; // 16 MB hard cap (C2)
-const MAX_VDF_RECURSION_DEPTH = 16; // Recursion depth hard cap (C2)
 const STEAM_ID64_BASE = BigInt('76561197960265728');
 const STEAM_ACH_ICON_BASE = 'https://shared.fastly.steamstatic.com/community_assets/images/apps';
+const ALLOWED_STEAM_ICON_HOSTS = Object.freeze([
+  'steamstatic.com',
+  'steamcommunity.com',
+  'steampowered.com',
+  'steamcdn-a.akamaihd.net',
+  'steamuserimages-a.akamaihd.net',
+  'akamaihd.net',
+]);
 
 /**
  * @param {number | null | undefined} percentage
@@ -44,20 +55,12 @@ function buildFetchSignal(callerSignal, timeoutMs = STEAM_ACH_HTTP_TIMEOUT_MS) {
 }
 
 /**
- * Convert a 17-digit SteamID64 string to 32-bit account ID string.
+ * Convert a 17-digit SteamID64 string to 32-bit account ID string (`''` when invalid).
  * @param {string | number | undefined | null} steamId64
  * @returns {string}
  */
 function steamId64ToAccountId32(steamId64) {
-  const clean = String(steamId64 || '').trim();
-  if (!/^\d{17}$/.test(clean)) return '';
-  try {
-    const val = BigInt(clean);
-    if (val <= STEAM_ID64_BASE) return '';
-    return String(val - STEAM_ID64_BASE);
-  } catch {
-    return '';
-  }
+  return steamId64ToAccountId32OrNull(steamId64) || '';
 }
 
 /**
@@ -146,7 +149,9 @@ async function discoverLocalSteamIdentity(options = {}) {
       if (acct32) {
         let mtimeMs = 0;
         try {
-          const cfgStat = await fs.promises.stat(path.join(ud, acct32, 'config', 'localconfig.vdf'));
+          const cfgStat = await fs.promises.stat(
+            path.join(ud, acct32, 'config', 'localconfig.vdf')
+          );
           mtimeMs = Number(cfgStat?.mtimeMs || 0);
         } catch {
           try {
@@ -172,6 +177,9 @@ async function discoverLocalSteamIdentity(options = {}) {
 }
 
 /**
+ * Validates and constructs a Steam achievement icon URL, enforcing an HTTPS Steam CDN host
+ * allowlist for absolute URLs and blocking traversal/scheme injection on relative hashes.
+ *
  * @param {number} appId
  * @param {string | undefined | null} rawIcon
  * @returns {string}
@@ -179,10 +187,23 @@ async function discoverLocalSteamIdentity(options = {}) {
 function buildSteamAchievementIconUrl(appId, rawIcon) {
   const clean = String(rawIcon || '').trim();
   if (!clean) return '';
-  if (/^https?:\/\//i.test(clean)) {
-    return clean.startsWith('http://') ? `https://${clean.slice(7)}` : clean;
+
+  if (/^https?:\/\//i.test(clean) || clean.startsWith('//')) {
+    const normalized = clean.startsWith('//')
+      ? `https:${clean}`
+      : clean.toLowerCase().startsWith('http://')
+        ? `https://${clean.slice(7)}`
+        : clean;
+    if (!isAllowedHttpsHost(normalized, ALLOWED_STEAM_ICON_HOSTS)) {
+      return '';
+    }
+    return normalized;
   }
-  if (clean.startsWith('//')) return `https:${clean}`;
+
+  if (clean.includes(':') || clean.includes('..') || !/^[a-zA-Z0-9._/-]+$/.test(clean)) {
+    return '';
+  }
+
   return `${STEAM_ACH_ICON_BASE}/${appId}/${clean.replace(/^\/+/, '')}`;
 }
 
@@ -207,109 +228,6 @@ function pickVdfLocalizedString(value) {
     }
   }
   return '';
-}
-
-/**
- * Pure-JS bounded parser for Steam Binary KeyValues (`.bin` files in `appcache/stats/`).
- * Enforces `<= 16 MB` buffer size and `<= 16` recursion depth (`C2`).
- *
- * @param {Buffer | Uint8Array} input
- * @param {{ maxBytes?: number, maxDepth?: number }} [options]
- * @returns {Record<string, any>}
- */
-function parseBinaryVdf(input, options = {}) {
-  const buf = Buffer.isBuffer(input) ? input : Buffer.from(input);
-  const maxBytes =
-    typeof options.maxBytes === 'number' && options.maxBytes > 0
-      ? options.maxBytes
-      : MAX_VDF_FILE_BYTES;
-  const maxDepth =
-    typeof options.maxDepth === 'number' && options.maxDepth > 0
-      ? options.maxDepth
-      : MAX_VDF_RECURSION_DEPTH;
-
-  if (buf.length > maxBytes) {
-    throw new Error(`Binary VDF exceeds safety cap (${buf.length} > ${maxBytes} bytes)`);
-  }
-
-  let offset = 0;
-
-  const readCString = () => {
-    const start = offset;
-    while (offset < buf.length && buf[offset] !== 0) {
-      offset++;
-    }
-    const str = buf.toString('utf8', start, offset);
-    if (offset < buf.length && buf[offset] === 0) {
-      offset++;
-    }
-    return str;
-  };
-
-  const readWideCString = () => {
-    const start = offset;
-    while (offset + 1 < buf.length && !(buf[offset] === 0 && buf[offset + 1] === 0)) {
-      offset += 2;
-    }
-    const str = buf.toString('utf16le', start, offset);
-    if (offset + 1 < buf.length && buf[offset] === 0 && buf[offset + 1] === 0) {
-      offset += 2;
-    }
-    return str;
-  };
-
-  /**
-   * @param {number} depth
-   * @returns {Record<string, any>}
-   */
-  const parseMap = (depth) => {
-    if (depth > maxDepth) {
-      throw new Error(`Binary VDF nesting depth exceeds limit (${maxDepth})`);
-    }
-    /** @type {Record<string, any>} */
-    const out = Object.create(null);
-
-    while (offset < buf.length) {
-      const type = buf[offset++];
-      if (type === 0x08 || type === 0x0b) {
-        break;
-      }
-      if (offset >= buf.length) break;
-      const key = readCString();
-
-      if (type === 0x00) {
-        out[key] = parseMap(depth + 1);
-      } else if (type === 0x01) {
-        out[key] = readCString();
-      } else if (type === 0x02) {
-        if (offset + 4 > buf.length) break;
-        out[key] = buf.readInt32LE(offset);
-        offset += 4;
-      } else if (type === 0x03) {
-        if (offset + 4 > buf.length) break;
-        out[key] = buf.readFloatLE(offset);
-        offset += 4;
-      } else if (type === 0x04 || type === 0x06) {
-        if (offset + 4 > buf.length) break;
-        out[key] = buf.readUInt32LE(offset);
-        offset += 4;
-      } else if (type === 0x05) {
-        out[key] = readWideCString();
-      } else if (type === 0x07) {
-        if (offset + 8 > buf.length) break;
-        const big = buf.readBigUInt64LE(offset);
-        offset += 8;
-        out[key] = big <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(big) : big.toString();
-      } else {
-        // Unknown binary VDF type marker: halt cleanly to prevent desync loop
-        break;
-      }
-    }
-
-    return out;
-  };
-
-  return parseMap(0);
 }
 
 /**
@@ -370,6 +288,68 @@ async function findNewestStatsFile(dirs, predicate) {
 }
 
 /**
+ * Find a user stats `.bin` file ONLY when unambiguously scoped to a single Steam account.
+ * When `accountId32` is explicitly specified (or an explicit `steamId` was supplied), NEVER
+ * falls back to another user's `.bin` file.
+ *
+ * @param {string[]} dirs
+ * @param {number} cleanAppId
+ * @param {string} resolvedAccountId32
+ * @param {boolean} hasExplicitAccountConstraint
+ * @returns {Promise<{ filePath: string, mtimeMs: number, size: number } | null>}
+ */
+async function findScopedUserStatsFile(
+  dirs,
+  cleanAppId,
+  resolvedAccountId32,
+  hasExplicitAccountConstraint
+) {
+  if (resolvedAccountId32) {
+    const exactLower = `usergamestats_${resolvedAccountId32}_${cleanAppId}.bin`;
+    return findNewestStatsFile(dirs, (f) => f.toLowerCase() === exactLower);
+  }
+  if (hasExplicitAccountConstraint) {
+    return null;
+  }
+
+  // No explicit account requested and local `loginusers.vdf` didn't identify one:
+  // only match if every discovered `.bin` belongs to ONE unique accountId32.
+  const userFileRe = new RegExp(`^usergamestats_(\\d+)_${cleanAppId}\\.bin$`, 'i');
+  /** @type {Set<string>} */
+  const seenAccountIds = new Set();
+  /** @type {{ filePath: string, mtimeMs: number, size: number } | null} */
+  let newest = null;
+
+  for (const dir of dirs) {
+    /** @type {string[]} */
+    let files = [];
+    try {
+      files = await fs.promises.readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const fileName of files) {
+      const m = fileName.match(userFileRe);
+      if (!m) continue;
+      const fullPath = path.join(dir, fileName);
+      try {
+        const st = await fs.promises.stat(fullPath);
+        if (!st.isFile() || st.size <= 0 || st.size > MAX_VDF_FILE_BYTES) continue;
+        seenAccountIds.add(m[1]);
+        if (seenAccountIds.size > 1) {
+          // Ambiguous multi-user machine without explicit accountId32: refuse cross-user guess
+          return null;
+        }
+        if (!newest || st.mtimeMs > newest.mtimeMs) {
+          newest = { filePath: fullPath, mtimeMs: st.mtimeMs, size: st.size };
+        }
+      } catch {}
+    }
+  }
+  return newest;
+}
+
+/**
  * Read and join local Steam binary VDF `UserGameStatsSchema_<appId>.bin` +
  * `UserGameStats_<accountId32>_<appId>.bin` across all native + bottle Steam roots.
  *
@@ -394,19 +374,29 @@ async function readLocalSteamBinaryVdfAchievements(appId, options = {}) {
   if (statsDirs.length === 0) return null;
 
   const schemaFileNameLower = `usergamestatsschema_${cleanAppId}.bin`;
-  const accountId32 =
-    String(options.accountId32 || '').trim() ||
-    steamId64ToAccountId32(options.steamId || options.activeSteamId64);
+  const rawExplicitAccountId32 =
+    options.accountId32 !== undefined && options.accountId32 !== null
+      ? String(options.accountId32).trim()
+      : '';
+  const rawExplicitSteamId = String(options.steamId || options.activeSteamId64 || '').trim();
+  const hasExplicitAccountConstraint = Boolean(rawExplicitAccountId32 || rawExplicitSteamId);
+
+  let accountId32 = '';
+  if (rawExplicitAccountId32) {
+    accountId32 = /^[1-9]\d*$/.test(rawExplicitAccountId32) ? rawExplicitAccountId32 : '';
+  } else if (rawExplicitSteamId) {
+    accountId32 = steamId64ToAccountId32(rawExplicitSteamId);
+  } else {
+    const discovered = await discoverLocalSteamIdentity(options).catch(() => ({
+      steamId: '',
+      accountId32: '',
+    }));
+    accountId32 = discovered.accountId32 || '';
+  }
 
   const [schemaHit, userHit] = await Promise.all([
     findNewestStatsFile(statsDirs, (f) => f.toLowerCase() === schemaFileNameLower),
-    findNewestStatsFile(statsDirs, (f) => {
-      const lower = f.toLowerCase();
-      if (accountId32) {
-        return lower === `usergamestats_${accountId32}_${cleanAppId}.bin`;
-      }
-      return new RegExp(`^usergamestats_\\d+_${cleanAppId}\\.bin$`, 'i').test(lower);
-    }),
+    findScopedUserStatsFile(statsDirs, cleanAppId, accountId32, hasExplicitAccountConstraint),
   ]);
 
   if (!schemaHit) return null;
@@ -422,7 +412,12 @@ async function readLocalSteamBinaryVdfAchievements(appId, options = {}) {
   const appNode =
     schemaRoot[String(cleanAppId)] ||
     Object.values(schemaRoot).find((v) => v && typeof v === 'object' && v.stats);
-  if (!appNode || typeof appNode !== 'object' || !appNode.stats || typeof appNode.stats !== 'object') {
+  if (
+    !appNode ||
+    typeof appNode !== 'object' ||
+    !appNode.stats ||
+    typeof appNode.stats !== 'object'
+  ) {
     return null;
   }
 
@@ -463,7 +458,13 @@ async function readLocalSteamBinaryVdfAchievements(appId, options = {}) {
         for (const bitKey of sortedBitKeys) {
           const bitIdx = Number(bitKey);
           const bitDef = statBits[bitKey];
-          if (!Number.isFinite(bitIdx) || bitIdx < 0 || bitIdx > 31 || !bitDef || typeof bitDef !== 'object') {
+          if (
+            !Number.isFinite(bitIdx) ||
+            bitIdx < 0 ||
+            bitIdx > 31 ||
+            !bitDef ||
+            typeof bitDef !== 'object'
+          ) {
             continue;
           }
           achievementDefs.push({ statId: String(statIdKey), bitIdx, def: bitDef });
@@ -503,7 +504,12 @@ async function readLocalSteamBinaryVdfAchievements(appId, options = {}) {
     /** @type {number | undefined} */
     let unlockedAt = undefined;
 
-    if (hasUserStatsFile && userCache && userCache[statId] && typeof userCache[statId] === 'object') {
+    if (
+      hasUserStatsFile &&
+      userCache &&
+      userCache[statId] &&
+      typeof userCache[statId] === 'object'
+    ) {
       const bucket = userCache[statId];
       const bitmask = Number(bucket.data ?? 0);
       // Unsigned right shift avoids JS signed 32-bit `1 << 31` sign-bit overflow (`C12`)
@@ -535,7 +541,8 @@ async function readLocalSteamBinaryVdfAchievements(appId, options = {}) {
         });
         if (!unlocked && hasUserStatsFile) {
           const linkedStatId = statIdByName.get(operand1.toLowerCase());
-          const rawStatVal = linkedStatId !== undefined ? statValuesById.get(linkedStatId) : undefined;
+          const rawStatVal =
+            linkedStatId !== undefined ? statValuesById.get(linkedStatId) : undefined;
           if (typeof rawStatVal === 'number' && Number.isFinite(rawStatVal) && rawStatVal > minVal) {
             const safeMin = Number.isFinite(minVal) ? minVal : 0;
             const span = maxVal - safeMin;
@@ -544,7 +551,10 @@ async function readLocalSteamBinaryVdfAchievements(appId, options = {}) {
               const current = Number.isInteger(clamped)
                 ? clamped
                 : Number(clamped.toFixed(1));
-              const percentage = Math.min(99, Math.max(1, Math.round(((clamped - safeMin) / span) * 100)));
+              const percentage = Math.min(
+                99,
+                Math.max(1, Math.round(((clamped - safeMin) / span) * 100))
+              );
               progress = { current, max: maxVal, percentage };
             }
           }
@@ -891,7 +901,9 @@ function parseSteamAchievementsSsrHtml(html, appId) {
       achievements.push({
         id: `steam:${cleanAppId}:${apiName || internalKey || achievements.length}`,
         apiName: apiName || internalKey || `ACH_${achievements.length + 1}`,
-        name: String(item.name || item.localized_name || apiName || `Achievement #${achievements.length + 1}`),
+        name: String(
+          item.name || item.localized_name || apiName || `Achievement #${achievements.length + 1}`
+        ),
         description: String(item.description || item.localized_desc || '').trim() || undefined,
         unlocked,
         ...(unlockedAt ? { unlockedAt } : {}),
@@ -952,9 +964,7 @@ async function fetchSteamGameAchievementsSchema(appId, options = {}) {
     return rawList.map((item, idx) => {
       const apiName = String(item?.internal_name || item?.name || `ACH_${idx + 1}`).trim();
       const rawPct = parseFloat(String(item?.player_percent_unlocked ?? ''));
-      const globalPercentage = Number.isFinite(rawPct)
-        ? Number(rawPct.toFixed(1))
-        : undefined;
+      const globalPercentage = Number.isFinite(rawPct) ? Number(rawPct.toFixed(1)) : undefined;
       const iconUnlockedUrl = buildSteamAchievementIconUrl(cleanAppId, item?.icon);
       const iconLockedUrl =
         buildSteamAchievementIconUrl(cleanAppId, item?.icon_gray) || iconUnlockedUrl;
@@ -986,7 +996,7 @@ async function fetchSteamGameAchievementsSchema(appId, options = {}) {
  *
  * @param {number} appId
  * @param {string} steamId64
- * @param {{ apiKey?: string, webapiToken?: string, fetchFn?: typeof fetch, signal?: AbortSignal }} options
+ * @param {{ apiKey?: string, webapiToken?: string, language?: string, fetchFn?: typeof fetch, signal?: AbortSignal }} options
  */
 async function fetchSteamWebApiPlayerProgress(appId, steamId64, options = {}) {
   const fetchImpl = typeof options.fetchFn === 'function' ? options.fetchFn : globalThis.fetch;
@@ -999,9 +1009,10 @@ async function fetchSteamWebApiPlayerProgress(appId, steamId64, options = {}) {
       : '';
   if (!authParam) return null;
 
+  const language = String(options.language || 'english').trim() || 'english';
   const achUrl = `https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v1/?${authParam}&steamid=${encodeURIComponent(
     steamId64
-  )}&appid=${appId}&l=english`;
+  )}&appid=${appId}&l=${encodeURIComponent(language)}`;
   const statsUrl = `https://api.steampowered.com/ISteamUserStats/GetUserStatsForGame/v2/?${authParam}&steamid=${encodeURIComponent(
     steamId64
   )}&appid=${appId}`;
@@ -1096,6 +1107,7 @@ async function fetchSteamDetailedGameAchievements(payload = {}, options = {}) {
   if (!Number.isFinite(appId) || appId <= 0) return null;
 
   const fetchImpl = typeof options.fetchFn === 'function' ? options.fetchFn : globalThis.fetch;
+  const language = String(options.language || payload.language || 'english').trim() || 'english';
   let steamId = String(options.steamId || payload.steamId || '').trim();
   let discoveredAccountId32 = String(options.accountId32 || '').trim();
   if (!steamId) {
@@ -1125,7 +1137,7 @@ async function fetchSteamDetailedGameAchievements(payload = {}, options = {}) {
     const pathSegment = isNumeric64
       ? `profiles/${steamId}`
       : `id/${encodeURIComponent(steamId)}`;
-    const ssrUrl = `https://steamcommunity.com/${pathSegment}/achievements/${appId}?l=english`;
+    const ssrUrl = `https://steamcommunity.com/${pathSegment}/achievements/${appId}?l=${encodeURIComponent(language)}`;
     try {
       const res = await fetchImpl(ssrUrl, {
         headers: {
@@ -1179,7 +1191,9 @@ async function fetchSteamDetailedGameAchievements(payload = {}, options = {}) {
       ...(discoveredAccountId32 ? { accountId32: discoveredAccountId32 } : {}),
     }).catch(() => null),
     !options.skipNetwork && !(ssrResult && ssrResult.achievements.length > 0)
-      ? fetchSteamGameAchievementsSchema(appId, { ...options, fetchFn: fetchImpl }).catch(() => [])
+      ? fetchSteamGameAchievementsSchema(appId, { ...options, language, fetchFn: fetchImpl }).catch(
+          () => []
+        )
       : Promise.resolve([]),
   ]);
 
@@ -1195,6 +1209,7 @@ async function fetchSteamDetailedGameAchievements(payload = {}, options = {}) {
     const webApi = await fetchSteamWebApiPlayerProgress(appId, steamId, {
       apiKey: options.apiKey,
       webapiToken: options.webapiToken,
+      language,
       fetchFn: fetchImpl,
       signal: options.signal,
     }).catch(() => null);
@@ -1364,6 +1379,7 @@ module.exports = {
   steamId64ToAccountId32,
   accountId32ToSteamId64,
   discoverLocalSteamIdentity,
+  buildSteamAchievementIconUrl,
   parseBinaryVdf,
   resolveLocalSteamAppcacheStatsDirs,
   readLocalSteamBinaryVdfAchievements,
