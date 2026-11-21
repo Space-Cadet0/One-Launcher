@@ -678,7 +678,47 @@ const GENERIC_SUBTITLE_TOKENS = new Set<string>([
   'complete',
   'anthology',
   'collection',
+  'legendary',
+  'heroic',
+  'legacy',
+  'royal',
+  'annual',
+  'pass',
+  'chest',
+  'battle',
+  'expansion',
+  'set',
+  'soundtrack',
+  'ost',
+  'original',
+  'role',
+  'playing',
+  'rpg',
+  'post',
+  'nuclear',
+  'action',
+  'adventure',
+  'strategy',
+  'tactical',
+  'simulator',
+  'simulation',
+  'pack',
+  'bundle',
+  'kit',
+  'starter',
+  'base',
+  'game',
+  'gold',
+  'platinum',
+  'anniversary',
+  'goty',
+  'upgrade',
 ]);
+
+const GENERIC_SUBTITLE_PHRASE_PATTERNS: readonly RegExp[] = [
+  /^(?:a\s+)?post[\s-]+nuclear\s+role[\s-]+playing(?:\s+game)?$/i,
+  /\b(?:role[\s-]+playing\s+game|season\s+pass|expansion\s+(?:pass|set|pack)|battle\s+chest|war\s+chest|original\s+soundtrack|starter\s+pack|upgrade\s+pack)\b/i,
+];
 
 function toCanonicalNumericToken(token: string): string | null {
   if (/^\d+$/.test(token)) return token;
@@ -739,8 +779,9 @@ function extractSubstantiveSubtitleTokens(tokens: string[]): string[] {
  * sequel numeral (2..20 / II..XX / two..ten, never 1/I/one) sitting strictly between an identical
  * leading franchise prefix and an identical distinctive subtitle:
  *   "<Franchise> <N>: <Distinctive Subtitle>" <-> "<Franchise>: <Distinctive Subtitle>".
- * Enforces exact bidirectional ordered substantive token equality (never one-directional subset inclusion)
- * and a strict subtitle distinctiveness floor (|S_N| >= 2 OR single >=6-char non-generic token with explicit delimiters).
+ * Enforces exact bidirectional ordered substantive token equality (never one-directional subset inclusion),
+ * rejects generic SKU/genre/tagline subtitle phrases and all-generic multi-word subtitles,
+ * and requires at least one distinctive non-generic subtitle token.
  */
 export function isIntermediateNumeralSubtitleMatch(titleA: string, titleB: string): boolean {
   if (!titleA || !titleB) return false;
@@ -816,8 +857,13 @@ export function isIntermediateNumeralSubtitleMatch(titleA: string, titleB: strin
     if (substantiveUnnumbered[substantivePrefix.length + j] !== substantiveSub[j]) return false;
   }
 
+  const rawSubPhrase = subN.join(' ');
+  if (GENERIC_SUBTITLE_PHRASE_PATTERNS.some((pattern) => pattern.test(rawSubPhrase))) {
+    return false;
+  }
+
   if (substantiveSub.length >= 2) {
-    return true;
+    return substantiveSub.some((t) => t.length >= 3 && !GENERIC_SUBTITLE_TOKENS.has(t));
   }
 
   return (

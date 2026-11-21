@@ -286,27 +286,34 @@ export function isAnchorSlugCompatible(title: string, rawAnchorSlug: string): bo
 
   // Ground-truth anchor Metacritic canonical subtitle suffix expansion ONLY:
   // Permits verified anchors whose slug starts with the exact normalized title tokens and appends
-  // Metacritic's official subtitle (e.g. "Cat Quest II" -> "cat-quest-ii-the-lupus-empire",
-  // "POSTAL 2" -> "postal-2-share-the-pain", "Monsters are Coming!" -> "monsters-are-coming!-rock-road")
-  // provided there is no sequel-number or spin-off/mode conflict.
+  // Metacritic's official subtitle ONLY when the title already carries an explicit installment numeral
+  // (>= 2, e.g. "Cat Quest II" -> "cat-quest-ii-the-lupus-empire", "POSTAL 2" -> "postal-2-share-the-pain")
+  // OR ends with explicit non-word clause punctuation ('!' or '?', e.g. "Monsters are Coming!" ->
+  // "monsters-are-coming-rock-road"), never allowing bare unnumbered franchise titles ("Deus Ex",
+  // "Grand Theft Auto", "Assassin's Creed", "Call of Duty") to match sequel/spinoff subtitles.
   if (!sequelMismatch) {
-    const titleTokens = tokenizeForAnchorPrefix(title);
-    const anchorTokens = tokenizeForAnchorPrefix(anchorWords);
-    const titleSubstantive = titleTokens.filter((t) => !PURE_EDITION_WORDS.has(t));
-    if (
-      titleSubstantive.length >= 2 &&
-      anchorTokens.length > titleSubstantive.length &&
-      titleSubstantive.every((t, idx) => anchorTokens[idx] === t)
-    ) {
-      const extraSuffix = anchorTokens.slice(titleSubstantive.length);
-      const hasConflict = extraSuffix.some(
-        (t) =>
-          ANCHOR_SUFFIX_CONFLICT_TOKENS.has(t) ||
-          NUMERIC_SEQUELS.has(t) ||
-          /^\d+$/.test(t)
-      );
-      if (!hasConflict) {
-        return true;
+    const hasInstallmentNumeral = extractSequelIdentifier(title) !== null;
+    const cleanedClause = stripTrademarkSymbols(decodeTitleHtmlEntities(title)).trim();
+    const endsWithClausePunctuation = /[!?]$/.test(cleanedClause);
+    if (hasInstallmentNumeral || endsWithClausePunctuation) {
+      const titleTokens = tokenizeForAnchorPrefix(title);
+      const anchorTokens = tokenizeForAnchorPrefix(anchorWords);
+      const titleSubstantive = titleTokens.filter((t) => !PURE_EDITION_WORDS.has(t));
+      if (
+        titleSubstantive.length >= 2 &&
+        anchorTokens.length > titleSubstantive.length &&
+        titleSubstantive.every((t, idx) => anchorTokens[idx] === t)
+      ) {
+        const extraSuffix = anchorTokens.slice(titleSubstantive.length);
+        const hasConflict = extraSuffix.some(
+          (t) =>
+            ANCHOR_SUFFIX_CONFLICT_TOKENS.has(t) ||
+            NUMERIC_SEQUELS.has(t) ||
+            /^\d+$/.test(t)
+        );
+        if (!hasConflict) {
+          return true;
+        }
       }
     }
   }
@@ -558,7 +565,7 @@ export interface MetacriticSearchCandidate {
 export async function searchMetacriticCandidates(
   query: string,
   priority: number = Priority.P1_VIEWPORT,
-  options?: { onTransientError?: () => void }
+  options?: { onTransientError?: () => void; onSuccess?: () => void }
 ): Promise<MetacriticSearchCandidate[]> {
   if (!onlineLifecycleManager.isOnline()) {
     options?.onTransientError?.();
@@ -599,15 +606,39 @@ export async function searchMetacriticCandidates(
     );
 
     if (!res.ok) {
-      if (res.status === 429 || res.status >= 500 || isWafOrChallengeResponse(res.status, '')) {
+      if (
+        res.status === 429 ||
+        res.status >= 500 ||
+        isWafOrChallengeResponse(res.status, '', res.headers, true)
+      ) {
         options?.onTransientError?.();
       }
       return [];
     }
-    const data: unknown = await res.json();
+
+    let data: unknown;
+    if (typeof res.text === 'function') {
+      const rawText = await res.text();
+      if (isWafOrChallengeResponse(res.status, rawText, res.headers, true)) {
+        options?.onTransientError?.();
+        return [];
+      }
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        options?.onTransientError?.();
+        return [];
+      }
+    } else {
+      data = await res.json();
+    }
+
+    if (!data || typeof data !== 'object') {
+      options?.onTransientError?.();
+      return [];
+    }
+
     const rawItems =
-      data &&
-      typeof data === 'object' &&
       (data as { data?: { items?: unknown } }).data &&
       Array.isArray((data as { data: { items?: unknown } }).data.items)
         ? ((data as { data: { items: unknown[] } }).data.items as Array<{
@@ -628,6 +659,7 @@ export async function searchMetacriticCandidates(
         });
       }
     }
+    options?.onSuccess?.();
     return candidates;
   } catch (err: unknown) {
     if (classifyNetworkError(err).status === 'transient_error') {
@@ -787,12 +819,43 @@ export function isTitleCompatible(rawQueryTitle: string, rawCanonicalName: strin
       rawQueryTitle
     );
 
+  // Compute candidate extra non-edition substantive tokens BEFORE edition-suffix early return
+  // so unnumbered franchise editions ("Fallout Complete Edition", "Portal: Enhanced Edition",
+  // "Diablo: Deluxe Edition") never match distinct spinoffs/mods ("Fallout Shelter", "Portal: Revolution", "Diablo Immortal").
+  const cExtra = cTokens.filter(
+    (t) =>
+      !qTokens.includes(t) &&
+      !PURE_EDITION_WORDS.has(t) &&
+      !NUMERIC_SEQUELS.has(t) &&
+      t !== cParenYrStr &&
+      !isYearEditionToken(rawCanonicalName, t) &&
+      !(t === 'plus' && rawQueryTitle.includes('+'))
+  );
+
+  // Numbered sequel editions replacing an original release subtitle (e.g.
+  // "Trine 4: Definitive Edition" -> "Trine 4: The Nightmare Prince") are allowed ONLY when
+  // the query has an explicit installment numeral at the end of qBase, an explicit delimiter
+  // before the edition tag, and a multi-word conflict-free candidate subtitle.
+  const hasNumberedEditionSubtitleReplacement =
+    hasEditionSuffix &&
+    extractSequelIdentifier(rawQueryTitle) !== null &&
+    qBase.length >= 2 &&
+    NUMERIC_SEQUELS.has(qBase[qBase.length - 1]) &&
+    (rawQueryTitle.includes(':') || rawQueryTitle.includes(' - ')) &&
+    cExtra.length >= 2 &&
+    !cExtra.some(
+      (t) =>
+        ANCHOR_SUFFIX_CONFLICT_TOKENS.has(t) ||
+        NUMERIC_SEQUELS.has(t) ||
+        /^\d+$/.test(t)
+    );
+
   if (
     hasEditionSuffix &&
     qBase.length >= 1 &&
     qTokens.every((t) => cTokens.includes(t)) &&
     qBase.every((t, idx) => cTokens[idx] === t) &&
-    (qBase.length > 1 || qBase[0].length >= 5 || extractSequelIdentifier(rawQueryTitle) !== null)
+    (cExtra.length === 0 || hasNumberedEditionSubtitleReplacement)
   ) {
     return true;
   }
@@ -819,16 +882,8 @@ export function isTitleCompatible(rawQueryTitle: string, rawCanonicalName: strin
   }
 
   // Reject if candidate has extra non-edition substantive words anywhere not in query
-  // (e.g. 'Pool of Radiance: Ruins of Myth Drannor' for 'Pool of Radiance', 'RPG Maker WITH' for 'RPG Maker XP')
-  const cExtra = cTokens.filter(
-    (t) =>
-      !qTokens.includes(t) &&
-      !PURE_EDITION_WORDS.has(t) &&
-      !NUMERIC_SEQUELS.has(t) &&
-      t !== cParenYrStr &&
-      !isYearEditionToken(rawCanonicalName, t) &&
-      !(t === 'plus' && rawQueryTitle.includes('+'))
-  );
+  // (e.g. 'Pool of Radiance: Ruins of Myth Drannor' for 'Pool of Radiance', 'RPG Maker WITH' for 'RPG Maker XP',
+  //  'Portal: Revolution' for 'Portal: Enhanced Edition')
   const qBaseTokens = qBase.filter((t) => !NUMERIC_SEQUELS.has(t));
   const candidateHasSubtitle =
     canonicalName.includes(':') || canonicalName.includes(' - ') || /!\s+\S/.test(canonicalName);
@@ -838,7 +893,7 @@ export function isTitleCompatible(rawQueryTitle: string, rawCanonicalName: strin
       return false;
     }
   } else {
-    if (qBaseTokens.length >= 2 && cExtra.length >= 1) {
+    if ((qBaseTokens.length >= 2 || hasEditionSuffix) && cExtra.length >= 1) {
       return false;
     }
   }
@@ -1918,7 +1973,8 @@ export class MetacriticResolver {
       const evaluateSlug = async (
         slug: string,
         isAnchor = false,
-        redirectDepth = 0
+        redirectDepth = 0,
+        allowAnchorFallback = isAnchor
       ): Promise<SlugEvaluationResult> => {
         const composerBaseUrl = isViteBrowserDev()
           ? '/api/metacritic-backend'
@@ -1973,7 +2029,12 @@ export class MetacriticResolver {
                     return composerEval.result;
                   }
                   if (composerEval.redirectSlug && redirectDepth < 1) {
-                    return evaluateSlug(composerEval.redirectSlug, isAnchor, redirectDepth + 1);
+                    return evaluateSlug(
+                      composerEval.redirectSlug,
+                      isAnchor,
+                      redirectDepth + 1,
+                      allowAnchorFallback
+                    );
                   }
                 }
                 // Composer returned 200 JSON lacking product/score nodes -> fall back to HTML
@@ -2008,7 +2069,7 @@ export class MetacriticResolver {
         }
 
         if (definitiveNotFound) {
-          const anchorFallback = isAnchor ? buildAnchorFallbackCritic(slug) : null;
+          const anchorFallback = allowAnchorFallback ? buildAnchorFallbackCritic(slug) : null;
           return { critic: anchorFallback, user: null };
         }
 
@@ -2067,20 +2128,20 @@ export class MetacriticResolver {
             ) {
               sawTransientError = true;
             }
-            const anchorFallback = isAnchor ? buildAnchorFallbackCritic(slug) : null;
+            const anchorFallback = allowAnchorFallback ? buildAnchorFallbackCritic(slug) : null;
             return { critic: anchorFallback, user: null };
           }
 
           const html = await res.text();
           if (isWafOrChallengeResponse(res.status, html, res.headers)) {
             sawTransientError = true;
-            const anchorFallback = isAnchor ? buildAnchorFallbackCritic(slug) : null;
+            const anchorFallback = allowAnchorFallback ? buildAnchorFallbackCritic(slug) : null;
             return { critic: anchorFallback, user: null };
           }
 
           return evaluateHtmlBody(html, slug, isAnchor);
         } catch {
-          const anchorFallback = isAnchor ? buildAnchorFallbackCritic(slug) : null;
+          const anchorFallback = allowAnchorFallback ? buildAnchorFallbackCritic(slug) : null;
           return { critic: anchorFallback, user: null };
         }
       };
@@ -2088,7 +2149,10 @@ export class MetacriticResolver {
       const testedSlugs = new Set<string>();
       const baseCanonicalSlug = toCanonicalMetacriticSlug(title);
 
-      // 1. If an anchor slug is present: evaluate anchor slug (with parenthetical year suffix if title specifies one)
+      // 1. If an anchor slug is present: evaluate anchor slug (with parenthetical year suffix if title specifies one).
+      // When Step 1 synthesizes `${anchorSlug}-${queryYr}` (`primaryAnchorSlug !== anchorSlug`), do NOT
+      // short-circuit straight to `buildAnchorFallbackCritic` on 404/error — probe `anchorSlug` directly
+      // (with full `titleYear` validation) first and let Step 4 handle true anchor fallback.
       const queryYr = titleYear !== null ? String(titleYear) : undefined;
       const primaryAnchorSlug =
         queryYr && anchorSlug && !anchorSlug.endsWith(`-${queryYr}`) && anchorSlug !== queryYr
@@ -2096,12 +2160,28 @@ export class MetacriticResolver {
           : anchorSlug;
 
       if (primaryAnchorSlug) {
+        const isSynthesizedYearAnchor = primaryAnchorSlug !== anchorSlug;
         testedSlugs.add(primaryAnchorSlug);
-        const evalRes = await evaluateSlug(primaryAnchorSlug, true);
+        const evalRes = await evaluateSlug(primaryAnchorSlug, true, 0, !isSynthesizedYearAnchor);
         if (evalRes.critic) {
           const bundle: MetacriticBundle = { critic: evalRes.critic, user: evalRes.user || fallbackUser };
           this.setCacheBounded(cacheKey, bundle, title);
           return bundle;
+        }
+        recordDeferredOlder(evalRes);
+
+        if (isSynthesizedYearAnchor && anchorSlug && !testedSlugs.has(anchorSlug)) {
+          testedSlugs.add(anchorSlug);
+          const baseAnchorEval = await evaluateSlug(anchorSlug, true, 0, false);
+          if (baseAnchorEval.critic) {
+            const bundle: MetacriticBundle = {
+              critic: baseAnchorEval.critic,
+              user: baseAnchorEval.user || fallbackUser,
+            };
+            this.setCacheBounded(cacheKey, bundle, title);
+            return bundle;
+          }
+          recordDeferredOlder(baseAnchorEval);
         }
       }
 
@@ -2122,7 +2202,7 @@ export class MetacriticResolver {
         if (testedSlugs.has(slug)) continue;
         testedSlugs.add(slug);
         const isAnchor = Boolean(anchorSlug && isAnchorMatch(slug, anchorSlug));
-        const evalRes = await evaluateSlug(slug, isAnchor);
+        const evalRes = await evaluateSlug(slug, isAnchor, 0, false);
         if (evalRes.critic) {
           const bundle: MetacriticBundle = { critic: evalRes.critic, user: evalRes.user || fallbackUser };
           this.setCacheBounded(cacheKey, bundle, title);
@@ -2148,12 +2228,17 @@ export class MetacriticResolver {
 
       // 3. Query Metacritic backend finder search API to discover verified slugs (and check for modern remakes)
       let modernRemakeExistsInFinder = false;
+      let finderSucceeded = false;
       try {
         const markSearchTransient = () => {
           sawTransientError = true;
         };
+        const markSearchSuccess = () => {
+          finderSucceeded = true;
+        };
         let searchCandidates = await searchMetacriticCandidates(title, priority, {
           onTransientError: markSearchTransient,
+          onSuccess: markSearchSuccess,
         });
         let ranked = rankCandidateSlugs(title, searchCandidates, storefrontAnchor);
 
@@ -2161,6 +2246,7 @@ export class MetacriticResolver {
         if (ranked.length === 0 && midNumeralQuery && midNumeralQuery !== title) {
           const midSearchCandidates = await searchMetacriticCandidates(midNumeralQuery, priority, {
             onTransientError: markSearchTransient,
+            onSuccess: markSearchSuccess,
           });
           if (midSearchCandidates.length > 0) {
             searchCandidates = midSearchCandidates;
@@ -2176,6 +2262,7 @@ export class MetacriticResolver {
           const strippedQuery = strippedSlug.replace(/-/g, ' ');
           searchCandidates = await searchMetacriticCandidates(strippedQuery, priority, {
             onTransientError: markSearchTransient,
+            onSuccess: markSearchSuccess,
           });
           ranked = rankCandidateSlugs(strippedQuery, searchCandidates, storefrontAnchor);
         }
@@ -2205,7 +2292,7 @@ export class MetacriticResolver {
           const isAnchor = Boolean(anchorSlug && isAnchorMatch(s, anchorSlug));
           if (!testedSlugs.has(s)) {
             testedSlugs.add(s);
-            const evalRes = await evaluateSlug(s, isAnchor);
+            const evalRes = await evaluateSlug(s, isAnchor, 0, false);
             if (evalRes.critic) {
               const bundle: MetacriticBundle = {
                 critic: evalRes.critic,
@@ -2258,11 +2345,20 @@ export class MetacriticResolver {
             }
           }
         }
-      } catch {}
+      } catch {
+        sawTransientError = true;
+      }
 
-      // Two-phase promotion: if NO modern remake exists within ±2 years of paramYear, promote deferredOlderCritic!
+      // Two-phase promotion: ONLY promote deferredOlderCritic / deferredOlderUser when Finder returned
+      // a valid HTTP 200 non-WAF JSON response (`finderSucceeded`), no transient error occurred
+      // (`!sawTransientError`), AND no ±2-year modern remake exists in Finder (`!modernRemakeExistsInFinder`).
       const promotedOlderCritic = deferredOlderCritic as DeferredOlderCritic | null;
-      if (promotedOlderCritic && !modernRemakeExistsInFinder) {
+      if (
+        promotedOlderCritic &&
+        finderSucceeded &&
+        !sawTransientError &&
+        !modernRemakeExistsInFinder
+      ) {
         const bundle: MetacriticBundle = {
           critic: promotedOlderCritic.critic,
           user: promotedOlderCritic.user || fallbackUser,
@@ -2272,8 +2368,18 @@ export class MetacriticResolver {
       }
 
       const promotedOlderUser = deferredOlderUser as DeferredOlderUser | null;
-      if (!fallbackUser && promotedOlderUser && !modernRemakeExistsInFinder) {
+      if (
+        !fallbackUser &&
+        promotedOlderUser &&
+        finderSucceeded &&
+        !sawTransientError &&
+        !modernRemakeExistsInFinder
+      ) {
         fallbackUser = promotedOlderUser.user;
+      }
+
+      if ((promotedOlderCritic || promotedOlderUser) && !finderSucceeded) {
+        sawTransientError = true;
       }
 
       // 4. Final Storefront Anchor ground-truth fallback if Composer/HTML & backend search failed
