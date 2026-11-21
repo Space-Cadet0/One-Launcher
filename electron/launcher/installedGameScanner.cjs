@@ -714,11 +714,51 @@ function createScanContext(options, isDefaultProdScan, skipWin32BackgroundPrewar
     return cachedEpicLocal;
   };
 
+  /** @type {Set<string>} */
+  const knownEpicDlcAppNames = new Set();
+  let epicDlcMetadataSeeded = false;
+  const markEpicDlcAppName = (/** @type {unknown} */ rawId) => {
+    const clean = String(rawId || '')
+      .trim()
+      .replace(/^epic[-_]/i, '')
+      .toLowerCase();
+    if (clean) {
+      knownEpicDlcAppNames.add(clean);
+    }
+  };
+  const ensureEpicDlcMetadataSeeded = () => {
+    if (epicDlcMetadataSeeded) return;
+    epicDlcMetadataSeeded = true;
+    try {
+      const localMeta = getEpicLocalMetadataOnce();
+      if (Array.isArray(localMeta?.metaSummaries)) {
+        for (const s of localMeta.metaSummaries) {
+          if (s && s.isDlc === true) {
+            if (s.appName) markEpicDlcAppName(s.appName);
+            if (s.catalogItemId) markEpicDlcAppName(s.catalogItemId);
+          }
+        }
+      }
+    } catch {}
+  };
+  const isKnownEpicDlc = (/** @type {unknown} */ rawId) => {
+    const clean = String(rawId || '')
+      .trim()
+      .replace(/^epic[-_]/i, '')
+      .toLowerCase();
+    if (!clean) return false;
+    ensureEpicDlcMetadataSeeded();
+    return knownEpicDlcAppNames.has(clean);
+  };
+
   const addRecord = (/** @type {any} */ record) => {
     if (!record || !record.platformId || !record.platformGameId) return;
     const cleanRecordId = String(record.platformGameId)
       .replace(/^(gog|steam|epic|xbox)-/i, '')
       .toLowerCase();
+    if (record.platformId === 'epic' && isKnownEpicDlc(cleanRecordId)) {
+      return;
+    }
     if (
       !managedCompletedKeys.has(`${String(record.platformId).toLowerCase()}:${cleanRecordId}`) &&
       isPathOrGameUnderIncompleteDownload(
@@ -831,6 +871,9 @@ function createScanContext(options, isDefaultProdScan, skipWin32BackgroundPrewar
     managedCompletedKeys,
     getDetectedDarwinLayersOnce,
     getEpicLocalMetadataOnce,
+    knownEpicDlcAppNames,
+    markEpicDlcAppName,
+    isKnownEpicDlc,
     addRecord,
   };
 }
@@ -1444,6 +1487,59 @@ function buildEpicScanSources(/** @type {any} */ ctx, /** @type {string[]} */ di
   };
 }
 
+function collectEpicDlcAppNamesFromLegendaryJson(
+  /** @type {any} */ ctx,
+  /** @type {string} */ rawText
+) {
+  try {
+    const raw = JSON.parse(rawText);
+    const entries = Array.isArray(raw)
+      ? raw
+      : raw && typeof raw === 'object'
+        ? Object.entries(raw).map(([k, v]) =>
+            v && typeof v === 'object' ? { _mapKey: k, app_name: k, ...v } : null
+          )
+        : [];
+    for (const item of entries) {
+      if (!item || typeof item !== 'object') continue;
+      if (item.is_dlc === true || item.isDlc === true) {
+        const appName = String(item.app_name || item.appName || '').trim();
+        if (appName) ctx.markEpicDlcAppName(appName);
+      }
+    }
+  } catch {}
+}
+
+function isEpicItemManifestDlc(/** @type {any} */ item, /** @type {string} */ appName) {
+  if (!item || typeof item !== 'object') return false;
+  if (item.bIsApplication === false) return true;
+  const mainGameAppName = String(item.MainGameAppName || '').trim();
+  if (mainGameAppName && appName && mainGameAppName.toLowerCase() !== appName.toLowerCase()) {
+    return true;
+  }
+  const catalogItemId = String(item.CatalogItemId || '').trim();
+  const mainGameCatalogItemId = String(item.MainGameCatalogItemId || '').trim();
+  if (
+    mainGameCatalogItemId &&
+    catalogItemId &&
+    mainGameCatalogItemId.toLowerCase() !== catalogItemId.toLowerCase()
+  ) {
+    return true;
+  }
+  if (Array.isArray(item.AppCategories)) {
+    const hasAddonCategory = item.AppCategories.some((/** @type {unknown} */ c) =>
+      String(c || '')
+        .toLowerCase()
+        .split('/')
+        .some((seg) =>
+          ['addons', 'add-on', 'addon', 'dlc', 'digitalextras', 'consumable'].includes(seg.trim())
+        )
+    );
+    if (hasAddonCategory) return true;
+  }
+  return false;
+}
+
 function processEpicItemJson(
   /** @type {any} */ ctx,
   /** @type {string | null} */ manifestBottleRoot,
@@ -1457,6 +1553,18 @@ function processEpicItemJson(
 
     const appName = String(item.AppName || item.CatalogItemId || '');
     if (!appName) return;
+
+    if (isEpicItemManifestDlc(item, appName)) {
+      ctx.markEpicDlcAppName(appName);
+      if (item.CatalogItemId) ctx.markEpicDlcAppName(item.CatalogItemId);
+      return;
+    }
+    if (
+      ctx.isKnownEpicDlc(appName) ||
+      (item.CatalogItemId && ctx.isKnownEpicDlc(item.CatalogItemId))
+    ) {
+      return;
+    }
 
     const title = String(item.DisplayName || appName);
     const rawInstallLoc = item.InstallLocation || '';
@@ -1568,6 +1676,9 @@ function processEpicDatJson(
     for (const entry of list) {
       const appName = String(entry.AppName || entry.ArtifactId || '');
       if (!appName || appName.startsWith('UE_')) continue;
+      if (ctx.isKnownEpicDlc(appName) || (entry.ItemId && ctx.isKnownEpicDlc(entry.ItemId))) {
+        continue;
+      }
       const rawInstallLoc = entry.InstallLocation || '';
       const installPath = datBottleRoot
         ? fromWineWindowsPath(rawInstallLoc, datBottleRoot)
@@ -1638,6 +1749,13 @@ function processLegendaryFileJson(
     for (const item of entries) {
       if (!item || typeof item !== 'object') continue;
       const appName = String(item.app_name || item.appName || '');
+      if (item.is_dlc === true || item.isDlc === true) {
+        if (appName) ctx.markEpicDlcAppName(appName);
+        continue;
+      }
+      if (appName && ctx.isKnownEpicDlc(appName)) {
+        continue;
+      }
       const rawInstallPath = item.install_path || item.installPath;
       if (!appName || !rawInstallPath) continue;
 
@@ -2458,6 +2576,17 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
         managedLegendaryInstalledPath,
       } = buildEpicScanSources(ctx, discoveredBottleRoots);
 
+      /** @type {Array<{ legFile: string, isExternalLegFile: boolean, rawLeg: string }>} */
+      const loadedLegendaryFiles = [];
+      for (const legFile of legendaryFiles) {
+        if (!fs.existsSync(legFile)) continue;
+        const isExternalLegFile = path.resolve(legFile) !== managedLegendaryInstalledPath;
+        const rawLeg = readTextFileBoundedSync(legFile, MAX_SCANNER_INDEX_JSON_BYTES);
+        if (!rawLeg) continue;
+        collectEpicDlcAppNamesFromLegendaryJson(ctx, rawLeg);
+        loadedLegendaryFiles.push({ legFile, isExternalLegFile, rawLeg });
+      }
+
       for (const manifestDir of epicManifestDirs) {
         if (!fs.existsSync(manifestDir)) continue;
         /** @type {string[]} */
@@ -2489,11 +2618,7 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
         } catch {}
       }
 
-      for (const legFile of legendaryFiles) {
-        if (!fs.existsSync(legFile)) continue;
-        const isExternalLegFile = path.resolve(legFile) !== managedLegendaryInstalledPath;
-        const rawLeg = readTextFileBoundedSync(legFile, MAX_SCANNER_INDEX_JSON_BYTES);
-        if (!rawLeg) continue;
+      for (const { legFile, isExternalLegFile, rawLeg } of loadedLegendaryFiles) {
         try {
           processLegendaryFileJson(ctx, legFile, isExternalLegFile, rawLeg);
         } catch {}
@@ -2833,6 +2958,19 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
         managedLegendaryInstalledPath,
       } = buildEpicScanSources(ctx, discoveredBottleRoots);
 
+      /** @type {Array<{ legFile: string, isExternalLegFile: boolean, rawLeg: string }>} */
+      const loadedLegendaryFiles = [];
+      for (const legFile of legendaryFiles) {
+        const isExternalLegFile = path.resolve(legFile) !== managedLegendaryInstalledPath;
+        try {
+          const rawLeg = await readTextFileBoundedAsync(legFile, MAX_SCANNER_INDEX_JSON_BYTES);
+          if (rawLeg) {
+            collectEpicDlcAppNamesFromLegendaryJson(ctx, rawLeg);
+            loadedLegendaryFiles.push({ legFile, isExternalLegFile, rawLeg });
+          }
+        } catch {}
+      }
+
       let epicProcessed = 0;
       for (const manifestDir of epicManifestDirs) {
         /** @type {string[]} */
@@ -2869,13 +3007,9 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
         } catch {}
       }
 
-      for (const legFile of legendaryFiles) {
-        const isExternalLegFile = path.resolve(legFile) !== managedLegendaryInstalledPath;
+      for (const { legFile, isExternalLegFile, rawLeg } of loadedLegendaryFiles) {
         try {
-          const rawLeg = await readTextFileBoundedAsync(legFile, MAX_SCANNER_INDEX_JSON_BYTES);
-          if (rawLeg) {
-            processLegendaryFileJson(ctx, legFile, isExternalLegFile, rawLeg);
-          }
+          processLegendaryFileJson(ctx, legFile, isExternalLegFile, rawLeg);
         } catch {}
       }
     } catch (stageErr) {

@@ -2208,11 +2208,37 @@ export function updateRoutedMetadataSnapshot(
       next.releaseDate = refreshed.releaseDate.trim();
     }
 
+    const areStringArraysEqual = (a?: string[], b?: string[]): boolean => {
+      if (a === b) return true;
+      if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+      }
+      return true;
+    };
+
+    const sanitizedCandidate = sanitizeUserOverrideUrls(next);
+    const hasSnapshotChange =
+      sanitizedCandidate.title !== existing.title ||
+      sanitizedCandidate.sortTitle !== existing.sortTitle ||
+      sanitizedCandidate.shortDescription !== existing.shortDescription ||
+      sanitizedCandidate.detailedDescription !== existing.detailedDescription ||
+      sanitizedCandidate.headerImage !== existing.headerImage ||
+      sanitizedCandidate.releaseDate !== existing.releaseDate ||
+      !areStringArraysEqual(sanitizedCandidate.developers, existing.developers) ||
+      !areStringArraysEqual(sanitizedCandidate.publishers, existing.publishers) ||
+      !areStringArraysEqual(sanitizedCandidate.genres, existing.genres) ||
+      !areStringArraysEqual(sanitizedCandidate.tags, existing.tags);
+    if (!hasSnapshotChange) {
+      return;
+    }
+
     const prevTs = parseOverrideTimestamp(existing);
     const nowTs = Date.now();
-    next.updatedAt = new Date(nowTs > prevTs ? nowTs : prevTs + 1).toISOString();
-
-    const sanitizedNext = sanitizeUserOverrideUrls(next);
+    const sanitizedNext: UserGameOverride = {
+      ...sanitizedCandidate,
+      updatedAt: new Date(nowTs > prevTs ? nowTs : prevTs + 1).toISOString(),
+    };
 
     current[gameId] = sanitizedNext;
     if (existing.gameId) {
@@ -2244,6 +2270,55 @@ export function updateRoutedMetadataSnapshot(
   } catch (err) {
     console.warn('Failed to update routed metadata snapshot:', err);
   }
+}
+
+/**
+ * Returns true when an `enrichedMetadata` snapshot belongs to a Steam App ID that is
+ * incompatible with the game's active user override / non-Steam route (e.g., an explicitly
+ * unlinked non-Steam title, a GOG/Epic/IGDB metadata route, or a re-matched Steam App ID).
+ */
+export function isEnrichedMetadataIncompatibleWithOverride(
+  meta: CanonicalGame['enrichedMetadata'] | null | undefined,
+  override?: UserGameOverride | null,
+  game?: Pick<CanonicalGame, 'steamAppId' | 'isExplicitNonSteam'> | null
+): boolean {
+  if (!meta || typeof meta !== 'object') return false;
+  const existingEnrichedAppId = Number(meta.appId);
+  if (!Number.isFinite(existingEnrichedAppId) || existingEnrichedAppId <= 0) {
+    return false;
+  }
+  const route = override ? inferMetadataRouteFromOverride(override) : undefined;
+  let isExplicitNonSteam = Boolean(game?.isExplicitNonSteam);
+  let effectiveSteamAppId: number | undefined =
+    typeof game?.steamAppId === 'number' && game.steamAppId > 0 ? game.steamAppId : undefined;
+  if (override) {
+    if (override.steamAppId === null) {
+      effectiveSteamAppId = undefined;
+      isExplicitNonSteam = true;
+    } else if (typeof override.steamAppId === 'number') {
+      effectiveSteamAppId = override.steamAppId;
+      isExplicitNonSteam = false;
+    } else if (
+      route?.source === 'steam' &&
+      typeof route.steamAppId === 'number' &&
+      route.steamAppId > 0
+    ) {
+      effectiveSteamAppId = route.steamAppId;
+      isExplicitNonSteam = false;
+    }
+    if (override.isExplicitNonSteam !== undefined) {
+      isExplicitNonSteam = override.isExplicitNonSteam;
+    }
+  }
+  return Boolean(
+    isExplicitNonSteam ||
+      (typeof effectiveSteamAppId === 'number' &&
+        effectiveSteamAppId > 0 &&
+        existingEnrichedAppId !== effectiveSteamAppId) ||
+      route?.source === 'gog' ||
+      route?.source === 'epic' ||
+      route?.source === 'igdb'
+  );
 }
 
 /**

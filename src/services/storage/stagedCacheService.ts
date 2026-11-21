@@ -1122,9 +1122,14 @@ export function recordMediaSyncAttempt(
   gameId: string,
   outcome: MediaSyncOutcome,
   customTtlMs?: number,
-  failureCount?: number
+  failureCount?: number,
+  attemptedAt?: number
 ): void {
   if (!gameId) return;
+  const effectiveAttemptedAt =
+    typeof attemptedAt === 'number' && Number.isFinite(attemptedAt) && attemptedAt > 0
+      ? attemptedAt
+      : Date.now();
   const ttlMs = customTtlMs ?? getMediaSyncOutcomeTtlMs(outcome);
   const tier: MutabilityTier =
     outcome === 'unavailable_404'
@@ -1134,11 +1139,12 @@ export function recordMediaSyncAttempt(
       : 'mature';
   const payload: MediaSyncAttemptRecord = {
     outcome,
-    attemptedAt: Date.now(),
+    attemptedAt: effectiveAttemptedAt,
     ...(typeof failureCount === 'number' && failureCount > 0 ? { failureCount } : {}),
   };
   saveStagedCache<MediaSyncAttemptRecord>(`${MEDIA_ATTEMPT_KEY_PREFIX}${gameId}`, payload, tier, {
     customTtlMs: ttlMs,
+    cachedAt: effectiveAttemptedAt,
     dynamicResolved: true,
     failureReason:
       outcome === 'unavailable_404'

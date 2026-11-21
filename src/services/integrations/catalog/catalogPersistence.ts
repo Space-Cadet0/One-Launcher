@@ -21,6 +21,7 @@ import {
   getUserOverrideForGame,
   hydrateUserOverridesFromVault,
   inferReviewRouteFromOverride,
+  isEnrichedMetadataIncompatibleWithOverride,
   loadUserOverrides,
 } from '../../storage/userOverrideStorage';
 import { hydrateUserTagOverridesFromVault } from '../../storage/userTagStorage';
@@ -687,37 +688,59 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
           }
         }
         if (!hasAuthoritativeIdbCatalog) {
+          const loadedOverrides = loadUserOverrides();
           vaultCatalog = snap.games.map((g) => {
+            const ov = getUserOverrideForGame(g, loadedOverrides);
             const detailEntry = g?.id ? details[g.id] : undefined;
             const rawDetailMeta = detailEntry?.enrichedMetadata ?? undefined;
+            const compatibleDetailMeta =
+              rawDetailMeta && !isEnrichedMetadataIncompatibleWithOverride(rawDetailMeta, ov, g)
+                ? rawDetailMeta
+                : undefined;
             const detailMeta =
-              rawDetailMeta && detailEntry?.enrichedAt && !rawDetailMeta.enrichedAt
-                ? { ...rawDetailMeta, enrichedAt: detailEntry.enrichedAt }
-                : rawDetailMeta;
-            const mergedMeta = pickBestEnrichedMetadata(g.enrichedMetadata, detailMeta);
+              compatibleDetailMeta && detailEntry?.enrichedAt && !compatibleDetailMeta.enrichedAt
+                ? { ...compatibleDetailMeta, enrichedAt: detailEntry.enrichedAt }
+                : compatibleDetailMeta;
+            const compatibleGameMeta =
+              g.enrichedMetadata &&
+              !isEnrichedMetadataIncompatibleWithOverride(g.enrichedMetadata, ov, g)
+                ? g.enrichedMetadata
+                : undefined;
+            const mergedMeta = pickBestEnrichedMetadata(compatibleGameMeta, detailMeta);
             return mergedMeta !== g.enrichedMetadata
               ? { ...g, enrichedMetadata: mergedMeta }
               : g;
           });
           void vaultSet(IDB_KEY_MAIN_CATALOG, vaultCatalog);
         } else {
+          const loadedOverrides = loadUserOverrides();
           const snapGamesById = new Map<string, CanonicalGame>();
           for (const sg of snap.games) {
             if (sg?.id) snapGamesById.set(sg.id, sg);
           }
           let upgradedAnyFromVaultDetails = false;
           vaultCatalog = vaultCatalog!.map((g) => {
+            const ov = getUserOverrideForGame(g, loadedOverrides);
             const snapGame = g?.id ? snapGamesById.get(g.id) : undefined;
             const detailEntry = g?.id ? details[g.id] : undefined;
             const rawDetailMeta =
               detailEntry?.enrichedMetadata ?? snapGame?.enrichedMetadata ?? undefined;
+            const compatibleDetailMeta =
+              rawDetailMeta && !isEnrichedMetadataIncompatibleWithOverride(rawDetailMeta, ov, g)
+                ? rawDetailMeta
+                : undefined;
             const detailMeta =
-              rawDetailMeta && detailEntry?.enrichedAt && !rawDetailMeta.enrichedAt
-                ? { ...rawDetailMeta, enrichedAt: detailEntry.enrichedAt }
-                : rawDetailMeta;
+              compatibleDetailMeta && detailEntry?.enrichedAt && !compatibleDetailMeta.enrichedAt
+                ? { ...compatibleDetailMeta, enrichedAt: detailEntry.enrichedAt }
+                : compatibleDetailMeta;
+            const compatibleIdbMeta =
+              g.enrichedMetadata &&
+              !isEnrichedMetadataIncompatibleWithOverride(g.enrichedMetadata, ov, g)
+                ? g.enrichedMetadata
+                : undefined;
             const mergedMeta = detailMeta
-              ? pickBestEnrichedMetadata(g.enrichedMetadata, detailMeta)
-              : g.enrichedMetadata;
+              ? pickBestEnrichedMetadata(compatibleIdbMeta, detailMeta)
+              : compatibleIdbMeta;
             let nextGame =
               mergedMeta !== g.enrichedMetadata ? { ...g, enrichedMetadata: mergedMeta } : g;
             if (snapGame || (mergedMeta && !mergedMeta.__quotaSlimmed)) {

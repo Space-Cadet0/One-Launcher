@@ -419,7 +419,35 @@ export async function executeStoreMediaSyncJob(
             game.enrichedMetadata &&
               game.enrichedMetadata.metadataQuality !== 'skeleton_fallback'
           );
-          const attemptNow = Date.now();
+          const willApplyRefreshed = Boolean(
+            refreshed && !(isSkeletonRefreshed && (hasRichExisting || isBackgroundWarmup))
+          );
+          if (
+            willApplyRefreshed &&
+            refreshed &&
+            !isNonSteamRouted &&
+            targetAppId &&
+            ov &&
+            route?.mode === 'routed'
+          ) {
+            updateRoutedMetadataSnapshot(game.id, {
+              title: refreshed.name,
+              shortDescription: refreshed.shortDescription,
+              detailedDescription: refreshed.detailedDescription || refreshed.aboutTheGame,
+              headerImage: refreshed.headerImage,
+              developers: refreshed.developers,
+              publishers: refreshed.publishers,
+              genres: refreshed.genres,
+              tags: refreshed.tags,
+              releaseDate: refreshed.releaseDate,
+            });
+          }
+
+          const latestOvAfterFetch = getUserOverrideForGame(game) ?? ov;
+          const latestOvUpdatedAtMs = latestOvAfterFetch?.updatedAt
+            ? Date.parse(latestOvAfterFetch.updatedAt) || 0
+            : 0;
+          const attemptNow = Math.max(Date.now(), latestOvUpdatedAtMs);
           const outcome: MediaSyncOutcome =
             !refreshed || isSkeletonRefreshed
               ? onlineLifecycleManager.isOnline()
@@ -432,23 +460,10 @@ export async function executeStoreMediaSyncJob(
                   : 'complete';
 
           if (onlineLifecycleManager.isOnline()) {
-            recordMediaSyncAttempt(game.id, outcome);
+            recordMediaSyncAttempt(game.id, outcome, undefined, undefined, attemptNow);
           }
 
-          if (refreshed && !(isSkeletonRefreshed && (hasRichExisting || isBackgroundWarmup))) {
-            if (!isNonSteamRouted && targetAppId && ov && route?.mode === 'routed') {
-              updateRoutedMetadataSnapshot(game.id, {
-                title: refreshed.name,
-                shortDescription: refreshed.shortDescription,
-                detailedDescription: refreshed.detailedDescription || refreshed.aboutTheGame,
-                headerImage: refreshed.headerImage,
-                developers: refreshed.developers,
-                publishers: refreshed.publishers,
-                genres: refreshed.genres,
-                tags: refreshed.tags,
-                releaseDate: refreshed.releaseDate,
-              });
-            }
+          if (willApplyRefreshed && refreshed) {
 
             const preservePinnedSynopsis = Boolean(
               ov && (route?.customSynopsisEdited || route?.mode === 'custom')
@@ -498,6 +513,12 @@ export async function executeStoreMediaSyncJob(
               ? {
                   ...rawMergedEnriched,
                   enrichedAt: rawMergedEnriched.enrichedAt || attemptNow,
+                  ...(!isSkeletonRefreshed
+                    ? {
+                        fetchedAt:
+                          rawMergedEnriched.fetchedAt || refreshed.fetchedAt || attemptNow,
+                      }
+                    : {}),
                   lastMediaSyncAttemptAt: attemptNow,
                   mediaSyncOutcome: outcome,
                 }
@@ -561,6 +582,12 @@ export async function executeStoreMediaSyncJob(
                 window.electronAPI?.offlineVault?.saveGameDetail
               ) {
                 try {
+                  const isExplicitNonSteamSave = Boolean(
+                    updatedGame.isExplicitNonSteam ||
+                      isNonSteamRouted ||
+                      latestOvAfterFetch?.isExplicitNonSteam ||
+                      latestOvAfterFetch?.steamAppId === null
+                  );
                   void window.electronAPI.offlineVault
                     .saveGameDetail({
                       gameId: updatedGame.id,
@@ -572,6 +599,9 @@ export async function executeStoreMediaSyncJob(
                         refreshed.metadataQuality ||
                         (targetAppId && !isNonSteamRouted ? 'authoritative' : 'scraped'),
                       enrichedAt: mergedEnriched?.enrichedAt || attemptNow,
+                      ...(isExplicitNonSteamSave
+                        ? { isExplicitNonSteam: true, forceReplaceEnriched: true }
+                        : {}),
                     })
                     ?.catch?.(() => {});
                 } catch {}
