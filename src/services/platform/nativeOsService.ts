@@ -2,6 +2,7 @@ import { CanonicalGame, NativeOsPlatform } from '../../contracts/game';
 import { StorefrontId } from '../../contracts/platform';
 import { steamApi } from '../steam/steamApi';
 import { getEffectiveSteamAppId } from '../storage/userOverrideStorage';
+import { createCachedLocalStorageSlot } from '../storage/storageRuntimeUtils';
 import steamEnrichedCacheData from '../storage/steamEnrichedCache.json';
 import gogEnrichedCacheData from '../storage/gogEnrichedCache.json';
 
@@ -26,36 +27,27 @@ const gogCache = (gogEnrichedCacheData || {}) as Record<string, StaticOsCacheEnt
 
 const GOG_OS_SUPPORT_CACHE_KEY = 'gog_os_support_cache_v1';
 const MAX_GOG_OS_CACHE_ENTRIES = 500;
-let gogDynamicCacheRawSnapshot: string | null = null;
-let gogDynamicCacheMap: Map<string, { windows: boolean; mac: boolean }> = new Map();
 
-function syncGogDynamicCacheFromStorage(): Map<string, { windows: boolean; mac: boolean }> {
-  try {
-    if (typeof localStorage === 'undefined') {
-      return gogDynamicCacheMap;
-    }
-    const raw = localStorage.getItem(GOG_OS_SUPPORT_CACHE_KEY);
-    if (raw === gogDynamicCacheRawSnapshot) {
-      return gogDynamicCacheMap;
-    }
-    gogDynamicCacheRawSnapshot = raw;
-    gogDynamicCacheMap = new Map();
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object') {
-        for (const [k, v] of Object.entries(parsed)) {
-          const extracted = extractExplicitOsFlags(v as RawOsFlags);
-          if (k && extracted) {
-            gogDynamicCacheMap.set(k, extracted);
-          }
+const gogDynamicCacheSlot = createCachedLocalStorageSlot<
+  Map<string, { windows: boolean; mac: boolean }>
+>({
+  storageKey: GOG_OS_SUPPORT_CACHE_KEY,
+  createEmpty: () => new Map<string, { windows: boolean; mac: boolean }>(),
+  deserialize: (raw) => {
+    const map = new Map<string, { windows: boolean; mac: boolean }>();
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        const extracted = extractExplicitOsFlags(v as RawOsFlags);
+        if (k && extracted) {
+          map.set(k, extracted);
         }
       }
     }
-  } catch {
-    // Ignore storage read errors
-  }
-  return gogDynamicCacheMap;
-}
+    return { value: map };
+  },
+  serialize: (map) => JSON.stringify(Object.fromEntries(map.entries())),
+});
 
 function setBoundedGogCacheEntry(
   map: Map<string, { windows: boolean; mac: boolean }>,
@@ -74,10 +66,13 @@ function setBoundedGogCacheEntry(
   }
 }
 
-export function getCachedGogOsSupport(key?: string): RawOsFlags | undefined {
-  if (!key) return undefined;
-  const map = syncGogDynamicCacheFromStorage();
+function lookupGogOsFromMap(
+  map: Map<string, { windows: boolean; mac: boolean }>,
+  key: string
+): RawOsFlags | undefined {
+  if (!key || map.size === 0) return undefined;
   const trimmed = String(key).trim();
+  if (!trimmed) return undefined;
   const strippedId = trimmed.replace(/^gog-/, '');
   const norm = normalizeLookupTitle(trimmed);
   return (
@@ -86,6 +81,12 @@ export function getCachedGogOsSupport(key?: string): RawOsFlags | undefined {
     (norm ? map.get(norm) : undefined) ||
     map.get(trimmed.toLowerCase())
   );
+}
+
+export function getCachedGogOsSupport(key?: string): RawOsFlags | undefined {
+  if (!key) return undefined;
+  const map = gogDynamicCacheSlot.load();
+  return lookupGogOsFromMap(map, key);
 }
 
 export function saveCachedGogOsSupport(
@@ -99,23 +100,20 @@ export function saveCachedGogOsSupport(
     windows: flags.windows !== false,
     mac: flags.mac === true,
   };
-  const map = syncGogDynamicCacheFromStorage();
+  const currentMap = gogDynamicCacheSlot.load();
+  const nextMap = new Map(currentMap);
   const cleanId = gogId ? String(gogId).replace(/^gog-/, '').trim() : '';
   const normTitle = normalizeLookupTitle(title);
 
   if (cleanId) {
-    setBoundedGogCacheEntry(map, cleanId, normalizedFlags);
+    setBoundedGogCacheEntry(nextMap, cleanId, normalizedFlags);
   }
   if (normTitle) {
-    setBoundedGogCacheEntry(map, normTitle, normalizedFlags);
+    setBoundedGogCacheEntry(nextMap, normTitle, normalizedFlags);
   }
 
   try {
-    if (typeof localStorage !== 'undefined') {
-      const serialized = JSON.stringify(Object.fromEntries(map.entries()));
-      localStorage.setItem(GOG_OS_SUPPORT_CACHE_KEY, serialized);
-      gogDynamicCacheRawSnapshot = serialized;
-    }
+    gogDynamicCacheSlot.persist(nextMap);
   } catch {
     // Ignore storage quota errors
   }
@@ -169,8 +167,18 @@ function normalizeLookupTitle(title?: string): string {
 
 function extractExplicitOsFlags(raw?: RawOsFlags | null): { windows: boolean; mac: boolean } | null {
   if (!raw || typeof raw !== 'object') return null;
-  const winVal = typeof raw.windows === 'boolean' ? raw.windows : typeof raw.Windows === 'boolean' ? raw.Windows : undefined;
-  const macVal = typeof raw.mac === 'boolean' ? raw.mac : typeof raw.Mac === 'boolean' ? raw.Mac : undefined;
+  const winVal =
+    typeof raw.windows === 'boolean'
+      ? raw.windows
+      : typeof raw.Windows === 'boolean'
+        ? raw.Windows
+        : undefined;
+  const macVal =
+    typeof raw.mac === 'boolean'
+      ? raw.mac
+      : typeof raw.Mac === 'boolean'
+        ? raw.Mac
+        : undefined;
   if (typeof winVal !== 'boolean' && typeof macVal !== 'boolean') {
     return null;
   }
@@ -250,9 +258,16 @@ export function getStorefrontNativeOsFlags(
     };
   }
 
-  const normTitle = normalizeLookupTitle(game.title);
-
   if (platformId === 'steam') {
+    const directFlags = extractExplicitOsFlags(platObj?.platforms);
+    if (directFlags) {
+      return {
+        windows: directFlags.windows,
+        mac: directFlags.mac || isNativeMacApp,
+        isExplicit: true,
+      };
+    }
+
     const steamPlatIdNum = platObj?.platformGameId
       ? Number(String(platObj.platformGameId).replace(/^steam-/, ''))
       : NaN;
@@ -260,22 +275,46 @@ export function getStorefrontNativeOsFlags(
       (Number.isFinite(steamPlatIdNum) && steamPlatIdNum > 0 ? steamPlatIdNum : undefined) ||
       getEffectiveSteamAppId(game);
 
-    const steamCandidates: Array<RawOsFlags | undefined | null> = [
-      platObj?.platforms,
-      effectiveSteamId ? steamApi.getCachedMetadata(effectiveSteamId)?.platforms : undefined,
-      game.enrichedMetadata?.metadataQuality !== 'skeleton_fallback'
-        ? game.enrichedMetadata?.platforms
-        : undefined,
-      effectiveSteamId ? steamCache[String(effectiveSteamId)]?.platforms : undefined,
-      normTitle && !game.isExplicitNonSteam ? getSteamPlatformsByTitle(normTitle) : undefined,
-    ];
+    const liveCachedFlags = effectiveSteamId
+      ? extractExplicitOsFlags(steamApi.getCachedMetadata(effectiveSteamId)?.platforms)
+      : null;
+    if (liveCachedFlags) {
+      return {
+        windows: liveCachedFlags.windows,
+        mac: liveCachedFlags.mac || isNativeMacApp,
+        isExplicit: true,
+      };
+    }
 
-    for (const cand of steamCandidates) {
-      const extracted = extractExplicitOsFlags(cand);
-      if (extracted) {
+    if (game.enrichedMetadata?.metadataQuality !== 'skeleton_fallback') {
+      const enrichedFlags = extractExplicitOsFlags(game.enrichedMetadata?.platforms);
+      if (enrichedFlags) {
         return {
-          windows: extracted.windows,
-          mac: extracted.mac || isNativeMacApp,
+          windows: enrichedFlags.windows,
+          mac: enrichedFlags.mac || isNativeMacApp,
+          isExplicit: true,
+        };
+      }
+    }
+
+    if (effectiveSteamId) {
+      const staticSteamFlags = extractExplicitOsFlags(steamCache[String(effectiveSteamId)]?.platforms);
+      if (staticSteamFlags) {
+        return {
+          windows: staticSteamFlags.windows,
+          mac: staticSteamFlags.mac || isNativeMacApp,
+          isExplicit: true,
+        };
+      }
+    }
+
+    if (!game.isExplicitNonSteam) {
+      const normTitle = normalizeLookupTitle(game.title);
+      const byTitleFlags = normTitle ? extractExplicitOsFlags(getSteamPlatformsByTitle(normTitle)) : null;
+      if (byTitleFlags) {
+        return {
+          windows: byTitleFlags.windows,
+          mac: byTitleFlags.mac || isNativeMacApp,
           isExplicit: true,
         };
       }
@@ -289,29 +328,68 @@ export function getStorefrontNativeOsFlags(
   }
 
   if (platformId === 'gog') {
+    const directFlags = extractExplicitOsFlags(platObj?.platforms);
+    if (directFlags) {
+      return {
+        windows: directFlags.windows,
+        mac: directFlags.mac || isNativeMacApp,
+        isExplicit: true,
+      };
+    }
+
     const gogId = platObj?.platformGameId
       ? String(platObj.platformGameId).replace(/^gog-/, '')
       : undefined;
+    const normTitle = normalizeLookupTitle(game.title);
+
+    // Single cached GOG dynamic OS map read (0 localStorage syscalls in prod after initial hydration)
+    const gogDynamicMap = gogDynamicCacheSlot.load();
+    if (gogDynamicMap.size > 0) {
+      const dynRaw =
+        (gogId ? lookupGogOsFromMap(gogDynamicMap, gogId) : undefined) ||
+        (normTitle ? lookupGogOsFromMap(gogDynamicMap, normTitle) : undefined);
+      const dynFlags = extractExplicitOsFlags(dynRaw);
+      if (dynFlags) {
+        return {
+          windows: dynFlags.windows,
+          mac: dynFlags.mac || isNativeMacApp,
+          isExplicit: true,
+        };
+      }
+    }
+
+    if (gogId && gogCache[gogId]) {
+      const staticGogFlags = extractExplicitOsFlags(gogCache[gogId]?.platforms || gogCache[gogId]?.worksOn);
+      if (staticGogFlags) {
+        return {
+          windows: staticGogFlags.windows,
+          mac: staticGogFlags.mac || isNativeMacApp,
+          isExplicit: true,
+        };
+      }
+    }
+
+    if (normTitle) {
+      const byTitleFlags = extractExplicitOsFlags(getGogPlatformsByTitle(normTitle));
+      if (byTitleFlags) {
+        return {
+          windows: byTitleFlags.windows,
+          mac: byTitleFlags.mac || isNativeMacApp,
+          isExplicit: true,
+        };
+      }
+    }
+
     const isSingleGogGame =
       Array.isArray(game.platforms) &&
       game.platforms.length === 1 &&
       game.platforms[0]?.platformId === 'gog';
-
-    const gogCandidates: Array<RawOsFlags | undefined | null> = [
-      platObj?.platforms,
-      gogId ? getCachedGogOsSupport(gogId) : undefined,
-      normTitle ? getCachedGogOsSupport(normTitle) : undefined,
-      gogId && gogCache[gogId] ? gogCache[gogId]?.platforms || gogCache[gogId]?.worksOn : undefined,
-      normTitle ? getGogPlatformsByTitle(normTitle) : undefined,
-      isSingleGogGame ? game.worksOn : undefined,
-    ];
-
-    for (const cand of gogCandidates) {
-      const extracted = extractExplicitOsFlags(cand);
-      if (extracted) {
+    if (isSingleGogGame) {
+      const worksOnFlags = extractExplicitOsFlags(game.worksOn);
+      if (worksOnFlags) {
         return {
-          windows: extracted.windows,
-          mac: extracted.mac || isNativeMacApp,
+          windows: worksOnFlags.windows,
+          mac: worksOnFlags.mac || isNativeMacApp,
           isExplicit: true,
         };
       }
@@ -325,24 +403,27 @@ export function getStorefrontNativeOsFlags(
   }
 
   if (platformId === 'epic') {
+    const directFlags = extractExplicitOsFlags(platObj?.platforms);
+    if (directFlags) {
+      return {
+        windows: directFlags.windows,
+        mac: directFlags.mac || isNativeMacApp,
+        isExplicit: true,
+      };
+    }
+
     const isSingleEpicWithOwnMeta =
       Array.isArray(game.platforms) &&
       game.platforms.length === 1 &&
       game.platforms[0]?.platformId === 'epic' &&
       game.enrichedMetadata?.appId === 0 &&
       Boolean(game.enrichedMetadata?.platforms);
-
-    const epicCandidates: Array<RawOsFlags | undefined | null> = [
-      platObj?.platforms,
-      isSingleEpicWithOwnMeta ? game.enrichedMetadata?.platforms : undefined,
-    ];
-
-    for (const cand of epicCandidates) {
-      const extracted = extractExplicitOsFlags(cand);
-      if (extracted) {
+    if (isSingleEpicWithOwnMeta) {
+      const ownMetaFlags = extractExplicitOsFlags(game.enrichedMetadata?.platforms);
+      if (ownMetaFlags) {
         return {
-          windows: extracted.windows,
-          mac: extracted.mac || isNativeMacApp,
+          windows: ownMetaFlags.windows,
+          mac: ownMetaFlags.mac || isNativeMacApp,
           isExplicit: true,
         };
       }

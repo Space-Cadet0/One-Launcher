@@ -1,5 +1,5 @@
 import type { CanonicalGame } from '../../contracts/game';
-import type { StorefrontId } from '../../contracts/platform';
+import { STOREFRONT_REGISTRY, type StorefrontId } from '../../contracts/platform';
 import type {
   UserGameOverride,
   UserGameOverridesMap,
@@ -9,7 +9,30 @@ import type {
 } from '../../contracts/override';
 import type { UserMetadataOverride } from '../../types/electron';
 import { sanitizeAllowedStoreUri } from '../common/htmlSanitizer';
+import { getSafeLocalStorage } from '../common/runtimeEnv';
 import { stripHtmlToPlainSynopsis } from '../common/synopsisTextUtils';
+import { getAlphabeticalTitleSortKey } from '../common/titleSortUtils';
+
+function isTestEnv(): boolean {
+  try {
+    return (
+      typeof process !== 'undefined' &&
+      Boolean(process.env?.VITEST || process.env?.NODE_ENV === 'test')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isSafeObjectKey(key: unknown): key is string {
+  return (
+    typeof key === 'string' &&
+    key.length > 0 &&
+    key !== '__proto__' &&
+    key !== 'constructor' &&
+    key !== 'prototype'
+  );
+}
 
 export const STORAGE_KEY_USER_OVERRIDES = 'universal_game_library_user_overrides';
 export const STORAGE_KEY_HIDDEN_ENTRIES = 'universal_game_library_hidden_entries';
@@ -60,7 +83,7 @@ function reconstructHiddenGameSnapshot(record: CompactHiddenStorefrontRecord): C
   return {
     id,
     title,
-    sortTitle: title.replace(/^(The|A|An)\s+/i, '').trim(),
+    sortTitle: getAlphabeticalTitleSortKey(title),
     originalStoreTitle: title,
     steamAppId: inferredSteamId,
     headerImage: record.headerImage || '',
@@ -110,13 +133,9 @@ function toCompactHiddenRecord(entry: HiddenStorefrontEntry): CompactHiddenStore
   return compact;
 }
 
-const VALID_STOREFRONT_IDS: ReadonlySet<StorefrontId> = new Set([
-  'steam',
-  'gog',
-  'epic',
-  'xbox',
-  'custom',
-]);
+const VALID_STOREFRONT_IDS: ReadonlySet<StorefrontId> = new Set(
+  Object.keys(STOREFRONT_REGISTRY) as StorefrontId[]
+);
 
 const VALID_MATCHED_STORES: ReadonlySet<UserGameOverride['matchedStore']> = new Set([
   'steam',
@@ -214,7 +233,7 @@ function serializeUserOverridesEnvelopeV2(map: UserGameOverridesMap): string {
 
   // Pass 1: register canonical records whose storage key matches `ov.gameId`
   for (const [key, ov] of Object.entries(map)) {
-    if (!ov || typeof ov !== 'object' || Array.isArray(ov)) continue;
+    if (!isSafeObjectKey(key) || !ov || typeof ov !== 'object' || Array.isArray(ov)) continue;
     if (ov.gameId && key === ov.gameId) {
       records[key] = ov;
       objectToCanonicalKey.set(ov, key);
@@ -223,8 +242,8 @@ function serializeUserOverridesEnvelopeV2(map: UserGameOverridesMap): string {
 
   // Pass 2: collapse alias keys referencing an already-registered record into string pointers
   for (const [key, ov] of Object.entries(map)) {
-    if (!ov || typeof ov !== 'object' || Array.isArray(ov)) continue;
-    if (Object.prototype.hasOwnProperty.call(records, key)) continue;
+    if (!isSafeObjectKey(key) || !ov || typeof ov !== 'object' || Array.isArray(ov)) continue;
+    if (Object.hasOwn(records, key)) continue;
 
     const existingObjKey = objectToCanonicalKey.get(ov);
     if (existingObjKey) {
@@ -233,8 +252,8 @@ function serializeUserOverridesEnvelopeV2(map: UserGameOverridesMap): string {
     }
 
     if (
-      ov.gameId &&
-      Object.prototype.hasOwnProperty.call(records, ov.gameId) &&
+      isSafeObjectKey(ov.gameId) &&
+      Object.hasOwn(records, ov.gameId) &&
       getCanonicalJson(ov.gameId) === JSON.stringify(ov)
     ) {
       aliases[key] = ov.gameId;
@@ -294,6 +313,7 @@ function deserializeUserOverridesPayload(parsed: unknown): UserGameOverridesMap 
     const projected: UserGameOverridesMap = {};
 
     for (const [k, rec] of Object.entries(records)) {
+      if (!isSafeObjectKey(k)) continue;
       if (rec && typeof rec === 'object' && !Array.isArray(rec)) {
         projected[k] = rec as UserGameOverride;
       }
@@ -301,7 +321,7 @@ function deserializeUserOverridesPayload(parsed: unknown): UserGameOverridesMap 
 
     // Absorb any top-level override records spread onto a v2 envelope by external/legacy writers
     for (const [k, val] of Object.entries(rawObj)) {
-      if (k === '__v' || k === 'records' || k === 'aliases') continue;
+      if (k === '__v' || k === 'records' || k === 'aliases' || !isSafeObjectKey(k)) continue;
       if (val && typeof val === 'object' && !Array.isArray(val)) {
         projected[k] = val as UserGameOverride;
       }
@@ -309,9 +329,10 @@ function deserializeUserOverridesPayload(parsed: unknown): UserGameOverridesMap 
 
     for (const [aliasKey, targetKey] of Object.entries(aliases)) {
       if (
-        typeof targetKey === 'string' &&
-        Object.prototype.hasOwnProperty.call(projected, targetKey) &&
-        !Object.prototype.hasOwnProperty.call(projected, aliasKey)
+        isSafeObjectKey(aliasKey) &&
+        isSafeObjectKey(targetKey) &&
+        Object.hasOwn(projected, targetKey) &&
+        !Object.hasOwn(projected, aliasKey)
       ) {
         projected[aliasKey] = projected[targetKey];
       }
@@ -323,6 +344,7 @@ function deserializeUserOverridesPayload(parsed: unknown): UserGameOverridesMap 
   // Legacy flat v1 map
   const legacyMap: UserGameOverridesMap = {};
   for (const [k, val] of Object.entries(rawObj)) {
+    if (!isSafeObjectKey(k)) continue;
     if (val && typeof val === 'object' && !Array.isArray(val)) {
       legacyMap[k] = val as UserGameOverride;
     }
@@ -340,7 +362,7 @@ function normalizeVaultUserOverride(
       : !key.includes(':')
       ? key.trim()
       : '';
-  if (!canonicalId) return null;
+  if (!isSafeObjectKey(canonicalId)) return null;
 
   const {
     platformId: rawPlatformId,
@@ -470,29 +492,8 @@ export function inferReviewRouteFromOverride(override?: UserGameOverride | null)
   return undefined;
 }
 
-function isTestEnv(): boolean {
-  try {
-    return (
-      typeof process !== 'undefined' &&
-      Boolean(process.env?.VITEST || process.env?.NODE_ENV === 'test')
-    );
-  } catch {
-    return false;
-  }
-}
-
 function getStorage(): Storage | null {
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      return window.localStorage;
-    }
-    if (typeof localStorage !== 'undefined' && localStorage) {
-      return localStorage;
-    }
-  } catch {
-    // Ignore storage access errors
-  }
-  return null;
+  return getSafeLocalStorage();
 }
 
 let userOverridesRevision = 0;
@@ -523,13 +524,7 @@ let cachedHiddenStorageRef: Storage | null = null;
 let inMemoryHiddenHydrated = false;
 
 const EMPTY_STRING_SET: ReadonlySet<string> = new Set<string>();
-const BARE_STOREFRONT_KEYS: ReadonlySet<string> = new Set([
-  'steam',
-  'gog',
-  'epic',
-  'xbox',
-  'custom',
-]);
+const BARE_STOREFRONT_KEYS: ReadonlySet<string> = new Set(Object.keys(STOREFRONT_REGISTRY));
 let cachedRestoredRaw: string | null = null;
 let cachedRestoredSet: ReadonlySet<string> = EMPTY_STRING_SET;
 let cachedRestoredStorageRef: Storage | null = null;
@@ -540,12 +535,12 @@ let cachedConfirmedSet: ReadonlySet<string> = EMPTY_STRING_SET;
 let cachedConfirmedStorageRef: Storage | null = null;
 let inMemoryConfirmedHydrated = false;
 
-let overrideStorageListenerAttached = false;
+let attachedOverrideStorageWindowRef: Window | null = null;
 
 function ensureOverrideStorageListener(): void {
-  if (overrideStorageListenerAttached) return;
   if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
-  overrideStorageListenerAttached = true;
+  if (attachedOverrideStorageWindowRef === window) return;
+  attachedOverrideStorageWindowRef = window;
   window.addEventListener('storage', (e: StorageEvent) => {
     let invalidated = false;
     if (e.key === null || e.key === STORAGE_KEY_USER_OVERRIDES) {
@@ -656,7 +651,7 @@ export function loadHiddenStorefrontEntries(): Record<string, HiddenStorefrontEn
     let hadLegacyRawSnapshot = false;
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-        if (!v || typeof v !== 'object') continue;
+        if (!isSafeObjectKey(k) || !v || typeof v !== 'object') continue;
         const rec = v as CompactHiddenStorefrontRecord;
         if (rec.rawGameSnapshot && typeof rec.rawGameSnapshot === 'object') {
           hadLegacyRawSnapshot = true;
@@ -899,6 +894,7 @@ export function confirmNonGameStorefrontEntry(
   gameId?: string
 ): void {
   const keys = loadConfirmedNonGameKeys();
+  const prevSize = keys.size;
   if (platformId && platformGameId) {
     keys.add(`${platformId}:${platformGameId}`);
     keys.add(`${platformId}-${platformGameId}`);
@@ -907,7 +903,9 @@ export function confirmNonGameStorefrontEntry(
     keys.add(gameId);
     keys.add(`game:${gameId}`);
   }
-  persistConfirmedNonGameKeys(keys);
+  if (keys.size !== prevSize) {
+    persistConfirmedNonGameKeys(keys);
+  }
   if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
     try {
       window.dispatchEvent(
@@ -924,6 +922,7 @@ export function confirmMultipleNonGameStorefrontEntries(
 ): void {
   if (!Array.isArray(entries) || entries.length === 0) return;
   const keys = loadConfirmedNonGameKeys();
+  const prevSize = keys.size;
   for (const entry of entries) {
     if (!entry) continue;
     const { platformId, platformGameId, gameId } = entry;
@@ -936,7 +935,9 @@ export function confirmMultipleNonGameStorefrontEntries(
       keys.add(`game:${gameId}`);
     }
   }
-  persistConfirmedNonGameKeys(keys);
+  if (keys.size !== prevSize) {
+    persistConfirmedNonGameKeys(keys);
+  }
   if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
     try {
       window.dispatchEvent(
@@ -954,6 +955,7 @@ export function unconfirmNonGameStorefrontEntry(
   gameId?: string
 ): void {
   const keys = loadConfirmedNonGameKeys();
+  const prevSize = keys.size;
   if (platformId && platformGameId) {
     keys.delete(`${platformId}:${platformGameId}`);
     keys.delete(`${platformId}-${platformGameId}`);
@@ -962,7 +964,9 @@ export function unconfirmNonGameStorefrontEntry(
     keys.delete(gameId);
     keys.delete(`game:${gameId}`);
   }
-  persistConfirmedNonGameKeys(keys);
+  if (keys.size !== prevSize) {
+    persistConfirmedNonGameKeys(keys);
+  }
   if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
     try {
       window.dispatchEvent(
@@ -987,6 +991,7 @@ export function hideStorefrontEntry(
   try {
     const current = { ...loadHiddenStorefrontEntries() };
     const restoredKeys = loadRestoredNonGameKeys();
+    const initialRestoredSize = restoredKeys.size;
     const now = new Date().toISOString();
 
     if (targetPlatformId) {
@@ -1004,7 +1009,7 @@ export function hideStorefrontEntry(
           ...game,
           id: singleId,
           title: rawTitle,
-          sortTitle: rawTitle.replace(/^(The|A|An)\s+/i, '').trim(),
+          sortTitle: getAlphabeticalTitleSortKey(rawTitle),
           originalStoreTitle: rawTitle,
           steamAppId:
             plat.platformId === 'steam' && !isNaN(Number(platGameId))
@@ -1042,7 +1047,7 @@ export function hideStorefrontEntry(
           ...game,
           id: singleId,
           title: rawTitle,
-          sortTitle: rawTitle.replace(/^(The|A|An)\s+/i, '').trim(),
+          sortTitle: getAlphabeticalTitleSortKey(rawTitle),
           originalStoreTitle: rawTitle,
           steamAppId:
             plat.platformId === 'steam' && !isNaN(Number(platGameId))
@@ -1088,7 +1093,9 @@ export function hideStorefrontEntry(
     }
 
     persistHiddenEntriesMap(current);
-    persistRestoredNonGameKeys(restoredKeys);
+    if (restoredKeys.size !== initialRestoredSize) {
+      persistRestoredNonGameKeys(restoredKeys);
+    }
 
     if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
       try {
@@ -1119,6 +1126,8 @@ export function unhideStorefrontEntry(
     const current = { ...loadHiddenStorefrontEntries() };
     const restoredKeys = loadRestoredNonGameKeys();
     const confirmedKeys = loadConfirmedNonGameKeys();
+    const initialRestoredSize = restoredKeys.size;
+    const initialConfirmedSize = confirmedKeys.size;
     let restoredSnapshot: CanonicalGame | undefined;
     let deleted = false;
 
@@ -1152,8 +1161,12 @@ export function unhideStorefrontEntry(
       restoredKeys.add(`${cleanKeyOrGameId}:${platformId}`);
       restoredKeys.add(`${cleanKeyOrGameId}-${platformId}`);
     }
-    persistRestoredNonGameKeys(restoredKeys);
-    persistConfirmedNonGameKeys(confirmedKeys);
+    if (restoredKeys.size !== initialRestoredSize) {
+      persistRestoredNonGameKeys(restoredKeys);
+    }
+    if (confirmedKeys.size !== initialConfirmedSize) {
+      persistConfirmedNonGameKeys(confirmedKeys);
+    }
 
     for (const [key, entry] of Object.entries(current)) {
       if (!entry) continue;
@@ -1209,6 +1222,49 @@ export function unhideStorefrontEntry(
   }
 }
 
+interface HiddenEntriesLookupIndex {
+  isEmpty: boolean;
+  byGameId: Map<string, Set<StorefrontId>>;
+}
+
+const hiddenEntriesLookupCache = new WeakMap<
+  Record<string, HiddenStorefrontEntry>,
+  HiddenEntriesLookupIndex
+>();
+
+function getHiddenEntriesLookupIndex(
+  map: Record<string, HiddenStorefrontEntry>
+): HiddenEntriesLookupIndex {
+  const cached = hiddenEntriesLookupCache.get(map);
+  if (cached) return cached;
+
+  const byGameId = new Map<string, Set<StorefrontId>>();
+  let hasAny = false;
+  const recordGameId = (gid: string | undefined, platId: StorefrontId) => {
+    if (!gid) return;
+    let set = byGameId.get(gid);
+    if (!set) {
+      set = new Set<StorefrontId>();
+      byGameId.set(gid, set);
+    }
+    set.add(platId);
+  };
+
+  for (const key of Object.keys(map)) {
+    const entry = map[key];
+    if (!entry) continue;
+    hasAny = true;
+    recordGameId(entry.gameId, entry.platformId);
+    if (entry.rawGameSnapshot?.id && entry.rawGameSnapshot.id !== entry.gameId) {
+      recordGameId(entry.rawGameSnapshot.id, entry.platformId);
+    }
+  }
+
+  const built: HiddenEntriesLookupIndex = { isEmpty: !hasAny, byGameId };
+  hiddenEntriesLookupCache.set(map, built);
+  return built;
+}
+
 /**
  * Checks whether a specific storefront entitlement or game ID is currently hidden by the user.
  */
@@ -1218,21 +1274,22 @@ export function isStorefrontEntryHidden(
   gameId?: string
 ): boolean {
   const map = loadHiddenStorefrontEntries();
-  if (!map || Object.keys(map).length === 0) return false;
-  if (platformId && platformGameId && map[`${platformId}:${platformGameId}`]) {
+  if (!map) return false;
+  const idx = getHiddenEntriesLookupIndex(map);
+  if (idx.isEmpty) return false;
+  if (platformId && platformGameId && Object.hasOwn(map, `${platformId}:${platformGameId}`)) {
     return true;
   }
-  if (
-    gameId &&
-    (map[`game:${gameId}`] ||
-      Object.values(map).some(
-        (e) =>
-          e &&
-          (e.gameId === gameId || e.rawGameSnapshot?.id === gameId) &&
-          (!platformId || e.platformId === platformId)
-      ))
-  ) {
-    return true;
+  if (gameId) {
+    if (Object.hasOwn(map, `game:${gameId}`)) {
+      return true;
+    }
+    const matchedPlatforms = idx.byGameId.get(gameId);
+    if (matchedPlatforms && matchedPlatforms.size > 0) {
+      if (!platformId || matchedPlatforms.has(platformId)) {
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -1292,14 +1349,15 @@ function buildNativeBaselineFromGame(game: CanonicalGame): NativeGameBaselineSna
 function persistUserOverridesMapToStorage(current: UserGameOverridesMap): void {
   const storage = getStorage();
   ensureOverrideStorageListener();
-  cachedOverridesMap = current;
-  inMemoryOverridesHydrated = true;
   if (storage) {
     const serialized = serializeUserOverridesEnvelopeV2(current);
+    // Persist to storage BEFORE mutating in-memory cache so QuotaExceededError never corrupts state
     storage.setItem(STORAGE_KEY_USER_OVERRIDES, serialized);
     cachedStorageRef = storage;
     cachedOverridesRaw = isTestEnv() ? serialized : null;
   }
+  cachedOverridesMap = current;
+  inMemoryOverridesHydrated = true;
   bumpUserOverridesRevision();
 }
 
@@ -1323,10 +1381,19 @@ interface ExtendedRemoveUserOverridePayload {
 export function saveUserOverride(override: UserGameOverride, oldGame?: CanonicalGame): void {
   if (!override || !override.gameId) return;
   try {
-    if (!override.isHidden) {
+    const platIdForUnhide = override.platformId as StorefrontId | undefined;
+    if (
+      !override.isHidden &&
+      (isStorefrontEntryHidden(platIdForUnhide, override.platformGameId, override.gameId) ||
+        isNonGameStorefrontEntryConfirmed(
+          platIdForUnhide,
+          override.platformGameId,
+          override.gameId
+        ))
+    ) {
       unhideStorefrontEntry(
         override.gameId,
-        override.platformId as StorefrontId | undefined,
+        platIdForUnhide,
         override.platformGameId,
         { silentEvent: true }
       );
@@ -1364,8 +1431,9 @@ export function saveUserOverride(override: UserGameOverride, oldGame?: Canonical
       pushPrior(current[`${effPlatformId.toLowerCase()}:${effPlatformGameId.toLowerCase()}`]);
       pushPrior(current[`${effPlatformId.toLowerCase()}-${effPlatformGameId.toLowerCase()}`]);
     }
-    priorCandidates.sort((a, b) => parseOverrideTimestamp(b) - parseOverrideTimestamp(a));
-    const priorExisting = priorCandidates[0];
+    const priorExisting = priorCandidates.toSorted(
+      (a, b) => parseOverrideTimestamp(b) - parseOverrideTimestamp(a)
+    )[0];
 
     const updatedOverride: UserGameOverride = sanitizeUserOverrideUrls({
       ...override,
@@ -1563,7 +1631,9 @@ export function removeUserOverride(
       }
     }
 
-    const parsedComposite = gameId.match(/^(steam|gog|epic|xbox|custom)[:\-_](.+)$/i);
+    const parsedComposite = gameId.match(
+      /^(steam|gog|epic|amazon|xbox|ubisoft|ea|bnet|itch|rockstar|humble|custom)[:\-_](.+)$/i
+    );
     if (parsedComposite) {
       addEntitlementPair(parsedComposite[1], parsedComposite[2]);
     }
@@ -1656,9 +1726,11 @@ export function removeUserOverride(
       }
     }
 
-    matchedOverrides.sort((a, b) => parseOverrideTimestamp(b) - parseOverrideTimestamp(a));
+    const sortedMatchedOverrides = matchedOverrides.toSorted(
+      (a, b) => parseOverrideTimestamp(b) - parseOverrideTimestamp(a)
+    );
     const removedOverride: UserGameOverride | undefined =
-      matchedOverrides[0] ??
+      sortedMatchedOverrides[0] ??
       (ctxOverride && ctxOverride.gameId ? (ctxOverride as UserGameOverride) : undefined);
 
     const deletedKeys: string[] = [];
@@ -2091,7 +2163,7 @@ export function updateRoutedMetadataSnapshot(
 
     if (!route.customTitleEdited && refreshed.title && refreshed.title.trim()) {
       next.title = refreshed.title.trim();
-      next.sortTitle = refreshed.title.replace(/^(The|A|An)\s+/i, '').trim();
+      next.sortTitle = getAlphabeticalTitleSortKey(refreshed.title);
     }
     if (!route.customSynopsisEdited && refreshed.shortDescription && refreshed.shortDescription.trim()) {
       next.shortDescription = stripHtmlToPlainSynopsis(refreshed.shortDescription, 360);
@@ -2126,6 +2198,10 @@ export function updateRoutedMetadataSnapshot(
     if (refreshed.releaseDate && refreshed.releaseDate.trim() && refreshed.releaseDate !== 'TBA') {
       next.releaseDate = refreshed.releaseDate.trim();
     }
+
+    const prevTs = parseOverrideTimestamp(existing);
+    const nowTs = Date.now();
+    next.updatedAt = new Date(nowTs > prevTs ? nowTs : prevTs + 1).toISOString();
 
     const sanitizedNext = sanitizeUserOverrideUrls(next);
 
@@ -2196,7 +2272,7 @@ export function applyUserOverrideToGame(
   if (override.sortTitle !== undefined && override.sortTitle.trim() !== '') {
     updated.sortTitle = override.sortTitle.trim();
   } else if (override.title) {
-    updated.sortTitle = override.title.replace(/^(The|A|An)\s+/i, '').trim();
+    updated.sortTitle = getAlphabeticalTitleSortKey(override.title);
   }
 
   // Steam App ID: null explicitly means unlinked from Steam
@@ -2434,19 +2510,7 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
   inFlightVaultOverrideSync = (async (): Promise<boolean> => {
     try {
       const vaultRaw = await window.electronAPI!.offlineVault!.getUserOverrides();
-      const storage = getStorage();
-      let diskNeedsV2Migration = false;
-      if (storage) {
-        try {
-          const rawBeforeLoad = storage.getItem(STORAGE_KEY_USER_OVERRIDES);
-          if (rawBeforeLoad) {
-            const parsedBeforeLoad: unknown = JSON.parse(rawBeforeLoad);
-            diskNeedsV2Migration = !isDeduplicatedUserOverridesEnvelopeV2(parsedBeforeLoad);
-          }
-        } catch {
-          // Ignore parse errors; loadUserOverrides will handle fallback
-        }
-      }
+      // Single parse: loadUserOverrides() also upgrades any legacy flat v1 payload to deduplicated v2 on disk.
       const localMap: UserGameOverridesMap = { ...loadUserOverrides() };
 
       const canonicalLocal: Record<string, UserGameOverride> = {};
@@ -2458,8 +2522,10 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
             : !key.includes(':')
             ? key.trim()
             : '';
-        if (!canonicalId) continue;
-        const prev = canonicalLocal[canonicalId];
+        if (!isSafeObjectKey(canonicalId)) continue;
+        const prev = Object.hasOwn(canonicalLocal, canonicalId)
+          ? canonicalLocal[canonicalId]
+          : undefined;
         const prevTs = prev ? Date.parse(prev.updatedAt || '') || 0 : -1;
         const curTs = Date.parse(ov.updatedAt || '') || 0;
         if (!prev || curTs >= prevTs) {
@@ -2470,11 +2536,15 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
       const canonicalVault: Record<string, UserGameOverride> = {};
       if (vaultRaw && typeof vaultRaw === 'object' && !Array.isArray(vaultRaw)) {
         for (const [key, rawOv] of Object.entries(vaultRaw)) {
-          if (!rawOv || typeof rawOv !== 'object' || Array.isArray(rawOv)) continue;
+          if (!isSafeObjectKey(key) || !rawOv || typeof rawOv !== 'object' || Array.isArray(rawOv)) {
+            continue;
+          }
           const normalizedOv = normalizeVaultUserOverride(key, rawOv);
           if (!normalizedOv) continue;
           const canonicalId = normalizedOv.gameId;
-          const prev = canonicalVault[canonicalId];
+          const prev = Object.hasOwn(canonicalVault, canonicalId)
+            ? canonicalVault[canonicalId]
+            : undefined;
           const prevTs = prev ? Date.parse(prev.updatedAt || '') || 0 : -1;
           const curTs = Date.parse(normalizedOv.updatedAt || '') || 0;
           if (!prev || curTs >= prevTs) {
@@ -2529,7 +2599,11 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
             ? `${vaultOv.platformId.toLowerCase()}:${String(vaultOv.platformGameId).toLowerCase()}`
             : null;
         const localEnt = entKey ? newestLocalByEntitlement.get(entKey) : undefined;
-        const localOv = canonicalLocal[gameId] || (localEnt ? canonicalLocal[localEnt.gameId] : undefined);
+        const localOv =
+          (Object.hasOwn(canonicalLocal, gameId) ? canonicalLocal[gameId] : undefined) ||
+          (localEnt && Object.hasOwn(canonicalLocal, localEnt.gameId)
+            ? canonicalLocal[localEnt.gameId]
+            : undefined);
         const vaultTs = parseOverrideTimestamp(vaultOv);
         const localTs = localOv ? parseOverrideTimestamp(localOv) : -1;
         if (!localOv || vaultTs > localTs) {
@@ -2551,7 +2625,11 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
             ? `${localOv.platformId.toLowerCase()}:${String(localOv.platformGameId).toLowerCase()}`
             : null;
         const vaultEnt = entKey ? newestVaultByEntitlement.get(entKey) : undefined;
-        const vaultOv = canonicalVault[gameId] || (vaultEnt ? canonicalVault[vaultEnt.gameId] : undefined);
+        const vaultOv =
+          (Object.hasOwn(canonicalVault, gameId) ? canonicalVault[gameId] : undefined) ||
+          (vaultEnt && Object.hasOwn(canonicalVault, vaultEnt.gameId)
+            ? canonicalVault[vaultEnt.gameId]
+            : undefined);
         const localTs = parseOverrideTimestamp(localOv);
         const vaultTs = vaultOv ? parseOverrideTimestamp(vaultOv) : -1;
         if (!vaultOv || localTs > vaultTs) {
@@ -2561,21 +2639,21 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
 
       if (hydratedFromVault.length > 0) {
         persistUserOverridesMapToStorage(localMap);
+        // Coalesce vault hydration into a SINGLE CustomEvent instead of N separate events in a loop
         if (typeof window.dispatchEvent === 'function') {
-          for (const ov of hydratedFromVault) {
-            try {
-              window.dispatchEvent(
-                new CustomEvent('antigravity:user-override-updated', {
-                  detail: { override: ov, hydratedFromVault: true },
-                })
-              );
-            } catch {}
-          }
+          try {
+            window.dispatchEvent(
+              new CustomEvent('antigravity:user-override-updated', {
+                detail: {
+                  hydratedFromVault: true,
+                  overrides: hydratedFromVault,
+                  ...(hydratedFromVault.length === 1 ? { override: hydratedFromVault[0] } : {}),
+                },
+              })
+            );
+          } catch {}
         }
-      } else if (
-        (diskNeedsV2Migration || prunedLocalEntitlements) &&
-        Object.keys(localMap).length > 0
-      ) {
+      } else if (prunedLocalEntitlements && Object.keys(localMap).length > 0) {
         persistUserOverridesMapToStorage(localMap);
       }
 
@@ -2616,6 +2694,7 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
 }
 
 if (
+  !isTestEnv() &&
   typeof window !== 'undefined' &&
   typeof window.electronAPI?.offlineVault?.getUserOverrides === 'function'
 ) {

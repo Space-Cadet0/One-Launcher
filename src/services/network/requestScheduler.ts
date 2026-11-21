@@ -133,6 +133,94 @@ function normalizeHeadersForInspection(
   return normalized;
 }
 
+function readNormalizedHeader(
+  headers: Headers | Record<string, unknown> | undefined,
+  name: string
+): string {
+  if (!headers || typeof headers !== 'object') return '';
+  if ('get' in headers && typeof (headers as Headers).get === 'function') {
+    return ((headers as Headers).get(name) || '').trim();
+  }
+  const rec = headers as Record<string, unknown>;
+  const raw = rec[name] ?? rec[name.toLowerCase()];
+  if (raw === undefined || raw === null) return '';
+  return (Array.isArray(raw) ? String(raw[0] ?? '') : String(raw)).trim();
+}
+
+function hasWafChallengeHeader(headers: Headers | Record<string, unknown> | undefined): boolean {
+  if (!headers || typeof headers !== 'object') return false;
+  if (
+    readNormalizedHeader(headers, 'cf-mitigated') ||
+    readNormalizedHeader(headers, 'x-datadome') ||
+    readNormalizedHeader(headers, 'x-dd-b') ||
+    readNormalizedHeader(headers, 'x-dd-type') ||
+    readNormalizedHeader(headers, 'x-perimeterx') ||
+    readNormalizedHeader(headers, 'x-px-cookie')
+  ) {
+    return true;
+  }
+  if ('forEach' in headers && typeof (headers as Headers).forEach === 'function') {
+    let found = false;
+    (headers as Headers).forEach((val, key) => {
+      const k = key.toLowerCase();
+      if (
+        val &&
+        (k.startsWith('x-px-') || k.startsWith('x-perimeterx') || k.startsWith('x-datadome'))
+      ) {
+        found = true;
+      }
+    });
+    return found;
+  }
+  for (const [key, val] of Object.entries(headers as Record<string, unknown>)) {
+    const k = key.toLowerCase();
+    if (
+      val &&
+      (k.startsWith('x-px-') || k.startsWith('x-perimeterx') || k.startsWith('x-datadome'))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const WAF_CHALLENGE_BODY_RE =
+  /cf-chl-bypass|cf-browser-verification|Just a moment\.\.\.|Attention Required! \| Cloudflare|Access Denied.*Reference #\d|PerimeterX|px-captcha|datadome|geo\.captcha-delivery\.com|g-recaptcha|hcaptcha|^\s*<!doctype html|^\s*<html/i;
+
+/**
+ * Narrows HTTP 403 WAF classification so normal JSON API privacy/auth 403s do not trigger
+ * 15-minute domain-wide cooldowns — only HTML/Cloudflare/Akamai/DataDome/PerimeterX
+ * challenge 403s or explicit `Retry-After` headers trigger cooldowns.
+ */
+function isSchedulerWaf403(
+  headers: Headers | Record<string, unknown> | undefined,
+  body: unknown,
+  retryAfterMs: number
+): boolean {
+  if (retryAfterMs > 0) return true;
+  if (hasWafChallengeHeader(headers)) return true;
+
+  const contentType = readNormalizedHeader(headers, 'content-type').toLowerCase();
+  if (contentType.includes('text/html') || contentType.includes('application/xhtml')) {
+    return true;
+  }
+
+  if (typeof body === 'string' && body.length > 0) {
+    if (WAF_CHALLENGE_BODY_RE.test(body.slice(0, 4096))) {
+      return true;
+    }
+  }
+
+  if (!contentType.includes('application/json')) {
+    const server = readNormalizedHeader(headers, 'server').toLowerCase();
+    if (/akamaighost|datadome|perimeterx/i.test(server)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function createAbortError(message: string): Error {
   if (typeof DOMException !== 'undefined') {
     return new DOMException(message, 'AbortError');
@@ -759,8 +847,12 @@ export class RequestScheduler {
 
     const now = Date.now();
     if (bucket.cooldownUntil > now) {
-      const delay = bucket.cooldownUntil - now;
-      bucket.timer = setTimeout(() => this.processDomainQueue(domain), Math.min(delay, 2147483647));
+      this.pruneAbortedHead(bucket);
+      // Avoid arming up-to-15m cooldown timers when no items are waiting in this bucket
+      if (this.getBucketQueueLength(bucket) > 0) {
+        const delay = bucket.cooldownUntil - now;
+        bucket.timer = setTimeout(() => this.processDomainQueue(domain), Math.min(delay, 2147483647));
+      }
       return;
     }
 
@@ -804,7 +896,7 @@ export class RequestScheduler {
         consecutiveFailures: bucket.consecutiveServerErrors,
         openedUntil: 0,
       });
-      void this.executeItem(domain, bucket, canaryItem);
+      void this.executeItem(domain, bucket, canaryItem, true);
       return;
     }
 
@@ -984,9 +1076,13 @@ export class RequestScheduler {
   private async executeItem(
     domain: string,
     bucket: TokenBucket,
-    item: QueueItem<unknown>
+    item: QueueItem<unknown>,
+    isCanary: boolean = false
   ): Promise<void> {
     if (item.signal?.aborted) {
+      if (isCanary) {
+        bucket.probeInFlight = false;
+      }
       item.cleanupAbort?.();
       item.reject(createAbortError('Request aborted'));
       this.processDomainQueue(domain);
@@ -1004,13 +1100,20 @@ export class RequestScheduler {
         const status = result.status;
         const headersMap = normalizeHeadersForInspection(result.headers);
         const retryAfterMs =
-          status === 429 || status === 503 ? this.parseRetryAfterMs(headersMap) : 0;
+          status === 429 || status === 403 || status === 503
+            ? this.parseRetryAfterMs(headersMap)
+            : 0;
         const isRateLimitOrWaf =
-          status === 429 || isWafOrChallengeResponse(status, '', headersMap, true);
+          status === 429 ||
+          (status === 403
+            ? isSchedulerWaf403(headersMap, undefined, retryAfterMs)
+            : hasWafChallengeHeader(headersMap));
         const isServerError = status >= 500;
         const isOnline = onlineLifecycleManager.isOnline();
 
-        bucket.probeInFlight = false;
+        if (isCanary) {
+          bucket.probeInFlight = false;
+        }
 
         if (isRateLimitOrWaf) {
           if (isOnline && (this.enforceDelays || domain === 'store.steampowered.com')) {
@@ -1054,10 +1157,12 @@ export class RequestScheduler {
             }
           }
         } else {
+          // Normal non-WAF HTTP 2xx/3xx/4xx (including 404/400/API privacy 403) proves upstream
+          // recovered from outage/rate-limit -> transition HALF_OPEN -> CLOSED.
           const recovered = bucket.wasCoolingDown || bucket.consecutiveServerErrors >= 3;
           bucket.consecutiveServerErrors = 0;
           bucket.wasCoolingDown = false;
-          if (status < 400 && recovered) {
+          if (recovered) {
             onlineLifecycleManager.recordEndpointHealth({
               host: domain,
               state: 'CLOSED',
@@ -1075,7 +1180,9 @@ export class RequestScheduler {
       const recovered = bucket.wasCoolingDown || bucket.consecutiveServerErrors >= 3;
       bucket.consecutiveServerErrors = 0;
       bucket.wasCoolingDown = false;
-      bucket.probeInFlight = false;
+      if (isCanary) {
+        bucket.probeInFlight = false;
+      }
       if (recovered) {
         onlineLifecycleManager.recordEndpointHealth({
           host: domain,
@@ -1087,7 +1194,9 @@ export class RequestScheduler {
       item.cleanupAbort?.();
       item.resolve(result);
     } catch (err: unknown) {
-      bucket.probeInFlight = false;
+      if (isCanary) {
+        bucket.probeInFlight = false;
+      }
       const errName =
         err && typeof err === 'object' && 'name' in err
           ? String((err as { name?: unknown }).name || '')
@@ -1100,16 +1209,20 @@ export class RequestScheduler {
 
       const httpErr = (err && typeof err === 'object' ? err : {}) as SchedulerHttpError;
       const status: number | undefined = httpErr.response?.status ?? httpErr.status;
-      const headers = httpErr.response?.headers ?? httpErr.headers;
+      const rawHeaders = httpErr.response?.headers ?? httpErr.headers;
+      const headersMap = normalizeHeadersForInspection(
+        rawHeaders as Headers | Record<string, unknown> | undefined
+      );
       const body = httpErr.response?.data;
       const retryAfterMs =
-        status === 429 || status === 503 ? this.parseRetryAfterMs(headers) : 0;
-      const isWafChallenge = isWafOrChallengeResponse(
-        status,
-        body,
-        headers as Record<string, unknown> | Headers | undefined
-      );
-      const isRateLimit = status === 429 || status === 403 || isWafChallenge;
+        status === 429 || status === 403 || status === 503
+          ? this.parseRetryAfterMs(headersMap)
+          : 0;
+      const isRateLimit =
+        status === 429 ||
+        (status === 403
+          ? isSchedulerWaf403(headersMap, body, retryAfterMs)
+          : isWafOrChallengeResponse(status, body, headersMap, false));
       const isServerError = typeof status === 'number' && status >= 500;
       const errCode = String(httpErr.code || '');
       const errMsg = String(httpErr.message || '');
@@ -1117,6 +1230,7 @@ export class RequestScheduler {
         errCode === 'ECONNABORTED' ||
         errCode === 'ETIMEDOUT' ||
         /timeout|timed out|aborted/i.test(errMsg);
+      const isRetryableTimeout = isTimeout && !/aborted/i.test(errMsg);
       const isOnline = onlineLifecycleManager.isOnline();
 
       if (isRateLimit && isOnline && (this.enforceDelays || domain === 'store.steampowered.com')) {
@@ -1156,9 +1270,27 @@ export class RequestScheduler {
             `[RequestScheduler] Domain ${domain} hit ${bucket.consecutiveServerErrors} consecutive server/timeout errors. Entering ${Math.round(outageCooldownMs / 1000)}s outage cooldown.`
           );
         }
+      } else if (typeof status === 'number' && status >= 200 && status < 500 && !isRateLimit) {
+        // Thrown Axios/HTTP 4xx application response (e.g. 404/400/API privacy 403) proves upstream
+        // is reachable -> close any HALF_OPEN canary state cleanly.
+        const recovered = bucket.wasCoolingDown || bucket.consecutiveServerErrors >= 3;
+        bucket.consecutiveServerErrors = 0;
+        bucket.wasCoolingDown = false;
+        if (recovered) {
+          onlineLifecycleManager.recordEndpointHealth({
+            host: domain,
+            state: 'CLOSED',
+            consecutiveFailures: 0,
+            openedUntil: 0,
+          });
+        }
       }
 
-      if ((isRateLimit || isServerError) && item.retries < bucket.maxRetries && bucket.cooldownUntil <= Date.now()) {
+      if (
+        (isRateLimit || isServerError || (isRetryableTimeout && isOnline)) &&
+        item.retries < bucket.maxRetries &&
+        bucket.cooldownUntil <= Date.now()
+      ) {
         item.retries++;
         const jitter = Math.random() * 100;
         const computedBackoff =
@@ -1186,6 +1318,9 @@ export class RequestScheduler {
       item.cleanupAbort?.();
       item.reject(err);
     } finally {
+      if (isCanary) {
+        bucket.probeInFlight = false;
+      }
       if (isP0) {
         bucket.activeInteractiveCount = Math.max(0, bucket.activeInteractiveCount - 1);
         this.inFlightP0Count = Math.max(0, this.inFlightP0Count - 1);
@@ -1259,10 +1394,11 @@ export class RequestScheduler {
   }
 
   /**
-   * Flushes queued P2_BACKGROUND items across all domains so a newly started or cancelled sync
-   * does not stall behind stale background requests.
+   * Flushes queued P2_BACKGROUND items (including parked backoff retry timers) across all domains
+   * so a newly started or cancelled sync does not stall behind stale background requests.
    */
   public clearBackgroundQueues(): void {
+    const cancelErr = new Error('Cancelled stale background request');
     for (const [domain, bucket] of this.buckets.entries()) {
       const bgLane = bucket.lanes[2];
       for (let i = bgLane.head; i < bgLane.items.length; i++) {
@@ -1270,11 +1406,26 @@ export class RequestScheduler {
         if (!item || item.removed) continue;
         item.removed = true;
         item.cleanupAbort?.();
-        item.reject(new Error('Cancelled stale background request'));
+        item.reject(cancelErr);
       }
       bgLane.items.length = 0;
       bgLane.head = 0;
       bgLane.activeCount = 0;
+
+      if (bucket.retryTimers.size > 0) {
+        for (const [retryTimer, retryItem] of Array.from(bucket.retryTimers.entries())) {
+          if (retryItem.priority >= RequestPriority.P2_BACKGROUND) {
+            clearTimeout(retryTimer);
+            bucket.retryTimers.delete(retryTimer);
+            if (!retryItem.removed) {
+              retryItem.removed = true;
+              retryItem.cleanupAbort?.();
+              retryItem.reject(cancelErr);
+            }
+          }
+        }
+      }
+
       this.processQueue(domain);
     }
   }

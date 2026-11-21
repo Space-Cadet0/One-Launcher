@@ -1,4 +1,4 @@
-import { CanonicalGame } from '../../contracts/game';
+import { CanonicalGame, NativeOsPlatform } from '../../contracts/game';
 import { StorefrontId } from '../../contracts/platform';
 import { SteamCategory, SteamReviewSummary } from '../../contracts/steam';
 import { OpenCriticData } from '../../contracts/critic';
@@ -14,21 +14,22 @@ import {
 import type { TagFacetCount } from '../../contracts/tags';
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 import { resolveGameReviewScore } from '../critic/reviewScoreResolver';
-import { steamMatcher } from '../steam/steamMatcher';
 import {
   getEffectiveCategories,
   getEffectiveTags,
   isGameOwnedOnSteam,
 } from '../steam/steamFeatureNormalizer';
 import {
+  getNativeOsPlatforms,
   getStorefrontNativeOsFlags,
-  isNativelyAvailableOnMac,
-  isNativelyAvailableOnWindows,
-  isPureUwpWindowsGame,
 } from '../platform/nativeOsService';
 import { launcherService } from '../launcher/launcherService';
 import { loadUserTagOverrides } from '../storage/userTagStorage';
 import { normalizeTagKey, resolveEffectiveGameTags } from '../tags/gameTagResolver';
+import {
+  extractFeaturesFromDescriptors,
+  isValidControllerSupportValue,
+} from './featureMatcher';
 
 export type { TagFacetCount };
 
@@ -137,13 +138,45 @@ const FEATURE_LABELS: Record<FeatureFilterOption, string> = {
   hdr: 'HDR Available',
 };
 
-function parseReleaseYear(rawDate?: string | number | null): number | null {
+interface ChipLabelLookupMaps {
+  genreLabelByKey: Map<string, string>;
+  creatorNameByKey: Map<string, string>;
+  tagLabelByKey: Map<string, string>;
+}
+
+const chipLabelLookupCache = new WeakMap<LibraryFilterIndex, ChipLabelLookupMaps>();
+
+function getChipLabelLookupMaps(index: LibraryFilterIndex): ChipLabelLookupMaps {
+  const cached = chipLabelLookupCache.get(index);
+  if (cached) return cached;
+
+  const genreLabelByKey = new Map<string, string>();
+  for (const g of index.genreCounts) {
+    genreLabelByKey.set(g.key, g.label);
+  }
+  const creatorNameByKey = new Map<string, string>();
+  for (const c of index.creatorCounts) {
+    creatorNameByKey.set(c.key, c.name);
+  }
+  const tagLabelByKey = new Map<string, string>();
+  for (const t of index.tagCounts || []) {
+    tagLabelByKey.set(t.key, t.label);
+  }
+
+  const maps: ChipLabelLookupMaps = { genreLabelByKey, creatorNameByKey, tagLabelByKey };
+  chipLabelLookupCache.set(index, maps);
+  return maps;
+}
+
+function parseReleaseYear(
+  rawDate: string | number | null | undefined,
+  maxAllowedYear: number
+): number | null {
   if (rawDate === undefined || rawDate === null) return null;
   const str = String(rawDate).trim();
   if (!str || /^(tba|tbd|coming soon|unannounced|unknown)$/i.test(str)) {
     return null;
   }
-  const maxAllowedYear = new Date().getFullYear() + 5;
   const match = str.match(/\b(19[7-9]\d|20\d\d)\b/);
   if (!match) return null;
   const yr = parseInt(match[1], 10);
@@ -178,13 +211,17 @@ function resolveReviewSentiment(
     game.reviewSummary?.positivePercent ??
     game.enrichedMetadata?.reviewSummary?.positivePercent ??
     cachedSteamEntry?.reviewSummary?.positivePercent;
-  const totalReviews =
+  const explicitTotal =
     game.reviewSummary?.totalReviews ??
     game.enrichedMetadata?.reviewSummary?.totalReviews ??
-    cachedSteamEntry?.reviewSummary?.totalReviews ??
-    1;
+    cachedSteamEntry?.reviewSummary?.totalReviews;
 
-  if (typeof pos === 'number' && pos > 0 && totalReviews > 0) {
+  const hasValidSample =
+    typeof pos === 'number' &&
+    Number.isFinite(pos) &&
+    (explicitTotal !== undefined ? explicitTotal > 0 : pos > 0);
+
+  if (hasValidSample) {
     if (pos >= 95) return 'overwhelmingly_positive';
     if (pos >= 80) return 'very_positive';
     if (pos >= 70) return 'mostly_positive';
@@ -224,24 +261,13 @@ function extractFeaturesForGame(
     ...effectiveCategories.map((c) => c.description || ''),
   ];
 
-  for (const raw of descriptors) {
-    if (!raw) continue;
-    if (/single-?player/i.test(raw)) features.add('singleplayer');
-    if (/\bco-?op\b|coop/i.test(raw)) features.add('coop');
-    if (/multi-?player|\bpvp\b|online pvp|lan pvp|cross-platform multiplayer/i.test(raw)) {
-      features.add('multiplayer');
-    }
-    if (/controller|gamepad/i.test(raw)) features.add('controller');
-    if (/steam cloud|cloud saves?|\bcloud\b/i.test(raw)) features.add('cloud_saves');
-    if (/achievements?/i.test(raw)) features.add('achievements');
-    if (/\bhdr\b/i.test(raw)) features.add('hdr');
-  }
+  extractFeaturesFromDescriptors(descriptors, features);
 
   const controllerSupport =
     game.controllerSupport ||
     game.enrichedMetadata?.controllerSupport ||
     cachedSteamEntry?.controllerSupport;
-  if (controllerSupport && String(controllerSupport).toLowerCase() !== 'none') {
+  if (isValidControllerSupportValue(controllerSupport)) {
     features.add('controller');
   }
 
@@ -284,6 +310,8 @@ export function buildLibraryFilterIndex(
     options?.hostPlatform
   ).supportsWindowsTranslation;
   const userTagOverrides = loadUserTagOverrides();
+  const currentYear = new Date().getFullYear();
+  const maxAllowedYear = currentYear + 5;
 
   const osCounts: Record<OsCompatibilityFilterOption, number> = {
     mac_native: 0,
@@ -332,40 +360,81 @@ export function buildLibraryFilterIndex(
 
     const cachedSteamEntry = game.steamAppId ? steamCache[String(game.steamAppId)] : undefined;
 
-    // Category 1: OS & Compatibility
+    // Category 1: OS & Compatibility — single-pass per-platform evaluation (1x getStorefrontNativeOsFlags!)
     const osFlags = new Set<OsCompatibilityFilterOption>();
     const osFlagsByPlatform = new Map<StorefrontId, Set<OsCompatibilityFilterOption>>();
-    const isMacNative = isNativelyAvailableOnMac(game);
-    const isWinNative = isNativelyAvailableOnWindows(game);
-    const hasXboxPlatform = (game.platforms || []).some((p) => p.platformId === 'xbox');
+    const ownedPlatforms = Array.isArray(game.platforms) ? game.platforms.filter(Boolean) : [];
+    const hasXboxPlatform = ownedPlatforms.some((p) => p.platformId === 'xbox');
     const cachedXboxInstallInfo =
       supportsWindowsTranslation && hasXboxPlatform
         ? launcherService.getCachedInstallInfo(game.id, 'xbox')
         : undefined;
+    const cachedXboxTier = cachedXboxInstallInfo?.xboxCompatibility?.tier;
     const hintIsUwp =
       typeof game.enrichedMetadata?.xboxDeliveryHints?.packageFormat === 'string' &&
       game.enrichedMetadata.xboxDeliveryHints.packageFormat.toLowerCase() === 'uwp';
 
-    for (const p of game.platforms || []) {
-      if (!p || !p.platformId) continue;
-      const platSet =
-        osFlagsByPlatform.get(p.platformId) || new Set<OsCompatibilityFilterOption>();
-      const storeFlags = getStorefrontNativeOsFlags(game, p.platformId);
-      if (storeFlags.mac) {
-        platSet.add('mac_native');
-      }
-      if (storeFlags.windows) {
-        platSet.add('windows_native');
-      }
-      if (supportsWindowsTranslation) {
+    let isMacNative = false;
+    let isWinNative = false;
+    let pureUwpOnly = false;
+    let hasAnyWindowsBinaryOnMac = false;
+
+    if (ownedPlatforms.length > 0) {
+      let hasWindows = false;
+      let hasMac = false;
+      let hasAnyExplicitStoreFlag = false;
+      let hasNativeMacAppInstall = false;
+      let ownsSteam = false;
+      let hasAnyWindowsStorefront = false;
+      let hasNonUwpWin32Storefront = false;
+
+      for (const p of ownedPlatforms) {
+        if (!p.platformId) continue;
+        if (p.platformId === 'steam') ownsSteam = true;
+        if (p.isWindowsBinaryOnMac) hasAnyWindowsBinaryOnMac = true;
+
+        const isCompatOrWinExe =
+          p.isWindowsBinaryOnMac === true ||
+          /crossover|bottles|drive_c|wine|gptk/i.test(p.installPath || '') ||
+          /crossover|bottles|drive_c|wine|gptk/i.test(p.executablePath || '') ||
+          /\.exe$/i.test(p.executablePath || '') ||
+          /\.exe$/i.test(p.installPath || '');
+        if (
+          Boolean(p.installed) &&
+          p.isWindowsBinaryOnMac !== true &&
+          !isCompatOrWinExe &&
+          (/\.app(\/|$)/i.test(p.installPath || '') || /\.app(\/|$)/i.test(p.executablePath || ''))
+        ) {
+          hasNativeMacAppInstall = true;
+        }
+
+        const platSet =
+          osFlagsByPlatform.get(p.platformId) || new Set<OsCompatibilityFilterOption>();
+        const storeFlags = getStorefrontNativeOsFlags(game, p.platformId);
+        if (storeFlags.isExplicit) hasAnyExplicitStoreFlag = true;
+        if (storeFlags.mac) {
+          hasMac = true;
+          platSet.add('mac_native');
+        }
+        if (storeFlags.windows) {
+          hasWindows = true;
+          hasAnyWindowsStorefront = true;
+          platSet.add('windows_native');
+        }
+
         const isStorePureUwp =
           p.platformId === 'xbox'
             ? p.xboxBottleCompatibilityTier === 'tier_b_legacy_uwp' ||
-              cachedXboxInstallInfo?.xboxCompatibility?.tier === 'tier_b_legacy_uwp' ||
+              cachedXboxTier === 'tier_b_legacy_uwp' ||
               (typeof p.packageFormat === 'string' && p.packageFormat.toLowerCase() === 'uwp') ||
               hintIsUwp
             : typeof p.packageFormat === 'string' && p.packageFormat.toLowerCase() === 'uwp';
-        if (!isStorePureUwp) {
+
+        if (storeFlags.windows && !isStorePureUwp) {
+          hasNonUwpWin32Storefront = true;
+        }
+
+        if (supportsWindowsTranslation && !isStorePureUwp) {
           const platLaunchCfg = launcherService.getLaunchConfig(game.id, p.platformId);
           const storeCompatEligible =
             (!storeFlags.mac && storeFlags.windows) ||
@@ -377,23 +446,59 @@ export function buildLibraryFilterIndex(
             platSet.add('mac_compat_layer');
           }
         }
+        osFlagsByPlatform.set(p.platformId, platSet);
       }
-      osFlagsByPlatform.set(p.platformId, platSet);
+
+      if (hasNativeMacAppInstall) {
+        hasMac = true;
+      }
+
+      const hasCrossStoreSteamMetaBleed =
+        !ownsSteam && Boolean(game.enrichedMetadata?.platforms && game.enrichedMetadata?.appId !== 0);
+
+      if (
+        !hasAnyExplicitStoreFlag &&
+        !hasCrossStoreSteamMetaBleed &&
+        Array.isArray(game.nativePlatforms) &&
+        game.nativePlatforms.length > 0
+      ) {
+        const normalized = new Set<NativeOsPlatform>();
+        for (const entry of game.nativePlatforms) {
+          if (entry === 'windows' || entry === 'mac') {
+            normalized.add(entry);
+          }
+        }
+        if (hasNativeMacAppInstall) {
+          normalized.add('mac');
+        }
+        if (normalized.size > 0) {
+          isWinNative = normalized.has('windows');
+          isMacNative = normalized.has('mac');
+        } else {
+          isWinNative = hasWindows || !hasMac;
+          isMacNative = hasMac;
+        }
+      } else {
+        isWinNative = hasWindows || !hasMac;
+        isMacNative = hasMac;
+      }
+
+      pureUwpOnly = hasAnyWindowsStorefront && !hasNonUwpWin32Storefront;
+    } else {
+      // Synthetic games with empty `game.platforms`: resolve once via getNativeOsPlatforms
+      const nativeOsList = getNativeOsPlatforms(game);
+      isMacNative = nativeOsList.includes('mac');
+      isWinNative = nativeOsList.includes('windows');
+      pureUwpOnly = hintIsUwp;
     }
 
     let isCompatLayerEligible = false;
-    if (supportsWindowsTranslation) {
-      const pureUwpOnly = isPureUwpWindowsGame(
-        game,
-        cachedXboxInstallInfo?.xboxCompatibility?.tier
-      );
-      if (!pureUwpOnly) {
-        const launchCfg = launcherService.getLaunchConfig(game.id);
-        isCompatLayerEligible =
-          (!isMacNative && isWinNative) ||
-          (game.platforms || []).some((p) => Boolean(p.isWindowsBinaryOnMac)) ||
-          Boolean(launchCfg?.compatibilityLayer && launchCfg.compatibilityLayer !== 'native');
-      }
+    if (supportsWindowsTranslation && !pureUwpOnly) {
+      const launchCfg = launcherService.getLaunchConfig(game.id);
+      isCompatLayerEligible =
+        (!isMacNative && isWinNative) ||
+        hasAnyWindowsBinaryOnMac ||
+        Boolean(launchCfg?.compatibilityLayer && launchCfg.compatibilityLayer !== 'native');
     }
 
     if (isMacNative) {
@@ -410,7 +515,6 @@ export function buildLibraryFilterIndex(
     }
 
     // Category 2: Rating (Critic Tier, Score & Review Sentiment)
-    const effectiveSteamAppId = steamMatcher.getEffectiveSteamAppId(game);
     const oc = resolveGameReviewScore(game, { skipBackgroundTrigger: true });
     const criticScore =
       oc && typeof oc.score === 'number' && oc.score > 0 ? Math.round(oc.score) : null;
@@ -457,9 +561,12 @@ export function buildLibraryFilterIndex(
 
     // Category 5: Release Year
     const releaseYear =
-      parseReleaseYear(game.releaseDate) ??
-      parseReleaseYear(game.enrichedMetadata?.releaseDate) ??
-      parseReleaseYear(cachedSteamEntry?.releaseDate || cachedSteamEntry?.release_date);
+      parseReleaseYear(game.releaseDate, maxAllowedYear) ??
+      parseReleaseYear(game.enrichedMetadata?.releaseDate, maxAllowedYear) ??
+      parseReleaseYear(
+        cachedSteamEntry?.releaseDate || cachedSteamEntry?.release_date,
+        maxAllowedYear
+      );
 
     if (releaseYear !== null) {
       if (releaseYear < minReleaseYear) minReleaseYear = releaseYear;
@@ -468,11 +575,8 @@ export function buildLibraryFilterIndex(
       unknownReleaseYearCount++;
     }
 
-    // Category 6: Creators (Developers & Publishers)
+    // Category 6: Creators (Developers & Publishers) — single Set per game
     const creatorsNormalized = new Set<string>();
-    const gameDevKeys = new Set<string>();
-    const gamePubKeys = new Set<string>();
-
     const rawDevs = [
       ...(game.developers || []),
       ...(game.enrichedMetadata?.developers || []),
@@ -488,11 +592,16 @@ export function buildLibraryFilterIndex(
       if (!isValidCreatorName(dev)) continue;
       const cleanName = dev.trim();
       const key = cleanName.toLowerCase();
-      gameDevKeys.add(key);
-      if (!creatorMap.has(key)) {
-        creatorMap.set(key, { name: cleanName, hasDev: true, hasPub: false, count: 0 });
+      let entry = creatorMap.get(key);
+      if (!entry) {
+        entry = { name: cleanName, hasDev: true, hasPub: false, count: 0 };
+        creatorMap.set(key, entry);
       } else {
-        creatorMap.get(key)!.hasDev = true;
+        entry.hasDev = true;
+      }
+      if (!creatorsNormalized.has(key)) {
+        creatorsNormalized.add(key);
+        entry.count++;
       }
     }
 
@@ -500,19 +609,16 @@ export function buildLibraryFilterIndex(
       if (!isValidCreatorName(pub)) continue;
       const cleanName = pub.trim();
       const key = cleanName.toLowerCase();
-      gamePubKeys.add(key);
-      if (!creatorMap.has(key)) {
-        creatorMap.set(key, { name: cleanName, hasDev: false, hasPub: true, count: 0 });
+      let entry = creatorMap.get(key);
+      if (!entry) {
+        entry = { name: cleanName, hasDev: false, hasPub: true, count: 0 };
+        creatorMap.set(key, entry);
       } else {
-        creatorMap.get(key)!.hasPub = true;
+        entry.hasPub = true;
       }
-    }
-
-    for (const key of new Set([...gameDevKeys, ...gamePubKeys])) {
-      creatorsNormalized.add(key);
-      const item = creatorMap.get(key);
-      if (item) {
-        item.count++;
+      if (!creatorsNormalized.has(key)) {
+        creatorsNormalized.add(key);
+        entry.count++;
       }
     }
 
@@ -542,7 +648,6 @@ export function buildLibraryFilterIndex(
 
     entriesById.set(game.id, {
       gameId: game.id,
-      effectiveSteamAppId,
       osFlags,
       osFlagsByPlatform,
       criticData: oc,
@@ -558,7 +663,6 @@ export function buildLibraryFilterIndex(
     });
   }
 
-  const currentYear = new Date().getFullYear();
   if (!isFinite(minReleaseYear) || !isFinite(maxReleaseYear) || minReleaseYear > maxReleaseYear) {
     minReleaseYear = 1990;
     maxReleaseYear = currentYear;
@@ -570,7 +674,7 @@ export function buildLibraryFilterIndex(
       label: val.label,
       count: val.count,
     }))
-    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+    .toSorted((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 
   const creatorCounts: CreatorFacetCount[] = Array.from(creatorMap.entries())
     .map(([key, val]) => ({
@@ -583,7 +687,7 @@ export function buildLibraryFilterIndex(
           : 'publisher') as CreatorFacetCount['role'],
       count: val.count,
     }))
-    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+    .toSorted((a, b) => b.count - a.count || a.name.localeCompare(b.name));
 
   const tagCounts: TagFacetCount[] = Array.from(tagMap.entries())
     .map(([key, val]) => ({
@@ -591,7 +695,7 @@ export function buildLibraryFilterIndex(
       label: val.label,
       count: val.count,
     }))
-    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+    .toSorted((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 
   return {
     entriesById,
@@ -764,18 +868,7 @@ export function describeActiveFilterChips(
   const supportsWindowsTranslation =
     launcherService.getHostCapabilities().supportsWindowsTranslation;
 
-  const genreLabelByKey = new Map<string, string>();
-  for (const g of index.genreCounts) {
-    genreLabelByKey.set(g.key, g.label);
-  }
-  const creatorNameByKey = new Map<string, string>();
-  for (const c of index.creatorCounts) {
-    creatorNameByKey.set(c.key, c.name);
-  }
-  const tagLabelByKey = new Map<string, string>();
-  for (const t of index.tagCounts || []) {
-    tagLabelByKey.set(t.key, t.label);
-  }
+  const { genreLabelByKey, creatorNameByKey, tagLabelByKey } = getChipLabelLookupMaps(index);
 
   for (const osOpt of state.osCompatibility) {
     if (!supportsWindowsTranslation && osOpt === 'mac_compat_layer') {

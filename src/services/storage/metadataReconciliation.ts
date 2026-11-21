@@ -4,6 +4,7 @@ import {
   isUnsuitableCoverUrl,
   isUnsuitableHeaderUrl,
 } from '../igdb/igdbCoverService';
+import { unwrapOlMediaUrl } from '../../contracts/network';
 import { isMicrosoftStoreCdnUrl, isSteamCdnAssetUrl } from '../common/titleUtils';
 
 /**
@@ -58,11 +59,12 @@ const EPIC_CDN_RE = /(?:epicgames\.com|unrealengine\.com)\//i;
 type StorefrontCdnFamily = 'steam' | 'gog' | 'epic' | 'ms' | 'igdb' | 'other';
 
 function getStorefrontCdnFamily(url: string): StorefrontCdnFamily {
-  if (isSteamCdnAssetUrl(url)) return 'steam';
-  if (GOG_CDN_RE.test(url)) return 'gog';
-  if (EPIC_CDN_RE.test(url)) return 'epic';
-  if (isMicrosoftStoreCdnUrl(url)) return 'ms';
-  if (IGDB_OR_LUTRIS_CDN_RE.test(url)) return 'igdb';
+  const unwrapped = unwrapOlMediaUrl(url);
+  if (isSteamCdnAssetUrl(unwrapped)) return 'steam';
+  if (GOG_CDN_RE.test(unwrapped)) return 'gog';
+  if (EPIC_CDN_RE.test(unwrapped)) return 'epic';
+  if (isMicrosoftStoreCdnUrl(unwrapped)) return 'ms';
+  if (IGDB_OR_LUTRIS_CDN_RE.test(unwrapped)) return 'igdb';
   return 'other';
 }
 
@@ -81,14 +83,18 @@ export function getCapsuleAuthorityRank(
     return ARTWORK_AUTHORITY_RANK.EMPTY;
   }
   const trimmed = url.trim();
+  const unwrapped = unwrapOlMediaUrl(trimmed);
+  const unwrappedHeader = isValidNonEmptyUrl(ctx?.headerUrl)
+    ? unwrapOlMediaUrl(ctx.headerUrl.trim())
+    : undefined;
 
   if (isValidNonEmptyUrl(ctx?.userOverrideCapsule) && ctx.userOverrideCapsule.trim() === trimmed) {
     return ARTWORK_AUTHORITY_RANK.USER_OVERRIDE;
   }
 
   if (
-    isUnsuitableCoverUrl(trimmed) ||
-    (isValidNonEmptyUrl(ctx?.headerUrl) && isGogCroppedHorizontalCover(trimmed, ctx.headerUrl))
+    isUnsuitableCoverUrl(unwrapped) ||
+    (unwrappedHeader && isGogCroppedHorizontalCover(unwrapped, unwrappedHeader))
   ) {
     return ARTWORK_AUTHORITY_RANK.UNSUITABLE_OR_LANDSCAPE;
   }
@@ -129,12 +135,13 @@ export function getHeaderAuthorityRank(
     return ARTWORK_AUTHORITY_RANK.EMPTY;
   }
   const trimmed = url.trim();
+  const unwrapped = unwrapOlMediaUrl(trimmed);
 
   if (isValidNonEmptyUrl(ctx?.userOverrideHeader) && ctx.userOverrideHeader.trim() === trimmed) {
     return ARTWORK_AUTHORITY_RANK.USER_OVERRIDE;
   }
 
-  if (isUnsuitableHeaderUrl(trimmed)) {
+  if (isUnsuitableHeaderUrl(unwrapped)) {
     return ARTWORK_AUTHORITY_RANK.UNSUITABLE_OR_LANDSCAPE;
   }
 

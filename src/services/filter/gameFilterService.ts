@@ -18,13 +18,25 @@ import {
   isNativelyAvailableOnMac,
   isNativelyAvailableOnWindows,
 } from '../platform/nativeOsService';
+import {
+  extractFeaturesFromDescriptors,
+  isValidControllerSupportValue,
+  matchFeatureOptionFromTarget,
+  resolveCanonicalStorefrontAlias,
+} from './featureMatcher';
 
 interface SteamEnrichedFilterEntry {
   reviewSummary?: {
     reviewScoreDesc?: string;
     positivePercent?: number;
+    totalReviews?: number;
   };
   categories?: SteamCategory[];
+  controllerSupport?: string;
+  hdrSupport?: boolean;
+  achievements?: {
+    total?: number;
+  };
 }
 
 const cache = steamEnrichedCache as Record<string, SteamEnrichedFilterEntry>;
@@ -113,14 +125,17 @@ export function matchesGameFilter(game: CanonicalGame, filter: ActiveGameFilter)
   }
 
   if (filter.type === 'review') {
+    const cachedReview = game.steamAppId ? cache[game.steamAppId.toString()]?.reviewSummary : undefined;
     const desc = (
       game.reviewSummary?.reviewScoreDesc ||
       game.enrichedMetadata?.reviewSummary?.reviewScoreDesc ||
-      (game.steamAppId ? cache[game.steamAppId.toString()]?.reviewSummary?.reviewScoreDesc : '') ||
+      cachedReview?.reviewScoreDesc ||
       ''
-    ).trim().toLowerCase();
+    )
+      .trim()
+      .toLowerCase();
 
-    if (desc) {
+    if (desc && desc !== 'no user reviews') {
       if (desc === target) return true;
       const normDesc = desc.replace(/[^a-z]/g, '');
       const normTarget = target.replace(/[^a-z]/g, '');
@@ -142,9 +157,18 @@ export function matchesGameFilter(game: CanonicalGame, filter: ActiveGameFilter)
     const pos =
       game.reviewSummary?.positivePercent ??
       game.enrichedMetadata?.reviewSummary?.positivePercent ??
-      (game.steamAppId ? cache[game.steamAppId.toString()]?.reviewSummary?.positivePercent : undefined);
+      cachedReview?.positivePercent;
+    const totalReviews =
+      game.reviewSummary?.totalReviews ??
+      game.enrichedMetadata?.reviewSummary?.totalReviews ??
+      cachedReview?.totalReviews;
 
-    if (pos !== undefined) {
+    const hasValidSample =
+      typeof pos === 'number' &&
+      Number.isFinite(pos) &&
+      (totalReviews !== undefined ? totalReviews > 0 : pos > 0);
+
+    if (hasValidSample) {
       if (pos >= 95 && target.includes('overwhelmingly positive')) return true;
       if (pos >= 80 && pos < 95 && target.includes('very positive')) return true;
       if (pos >= 70 && pos < 80 && target.includes('mostly positive')) return true;
@@ -202,6 +226,9 @@ export function matchesGameFilter(game: CanonicalGame, filter: ActiveGameFilter)
     if (isSteamExclusiveFeature(target) && !isOwnedOnSteam) {
       return false;
     }
+    if (!isOwnedOnSteam && /^steam\s+/i.test(target)) {
+      return false;
+    }
 
     const effectiveTags = getEffectiveTags(game.tags, isOwnedOnSteam);
 
@@ -210,145 +237,71 @@ export function matchesGameFilter(game: CanonicalGame, filter: ActiveGameFilter)
       return true;
     }
 
-    // 2. Direct metadata categories on the game
+    // 2. Direct metadata categories on the game (ownership-normalized)
     const directCategories = getEffectiveCategories(game.enrichedMetadata?.categories, isOwnedOnSteam);
-    if (
-      directCategories.some((c) =>
-        c.description.toLowerCase().includes(target)
-      )
-    ) {
+    if (directCategories.some((c) => c.description.toLowerCase().includes(target))) {
       return true;
     }
 
-    // 3. Categories stored in steamEnrichedCache
-    if (game.steamAppId) {
-      const cached = cache[game.steamAppId.toString()];
-      if (cached?.categories) {
-        const cachedCategories = getEffectiveCategories(cached.categories, isOwnedOnSteam);
-        if (
-          cachedCategories.some((c) =>
-            c.description?.toLowerCase().includes(target)
-          )
-        ) {
-          return true;
-        }
-      }
+    // 3. Categories stored in steamEnrichedCache (ownership-normalized)
+    const cachedSteam = game.steamAppId ? cache[game.steamAppId.toString()] : undefined;
+    const cachedCategories = cachedSteam?.categories
+      ? getEffectiveCategories(cachedSteam.categories, isOwnedOnSteam)
+      : [];
+    if (cachedCategories.some((c) => c.description?.toLowerCase().includes(target))) {
+      return true;
     }
 
-    // 4. Feature-specific keyword mappings
-    // HDR
-    if (target.includes('hdr')) {
-      if (game.tags.some((t) => t.toLowerCase().includes('hdr'))) return true;
-      if (
-        game.steamAppId &&
-        cache[game.steamAppId.toString()]?.categories?.some((c) =>
-          c.description?.toLowerCase().includes('hdr')
-        )
-      ) {
-        return true;
-      }
-    }
-
-    // Controller Support
-    if (target.includes('controller')) {
-      if (game.tags.some((t) => t.toLowerCase().includes('controller'))) return true;
-      if (game.enrichedMetadata?.controllerSupport) return true;
-      if (
-        game.steamAppId &&
-        cache[game.steamAppId.toString()]?.categories?.some((c) =>
-          c.description?.toLowerCase().includes('controller')
-        )
-      ) {
-        return true;
-      }
-    }
-
-    // Co-op
-    if (target.includes('co-op') || target.includes('coop')) {
-      if (
-        game.tags.some(
-          (t) => t.toLowerCase().includes('co-op') || t.toLowerCase().includes('coop')
-        )
-      ) {
-        return true;
-      }
-      if (
-        game.steamAppId &&
-        cache[game.steamAppId.toString()]?.categories?.some((c) =>
-          c.description?.toLowerCase().includes('co-op')
-        )
-      ) {
-        return true;
-      }
-    }
-
-    // Multiplayer / PvP
-    if (
-      target.includes('multiplayer') ||
-      target.includes('pvp') ||
-      target.includes('multi-player')
-    ) {
-      if (
-        game.tags.some(
-          (t) =>
-            t.toLowerCase().includes('multiplayer') ||
-            t.toLowerCase().includes('pvp') ||
-            t.toLowerCase().includes('multi-player')
-        )
-      ) {
-        return true;
-      }
-      if (
-        game.steamAppId &&
-        cache[game.steamAppId.toString()]?.categories?.some((c) => {
-          const desc = c.description?.toLowerCase() || '';
-          return (
-            desc.includes('multiplayer') ||
-            desc.includes('multi-player') ||
-            desc.includes('pvp')
-          );
-        })
-      ) {
-        return true;
-      }
-    }
-
-    // Cloud Sync
-    if (target.includes('cloud')) {
-      if (game.tags.some((t) => t.toLowerCase().includes('cloud'))) return true;
-      if (
-        game.steamAppId &&
-        cache[game.steamAppId.toString()]?.categories?.some((c) =>
-          c.description?.toLowerCase().includes('cloud')
-        )
-      ) {
-        return true;
-      }
-    }
-
-    // Achievements
-    if (target.includes('achievement')) {
-      if (game.platforms.some((p) => p.achievements && p.achievements.total > 0)) return true;
-      if (effectiveTags.some((t) => t.toLowerCase().includes('achievement'))) return true;
-      if (
-        game.steamAppId &&
-        cache[game.steamAppId.toString()]?.categories?.some((c) =>
-          c.description?.toLowerCase().includes('achievement')
-        )
-      ) {
-        return true;
-      }
-    }
-
-    // Family Sharing
+    // 4. Feature-specific keyword mappings strictly over ownership-normalized descriptors
     if (target.includes('family')) {
       if (!isOwnedOnSteam) return false;
-      if (game.tags.some((t) => t.toLowerCase().includes('family'))) return true;
+      if (effectiveTags.some((t) => t.toLowerCase().includes('family'))) return true;
+      if (directCategories.some((c) => c.description.toLowerCase().includes('family'))) return true;
+      if (cachedCategories.some((c) => c.description?.toLowerCase().includes('family'))) return true;
+      return false;
+    }
+
+    const featureKey = matchFeatureOptionFromTarget(target);
+    if (!featureKey) {
+      return false;
+    }
+
+    const normalizedDescriptors: string[] = [
+      ...effectiveTags,
+      ...directCategories.map((c) => c.description || ''),
+      ...cachedCategories.map((c) => c.description || ''),
+    ];
+    const detected = extractFeaturesFromDescriptors(normalizedDescriptors);
+    if (detected.has(featureKey)) {
+      return true;
+    }
+
+    if (featureKey === 'controller') {
+      const controllerVal =
+        game.controllerSupport ??
+        game.enrichedMetadata?.controllerSupport ??
+        cachedSteam?.controllerSupport;
+      if (isValidControllerSupportValue(controllerVal)) {
+        return true;
+      }
+    }
+
+    if (featureKey === 'hdr') {
       if (
-        game.steamAppId &&
-        cache[game.steamAppId.toString()]?.categories?.some((c) =>
-          c.description?.toLowerCase().includes('family')
-        )
+        Boolean(game.hdrSupport) ||
+        Boolean(game.enrichedMetadata?.hdrSupport) ||
+        Boolean(cachedSteam?.hdrSupport)
+      ) {
+        return true;
+      }
+    }
+
+    if (featureKey === 'achievements') {
+      if (
+        (game.platforms || []).some((p) => p.achievements && p.achievements.total > 0) ||
+        (isOwnedOnSteam &&
+          ((game.enrichedMetadata?.achievements?.total ?? 0) > 0 ||
+            (cachedSteam?.achievements?.total ?? 0) > 0))
       ) {
         return true;
       }
@@ -368,9 +321,11 @@ export function matchesGameFilter(game: CanonicalGame, filter: ActiveGameFilter)
   }
 
   if (filter.type === 'platform') {
-    return (game.platforms || []).some(
-      (p) => p.platformId.toLowerCase() === target || target.includes(p.platformId.toLowerCase())
-    );
+    const canonicalTarget = resolveCanonicalStorefrontAlias(target);
+    if (!canonicalTarget) {
+      return (game.platforms || []).some((p) => p.platformId.toLowerCase() === target);
+    }
+    return (game.platforms || []).some((p) => p.platformId.toLowerCase() === canonicalTarget);
   }
 
   if (filter.type === 'status') {
