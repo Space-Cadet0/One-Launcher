@@ -352,14 +352,45 @@ export function hasSameStorefrontConflict(
   if (existing.steamAppId && incoming.steamAppId && existing.steamAppId !== incoming.steamAppId) {
     return true;
   }
-  for (const ep of existing.platforms || []) {
-    if (!ep.platformId || !ep.platformGameId) continue;
-    const ip = (incoming.platforms || []).find((p) => p.platformId === ep.platformId);
-    if (
-      ip &&
-      ip.platformGameId &&
-      String(ep.platformGameId).trim() !== String(ip.platformGameId).trim()
-    ) {
+  const existingPlatforms = existing.platforms || [];
+  const incomingPlatforms = incoming.platforms || [];
+  for (const ep of existingPlatforms) {
+    if (!ep?.platformId) continue;
+    const platIdLower = String(ep.platformId).toLowerCase();
+    const matchingIncoming = incomingPlatforms.filter(
+      (p) => p?.platformId && String(p.platformId).toLowerCase() === platIdLower
+    );
+    if (matchingIncoming.length === 0) continue;
+
+    if (platIdLower === 'xbox') {
+      const epGameId = String(ep.platformGameId || '').trim().toLowerCase();
+      const epProductId = String(ep.xboxProductId || '').trim().toLowerCase();
+      const epIds = [epGameId, epProductId].filter(Boolean);
+      if (epIds.length === 0) continue;
+
+      const anyCompatible = matchingIncoming.some((ip) => {
+        const ipGameId = String(ip.platformGameId || '').trim().toLowerCase();
+        const ipProductId = String(ip.xboxProductId || '').trim().toLowerCase();
+        const ipIds = [ipGameId, ipProductId].filter(Boolean);
+        if (ipIds.length === 0) return true;
+        if (epProductId && ipProductId && epProductId !== ipProductId) {
+          return false;
+        }
+        return epIds.some((id) => ipIds.includes(id));
+      });
+      if (!anyCompatible) {
+        return true;
+      }
+      continue;
+    }
+
+    const epId = String(ep.platformGameId || '').trim();
+    if (!epId) continue;
+    const anyCompatible = matchingIncoming.some((ip) => {
+      const ipId = String(ip.platformGameId || '').trim();
+      return !ipId || ipId === epId;
+    });
+    if (!anyCompatible) {
       return true;
     }
   }

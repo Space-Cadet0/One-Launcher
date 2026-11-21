@@ -19,6 +19,7 @@ const {
   normalizeAssetIdentityUrl,
   hasXboxPlatform,
   extractXboxBigIdsFromGame,
+  hasVaultSameStorefrontConflict,
   carryForwardVaultRequirements,
   getCriticAuthorityRank,
   carryForwardVaultCriticAndReviewFields,
@@ -491,14 +492,34 @@ function upsertGames(service, games) {
         }
       }
 
+      const existingPlatforms =
+        existing && existing.platforms_json !== null && existing.platforms_json !== undefined
+          ? parseVaultJson(existing.platforms_json)
+          : null;
+      const existingRowPlatformConflict = hasVaultSameStorefrontConflict(
+        existingPlatforms,
+        platforms
+      );
+
       const summaryCopy = { ...g };
       delete summaryCopy.enrichedMetadata;
       if (platforms) {
         summaryCopy.platforms = platforms;
       }
 
-      // Protect summary_json against __quotaSlimmed / empty-field clobber
-      if (existingSummaryObj && typeof existingSummaryObj === 'object') {
+      const existingSummaryPolarityConflict = Boolean(
+        existingSummaryObj &&
+          typeof existingSummaryObj === 'object' &&
+          Boolean(existingSummaryObj.isExplicitNonSteam) !== Boolean(g.isExplicitNonSteam)
+      );
+
+      // Protect summary_json against __quotaSlimmed / empty-field clobber (never across conflicting products)
+      if (
+        existingSummaryObj &&
+        typeof existingSummaryObj === 'object' &&
+        !existingRowPlatformConflict &&
+        !existingSummaryPolarityConflict
+      ) {
         if (
           !(
             typeof summaryCopy.shortDescription === 'string' &&
@@ -620,12 +641,14 @@ function upsertGames(service, games) {
       const existingEnrichedInvalidated = isExistingVaultEnrichedInvalidated(existingEnrichedObj, {
         isExplicitNonSteam: g.isExplicitNonSteam === true,
         steamAppId,
+        forceReplaceEnriched: existingRowPlatformConflict || existingSummaryPolarityConflict,
       });
 
       if (
         incomingEnriched &&
         existingEnrichedObj?.xboxDeliveryHints &&
-        !incomingEnriched.xboxDeliveryHints
+        !incomingEnriched.xboxDeliveryHints &&
+        !existingRowPlatformConflict
       ) {
         incomingEnriched.xboxDeliveryHints = existingEnrichedObj.xboxDeliveryHints;
       }
@@ -1075,6 +1098,40 @@ function saveUserOverride(service, gameId, record = {}, extraKeys = []) {
     'DELETE FROM url_resolution_cache WHERE norm_url = ? AND blob_sha256 IS NULL'
   );
 
+  const pinnedOverridePlatformId =
+    typeof record?.platformId === 'string' && record.platformId.trim()
+      ? record.platformId.trim().toLowerCase()
+      : typeof record?.reviewRoute?.xboxProductId === 'string' &&
+          record.reviewRoute.xboxProductId.trim()
+        ? 'xbox'
+        : '';
+  const pinnedOverridePlatformGameId =
+    typeof record?.platformGameId === 'string' && record.platformGameId.trim()
+      ? record.platformGameId.trim()
+      : pinnedOverridePlatformId === 'xbox' &&
+          typeof record?.reviewRoute?.xboxProductId === 'string' &&
+          record.reviewRoute.xboxProductId.trim()
+        ? record.reviewRoute.xboxProductId.trim()
+        : '';
+  const pinnedOverridePlatformSpec =
+    pinnedOverridePlatformId && pinnedOverridePlatformGameId
+      ? [
+          {
+            platformId: pinnedOverridePlatformId,
+            platformGameId: pinnedOverridePlatformGameId,
+            ...(pinnedOverridePlatformId === 'xbox'
+              ? { xboxProductId: pinnedOverridePlatformGameId }
+              : {}),
+          },
+        ]
+      : null;
+  const selectGamePlatformsStmt = pinnedOverridePlatformSpec
+    ? service.stmt(
+        'override.selectGamePlatformsById',
+        'SELECT platforms_json FROM vault_games WHERE game_id = ?'
+      )
+    : null;
+
   let invalidated = 0;
   db.exec('BEGIN IMMEDIATE');
   try {
@@ -1085,6 +1142,15 @@ function saveUserOverride(service, gameId, record = {}, extraKeys = []) {
       clearExactUrlCache404Stmt.run(nextHeaderNorm);
     }
     for (const cid of candidateIds) {
+      if (selectGamePlatformsStmt && pinnedOverridePlatformSpec) {
+        const rowMeta = selectGamePlatformsStmt.get(cid);
+        if (rowMeta && rowMeta.platforms_json) {
+          const rowPlatforms = parseVaultJson(rowMeta.platforms_json);
+          if (hasVaultSameStorefrontConflict(rowPlatforms, pinnedOverridePlatformSpec)) {
+            continue;
+          }
+        }
+      }
       clearUrlCache404Stmt.run(cid);
       const rows = selectRowsStmt.all(cid);
       let touchedGame = false;
@@ -1304,7 +1370,7 @@ function saveGameDetail(service, payload = {}) {
         'games.selectDetailForSave',
         `
         SELECT canonical_title, steam_app_id, is_installed, is_favorited,
-               archived_by_subscription_rotation,
+               archived_by_subscription_rotation, platforms_json,
                enriched_json, achievements_json, hltb_json, critic_json,
                metadata_quality, enriched_at
         FROM vault_games
@@ -1312,6 +1378,12 @@ function saveGameDetail(service, payload = {}) {
       `
       )
       .get(gameId);
+
+    const existingDetailPlatforms =
+      existing && existing.platforms_json ? parseVaultJson(existing.platforms_json) : null;
+    const detailPlatformConflict =
+      Array.isArray(payload.platforms) &&
+      hasVaultSameStorefrontConflict(existingDetailPlatforms, payload.platforms);
 
     const incomingEnrichedObj =
       payload.enrichedMetadata && typeof payload.enrichedMetadata === 'object'
@@ -1334,13 +1406,14 @@ function saveGameDetail(service, payload = {}) {
     const existingEnrichedInvalidated = isExistingVaultEnrichedInvalidated(existingEnrichedObj, {
       isExplicitNonSteam: payload.isExplicitNonSteam === true,
       steamAppId: incomingSteamAppId,
-      forceReplaceEnriched: payload.forceReplaceEnriched === true,
+      forceReplaceEnriched: payload.forceReplaceEnriched === true || detailPlatformConflict,
     });
 
     if (
       incomingEnrichedObj &&
       existingEnrichedObj?.xboxDeliveryHints &&
-      !incomingEnrichedObj.xboxDeliveryHints
+      !incomingEnrichedObj.xboxDeliveryHints &&
+      !detailPlatformConflict
     ) {
       incomingEnrichedObj.xboxDeliveryHints = existingEnrichedObj.xboxDeliveryHints;
     }
@@ -1429,13 +1502,16 @@ function saveGameDetail(service, payload = {}) {
         : existing?.hltb_json
           ? compressVaultJson(existing.hltb_json)
           : null;
-    let finalCriticJson = existing?.critic_json ? compressVaultJson(existing.critic_json) : null;
+    let finalCriticJson =
+      !detailPlatformConflict && existing?.critic_json
+        ? compressVaultJson(existing.critic_json)
+        : null;
     if (payload.clearCriticScore === true) {
       finalCriticJson = null;
     } else if (payload.criticScore === null && payload.forceCriticScore === true) {
       finalCriticJson = null;
     } else if (payload.criticScore !== undefined && payload.criticScore !== null) {
-      if (payload.forceCriticScore === true) {
+      if (payload.forceCriticScore === true || detailPlatformConflict) {
         finalCriticJson = compressVaultJson(JSON.stringify(payload.criticScore));
       } else {
         const existingCriticObj =

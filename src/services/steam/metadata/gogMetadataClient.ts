@@ -10,6 +10,7 @@ import {
   SteamSystemRequirements,
 } from '../../../contracts/steam';
 import { extractFirstParagraph, stripHtmlToPlainSynopsis } from '../../common/synopsisTextUtils';
+import { computeTitleSimilarity, isTitleCompatible } from '../../common/titleMatching';
 import { isSequelMismatch, normalizeTitleKey, stripEditionSuffix } from '../../common/titleUtils';
 import { getDevProxyBaseForRoute } from '../../network/browserDevProxy';
 import { Priority, RequestPriority, requestScheduler } from '../../network/requestScheduler';
@@ -87,6 +88,9 @@ export interface GogMetadataFetchOptions {
   synopsisOnly?: boolean;
 }
 
+const GOG_LEADING_ARTICLE_RE = /^(?:the|a|an)$/i;
+const GOG_HTTP_STATUS_MSG_RE = /\bstatus code (\d{3})\b/i;
+
 export function sanitizeGogCatalogLikeQuery(raw: string): string {
   return String(raw || '')
     .replace(/^like:/i, '')
@@ -94,6 +98,76 @@ export function sanitizeGogCatalogLikeQuery(raw: string): string {
     .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * Derives a single fallback `like:` query token/prefix for GOG's `/v1/catalog` OpenResty
+ * endpoint when a multi-token `like:` query returns HTTP 400 (e.g. `"Daggerfall Unity GOG Cut"` ->
+ * `"Daggerfall"`). Returns `null` for single-token queries or when no `>= 4`-char shorter query exists.
+ */
+export function deriveGogCatalogRetryQuery(
+  sanitizedQuery: string,
+  rawTitle?: string
+): string | null {
+  const clean = sanitizeGogCatalogLikeQuery(sanitizedQuery);
+  const tokens = clean.split(' ').filter(Boolean);
+  if (tokens.length <= 1) return null;
+
+  // 1. Primary leading substantive token (skip leading articles "The"/"A"/"An")
+  const primaryIdx = GOG_LEADING_ARTICLE_RE.test(tokens[0]) && tokens.length > 1 ? 1 : 0;
+  const primaryToken = tokens[primaryIdx];
+  if (primaryToken && primaryToken.length >= 4 && primaryToken !== clean) {
+    return primaryToken;
+  }
+
+  // 2. Pre-subtitle prefix (before `:`, ` - `, ` – `, or ` — `) if shorter and >= 4 chars
+  if (rawTitle) {
+    const rawPrefix = rawTitle.split(/\s*(?::|\s[-–—]\s)\s*/)[0] || '';
+    const cleanPrefix = sanitizeGogCatalogLikeQuery(rawPrefix);
+    if (
+      cleanPrefix &&
+      cleanPrefix.length >= 4 &&
+      cleanPrefix !== clean &&
+      cleanPrefix.length < clean.length
+    ) {
+      return cleanPrefix;
+    }
+  }
+
+  // 3. First remaining token >= 4 chars
+  const firstSubstantive = tokens.find((token) => token.length >= 4 && token !== clean);
+  return firstSubstantive || null;
+}
+
+function extractGogHttpStatusCode(err: unknown): number | undefined {
+  if (err && typeof err === 'object') {
+    if ('response' in err) {
+      const resp = (err as { response?: unknown }).response;
+      if (resp && typeof resp === 'object' && 'status' in resp) {
+        const status = (resp as { status?: unknown }).status;
+        if (typeof status === 'number' && Number.isFinite(status)) {
+          return status;
+        }
+      }
+    }
+    if ('status' in err) {
+      const status = (err as { status?: unknown }).status;
+      if (typeof status === 'number' && Number.isFinite(status)) {
+        return status;
+      }
+    }
+  }
+  const msg = getErrorMessage(err);
+  const match = msg.match(GOG_HTTP_STATUS_MSG_RE);
+  if (match) {
+    const parsed = Number(match[1]);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function isBenignGogCatalogMissStatus(status?: number): boolean {
+  return status === 400 || status === 404;
 }
 
 function mapGogScreenshots(rawShots: GogRawScreenshot[]): SteamScreenshot[] {
@@ -309,8 +383,35 @@ export async function fetchGogProductMetadata(
       let catProd: GogCatalogProduct | null = null;
       const sanitizedCatalogQuery = sanitizeGogCatalogLikeQuery(lookupTitle || purchaseSlug || '');
       if (sanitizedCatalogQuery) {
-        try {
-          const likeParam = encodeURIComponent(`like:${sanitizedCatalogQuery}`);
+        const isQaSandboxProduct = (p?: GogCatalogProduct | null): boolean => {
+          if (!p) return true;
+          const orgs = [...(p.developers || []), ...(p.publishers || [])];
+          return orgs.some((name) =>
+            /^test\s+(?:developer|publisher)$/i.test(String(name || '').trim())
+          );
+        };
+        const normLookup = normalizeTitleKey(lookupTitle);
+        const normBaseLookup = normalizeTitleKey(stripEditionSuffix(lookupTitle));
+        const isCorroboratedCatalogCandidate = (p?: GogCatalogProduct | null): boolean => {
+          if (!p?.title || !normLookup) return false;
+          const candNorm = normalizeTitleKey(p.title);
+          if (!candNorm) return false;
+          if (candNorm === normLookup) return true;
+          if (isSequelMismatch(lookupTitle, p.title)) return false;
+          const candBase = normalizeTitleKey(stripEditionSuffix(p.title));
+          if (normBaseLookup && candBase === normBaseLookup) {
+            return true;
+          }
+          if (isTitleCompatible(lookupTitle, p.title) && isTitleCompatible(p.title, lookupTitle)) {
+            return true;
+          }
+          return computeTitleSimilarity(lookupTitle, p.title) >= 0.85;
+        };
+
+        const runCatalogLikeQuery = async (
+          likeQuery: string
+        ): Promise<{ product: GogCatalogProduct | null; status?: number }> => {
+          const likeParam = encodeURIComponent(`like:${likeQuery}`);
           const catUrl = `${gogCatalogBaseUrl}/v1/catalog?query=${likeParam}&limit=5&productType=in:game,pack`;
           const catRes = await requestScheduler.schedule(
             `https://catalog.gog.com/v1/catalog?query=${likeParam}&limit=5&productType=in:game,pack`,
@@ -322,44 +423,55 @@ export async function fetchGogProductMetadata(
             'catalog.gog.com',
             gogGameKey
           );
+          if (isBenignGogCatalogMissStatus(catRes?.status)) {
+            return { product: null, status: catRes.status };
+          }
           const hasZeroMatches =
             typeof catRes.data?.productCount === 'number' && catRes.data.productCount <= 0;
           const rawProducts =
             !hasZeroMatches && Array.isArray(catRes.data?.products) ? catRes.data.products : [];
-          const isQaSandboxProduct = (p?: GogCatalogProduct | null): boolean => {
-            if (!p) return true;
-            const orgs = [...(p.developers || []), ...(p.publishers || [])];
-            return orgs.some((name) =>
-              /^test\s+(?:developer|publisher)$/i.test(String(name || '').trim())
-            );
-          };
           const products = rawProducts.filter((p) => !isQaSandboxProduct(p));
-          const normLookup = normalizeTitleKey(lookupTitle);
-          const normBaseLookup = normalizeTitleKey(stripEditionSuffix(lookupTitle));
-          const isCorroboratedCatalogCandidate = (p?: GogCatalogProduct | null): boolean => {
-            if (!p?.title || !normLookup) return false;
-            const candNorm = normalizeTitleKey(p.title);
-            if (!candNorm) return false;
-            if (candNorm === normLookup) return true;
-            const candBase = normalizeTitleKey(stripEditionSuffix(p.title));
-            if (
-              normBaseLookup &&
-              candBase === normBaseLookup &&
-              !isSequelMismatch(lookupTitle, p.title)
-            ) {
-              return true;
-            }
-            return false;
-          };
-          catProd =
+          const matched =
             (purchaseSlug ? products.find((p) => p?.slug === purchaseSlug) || null : null) ||
             products.find((p) => isCorroboratedCatalogCandidate(p)) ||
             null;
+          return { product: matched, status: catRes?.status ?? 200 };
+        };
+
+        try {
+          const initialResult = await runCatalogLikeQuery(sanitizedCatalogQuery);
+          catProd = initialResult.product;
+          if (!catProd && initialResult.status === 400) {
+            const retryQuery = deriveGogCatalogRetryQuery(sanitizedCatalogQuery, lookupTitle);
+            if (retryQuery) {
+              const retryResult = await runCatalogLikeQuery(retryQuery);
+              catProd = retryResult.product;
+            }
+          }
         } catch (catErr: unknown) {
-          console.warn(
-            `[Fallback Provider] GOG catalog search fallback failed for ${lookupTitle}:`,
-            getErrorMessage(catErr)
-          );
+          const status = extractGogHttpStatusCode(catErr);
+          if (status === 400) {
+            const retryQuery = deriveGogCatalogRetryQuery(sanitizedCatalogQuery, lookupTitle);
+            if (retryQuery) {
+              try {
+                const retryResult = await runCatalogLikeQuery(retryQuery);
+                catProd = retryResult.product;
+              } catch (retryErr: unknown) {
+                const retryStatus = extractGogHttpStatusCode(retryErr);
+                if (!isBenignGogCatalogMissStatus(retryStatus)) {
+                  console.warn(
+                    `[Fallback Provider] GOG catalog search fallback failed for ${lookupTitle}:`,
+                    getErrorMessage(retryErr)
+                  );
+                }
+              }
+            }
+          } else if (!isBenignGogCatalogMissStatus(status)) {
+            console.warn(
+              `[Fallback Provider] GOG catalog search fallback failed for ${lookupTitle}:`,
+              getErrorMessage(catErr)
+            );
+          }
         }
       }
 

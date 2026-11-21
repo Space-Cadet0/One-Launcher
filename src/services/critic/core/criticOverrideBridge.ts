@@ -5,6 +5,7 @@ import type { StorefrontId } from '../../../contracts/platform';
 import { Priority } from '../../network/requestScheduler';
 import {
   getUserOverrideForGame,
+  isUserOverrideCompatibleWithGame,
   loadUserOverrides,
 } from '../../storage/userOverrideStorage';
 import { normalizeCriticTitleKey } from '../criticUtils';
@@ -153,6 +154,7 @@ export function findMatchingUserOverrideWithMemo(
           .map((p) => ({
             platformId: p.platformId as StorefrontId,
             platformGameId: String(p.platformGameId || p.xboxProductId || p.storefrontAppId || ''),
+            ...(p.xboxProductId ? { xboxProductId: p.xboxProductId } : {}),
             storefrontAppId: p.storefrontAppId,
             installed: false,
           }))
@@ -165,35 +167,50 @@ export function findMatchingUserOverrideWithMemo(
       return { platformId: m[1].toLowerCase(), platformGameId: m[2].toLowerCase() };
     })();
 
+    const synthGame: CanonicalGame = {
+      id: gameId || (steamAppId ? `steam-${steamAppId}` : title ? `game-${title.toLowerCase().trim()}` : ''),
+      title: title || '',
+      sortTitle: title || '',
+      steamAppId: typeof steamAppId === 'number' && steamAppId > 0 ? steamAppId : undefined,
+      platforms: normalizedPlatforms,
+      headerImage: '',
+      developers: [],
+      publishers: [],
+      genres: [],
+      tags: [],
+    };
+
     const isOverrideCompatible = (ov?: UserGameOverride): boolean => {
       if (!ov) return false;
-      if (ov.splitFromMerged) {
-        if (!hasPlatforms || normalizedPlatforms.length !== 1) return false;
-        const p = normalizedPlatforms[0];
-        if (ov.platformId && String(p.platformId).toLowerCase() !== String(ov.platformId).toLowerCase()) {
-          return false;
-        }
-        if (
-          ov.platformGameId &&
-          String(p.platformGameId).toLowerCase() !== String(ov.platformGameId).toLowerCase()
-        ) {
-          return false;
-        }
-        return true;
+      if (!isUserOverrideCompatibleWithGame(ov, synthGame)) {
+        return false;
       }
 
-      if (hasPlatforms && ov.platformId && ov.platformGameId) {
-        const ovPlat = String(ov.platformId).toLowerCase();
-        const ovPlatGame = String(ov.platformGameId).toLowerCase();
+      const pinnedPlatId = String(
+        ov.platformId || (ov.reviewRoute?.xboxProductId ? 'xbox' : '')
+      ).toLowerCase();
+      const pinnedPlatGameId = String(
+        ov.platformGameId || (pinnedPlatId === 'xbox' ? ov.reviewRoute?.xboxProductId || '' : '')
+      ).toLowerCase();
+
+      if (hasPlatforms && pinnedPlatId && pinnedPlatGameId) {
         const ownsMatchingPlat = normalizedPlatforms.some(
           (p) =>
-            String(p.platformId).toLowerCase() === ovPlat &&
-            String(p.platformGameId).toLowerCase() === ovPlatGame
+            String(p.platformId).toLowerCase() === pinnedPlatId &&
+            (String(p.platformGameId).toLowerCase() === pinnedPlatGameId ||
+              (Boolean(p.xboxProductId) &&
+                String(p.xboxProductId).toLowerCase() === pinnedPlatGameId))
         );
         if (ownsMatchingPlat) return true;
+        const hasSamePlatformWithoutMatch = normalizedPlatforms.some(
+          (p) => String(p.platformId).toLowerCase() === pinnedPlatId
+        );
+        if (hasSamePlatformWithoutMatch) {
+          return false;
+        }
         if (gameId && ov.gameId && gameId === ov.gameId) {
           const onlyConflictingStore = normalizedPlatforms.every(
-            (p) => String(p.platformId).toLowerCase() !== ovPlat
+            (p) => String(p.platformId).toLowerCase() !== pinnedPlatId
           );
           if (onlyConflictingStore) return false;
           return true;
@@ -201,13 +218,17 @@ export function findMatchingUserOverrideWithMemo(
         return false;
       }
 
-      if (!hasPlatforms && parsedGameIdPlatform && ov.platformId && ov.platformGameId) {
-        if (gameId && ov.gameId && gameId === ov.gameId) return true;
-        const ovPlat = String(ov.platformId).toLowerCase();
-        const ovPlatGame = String(ov.platformGameId).toLowerCase();
+      if (!hasPlatforms && parsedGameIdPlatform && pinnedPlatId && pinnedPlatGameId) {
         if (
-          parsedGameIdPlatform.platformId !== ovPlat ||
-          parsedGameIdPlatform.platformGameId !== ovPlatGame
+          parsedGameIdPlatform.platformId === pinnedPlatId &&
+          parsedGameIdPlatform.platformGameId !== pinnedPlatGameId
+        ) {
+          return false;
+        }
+        if (gameId && ov.gameId && gameId === ov.gameId) return true;
+        if (
+          parsedGameIdPlatform.platformId !== pinnedPlatId ||
+          parsedGameIdPlatform.platformGameId !== pinnedPlatGameId
         ) {
           return false;
         }
@@ -232,18 +253,6 @@ export function findMatchingUserOverrideWithMemo(
       return best;
     };
 
-    const synthGame: CanonicalGame = {
-      id: gameId || (steamAppId ? `steam-${steamAppId}` : title ? `game-${title.toLowerCase().trim()}` : ''),
-      title: title || '',
-      sortTitle: title || '',
-      steamAppId: typeof steamAppId === 'number' && steamAppId > 0 ? steamAppId : undefined,
-      platforms: normalizedPlatforms,
-      headerImage: '',
-      developers: [],
-      publishers: [],
-      genres: [],
-      tags: [],
-    };
     const directMatch = getUserOverrideForGame(synthGame, overrides);
     if (
       directMatch &&

@@ -16,6 +16,7 @@ import steamEnrichedCache from '../../storage/steamEnrichedCache.json';
 import {
   applyUserOverrideToGame,
   getUserOverrideForGame,
+  isUserOverrideCompatibleWithGame,
 } from '../../storage/userOverrideStorage';
 import {
   mergePlatformEntries,
@@ -172,10 +173,14 @@ export function mergeDuplicateCatalogEntries(params: {
     : secondaryHasReviews
     ? secondary.reviewSummary
     : primary.reviewSummary || secondary.reviewSummary;
+  const sameNonSteamPolarity =
+    Boolean(primary.isExplicitNonSteam) === Boolean(secondary.isExplicitNonSteam);
   const mergedReviewScoreOverride =
     primary.reviewScoreOverride !== undefined
       ? primary.reviewScoreOverride
-      : secondary.reviewScoreOverride;
+      : sameNonSteamPolarity && (!secondaryOv || isUserOverrideCompatibleWithGame(secondaryOv, primary))
+      ? secondary.reviewScoreOverride
+      : undefined;
   const mergedWorksOn = mergeWorksOnFlags(primary.worksOn, secondary.worksOn);
   const mergedPlatformsOs = mergePlatformsOsFlags(primary.platforms_os, secondary.platforms_os);
   const mergedNativePlatforms = mergeNativePlatforms(
@@ -255,7 +260,14 @@ export function mergeDuplicateCatalogEntries(params: {
 
   if (hasUserOverrides) {
     const existingOv = getUserOverrideForGame(existing, userOverrides);
-    const effectiveOv = incomingOverride || existingOv;
+    const effectiveOv =
+      (incomingOverride && isUserOverrideCompatibleWithGame(incomingOverride, mergedGame)
+        ? incomingOverride
+        : undefined) ||
+      (existingOv && isUserOverrideCompatibleWithGame(existingOv, mergedGame)
+        ? existingOv
+        : undefined) ||
+      getUserOverrideForGame(mergedGame, userOverrides);
     if (effectiveOv) {
       mergedGame = applyUserOverrideToGame(mergedGame, effectiveOv);
     }

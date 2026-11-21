@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import React from 'react';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import axios from 'axios';
 
 import { makeCanonicalGame, makeUserGameOverride } from './helpers/factories';
@@ -99,7 +101,24 @@ import { gogIntegration } from '../src/services/integrations/gogIntegration';
 import { xboxIntegration } from '../src/services/integrations/xboxIntegration';
 import { steamAchievementsService } from '../src/services/steam/steamAchievementsService';
 import * as localSystemScanner from '../src/services/system/localSystemScanner';
-import { getUserOverrideForGame } from '../src/services/storage/userOverrideStorage';
+import {
+  getUserOverrideForGame,
+  saveUserOverride,
+} from '../src/services/storage/userOverrideStorage';
+import {
+  isDonorGameCompatibleWithTarget,
+  recoverRichSummaryFieldsFromDonor,
+  slimGameForLocalStorageQuota,
+} from '../src/services/integrations/catalog/catalogSlimming';
+import {
+  mergeHydratedCatalogPreservingLiveState,
+  mergeStorefrontGames,
+  mergeUpdatedGamePreservingLivePlatformState,
+} from '../src/services/integrations/catalog/catalogMerger';
+import { sanitizeGameCatalog } from '../src/services/integrations/catalogSanitizer';
+import { runIntelligentNonSteamMatchPass } from '../src/utils/catalogMergeUtils';
+import { findMatchingUserOverrideWithMemo } from '../src/services/critic/core/criticOverrideBridge';
+import type { CompiledReviewOverrideIndex } from '../src/services/critic/core/criticServiceTypes';
 import { launcherService } from '../src/services/launcher/launcherService';
 import { SyncJobManager, syncJobManager } from '../src/services/network/syncJobManager';
 import {
@@ -109,10 +128,13 @@ import {
 import { metadataScraperService } from '../src/services/scraper/metadataScraperService';
 import { executeParallelStorefrontSearch } from '../src/services/scraper/storefrontSearchEngine';
 import {
+  deriveGogCatalogRetryQuery,
   fetchGogProductMetadata,
   sanitizeGogCatalogLikeQuery as sanitizeGogClientLikeQuery,
 } from '../src/services/steam/metadata/gogMetadataClient';
 import { StorefrontReviewHarvester } from '../src/services/critic/storefrontReviewHarvester';
+
+const nodeRequire = createRequire(import.meta.url);
 
 // ---------------------------------------------------------------------------
 // Minimal Zero-`any` React Hook Test Harness
@@ -585,6 +607,332 @@ describe('UAT Phase 3 Services & Hooks Remediation Suite', () => {
       expect(getUserOverrideForGame(msfs2024Game, overridesMap)).toBeUndefined();
       expect(getUserOverrideForGame(msfs2020Game, overridesMap)).toEqual(msfs2020Override);
     });
+
+    it('blocks secondary releaseDate, isExplicitNonSteam, reviewScoreOverride, criticScore, and enrichedMetadata bleed across distinct Xbox product IDs sharing an upstream appId', () => {
+      const msfs2020CriticOverride = {
+        id: 'mc-microsoft-flight-simulator',
+        source: 'metacritic' as const,
+        score: 91,
+        tier: 'Mighty' as const,
+        numReviews: 71,
+        url: 'https://www.metacritic.com/game/microsoft-flight-simulator/critic-reviews/',
+        summary: 'Synthetic MSFS 2020 press consensus',
+        isVerified: true,
+        isSynthetic: false,
+      };
+      const msfs2020Override = makeUserGameOverride({
+        gameId: 'steam-2537590',
+        platformId: 'xbox',
+        platformGameId: '9NRRJLLXM68V',
+        title: 'Microsoft Flight Simulator (2020)',
+        steamAppId: null,
+        isExplicitNonSteam: true,
+        matchedStore: 'custom',
+        matchedId: 'xbox-9NRRJLLXM68V',
+        releaseDate: '2021-07-27',
+        reviewScoreOverride: msfs2020CriticOverride,
+        reviewRoute: {
+          mode: 'routed',
+          source: 'metacritic',
+          url: msfs2020CriticOverride.url,
+          metacriticSlug: 'microsoft-flight-simulator',
+          steamAppId: 2537590,
+          xboxProductId: '9NRRJLLXM68V',
+          targetTitle: 'Microsoft Flight Simulator (2020)',
+        },
+      });
+      saveUserOverride(msfs2020Override);
+
+      const msfs2020Game = makeCanonicalGame({
+        id: 'steam-2537590',
+        title: 'Microsoft Flight Simulator (2020)',
+        originalStoreTitle: 'Microsoft Flight Simulator (2020)',
+        steamAppId: undefined,
+        isExplicitNonSteam: true,
+        releaseDate: '2021-07-27',
+        reviewScoreOverride: msfs2020CriticOverride,
+        platforms: [
+          {
+            platformId: 'xbox',
+            platformGameId: '9NRRJLLXM68V',
+            xboxProductId: '9NRRJLLXM68V',
+            installed: false,
+          },
+        ],
+        enrichedMetadata: {
+          appId: 0,
+          name: 'Microsoft Flight Simulator (2020)',
+          aboutTheGame: 'MSFS 2020 description',
+          detailedDescription: 'MSFS 2020 description',
+          shortDescription: 'MSFS 2020 description',
+          headerImage: '',
+          screenshots: [],
+          movies: [],
+          developers: ['Asobo Studio'],
+          publishers: ['Xbox Game Studios'],
+          genres: ['Simulation'],
+          tags: [],
+          categories: [],
+          releaseDate: '2021-07-27',
+          supportedLanguages: 'English',
+          systemRequirements: {},
+          reviewSummary: {
+            reviewScore: 0,
+            reviewScoreDesc: '',
+            totalPositive: 0,
+            totalNegative: 0,
+            totalReviews: 0,
+            positivePercent: 0,
+          },
+          enrichedSource: 'xbox',
+          metadataQuality: 'storefront_native',
+        },
+      });
+
+      const msfs2024Clean = makeCanonicalGame({
+        id: 'xbox-9P38D19T7LRV',
+        title: 'Microsoft Flight Simulator 2024',
+        originalStoreTitle: 'Microsoft Flight Simulator 2024',
+        steamAppId: undefined,
+        isExplicitNonSteam: undefined,
+        releaseDate: 'Nov 19, 2024',
+        reviewScoreOverride: undefined,
+        platforms: [
+          {
+            platformId: 'xbox',
+            platformGameId: '9P38D19T7LRV',
+            xboxProductId: '9P38D19T7LRV',
+            installed: false,
+          },
+        ],
+        enrichedMetadata: {
+          appId: 2537590,
+          name: 'Microsoft Flight Simulator 2024',
+          aboutTheGame: 'MSFS 2024 description',
+          detailedDescription: 'MSFS 2024 description',
+          shortDescription: 'MSFS 2024 description',
+          headerImage: '',
+          screenshots: [],
+          movies: [],
+          developers: ['Asobo Studio'],
+          publishers: ['Xbox Game Studios'],
+          genres: ['Simulation'],
+          tags: [],
+          categories: [],
+          releaseDate: 'TBA',
+          supportedLanguages: 'English',
+          systemRequirements: {},
+          reviewSummary: {
+            reviewScore: 0,
+            reviewScoreDesc: '',
+            totalPositive: 0,
+            totalNegative: 0,
+            totalReviews: 0,
+            positivePercent: 0,
+          },
+          enrichedSource: 'steam',
+          metadataQuality: 'authoritative',
+        },
+      });
+
+      // 1. Donor compatibility & recoverRichSummaryFieldsFromDonor block cross-product bleed
+      expect(isDonorGameCompatibleWithTarget(msfs2024Clean, msfs2020Game)).toBe(false);
+      const slimmed2024 = slimGameForLocalStorageQuota(msfs2024Clean);
+      const recovered2024 = recoverRichSummaryFieldsFromDonor(
+        slimmed2024,
+        msfs2020Game,
+        msfs2020Game.enrichedMetadata,
+        true
+      );
+      expect(recovered2024.reviewScoreOverride).toBeUndefined();
+      expect(recovered2024.isExplicitNonSteam).toBeUndefined();
+      expect(recovered2024.releaseDate).toBe('Nov 19, 2024');
+
+      // 2. mergeUpdatedGamePreservingLivePlatformState & mergeHydratedCatalogPreservingLiveState reject conflicting products
+      const preserved = mergeUpdatedGamePreservingLivePlatformState(msfs2020Game, msfs2024Clean);
+      expect(preserved.releaseDate).toBe('Nov 19, 2024');
+      expect(preserved.isExplicitNonSteam).toBeUndefined();
+      expect(preserved.reviewScoreOverride).toBeUndefined();
+      expect(preserved.enrichedMetadata?.releaseDate).toBe('TBA');
+
+      const collidingHydrated2024: CanonicalGame = {
+        ...msfs2024Clean,
+        id: 'steam-2537590',
+        steamAppId: 2537590,
+      };
+      const hydratedMerged = mergeHydratedCatalogPreservingLiveState(
+        [msfs2020Game, slimmed2024],
+        [msfs2020Game, collidingHydrated2024]
+      );
+      const hydrated2024 = hydratedMerged.find((g) =>
+        g.platforms.some((p) => p.platformId === 'xbox' && p.platformGameId === '9P38D19T7LRV')
+      );
+      expect(hydrated2024).toBeDefined();
+      expect(hydrated2024?.title).toBe('Microsoft Flight Simulator 2024');
+      expect(hydrated2024?.releaseDate).toBe('Nov 19, 2024');
+      expect(hydrated2024?.isExplicitNonSteam).toBeUndefined();
+      expect(hydrated2024?.reviewScoreOverride).toBeUndefined();
+      expect(hydrated2024?.enrichedMetadata?.releaseDate).toBe('TBA');
+
+      // 3. Full Sync Integrations pipeline (mergeStorefrontGames -> runIntelligentNonSteamMatchPass -> sanitizeGameCatalog)
+      const incomingXbox2024 = makeCanonicalGame({
+        id: 'xbox-9P38D19T7LRV',
+        title: 'Microsoft Flight Simulator 2024',
+        releaseDate: '2024-11-19',
+        isVerifiedEntitlement: true,
+        platforms: [
+          {
+            platformId: 'xbox',
+            platformGameId: '9P38D19T7LRV',
+            xboxProductId: '9P38D19T7LRV',
+            installed: false,
+            ownershipType: 'subscription',
+          },
+        ],
+      });
+      const incomingXbox2020 = makeCanonicalGame({
+        id: 'xbox-9NRRJLLXM68V',
+        title: 'Microsoft Flight Simulator',
+        releaseDate: '2021-07-27',
+        isVerifiedEntitlement: true,
+        platforms: [
+          {
+            platformId: 'xbox',
+            platformGameId: '9NRRJLLXM68V',
+            xboxProductId: '9NRRJLLXM68V',
+            installed: false,
+            ownershipType: 'subscription',
+          },
+        ],
+      });
+
+      const afterXboxMerge = mergeStorefrontGames(
+        [msfs2020Game, msfs2024Clean],
+        [incomingXbox2020, incomingXbox2024],
+        'xbox',
+        { authoritativeComplete: true }
+      );
+      const afterMatchPass = runIntelligentNonSteamMatchPass(afterXboxMerge);
+      const afterSanitize = sanitizeGameCatalog(afterMatchPass);
+
+      const synced2024 = afterSanitize.find((g) => g.id === 'xbox-9P38D19T7LRV');
+      const synced2020 = afterSanitize.find((g) => g.id === 'steam-2537590');
+      expect(synced2024).toBeDefined();
+      expect(synced2024?.title).toBe('Microsoft Flight Simulator 2024');
+      expect(synced2024?.releaseDate).toBe('Nov 19, 2024');
+      expect(synced2024?.isExplicitNonSteam).toBeUndefined();
+      expect(synced2024?.reviewScoreOverride).toBeUndefined();
+      expect(synced2024?.enrichedMetadata?.appId).toBe(2537590);
+      expect(synced2024?.enrichedMetadata?.releaseDate).toBe('TBA');
+
+      expect(synced2020).toBeDefined();
+      expect(synced2020?.title).toBe('Microsoft Flight Simulator (2020)');
+      expect(synced2020?.releaseDate).toBe('2021-07-27');
+      expect(synced2020?.isExplicitNonSteam).toBe(true);
+      expect(synced2020?.reviewScoreOverride?.id).toBe('mc-microsoft-flight-simulator');
+
+      // 4. Self-heal already-poisoned xbox-9P38D19T7LRV row during Sync Integrations
+      const poisoned2024: CanonicalGame = {
+        ...msfs2024Clean,
+        releaseDate: '2021-07-27',
+        isExplicitNonSteam: true,
+        reviewScoreOverride: msfs2020CriticOverride,
+        enrichedMetadata: {
+          ...msfs2024Clean.enrichedMetadata!,
+          releaseDate: '2021-07-27',
+        },
+      };
+      const healedCatalog = sanitizeGameCatalog(
+        mergeStorefrontGames(
+          [msfs2020Game, poisoned2024],
+          [incomingXbox2020, incomingXbox2024],
+          'xbox',
+          { authoritativeComplete: true }
+        )
+      );
+      const healed2024 = healedCatalog.find((g) => g.id === 'xbox-9P38D19T7LRV');
+      expect(healed2024).toBeDefined();
+      expect(healed2024?.title).toBe('Microsoft Flight Simulator 2024');
+      expect(healed2024?.releaseDate).toBe('2024-11-19');
+      expect(healed2024?.isExplicitNonSteam).toBeUndefined();
+      expect(healed2024?.reviewScoreOverride).toBeUndefined();
+      expect(healed2024?.enrichedMetadata?.releaseDate).toBe('2024-11-19');
+
+      // 5. criticOverrideBridge refuses to bind xbox:9NRRJLLXM68V override onto xbox:9P38D19T7LRV
+      const memo = new WeakMap<object, CompiledReviewOverrideIndex>();
+      const criticOvFor2024 = findMatchingUserOverrideWithMemo(
+        memo,
+        2537590,
+        'Microsoft Flight Simulator 2024',
+        'steam-2537590',
+        [{ platformId: 'xbox', platformGameId: '9P38D19T7LRV', xboxProductId: '9P38D19T7LRV' }]
+      );
+      const criticOvFor2020 = findMatchingUserOverrideWithMemo(
+        memo,
+        2537590,
+        'Microsoft Flight Simulator (2020)',
+        'steam-2537590',
+        [{ platformId: 'xbox', platformGameId: '9NRRJLLXM68V', xboxProductId: '9NRRJLLXM68V' }]
+      );
+      expect(criticOvFor2024).toBeUndefined();
+      expect(criticOvFor2020?.reviewScoreOverride?.id).toBe('mc-microsoft-flight-simulator');
+
+      // 6. SQLite offlineVault upsertGames & saveUserOverride block cross-product bleed on conflicting Xbox BigIds
+      const tmpVaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-bug-c2-vault-'));
+      interface VaultServiceLike {
+        upsertGames: (games: CanonicalGame[]) => { success: boolean };
+        saveUserOverride: (
+          gameId: string,
+          record: Record<string, unknown>
+        ) => { success: boolean };
+        saveGameDetail: (payload: Record<string, unknown>) => { success: boolean };
+        getGameDetail: (gameId: string) => {
+          enrichedMetadata?: { releaseDate?: string } | null;
+          criticScore?: { id?: string; score?: number } | null;
+        } | null;
+        shutdown: () => void;
+      }
+      const { OfflineVaultService } = nodeRequire(
+        path.join(ROOT_DIR, 'electron/launcher/offlineVaultService.cjs')
+      ) as {
+        OfflineVaultService: new (opts: { userDataDir: string }) => VaultServiceLike;
+      };
+      const vault = new OfflineVaultService({ userDataDir: tmpVaultDir });
+      try {
+        // Seed MSFS 2024 under colliding key with its own critic score 78
+        vault.upsertGames([collidingHydrated2024]);
+        vault.saveGameDetail({
+          gameId: 'steam-2537590',
+          steamAppId: 2537590,
+          canonicalTitle: 'Microsoft Flight Simulator 2024',
+          criticScore: {
+            id: 'mc-microsoft-flight-simulator-2024',
+            source: 'metacritic',
+            score: 78,
+          },
+        });
+        // Saving MSFS 2020's override (pinned to xbox:9NRRJLLXM68V) MUST NOT overwrite xbox:9P38D19T7LRV's critic_json
+        vault.saveUserOverride('steam-2537590', {
+          gameId: 'steam-2537590',
+          platformId: 'xbox',
+          platformGameId: '9NRRJLLXM68V',
+          reviewScoreOverride: msfs2020CriticOverride,
+        });
+        const detailAfterOtherOverride = vault.getGameDetail('steam-2537590');
+        expect(detailAfterOtherOverride?.criticScore?.id).toBe(
+          'mc-microsoft-flight-simulator-2024'
+        );
+        expect(detailAfterOtherOverride?.criticScore?.score).toBe(78);
+
+        // Upserting MSFS 2020 row onto a colliding gameId replaces instead of carrying forward MSFS 2024 fields
+        vault.upsertGames([msfs2020Game]);
+        const detailAfterReplace = vault.getGameDetail('steam-2537590');
+        expect(detailAfterReplace?.enrichedMetadata?.releaseDate).toBe('2021-07-27');
+      } finally {
+        vault.shutdown();
+        fs.rmSync(tmpVaultDir, { recursive: true, force: true });
+      }
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -914,6 +1262,149 @@ describe('UAT Phase 3 Services & Hooks Remediation Suite', () => {
       const decodedCatalogCall = decodeURIComponent(catalogCall || '');
       expect(decodedCatalogCall).toContain('query=like:Daggerfall Unity GOG Cut');
       expect(decodedCatalogCall).not.toContain('like:Daggerfall Unity - GOG Cut');
+    });
+
+    it('BUG-B7 residual: retries once with primary leading token on GOG /v1/catalog HTTP 400, validates title similarity, and stays silent on benign 400/404 misses', async () => {
+      expect(
+        deriveGogCatalogRetryQuery('Daggerfall Unity GOG Cut', 'Daggerfall Unity - GOG Cut')
+      ).toBe('Daggerfall');
+      expect(deriveGogCatalogRetryQuery('The Witcher 3 Wild Hunt', 'The Witcher 3: Wild Hunt')).toBe(
+        'Witcher'
+      );
+      expect(deriveGogCatalogRetryQuery('Daggerfall')).toBeNull();
+      expect(deriveGogCatalogRetryQuery('F1 24')).toBeNull();
+
+      // Case 1: Multi-token query returns HTTP 400 -> retries once with `like:Daggerfall` ->
+      // rejects unrelated "The Elder Scrolls II: Daggerfall" and returns null with ZERO warnings!
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const urlsCase1: string[] = [];
+      vi.spyOn(axios, 'get').mockImplementation(async (url: string) => {
+        urlsCase1.push(url);
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes('/v1/catalog') && decoded.includes('query=like:Daggerfall Unity GOG Cut')) {
+          throw Object.assign(new Error('Request failed with status code 400'), {
+            response: { status: 400 },
+          });
+        }
+        if (decoded.includes('/v1/catalog') && decoded.includes('query=like:Daggerfall')) {
+          return {
+            status: 200,
+            data: {
+              productCount: 2,
+              products: [
+                {
+                  id: '1435828767',
+                  title: 'The Elder Scrolls II: Daggerfall',
+                  slug: 'the_elder_scrolls_ii_daggerfall',
+                  releaseDate: '1996.08.31',
+                },
+                {
+                  id: '1435828999',
+                  title: 'Daggerfall 2',
+                  slug: 'daggerfall_2',
+                  releaseDate: '2025.01.01',
+                },
+              ],
+            },
+          };
+        }
+        throw Object.assign(new Error('Not found'), { response: { status: 404 } });
+      });
+
+      const resCase1 = await fetchGogProductMetadata('1782995089', 'Daggerfall Unity - GOG Cut');
+      expect(resCase1).toBeNull();
+      const catalogUrlsCase1 = urlsCase1
+        .filter((u) => u.includes('/v1/catalog'))
+        .map((u) => decodeURIComponent(u));
+      expect(catalogUrlsCase1).toHaveLength(2);
+      expect(catalogUrlsCase1[0]).toContain('query=like:Daggerfall Unity GOG Cut');
+      expect(catalogUrlsCase1[1]).toContain('query=like:Daggerfall');
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      // Case 2: Retry returns both an unrelated game AND a corroborated candidate -> picks only the corroborated match
+      warnSpy.mockClear();
+      vi.spyOn(axios, 'get').mockImplementation(async (url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes('/v1/catalog') && decoded.includes('query=like:Daggerfall Unity GOG Cut')) {
+          throw Object.assign(new Error('Request failed with status code 400'), {
+            response: { status: 400 },
+          });
+        }
+        if (decoded.includes('/v1/catalog') && decoded.includes('query=like:Daggerfall')) {
+          return {
+            status: 200,
+            data: {
+              productCount: 2,
+              products: [
+                {
+                  id: '1435828767',
+                  title: 'The Elder Scrolls II: Daggerfall',
+                  slug: 'the_elder_scrolls_ii_daggerfall',
+                  releaseDate: '1996.08.31',
+                  developers: ['Bethesda Softworks'],
+                },
+                {
+                  id: '1782995089',
+                  title: 'Daggerfall Unity',
+                  slug: 'daggerfall_unity',
+                  releaseDate: '2022.05.01',
+                  developers: ['Interkarma'],
+                  coverVertical: 'https://images.gog.com/daggerfall_unity_cover.jpg',
+                },
+              ],
+            },
+          };
+        }
+        if (decoded.includes('/en/game/daggerfall_unity')) {
+          return {
+            status: 200,
+            data: '<div class="description"><p>Daggerfall Unity brings the classic RPG into a modern open-source engine.</p></div>',
+          };
+        }
+        throw Object.assign(new Error('Not found'), { response: { status: 404 } });
+      });
+
+      const resCase2 = await fetchGogProductMetadata('1782995089', 'Daggerfall Unity - GOG Cut');
+      expect(resCase2).not.toBeNull();
+      expect(resCase2?.releaseDate).toBe('2022-05-01');
+      expect(resCase2?.developers).toEqual(['Interkarma']);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      // Case 3: Persistent HTTP 400 on both initial query and single retry -> silent null (zero console.warn)
+      warnSpy.mockClear();
+      const urlsCase3: string[] = [];
+      vi.spyOn(axios, 'get').mockImplementation(async (url: string) => {
+        urlsCase3.push(url);
+        if (url.includes('/v1/catalog')) {
+          throw Object.assign(new Error('Request failed with status code 400'), {
+            response: { status: 400 },
+          });
+        }
+        throw Object.assign(new Error('Not found'), { response: { status: 404 } });
+      });
+
+      const resCase3 = await fetchGogProductMetadata('1782995089', 'Daggerfall Unity - GOG Cut');
+      expect(resCase3).toBeNull();
+      expect(urlsCase3.filter((u) => u.includes('/v1/catalog'))).toHaveLength(2);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      // Case 4: Real server error (HTTP 500) still logs diagnostic warning
+      warnSpy.mockClear();
+      vi.spyOn(axios, 'get').mockImplementation(async (url: string) => {
+        if (url.includes('/v1/catalog')) {
+          throw Object.assign(new Error('Request failed with status code 500'), {
+            response: { status: 500 },
+          });
+        }
+        throw Object.assign(new Error('Not found'), { response: { status: 404 } });
+      });
+
+      const resCase4 = await fetchGogProductMetadata('1782995089', 'Daggerfall Unity - GOG Cut');
+      expect(resCase4).toBeNull();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0]?.[0] || '')).toContain(
+        '[Fallback Provider] GOG catalog search fallback failed'
+      );
     });
 
     it('Epic GraphQL 400 guard: trips session cooldown on HTTP 400 so Harvester does not spam repeated 400s across SKUs or games, and Electron epicIntegration skips unauthenticated renderer GraphQL POST', async () => {

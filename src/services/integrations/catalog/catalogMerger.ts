@@ -6,6 +6,7 @@ import {
 } from '../../../contracts/game';
 import { StorefrontId } from '../../../contracts/platform';
 import { sanitizeGameInstallSizeBytes } from '../../../utils/formatBytes';
+import { sanitizeStoreReleaseDate } from '../../common/titleUtils';
 import { LIBRARY_TITLE_COLLATOR } from '../../common/titleSortUtils';
 import { isUnsuitableHeaderUrl } from '../../igdb/igdbCoverService';
 import { reconcileAchievementSummaries } from '../../storage/achievementReconciliation';
@@ -21,7 +22,11 @@ import {
 } from '../../storage/metadataReconciliation';
 import {
   applyUserOverrideToGame,
+  doesReviewScoreOverrideMatch,
+  findIncompatibleCollidingOverrideForGame,
   getUserOverrideForGame,
+  isEnrichedMetadataIncompatibleWithOverride,
+  isUserOverrideCompatibleWithGame,
   loadUserOverrides,
 } from '../../storage/userOverrideStorage';
 import {
@@ -35,8 +40,10 @@ import {
 import {
   areAchievementSummariesSubstantivelyEqual,
   areCanonicalGamesShallowEqual,
+  arePlatformEntriesCompatibleForDonor,
   arePlatformOwnershipsEqual,
   areStringArraysEqual,
+  isDonorGameCompatibleWithTarget,
   recoverRichSummaryFieldsFromDonor,
 } from './catalogSlimming';
 import {
@@ -339,6 +346,29 @@ export function mergeStorefrontGames(
         if (!g || g.platforms.length === 0) continue;
         if (hasSameStorefrontConflict(g, newGame)) continue;
         if (hasSplitOverrideConflict(g, newGame, userOverrides)) continue;
+        // Never collapse a Steam storefront game into an explicitly unlinked non-Steam game
+        // (e.g. an Xbox title with a legacy `steam-<id>` key and `isExplicitNonSteam: true`).
+        if (
+          storefrontId === 'steam' &&
+          !g.platforms.some((p) => p.platformId === 'steam') &&
+          (g.isExplicitNonSteam === true ||
+            entryMeta[candIdx]?.override?.steamAppId === null ||
+            entryMeta[candIdx]?.override?.isExplicitNonSteam === true)
+        ) {
+          continue;
+        }
+        const candOverride = entryMeta[candIdx]?.override;
+        if (
+          candOverride &&
+          candOverride.platformId &&
+          candOverride.platformGameId &&
+          newGame.platforms.some(
+            (p) => String(p.platformId).toLowerCase() === String(candOverride.platformId).toLowerCase()
+          ) &&
+          !isUserOverrideCompatibleWithGame(candOverride, newGame)
+        ) {
+          continue;
+        }
         existingIndex = candIdx;
         break;
       }
@@ -654,7 +684,34 @@ export function mergeStorefrontGames(
           ? existing.platforms
           : updatedPlatforms;
 
-      const mergedSteamAppId = existing.isExplicitNonSteam
+      const conflictingSiblingOverride = !existingOverride
+        ? findIncompatibleCollidingOverrideForGame(existing, userOverrides)
+        : undefined;
+      const leakedExplicitNonSteam = Boolean(
+        conflictingSiblingOverride &&
+          existing.isExplicitNonSteam === true &&
+          (conflictingSiblingOverride.isExplicitNonSteam === true ||
+            conflictingSiblingOverride.steamAppId === null)
+      );
+      const leakedReviewScoreOverride = Boolean(
+        conflictingSiblingOverride &&
+          doesReviewScoreOverrideMatch(
+            existing.reviewScoreOverride,
+            conflictingSiblingOverride.reviewScoreOverride
+          )
+      );
+      const leakedReleaseDate = Boolean(
+        conflictingSiblingOverride?.releaseDate &&
+          existing.releaseDate === conflictingSiblingOverride.releaseDate
+      );
+      const nextIsExplicitNonSteam = leakedExplicitNonSteam
+        ? undefined
+        : existing.isExplicitNonSteam;
+      const nextReviewScoreOverride = leakedReviewScoreOverride
+        ? undefined
+        : existing.reviewScoreOverride;
+
+      const mergedSteamAppId = nextIsExplicitNonSteam
         ? undefined
         : existing.steamAppId || newGame.steamAppId;
 
@@ -752,10 +809,13 @@ export function mergeStorefrontGames(
         existing.detailedDescription,
         newGame.detailedDescription
       );
+      const validIncomingReleaseDate = sanitizeStoreReleaseDate(newGame.releaseDate);
       const nextReleaseDate =
-        pickPreferredReleaseDate(existing.releaseDate, newGame.releaseDate) ||
-        existing.releaseDate ||
-        newGame.releaseDate;
+        leakedReleaseDate && validIncomingReleaseDate
+          ? validIncomingReleaseDate
+          : pickPreferredReleaseDate(existing.releaseDate, newGame.releaseDate) ||
+            existing.releaseDate ||
+            newGame.releaseDate;
       const nextReviewSummary = existing.reviewSummary || newGame.reviewSummary;
       const nextIsVerifiedEntitlement =
         existing.isVerifiedEntitlement || newGame.isVerifiedEntitlement;
@@ -766,10 +826,17 @@ export function mergeStorefrontGames(
       const nextKernelAntiCheatName =
         existing.kernelAntiCheatName || newGame.kernelAntiCheatName;
       const nextAntiCheatName = existing.antiCheatName || newGame.antiCheatName;
-      const nextEnrichedMetadata = pickBestEnrichedMetadata(
+      const rawNextEnrichedMetadata = pickBestEnrichedMetadata(
         existing.enrichedMetadata,
         newGame.enrichedMetadata
       );
+      const nextEnrichedMetadata =
+        conflictingSiblingOverride?.releaseDate &&
+        rawNextEnrichedMetadata &&
+        rawNextEnrichedMetadata.releaseDate === conflictingSiblingOverride.releaseDate &&
+        validIncomingReleaseDate
+          ? { ...rawNextEnrichedMetadata, releaseDate: validIncomingReleaseDate }
+          : rawNextEnrichedMetadata;
 
       const gameUnchanged =
         nextTitle === existing.title &&
@@ -788,6 +855,8 @@ export function mergeStorefrontGames(
         nextDetailedDescription === existing.detailedDescription &&
         nextReleaseDate === existing.releaseDate &&
         nextReviewSummary === existing.reviewSummary &&
+        nextIsExplicitNonSteam === existing.isExplicitNonSteam &&
+        nextReviewScoreOverride === existing.reviewScoreOverride &&
         nextIsVerifiedEntitlement === existing.isVerifiedEntitlement &&
         nextMatchConfidence === existing.matchConfidence &&
         nextNeedsMatchReview === existing.needsMatchReview &&
@@ -796,36 +865,45 @@ export function mergeStorefrontGames(
         nextAntiCheatName === existing.antiCheatName &&
         nextEnrichedMetadata === existing.enrichedMetadata;
 
-      merged[existingIndex] = gameUnchanged
-        ? existing
-        : {
-            ...existing,
-            title: nextTitle,
-            sortTitle: nextSortTitle,
-            headerImage: nextHeaderImage,
-            capsuleImage: nextCapsuleImage,
-            iconUrl: nextIconUrl,
-            steamAppId: mergedSteamAppId,
-            id: nextId,
-            platforms: platformsRef,
-            developers: nextDevelopers,
-            publishers: nextPublishers,
-            genres: nextGenres,
-            tags: nextTags,
-            shortDescription: nextShortDescription,
-            detailedDescription: nextDetailedDescription,
-            releaseDate: nextReleaseDate,
-            reviewSummary: nextReviewSummary,
-            isVerifiedEntitlement: nextIsVerifiedEntitlement,
-            matchConfidence: nextMatchConfidence,
-            needsMatchReview: nextNeedsMatchReview,
-            ...(nextRequiresKernelAntiCheat
-              ? { requiresKernelAntiCheat: nextRequiresKernelAntiCheat }
-              : {}),
-            ...(nextKernelAntiCheatName ? { kernelAntiCheatName: nextKernelAntiCheatName } : {}),
-            ...(nextAntiCheatName ? { antiCheatName: nextAntiCheatName } : {}),
-            enrichedMetadata: nextEnrichedMetadata,
-          };
+      if (gameUnchanged) {
+        merged[existingIndex] = existing;
+      } else {
+        const updatedMerged: CanonicalGame = {
+          ...existing,
+          title: nextTitle,
+          sortTitle: nextSortTitle,
+          headerImage: nextHeaderImage,
+          capsuleImage: nextCapsuleImage,
+          iconUrl: nextIconUrl,
+          steamAppId: mergedSteamAppId,
+          id: nextId,
+          platforms: platformsRef,
+          developers: nextDevelopers,
+          publishers: nextPublishers,
+          genres: nextGenres,
+          tags: nextTags,
+          shortDescription: nextShortDescription,
+          detailedDescription: nextDetailedDescription,
+          releaseDate: nextReleaseDate,
+          reviewSummary: nextReviewSummary,
+          isVerifiedEntitlement: nextIsVerifiedEntitlement,
+          matchConfidence: nextMatchConfidence,
+          needsMatchReview: nextNeedsMatchReview,
+          ...(nextRequiresKernelAntiCheat
+            ? { requiresKernelAntiCheat: nextRequiresKernelAntiCheat }
+            : {}),
+          ...(nextKernelAntiCheatName ? { kernelAntiCheatName: nextKernelAntiCheatName } : {}),
+          ...(nextAntiCheatName ? { antiCheatName: nextAntiCheatName } : {}),
+          enrichedMetadata: nextEnrichedMetadata,
+        };
+        if (leakedExplicitNonSteam) {
+          delete updatedMerged.isExplicitNonSteam;
+        }
+        if (leakedReviewScoreOverride) {
+          delete updatedMerged.reviewScoreOverride;
+        }
+        merged[existingIndex] = updatedMerged;
+      }
 
       if (existingOverride) {
         merged[existingIndex] = applyUserOverrideToGame(merged[existingIndex], existingOverride);
@@ -1098,9 +1176,29 @@ export function mergeUpdatedGamePreservingLivePlatformState(
 ): CanonicalGame {
   if (!liveGame) return incomingGame;
   if (!incomingGame) return liveGame;
+  if (hasSameStorefrontConflict(liveGame, incomingGame)) {
+    return incomingGame;
+  }
+
+  const donorCompatible = isDonorGameCompatibleWithTarget(incomingGame, liveGame);
+  const loadedOverrides = loadUserOverrides();
+  const hasAnyOverrides = Object.keys(loadedOverrides).length > 0;
+  const incomingOverride = hasAnyOverrides
+    ? getUserOverrideForGame(incomingGame, loadedOverrides)
+    : undefined;
+  const liveMetaForMerge =
+    donorCompatible &&
+    liveGame.enrichedMetadata &&
+    !isEnrichedMetadataIncompatibleWithOverride(
+      liveGame.enrichedMetadata,
+      incomingOverride,
+      incomingGame
+    )
+      ? liveGame.enrichedMetadata
+      : undefined;
 
   const bestEnriched = pickBestEnrichedMetadata(
-    liveGame.enrichedMetadata,
+    liveMetaForMerge,
     incomingGame.enrichedMetadata
   );
   const enrichedChanged = bestEnriched !== incomingGame.enrichedMetadata;
@@ -1113,7 +1211,9 @@ export function mergeUpdatedGamePreservingLivePlatformState(
   let platformsChanged = false;
 
   const mergedPlatforms: GamePlatformOwnership[] = incomingPlatforms.map((incPlat) => {
-    const livePlat = liveGame.platforms.find((lp) => lp.platformId === incPlat.platformId);
+    const livePlat = liveGame.platforms.find(
+      (lp) => lp.platformId === incPlat.platformId && arePlatformEntriesCompatibleForDonor(incPlat, lp)
+    );
     if (!livePlat) {
       const sanitizedIncOnlySize = sanitizeGameInstallSizeBytes(incPlat.installSize);
       if (incPlat.installSize === sanitizedIncOnlySize) return incPlat;
@@ -1425,12 +1525,24 @@ export function mergeUpdatedGamePreservingLivePlatformState(
           ...(enrichedChanged ? { enrichedMetadata: bestEnriched } : {}),
         };
 
-  if (incomingGame.enrichedMetadata?.__quotaSlimmed && !liveGame.enrichedMetadata?.__quotaSlimmed) {
+  if (
+    donorCompatible &&
+    incomingGame.enrichedMetadata?.__quotaSlimmed &&
+    !liveGame.enrichedMetadata?.__quotaSlimmed
+  ) {
+    const allowReviewScoreOverride = hasAnyOverrides
+      ? Boolean(
+          incomingOverride &&
+            (incomingOverride.reviewScoreOverride !== undefined ||
+              incomingOverride.reviewRoute !== undefined)
+        )
+      : true;
     candidateMerged = recoverRichSummaryFieldsFromDonor(
       candidateMerged,
       liveGame,
       bestEnriched,
-      true
+      true,
+      { allowReviewScoreOverride }
     );
   }
 
@@ -1444,39 +1556,71 @@ export function mergeHydratedCatalogPreservingLiveState(
   if (!Array.isArray(hydratedGames) || hydratedGames.length === 0) return liveGames;
   if (!Array.isArray(liveGames) || liveGames.length === 0) return hydratedGames;
 
-  const liveById = new Map<string, CanonicalGame>();
-  const liveBySteamAppId = new Map<number, CanonicalGame>();
-  const liveByPlatKey = new Map<string, CanonicalGame>();
+  const userOverrides = loadUserOverrides();
+  const hasUserOverrides = Object.keys(userOverrides).length > 0;
+  const liveById = new Map<string, CanonicalGame[]>();
+  const liveBySteamAppId = new Map<number, CanonicalGame[]>();
+  const liveByPlatKey = new Map<string, CanonicalGame[]>();
+
+  const pushBucket = <K>(map: Map<K, CanonicalGame[]>, key: K, game: CanonicalGame) => {
+    let list = map.get(key);
+    if (!list) {
+      list = [];
+      map.set(key, list);
+    }
+    if (!list.includes(game)) {
+      list.push(game);
+    }
+  };
 
   for (const lg of liveGames) {
     if (!lg) continue;
-    if (lg.id) liveById.set(lg.id, lg);
-    if (lg.steamAppId) liveBySteamAppId.set(lg.steamAppId, lg);
+    if (lg.id) pushBucket(liveById, lg.id, lg);
+    if (lg.steamAppId) pushBucket(liveBySteamAppId, lg.steamAppId, lg);
     for (const lp of lg.platforms || []) {
       const normId = normalizePlatformGameIdForLookup(lp.platformGameId || lp.storefrontAppId);
       if (normId) {
-        liveByPlatKey.set(`${lp.platformId}:${normId}`, lg);
+        pushBucket(liveByPlatKey, `${lp.platformId}:${normId}`, lg);
       }
       if (lp.platformId === 'xbox') {
         const xBig = normalizePlatformGameIdForLookup(lp.xboxProductId);
         const xPfn = String(lp.packageFamilyName || '').trim().toLowerCase();
-        if (xBig) liveByPlatKey.set(`xbox:${xBig}`, lg);
-        if (xPfn) liveByPlatKey.set(`xbox:${xPfn}`, lg);
+        if (xBig) pushBucket(liveByPlatKey, `xbox:${xBig}`, lg);
+        if (xPfn) pushBucket(liveByPlatKey, `xbox:${xPfn}`, lg);
       }
     }
   }
 
-  const matchedLiveIds = new Set<string>();
+  const isCompatibleLiveMatch = (cand: CanonicalGame, hg: CanonicalGame): boolean => {
+    if (hasSameStorefrontConflict(cand, hg)) return false;
+    if (hasUserOverrides && hasSplitOverrideConflict(cand, hg, userOverrides)) return false;
+    return true;
+  };
+
+  const findCompatibleInBucket = (
+    bucket: CanonicalGame[] | undefined,
+    hg: CanonicalGame
+  ): CanonicalGame | undefined => {
+    if (!bucket || bucket.length === 0) return undefined;
+    // Prefer a candidate that is also a fully compatible donor (matching isExplicitNonSteam)
+    const exact = bucket.find(
+      (cand) => isCompatibleLiveMatch(cand, hg) && isDonorGameCompatibleWithTarget(hg, cand)
+    );
+    if (exact) return exact;
+    return bucket.find((cand) => isCompatibleLiveMatch(cand, hg));
+  };
+
+  const matchedLiveGames = new Set<CanonicalGame>();
   const merged = hydratedGames.map((hg) => {
-    let liveMatch = hg.id ? liveById.get(hg.id) : undefined;
+    let liveMatch = hg.id ? findCompatibleInBucket(liveById.get(hg.id), hg) : undefined;
     if (!liveMatch && hg.steamAppId) {
-      liveMatch = liveBySteamAppId.get(hg.steamAppId);
+      liveMatch = findCompatibleInBucket(liveBySteamAppId.get(hg.steamAppId), hg);
     }
     if (!liveMatch) {
       for (const hp of hg.platforms || []) {
         const normId = normalizePlatformGameIdForLookup(hp.platformGameId || hp.storefrontAppId);
         if (normId) {
-          const cand = liveByPlatKey.get(`${hp.platformId}:${normId}`);
+          const cand = findCompatibleInBucket(liveByPlatKey.get(`${hp.platformId}:${normId}`), hg);
           if (cand) {
             liveMatch = cand;
             break;
@@ -1486,8 +1630,8 @@ export function mergeHydratedCatalogPreservingLiveState(
           const xBig = normalizePlatformGameIdForLookup(hp.xboxProductId);
           const xPfn = String(hp.packageFamilyName || '').trim().toLowerCase();
           const cand =
-            (xBig ? liveByPlatKey.get(`xbox:${xBig}`) : undefined) ||
-            (xPfn ? liveByPlatKey.get(`xbox:${xPfn}`) : undefined);
+            (xBig ? findCompatibleInBucket(liveByPlatKey.get(`xbox:${xBig}`), hg) : undefined) ||
+            (xPfn ? findCompatibleInBucket(liveByPlatKey.get(`xbox:${xPfn}`), hg) : undefined);
           if (cand) {
             liveMatch = cand;
             break;
@@ -1496,15 +1640,15 @@ export function mergeHydratedCatalogPreservingLiveState(
       }
     }
     if (!liveMatch) return hg;
-    if (liveMatch.id) matchedLiveIds.add(liveMatch.id);
+    matchedLiveGames.add(liveMatch);
     return mergeUpdatedGamePreservingLivePlatformState(liveMatch, hg);
   });
 
-  const mergedSteamAppIds = new Set<number>();
+  const mergedBySteamAppId = new Map<number, CanonicalGame[]>();
   const mergedPlatformKeys = new Set<string>();
   const indexGameIntoMergedSets = (g: CanonicalGame) => {
     if (g.steamAppId && g.steamAppId > 0) {
-      mergedSteamAppIds.add(g.steamAppId);
+      pushBucket(mergedBySteamAppId, g.steamAppId, g);
     }
     for (const mp of g.platforms || []) {
       const normId = normalizePlatformGameIdForLookup(mp.platformGameId || mp.storefrontAppId);
@@ -1524,9 +1668,13 @@ export function mergeHydratedCatalogPreservingLiveState(
   }
 
   for (const lg of liveGames) {
-    if (!lg || (lg.id && matchedLiveIds.has(lg.id))) continue;
+    if (!lg || matchedLiveGames.has(lg)) continue;
+    const steamOwners = lg.steamAppId ? mergedBySteamAppId.get(lg.steamAppId) : undefined;
+    const matchedByCompatibleSteamAppId = Boolean(
+      steamOwners?.some((owner) => !hasSameStorefrontConflict(owner, lg))
+    );
     const alreadyInHydrated =
-      Boolean(lg.steamAppId && mergedSteamAppIds.has(lg.steamAppId)) ||
+      matchedByCompatibleSteamAppId ||
       (lg.platforms || []).some((lp) => {
         const normId = normalizePlatformGameIdForLookup(lp.platformGameId || lp.storefrontAppId);
         if (normId && mergedPlatformKeys.has(`${lp.platformId}:${normId}`)) {

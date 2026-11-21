@@ -33,6 +33,7 @@ import {
   compactGameForStorage,
   computeCatalogFingerprint,
   computeCatalogGamesFingerprint,
+  isDonorGameCompatibleWithTarget,
   recoverRichSummaryFieldsFromDonor,
   slimGameForLocalStorageQuota,
 } from './catalogSlimming';
@@ -290,21 +291,42 @@ function writeCatalogToLocalStorage(
   // Guard against slimmed projections overwriting non-slimmed in-memory / durable records
   const hasIncomingSlimmed = compacted.some((g) => Boolean(g?.enrichedMetadata?.__quotaSlimmed));
   if (hasIncomingSlimmed && Array.isArray(previousInMemory) && previousInMemory.length > 0) {
-    const prevById = new Map<string, CanonicalGame>();
+    const prevById = new Map<string, CanonicalGame[]>();
     for (const pg of previousInMemory) {
       if (pg?.id && !pg.enrichedMetadata?.__quotaSlimmed) {
-        prevById.set(pg.id, pg);
+        let list = prevById.get(pg.id);
+        if (!list) {
+          list = [];
+          prevById.set(pg.id, list);
+        }
+        list.push(pg);
       }
     }
     if (prevById.size > 0) {
+      const loadedOverrides = loadUserOverrides();
+      const hasAnyOverrides = Object.keys(loadedOverrides).length > 0;
       compacted = compacted.map((g) => {
         if (!g?.id || !g.enrichedMetadata?.__quotaSlimmed) return g;
-        const prevRich = prevById.get(g.id);
+        const prevCandidates = prevById.get(g.id);
+        const prevRich = prevCandidates?.find((cand) => isDonorGameCompatibleWithTarget(g, cand));
         if (!prevRich) return g;
-        const mergedMeta = pickBestEnrichedMetadata(prevRich.enrichedMetadata, g.enrichedMetadata);
+        const gOv = hasAnyOverrides ? getUserOverrideForGame(g, loadedOverrides) : undefined;
+        const compatiblePrevMeta =
+          prevRich.enrichedMetadata &&
+          !isEnrichedMetadataIncompatibleWithOverride(prevRich.enrichedMetadata, gOv, g)
+            ? prevRich.enrichedMetadata
+            : undefined;
+        const mergedMeta = compatiblePrevMeta
+          ? pickBestEnrichedMetadata(compatiblePrevMeta, g.enrichedMetadata)
+          : g.enrichedMetadata;
         const withRichMeta =
           mergedMeta !== g.enrichedMetadata ? { ...g, enrichedMetadata: mergedMeta } : g;
-        return recoverRichSummaryFieldsFromDonor(withRichMeta, prevRich, mergedMeta, true);
+        const allowReviewScoreOverride = hasAnyOverrides
+          ? Boolean(gOv && (gOv.reviewScoreOverride !== undefined || gOv.reviewRoute !== undefined))
+          : true;
+        return recoverRichSummaryFieldsFromDonor(withRichMeta, prevRich, mergedMeta, true, {
+          allowReviewScoreOverride,
+        });
       });
     }
   }
@@ -659,14 +681,33 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
       const details = snap?.details || {};
       if (snap?.success && Array.isArray(snap.games) && snap.games.length > 0) {
         const hasAuthoritativeIdbCatalog = Array.isArray(vaultCatalog) && vaultCatalog.length > 0;
-        const existingIdbIds = hasAuthoritativeIdbCatalog
-          ? new Set(vaultCatalog!.map((vg) => vg?.id).filter((id): id is string => Boolean(id)))
+        const existingIdbById = hasAuthoritativeIdbCatalog
+          ? new Map<string, CanonicalGame[]>()
           : null;
+        if (existingIdbById && vaultCatalog) {
+          for (const vg of vaultCatalog) {
+            if (!vg?.id) continue;
+            let list = existingIdbById.get(vg.id);
+            if (!list) {
+              list = [];
+              existingIdbById.set(vg.id, list);
+            }
+            list.push(vg);
+          }
+        }
         vaultSnapIds = new Set<string>();
         for (const g of snap.games) {
           if (!g?.id) continue;
           vaultSnapIds.add(g.id);
-          if (existingIdbIds && !existingIdbIds.has(g.id)) continue;
+          if (existingIdbById) {
+            const matchingIdbGames = existingIdbById.get(g.id);
+            if (
+              !matchingIdbGames ||
+              !matchingIdbGames.some((vg) => isDonorGameCompatibleWithTarget(vg, g))
+            ) {
+              continue;
+            }
+          }
           const detailEntry = details[g.id];
           const vaultCriticData = parseVaultCriticScore(detailEntry?.criticScore);
           if (vaultCriticData) {
@@ -714,15 +755,28 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
           void vaultSet(IDB_KEY_MAIN_CATALOG, vaultCatalog);
         } else {
           const loadedOverrides = loadUserOverrides();
-          const snapGamesById = new Map<string, CanonicalGame>();
+          const hasAnyOverrides = Object.keys(loadedOverrides).length > 0;
+          const snapGamesById = new Map<string, CanonicalGame[]>();
           for (const sg of snap.games) {
-            if (sg?.id) snapGamesById.set(sg.id, sg);
+            if (!sg?.id) continue;
+            let list = snapGamesById.get(sg.id);
+            if (!list) {
+              list = [];
+              snapGamesById.set(sg.id, list);
+            }
+            list.push(sg);
           }
           let upgradedAnyFromVaultDetails = false;
           vaultCatalog = vaultCatalog!.map((g) => {
             const ov = getUserOverrideForGame(g, loadedOverrides);
-            const snapGame = g?.id ? snapGamesById.get(g.id) : undefined;
-            const detailEntry = g?.id ? details[g.id] : undefined;
+            const rawSnapCandidates = g?.id ? snapGamesById.get(g.id) : undefined;
+            const snapGame = rawSnapCandidates?.find((cand) =>
+              isDonorGameCompatibleWithTarget(g, cand)
+            );
+            const hadIncompatibleSnapGame = Boolean(
+              rawSnapCandidates && rawSnapCandidates.length > 0 && !snapGame
+            );
+            const detailEntry = !hadIncompatibleSnapGame && g?.id ? details[g.id] : undefined;
             const rawDetailMeta =
               detailEntry?.enrichedMetadata ?? snapGame?.enrichedMetadata ?? undefined;
             const compatibleDetailMeta =
@@ -744,11 +798,15 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
             let nextGame =
               mergedMeta !== g.enrichedMetadata ? { ...g, enrichedMetadata: mergedMeta } : g;
             if (snapGame || (mergedMeta && !mergedMeta.__quotaSlimmed)) {
+              const allowReviewScoreOverride = hasAnyOverrides
+                ? Boolean(ov && (ov.reviewScoreOverride !== undefined || ov.reviewRoute !== undefined))
+                : true;
               const recovered = recoverRichSummaryFieldsFromDonor(
                 nextGame,
                 snapGame,
                 mergedMeta,
-                Boolean(g.enrichedMetadata?.__quotaSlimmed)
+                Boolean(g.enrichedMetadata?.__quotaSlimmed),
+                { allowReviewScoreOverride }
               );
               if (recovered !== nextGame) {
                 nextGame = recovered;

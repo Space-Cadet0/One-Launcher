@@ -1510,6 +1510,64 @@ function isFederatedAssetRowCompatible(sourceUrl, federatedPath, params = null) 
   return true;
 }
 
+/**
+ * Returns `true` when two platform ownership arrays represent distinct product entitlements
+ * on a shared storefront (e.g. `xbox:9NRRJLLXM68V` vs `xbox:9P38D19T7LRV`), preventing
+ * SQLite vault rows from carrying forward summary/enriched/critic fields across products.
+ *
+ * @param {any[] | null | undefined} existingPlatforms
+ * @param {any[] | null | undefined} incomingPlatforms
+ * @returns {boolean}
+ */
+function hasVaultSameStorefrontConflict(existingPlatforms, incomingPlatforms) {
+  if (
+    !Array.isArray(existingPlatforms) ||
+    existingPlatforms.length === 0 ||
+    !Array.isArray(incomingPlatforms) ||
+    incomingPlatforms.length === 0
+  ) {
+    return false;
+  }
+  for (const ep of existingPlatforms) {
+    if (!ep || typeof ep !== 'object' || !ep.platformId) continue;
+    const platIdLower = String(ep.platformId).trim().toLowerCase();
+    if (!platIdLower) continue;
+    const matchingIncoming = incomingPlatforms.filter(
+      (/** @type {any} */ ip) =>
+        ip &&
+        typeof ip === 'object' &&
+        String(ip.platformId || '').trim().toLowerCase() === platIdLower
+    );
+    if (matchingIncoming.length === 0) continue;
+
+    if (platIdLower === 'xbox') {
+      const epGameId = String(ep.platformGameId || '').trim().toLowerCase();
+      const epProdId = String(ep.xboxProductId || '').trim().toLowerCase();
+      const epIds = [epGameId, epProdId].filter(Boolean);
+      if (epIds.length === 0) continue;
+      const anyCompatible = matchingIncoming.some((/** @type {any} */ ip) => {
+        const ipGameId = String(ip.platformGameId || '').trim().toLowerCase();
+        const ipProdId = String(ip.xboxProductId || '').trim().toLowerCase();
+        const ipIds = [ipGameId, ipProdId].filter(Boolean);
+        if (ipIds.length === 0) return true;
+        if (epProdId && ipProdId && epProdId !== ipProdId) return false;
+        return epIds.some((id) => ipIds.includes(id));
+      });
+      if (!anyCompatible) return true;
+      continue;
+    }
+
+    const epId = String(ep.platformGameId || '').trim();
+    if (!epId) continue;
+    const anyCompatible = matchingIncoming.some((/** @type {any} */ ip) => {
+      const ipId = String(ip.platformGameId || '').trim();
+      return !ipId || ipId === epId;
+    });
+    if (!anyCompatible) return true;
+  }
+  return false;
+}
+
 module.exports = {
   isStandaloneStorefrontLauncherUtility,
   QUALITY_RANK,
@@ -1525,6 +1583,7 @@ module.exports = {
   isAnimatedGifBuffer,
   hasXboxPlatform,
   extractXboxBigIdsFromGame,
+  hasVaultSameStorefrontConflict,
   hasVaultReqContent,
   mergeVaultSystemRequirements,
   carryForwardVaultRequirements,

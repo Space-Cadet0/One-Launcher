@@ -597,25 +597,120 @@ function hasNonPlaceholderStrings(list: string[] | undefined, placeholder: strin
   );
 }
 
+export interface RecoverFromDonorOptions {
+  allowReviewScoreOverride?: boolean;
+}
+
+/**
+ * Checks whether two platform ownership entries on the same storefront represent compatible
+ * product entitlements (preventing e.g. `xbox:9NRRJLLXM68V` from donating fields to `xbox:9P38D19T7LRV`).
+ */
+export function arePlatformEntriesCompatibleForDonor(
+  targetPlat: GamePlatformOwnership,
+  donorPlat: GamePlatformOwnership
+): boolean {
+  if (!targetPlat?.platformId || !donorPlat?.platformId) return false;
+  const tpId = String(targetPlat.platformId).toLowerCase();
+  const dpId = String(donorPlat.platformId).toLowerCase();
+  if (tpId !== dpId) return false;
+
+  if (tpId === 'xbox') {
+    const tGameId = String(targetPlat.platformGameId || '').trim().toLowerCase();
+    const tProdId = String(targetPlat.xboxProductId || '').trim().toLowerCase();
+    const dGameId = String(donorPlat.platformGameId || '').trim().toLowerCase();
+    const dProdId = String(donorPlat.xboxProductId || '').trim().toLowerCase();
+    const tIds = [tGameId, tProdId].filter(Boolean);
+    const dIds = [dGameId, dProdId].filter(Boolean);
+    if (tIds.length === 0 || dIds.length === 0) return true;
+    if (tProdId && dProdId && tProdId !== dProdId) return false;
+    return tIds.some((id) => dIds.includes(id));
+  }
+
+  const tRaw = String(targetPlat.platformGameId || '').trim();
+  const dRaw = String(donorPlat.platformGameId || '').trim();
+  if (!tRaw || !dRaw) return true;
+  return tRaw === dRaw;
+}
+
+/**
+ * Returns `true` when `donor` is structurally compatible with `target` as a metadata/summary
+ * donor: no conflicting product IDs on any shared storefront, no conflicting explicit Steam
+ * App IDs, and no opposite `isExplicitNonSteam` polarity.
+ */
+export function isDonorGameCompatibleWithTarget(
+  target: CanonicalGame,
+  donor?: CanonicalGame | null
+): boolean {
+  if (!donor) return true;
+  if (target.steamAppId && donor.steamAppId && target.steamAppId !== donor.steamAppId) {
+    return false;
+  }
+  if (Boolean(donor.isExplicitNonSteam) !== Boolean(target.isExplicitNonSteam)) {
+    return false;
+  }
+  const targetPlats = Array.isArray(target.platforms) ? target.platforms : [];
+  const donorPlats = Array.isArray(donor.platforms) ? donor.platforms : [];
+  for (const tp of targetPlats) {
+    if (!tp?.platformId) continue;
+    const tpLower = String(tp.platformId).toLowerCase();
+    const sameStoreDonorPlats = donorPlats.filter(
+      (dp) => dp?.platformId && String(dp.platformId).toLowerCase() === tpLower
+    );
+    if (sameStoreDonorPlats.length === 0) continue;
+    if (!sameStoreDonorPlats.some((dp) => arePlatformEntriesCompatibleForDonor(tp, dp))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function recoverRichSummaryFieldsFromDonor(
   target: CanonicalGame,
   donor?: CanonicalGame | null,
   donorMeta?: CanonicalGame['enrichedMetadata'] | null,
-  wasSlimmed = false
+  wasSlimmed = false,
+  options?: RecoverFromDonorOptions
 ): CanonicalGame {
-  const effectiveMeta =
-    donorMeta && !donorMeta.__quotaSlimmed
-      ? donorMeta
-      : donor?.enrichedMetadata && !donor.enrichedMetadata.__quotaSlimmed
-      ? donor.enrichedMetadata
-      : undefined;
+  const donorCompatible = isDonorGameCompatibleWithTarget(target, donor);
+  const effectiveDonor = donorCompatible ? donor : undefined;
+
+  const isMetaCompatibleWithTarget = (
+    meta?: CanonicalGame['enrichedMetadata'] | null
+  ): meta is NonNullable<CanonicalGame['enrichedMetadata']> => {
+    if (!meta || meta.__quotaSlimmed) return false;
+    const metaAppId = Number(meta.appId);
+    if (Number.isFinite(metaAppId) && metaAppId > 0) {
+      if (target.isExplicitNonSteam === true) return false;
+      if (typeof target.steamAppId === 'number' && target.steamAppId > 0 && metaAppId !== target.steamAppId) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const canUsePassedDonorMeta = Boolean(
+    donorMeta &&
+      isMetaCompatibleWithTarget(donorMeta) &&
+      (donorCompatible || (donorMeta !== donor?.enrichedMetadata && !donor))
+  );
+  const effectiveMeta = canUsePassedDonorMeta
+    ? donorMeta!
+    : isMetaCompatibleWithTarget(effectiveDonor?.enrichedMetadata)
+    ? effectiveDonor!.enrichedMetadata
+    : undefined;
+
+  if (!effectiveDonor && !effectiveMeta) {
+    return target;
+  }
+
   const targetIsSlimmed = Boolean(wasSlimmed || target.enrichedMetadata?.__quotaSlimmed);
 
   const nextShortDescription =
     typeof target.shortDescription === 'string' && target.shortDescription.trim().length > 0
       ? target.shortDescription
-      : typeof donor?.shortDescription === 'string' && donor.shortDescription.trim().length > 0
-      ? donor.shortDescription
+      : typeof effectiveDonor?.shortDescription === 'string' &&
+        effectiveDonor.shortDescription.trim().length > 0
+      ? effectiveDonor.shortDescription
       : typeof effectiveMeta?.shortDescription === 'string' &&
         effectiveMeta.shortDescription.trim().length > 0
       ? effectiveMeta.shortDescription
@@ -624,9 +719,9 @@ export function recoverRichSummaryFieldsFromDonor(
   const nextDetailedDescription =
     typeof target.detailedDescription === 'string' && target.detailedDescription.trim().length > 0
       ? target.detailedDescription
-      : typeof donor?.detailedDescription === 'string' &&
-        donor.detailedDescription.trim().length > 0
-      ? donor.detailedDescription
+      : typeof effectiveDonor?.detailedDescription === 'string' &&
+        effectiveDonor.detailedDescription.trim().length > 0
+      ? effectiveDonor.detailedDescription
       : typeof effectiveMeta?.detailedDescription === 'string' &&
         effectiveMeta.detailedDescription.trim().length > 0
       ? effectiveMeta.detailedDescription
@@ -637,16 +732,16 @@ export function recoverRichSummaryFieldsFromDonor(
 
   const nextDevelopers = hasNonPlaceholderStrings(target.developers, 'Unknown Developer')
     ? target.developers
-    : hasNonPlaceholderStrings(donor?.developers, 'Unknown Developer')
-    ? donor!.developers
+    : hasNonPlaceholderStrings(effectiveDonor?.developers, 'Unknown Developer')
+    ? effectiveDonor!.developers
     : hasNonPlaceholderStrings(effectiveMeta?.developers, 'Unknown Developer')
     ? effectiveMeta!.developers
     : target.developers;
 
   const nextPublishers = hasNonPlaceholderStrings(target.publishers, 'Unknown Publisher')
     ? target.publishers
-    : hasNonPlaceholderStrings(donor?.publishers, 'Unknown Publisher')
-    ? donor!.publishers
+    : hasNonPlaceholderStrings(effectiveDonor?.publishers, 'Unknown Publisher')
+    ? effectiveDonor!.publishers
     : hasNonPlaceholderStrings(effectiveMeta?.publishers, 'Unknown Publisher')
     ? effectiveMeta!.publishers
     : target.publishers;
@@ -654,15 +749,15 @@ export function recoverRichSummaryFieldsFromDonor(
   const nextTags =
     Array.isArray(target.tags) && target.tags.length > 0
       ? target.tags
-      : Array.isArray(donor?.tags) && donor.tags.length > 0
-      ? donor.tags
+      : Array.isArray(effectiveDonor?.tags) && effectiveDonor.tags.length > 0
+      ? effectiveDonor.tags
       : Array.isArray(effectiveMeta?.tags) && effectiveMeta.tags.length > 0
       ? effectiveMeta.tags
       : target.tags;
 
   const donorGenres =
-    Array.isArray(donor?.genres) && donor.genres.length > 0
-      ? donor.genres
+    Array.isArray(effectiveDonor?.genres) && effectiveDonor.genres.length > 0
+      ? effectiveDonor.genres
       : Array.isArray(effectiveMeta?.genres) && effectiveMeta.genres.length > 0
       ? effectiveMeta.genres
       : undefined;
@@ -678,8 +773,9 @@ export function recoverRichSummaryFieldsFromDonor(
       (target.reviewSummary.totalReviews > 0 || target.reviewSummary.positivePercent > 0)
   );
   const donorHasReviews = Boolean(
-    donor?.reviewSummary &&
-      (donor.reviewSummary.totalReviews > 0 || donor.reviewSummary.positivePercent > 0)
+    effectiveDonor?.reviewSummary &&
+      (effectiveDonor.reviewSummary.totalReviews > 0 ||
+        effectiveDonor.reviewSummary.positivePercent > 0)
   );
   const metaHasReviews = Boolean(
     effectiveMeta?.reviewSummary &&
@@ -689,36 +785,49 @@ export function recoverRichSummaryFieldsFromDonor(
   const nextReviewSummary = targetHasReviews
     ? target.reviewSummary
     : donorHasReviews
-    ? donor!.reviewSummary
+    ? effectiveDonor!.reviewSummary
     : metaHasReviews
     ? effectiveMeta!.reviewSummary
     : target.reviewSummary;
 
+  const allowReviewScoreOverrideCarry = options?.allowReviewScoreOverride !== false;
   const nextReviewScoreOverride =
     target.reviewScoreOverride !== undefined
       ? target.reviewScoreOverride
-      : donor?.reviewScoreOverride;
+      : allowReviewScoreOverrideCarry
+      ? effectiveDonor?.reviewScoreOverride
+      : undefined;
   const nextControllerSupport =
-    target.controllerSupport || donor?.controllerSupport || effectiveMeta?.controllerSupport;
-  const nextHdrSupport = target.hdrSupport ?? donor?.hdrSupport ?? effectiveMeta?.hdrSupport;
+    target.controllerSupport ||
+    effectiveDonor?.controllerSupport ||
+    effectiveMeta?.controllerSupport;
+  const nextHdrSupport =
+    target.hdrSupport ?? effectiveDonor?.hdrSupport ?? effectiveMeta?.hdrSupport;
   const nextNativePlatforms =
     Array.isArray(target.nativePlatforms) && target.nativePlatforms.length > 0
       ? target.nativePlatforms
-      : donor?.nativePlatforms;
-  const nextWorksOn = target.worksOn || donor?.worksOn;
-  const nextPlatformsOs = target.platforms_os || donor?.platforms_os;
-  const nextOriginalStoreTitle = target.originalStoreTitle || donor?.originalStoreTitle;
+      : effectiveDonor?.nativePlatforms;
+  const nextWorksOn = target.worksOn || effectiveDonor?.worksOn;
+  const nextPlatformsOs = target.platforms_os || effectiveDonor?.platforms_os;
+  const nextOriginalStoreTitle = target.originalStoreTitle || effectiveDonor?.originalStoreTitle;
   const nextRequiresKernelAntiCheat =
-    target.requiresKernelAntiCheat ?? donor?.requiresKernelAntiCheat;
-  const nextKernelAntiCheatName = target.kernelAntiCheatName || donor?.kernelAntiCheatName;
-  const nextAntiCheatName = target.antiCheatName || donor?.antiCheatName;
+    target.requiresKernelAntiCheat ?? effectiveDonor?.requiresKernelAntiCheat;
+  const nextKernelAntiCheatName =
+    target.kernelAntiCheatName || effectiveDonor?.kernelAntiCheatName;
+  const nextAntiCheatName = target.antiCheatName || effectiveDonor?.antiCheatName;
 
   // Also restore platform-level fields stripped during localStorage quota slimming
   let platformsRecovered = false;
   let nextPlatforms = target.platforms;
-  if (Array.isArray(target.platforms) && Array.isArray(donor?.platforms) && donor.platforms.length > 0) {
+  if (
+    Array.isArray(target.platforms) &&
+    Array.isArray(effectiveDonor?.platforms) &&
+    effectiveDonor.platforms.length > 0
+  ) {
     const recoveredPlats = target.platforms.map((tp) => {
-      const dp = donor.platforms.find((p) => p.platformId === tp.platformId);
+      const dp = effectiveDonor.platforms.find(
+        (p) => p.platformId === tp.platformId && arePlatformEntriesCompatibleForDonor(tp, p)
+      );
       if (!dp) return tp;
       const mergedAchievements = tp.achievements ?? dp.achievements;
       const mergedNamespace = tp.namespace || dp.namespace;

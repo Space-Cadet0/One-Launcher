@@ -1876,6 +1876,181 @@ function getOverrideLookupIndex(map: UserGameOverridesMap): OverrideLookupIndex 
 }
 
 /**
+ * Checks whether a persisted `UserGameOverride` is compatible with a candidate `CanonicalGame`.
+ * Rejects overrides pinned to a different platform product ID on a storefront owned by `game`
+ * (e.g., preventing an `xbox:9NRRJLLXM68V` override from bleeding onto `xbox:9P38D19T7LRV`).
+ */
+export function isUserOverrideCompatibleWithGame(
+  ov: UserGameOverride | undefined | null,
+  game: Pick<CanonicalGame, 'id' | 'platforms'> | undefined | null
+): boolean {
+  if (!ov || !game) return false;
+  const platforms = Array.isArray(game.platforms) ? game.platforms : [];
+  const hasPlatforms = platforms.length > 0;
+
+  if (ov.splitFromMerged) {
+    if (!hasPlatforms || platforms.length !== 1) return false;
+    const p = platforms[0];
+    if (ov.platformId && String(p.platformId).toLowerCase() !== String(ov.platformId).toLowerCase()) {
+      return false;
+    }
+    if (ov.platformGameId) {
+      const ovPlatGameIdLower = String(ov.platformGameId).toLowerCase();
+      const matchesPlatId =
+        String(p.platformGameId).toLowerCase() === ovPlatGameIdLower ||
+        (Boolean(p.xboxProductId) && String(p.xboxProductId).toLowerCase() === ovPlatGameIdLower);
+      if (!matchesPlatId) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // If an override explicitly pins a platform entitlement and `game.platforms` is populated,
+  // verify `game` either owns that exact entitlement or does NOT carry a conflicting entitlement
+  // on the same storefront (preventing e.g. xbox:9NRRJLLXM68V from hijacking xbox:9P38D19T7LRV).
+  const pinnedPlatformId =
+    ov.platformId || (ov.reviewRoute?.xboxProductId ? 'xbox' : undefined);
+  const pinnedPlatformGameId =
+    ov.platformGameId || (pinnedPlatformId === 'xbox' ? ov.reviewRoute?.xboxProductId : undefined);
+
+  if (hasPlatforms && pinnedPlatformId && pinnedPlatformGameId) {
+    const ovPlatIdLower = String(pinnedPlatformId).toLowerCase();
+    const ovPlatGameIdLower = String(pinnedPlatformGameId).toLowerCase();
+    const ownsMatchingPlat = platforms.some(
+      (p) =>
+        p &&
+        String(p.platformId).toLowerCase() === ovPlatIdLower &&
+        (String(p.platformGameId).toLowerCase() === ovPlatGameIdLower ||
+          (Boolean(p.xboxProductId) &&
+            String(p.xboxProductId).toLowerCase() === ovPlatGameIdLower))
+    );
+    if (ownsMatchingPlat) return true;
+
+    // Reject whenever the game owns one or more entries for `pinnedPlatformId` and NONE match `pinnedPlatformGameId`.
+    const hasSamePlatformWithoutMatch = platforms.some(
+      (p) => p && String(p.platformId).toLowerCase() === ovPlatIdLower
+    );
+    if (hasSamePlatformWithoutMatch) {
+      return false;
+    }
+
+    if (game.id && ov.gameId && game.id === ov.gameId) {
+      // Allow direct game.id match only when game does NOT exclusively belong to a conflicting storefront entitlement
+      const onlySteamWithoutTargetStore = platforms.every(
+        (p) => String(p?.platformId).toLowerCase() !== ovPlatIdLower
+      );
+      if (onlySteamWithoutTargetStore && platforms.some((p) => p?.platformId === 'steam')) {
+        return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Compares two `reviewScoreOverride` payloads for substantive equality (used to detect
+ * leaked review overrides carried from an incompatible sibling override).
+ */
+export function doesReviewScoreOverrideMatch(
+  a: CanonicalGame['reviewScoreOverride'],
+  b: UserGameOverride['reviewScoreOverride']
+): boolean {
+  if (a === undefined || b === undefined) return false;
+  if (a === null && b === null) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  if (a.id && b.id && a.id === b.id && a.score === b.score && a.source === b.source) {
+    return true;
+  }
+  return (
+    a.source === b.source &&
+    a.score === b.score &&
+    Boolean(a.url) &&
+    Boolean(b.url) &&
+    a.url === b.url
+  );
+}
+
+/**
+ * Finds an incompatible user override pinned to a different product ID on the same storefront
+ * that collides with `game`'s ID or Steam App ID / `enrichedMetadata.appId` (for a game that
+ * has NO compatible override of its own). Returns `undefined` when `game` owns a compatible
+ * override or has no same-storefront colliding override.
+ */
+export function findIncompatibleCollidingOverrideForGame(
+  game: CanonicalGame,
+  overrides?: UserGameOverridesMap
+): UserGameOverride | undefined {
+  if (!game || !Array.isArray(game.platforms) || game.platforms.length === 0) return undefined;
+  const map = overrides ?? loadUserOverrides();
+  if (!map) return undefined;
+  const idx = getOverrideLookupIndex(map);
+  if (idx.isEmpty) return undefined;
+  if (getUserOverrideForGame(game, map)) return undefined;
+
+  const candidates: UserGameOverride[] = [];
+  const seen = new Set<UserGameOverride>();
+  const addCandidate = (ov?: UserGameOverride) => {
+    if (ov && !seen.has(ov)) {
+      seen.add(ov);
+      candidates.push(ov);
+    }
+  };
+
+  if (game.id) {
+    addCandidate(map[game.id]);
+    const byId = idx.byGameId.get(game.id);
+    if (byId) {
+      for (const c of byId) addCandidate(c);
+    }
+  }
+  const appIds = new Set<number>();
+  if (typeof game.steamAppId === 'number' && game.steamAppId > 0) {
+    appIds.add(game.steamAppId);
+  }
+  const enrichedAppId = Number(game.enrichedMetadata?.appId);
+  if (Number.isFinite(enrichedAppId) && enrichedAppId > 0) {
+    appIds.add(enrichedAppId);
+  }
+  for (const appId of appIds) {
+    const steamKey = `steam-${appId}`;
+    addCandidate(map[steamKey]);
+    addCandidate(map[String(appId)]);
+    const bySteamId = idx.byGameId.get(steamKey);
+    if (bySteamId) {
+      for (const c of bySteamId) addCandidate(c);
+    }
+  }
+
+  for (const ov of candidates) {
+    if (isUserOverrideCompatibleWithGame(ov, game)) continue;
+    const pinnedPlatId = String(
+      ov.platformId || (ov.reviewRoute?.xboxProductId ? 'xbox' : '')
+    ).toLowerCase();
+    const pinnedPlatGameId = String(
+      ov.platformGameId || (pinnedPlatId === 'xbox' ? ov.reviewRoute?.xboxProductId || '' : '')
+    ).toLowerCase();
+    if (!pinnedPlatId || !pinnedPlatGameId) continue;
+
+    const ownsDifferentProductOnSameStore = game.platforms.some(
+      (p) =>
+        p &&
+        String(p.platformId).toLowerCase() === pinnedPlatId &&
+        String(p.platformGameId || '').toLowerCase() !== pinnedPlatGameId &&
+        (!p.xboxProductId || String(p.xboxProductId).toLowerCase() !== pinnedPlatGameId)
+    );
+    if (ownsDifferentProductOnSameStore) {
+      return ov;
+    }
+  }
+
+  return undefined;
+}
+
+/**
  * Retrieves a matching user override for a canonical game.
  * Gathers all compatible candidate overrides across game.id, steamAppId, and composite/dash/underscore/bare
  * platform keys and deterministically returns the candidate with the newest `updatedAt` timestamp.
@@ -1892,69 +2067,12 @@ export function getUserOverrideForGame(
 
   const hasPlatforms = Array.isArray(game.platforms) && game.platforms.length > 0;
 
-  const isCompatibleWithGame = (ov?: UserGameOverride): boolean => {
-    if (!ov) return false;
-    if (ov.splitFromMerged) {
-      if (!hasPlatforms || game.platforms.length !== 1) return false;
-      const p = game.platforms[0];
-      if (ov.platformId && String(p.platformId).toLowerCase() !== String(ov.platformId).toLowerCase()) {
-        return false;
-      }
-      if (
-        ov.platformGameId &&
-        String(p.platformGameId).toLowerCase() !== String(ov.platformGameId).toLowerCase()
-      ) {
-        return false;
-      }
-      return true;
-    }
-
-    // If an override explicitly pins a platform entitlement and `game.platforms` is populated,
-    // verify `game` either owns that exact entitlement or does NOT carry a conflicting entitlement
-    // on the same storefront (preventing e.g. xbox:9NRRJLLXM68V from hijacking xbox:9P38D19T7LRV).
-    if (hasPlatforms && ov.platformId && ov.platformGameId) {
-      const ovPlatIdLower = String(ov.platformId).toLowerCase();
-      const ovPlatGameIdLower = String(ov.platformGameId).toLowerCase();
-      const ownsMatchingPlat = game.platforms.some(
-        (p) =>
-          p &&
-          String(p.platformId).toLowerCase() === ovPlatIdLower &&
-          (String(p.platformGameId).toLowerCase() === ovPlatGameIdLower ||
-            (Boolean(p.xboxProductId) &&
-              String(p.xboxProductId).toLowerCase() === ovPlatGameIdLower))
-      );
-      if (ownsMatchingPlat) return true;
-
-      // Reject whenever the game owns one or more entries for `ov.platformId` and NONE match `ov.platformGameId`.
-      const hasSamePlatformWithoutMatch = game.platforms.some(
-        (p) => p && String(p.platformId).toLowerCase() === ovPlatIdLower
-      );
-      if (hasSamePlatformWithoutMatch) {
-        return false;
-      }
-
-      if (game.id && ov.gameId && game.id === ov.gameId) {
-        // Allow direct game.id match only when game does NOT exclusively belong to a conflicting storefront entitlement
-        const onlySteamWithoutTargetStore = game.platforms.every(
-          (p) => String(p?.platformId).toLowerCase() !== ovPlatIdLower
-        );
-        if (onlySteamWithoutTargetStore && game.platforms.some((p) => p?.platformId === 'steam')) {
-          return false;
-        }
-        return true;
-      }
-      return false;
-    }
-
-    return true;
-  };
-
   let bestCandidate: UserGameOverride | undefined;
   let bestTs = -1;
   let bestRank = Number.POSITIVE_INFINITY;
 
   const considerCandidate = (ov: UserGameOverride | undefined, rank: number) => {
-    if (!ov || !isCompatibleWithGame(ov)) return;
+    if (!ov || !isUserOverrideCompatibleWithGame(ov, game)) return;
     if (bestCandidate === ov) {
       if (rank < bestRank) bestRank = rank;
       return;

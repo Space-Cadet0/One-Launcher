@@ -284,6 +284,7 @@ export function reconcileCatalogTrophiesRecords(
  */
 export function runIntelligentNonSteamMatchPass(currentCatalog: CanonicalGame[]): CanonicalGame[] {
   const assignedSteamIds = new Map<number, CanonicalGame[]>();
+  const assignedGameIds = new Map<string, CanonicalGame[]>();
   const registerAssigned = (appId: number, game: CanonicalGame) => {
     let bucket = assignedSteamIds.get(appId);
     if (!bucket) {
@@ -292,9 +293,21 @@ export function runIntelligentNonSteamMatchPass(currentCatalog: CanonicalGame[])
     }
     bucket.push(game);
   };
+  const registerGameId = (id: string, game: CanonicalGame) => {
+    if (!id) return;
+    let bucket = assignedGameIds.get(id);
+    if (!bucket) {
+      bucket = [];
+      assignedGameIds.set(id, bucket);
+    }
+    bucket.push(game);
+  };
   for (const existingGame of currentCatalog) {
     if (existingGame.steamAppId) {
       registerAssigned(existingGame.steamAppId, existingGame);
+    }
+    if (existingGame.id) {
+      registerGameId(existingGame.id, existingGame);
     }
   }
   let anyChanged = false;
@@ -302,15 +315,16 @@ export function runIntelligentNonSteamMatchPass(currentCatalog: CanonicalGame[])
     if (g.steamAppId || g.isExplicitNonSteam) return g;
     const matched = steamMatcher.getEffectiveSteamAppId(g);
     if (matched) {
+      const candidateId = `steam-${matched}`;
       const existingOwners = assignedSteamIds.get(matched);
+      const existingIdOwners = assignedGameIds.get(candidateId);
       const normTitle = normalizeCanonicalTitle(g.title);
+      const isConflictingOwner = (owner: CanonicalGame): boolean =>
+        owner !== g &&
+        (hasSameStorefrontConflict(owner, g) ||
+          normalizeCanonicalTitle(owner.title) !== normTitle);
       const conflictingOwner = Boolean(
-        existingOwners?.some(
-          (owner) =>
-            owner !== g &&
-            (hasSameStorefrontConflict(owner, g) ||
-              normalizeCanonicalTitle(owner.title) !== normTitle)
-        )
+        existingOwners?.some(isConflictingOwner) || existingIdOwners?.some(isConflictingOwner)
       );
       if (conflictingOwner) {
         return g;
@@ -344,11 +358,12 @@ export function runIntelligentNonSteamMatchPass(currentCatalog: CanonicalGame[])
       const enriched: CanonicalGame = {
         ...g,
         steamAppId: matched,
-        id: `steam-${matched}`,
+        id: candidateId,
         headerImage: nextHeader,
         capsuleImage: nextCapsule,
       };
       registerAssigned(matched, enriched);
+      registerGameId(candidateId, enriched);
       anyChanged = true;
       return enriched;
     }
