@@ -19,6 +19,10 @@ import {
   ExternalLink,
   RefreshCw,
 } from 'lucide-react';
+import {
+  openSetupExternalUrlViaElectron,
+  sanitizeSetupExternalHref,
+} from '../setupWizardExternalUrl';
 
 export interface StorefrontClientsStepProps {
   snapshot: EnvironmentHealthSnapshot;
@@ -245,18 +249,6 @@ export const StorefrontClientsStep: React.FC<StorefrontClientsStepProps> = ({
     return { count, storeLabels };
   }, [catalogGames]);
 
-  const handleOpenExternal = (url?: string) => {
-    if (!url) return;
-    const api = typeof window !== 'undefined' ? window.electronAPI : undefined;
-    if (typeof api?.openExternalUrl === 'function') {
-      void api.openExternalUrl(url);
-    } else if (typeof api?.openExternal === 'function') {
-      void api.openExternal(url);
-    } else if (typeof window !== 'undefined') {
-      window.open(url, '_blank', 'noopener,noreferrer');
-    }
-  };
-
   const renderClientCard = (compId: RenderableClientComponentId) => {
     const rawComp: EnvironmentComponentState | undefined = snapshot.components[compId];
     const isEaClient = compId === 'bottle_ea' || compId === 'host_ea';
@@ -425,6 +417,7 @@ export const StorefrontClientsStep: React.FC<StorefrontClientsStepProps> = ({
 
   const xboxComp = snapshot.components.xbox_runtime;
   const showMissingWinGamingServices = isWin && xboxComp?.status === 'missing';
+  const safeXboxExternalUrl = sanitizeSetupExternalHref(xboxComp?.externalDownloadUrl);
 
   const introCopy = showBottleSection
     ? 'Pick which store launchers to install. Steam is recommended; GOG and Epic already download and play without their apps.'
@@ -559,15 +552,21 @@ export const StorefrontClientsStep: React.FC<StorefrontClientsStepProps> = ({
               Install Gaming Services from the Microsoft Store to play PC Game Pass games.
             </p>
           </div>
-          {xboxComp?.externalDownloadUrl && (
-            <button
-              type="button"
-              onClick={() => handleOpenExternal(xboxComp.externalDownloadUrl)}
+          {safeXboxExternalUrl && (
+            <a
+              href={safeXboxExternalUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => {
+                if (openSetupExternalUrlViaElectron(safeXboxExternalUrl)) {
+                  e.preventDefault();
+                }
+              }}
               className="min-h-6 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#131c27] hover:bg-[#2a475e] border border-[#2a475e] text-xs font-semibold text-[#66c0f4] hover:text-white transition-colors cursor-pointer shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#66c0f4]"
             >
               <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
               <span>Open Microsoft Store</span>
-            </button>
+            </a>
           )}
         </div>
       )}

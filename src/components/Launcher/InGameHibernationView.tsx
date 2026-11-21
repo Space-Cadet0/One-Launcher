@@ -42,6 +42,7 @@ export const InGameHibernationView = ({
           }`}
         >
           <span
+            aria-hidden="true"
             className={`w-2 h-2 rounded-full ${
               hasCloudSyncWarning ? 'bg-amber-400' : 'bg-emerald-400'
             }`}
@@ -60,9 +61,14 @@ export const InGameHibernationView = ({
         {hasCloudSyncWarning && (
           <div
             data-testid="hibernation-cloud-sync-warning"
+            role="status"
+            aria-live="polite"
             className="text-left text-[11px] text-amber-200 bg-amber-950/35 border border-amber-500/35 rounded-lg px-3 py-2 flex items-start gap-2"
           >
-            <AlertTriangle className="w-3.5 h-3.5 text-amber-400 flex-shrink-0 mt-0.5" />
+            <AlertTriangle
+              className="w-3.5 h-3.5 text-amber-400 flex-shrink-0 mt-0.5"
+              aria-hidden="true"
+            />
             <span>
               {activeSession?.cloudSync?.reason ||
                 activeSession?.statusMessage ||
@@ -82,7 +88,7 @@ export const InGameHibernationView = ({
             type="button"
             data-testid="resume-full-ui-btn"
             onClick={onResumeFullUi}
-            className="w-full px-4 py-2.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-xs font-bold text-sky-200 hover:text-white uppercase tracking-wider transition-colors cursor-pointer"
+            className="w-full px-4 py-2.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-xs font-bold text-sky-200 hover:text-white uppercase tracking-wider transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
           >
             Resume Full UI
           </button>

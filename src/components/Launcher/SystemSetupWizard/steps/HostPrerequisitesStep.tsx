@@ -11,6 +11,10 @@ import {
   ExternalLink,
   RefreshCw,
 } from 'lucide-react';
+import {
+  openSetupExternalUrlViaElectron,
+  sanitizeSetupExternalHref,
+} from '../setupWizardExternalUrl';
 
 export interface HostPrerequisitesStepProps {
   snapshot: EnvironmentHealthSnapshot;
@@ -67,18 +71,6 @@ export const HostPrerequisitesStep: React.FC<HostPrerequisitesStepProps> = ({
   const isAppleSiliconMac = isMac && snapshot.isAppleSiliconMac;
   const isRepairCapableMode = mode === 'health_check' || mode === 'repair';
 
-  const handleOpenExternal = (url?: string) => {
-    if (!url) return;
-    const api = typeof window !== 'undefined' ? window.electronAPI : undefined;
-    if (typeof api?.openExternalUrl === 'function') {
-      void api.openExternalUrl(url);
-    } else if (typeof api?.openExternal === 'function') {
-      void api.openExternal(url);
-    } else if (typeof window !== 'undefined') {
-      window.open(url, '_blank', 'noopener,noreferrer');
-    }
-  };
-
   const renderPrerequisiteCard = (
     comp: EnvironmentComponentState,
     options?: {
@@ -91,6 +83,10 @@ export const HostPrerequisitesStep: React.FC<HostPrerequisitesStepProps> = ({
     const isChecked = isReady ? isForceRepair : selectedIds.has(comp.id);
     const isFocused = focusComponentId === comp.id;
     const canToggle = comp.canAutoInstall || isReady;
+    const safeExternalDownloadUrl =
+      !isReady && comp.requiresExternalDownload
+        ? sanitizeSetupExternalHref(comp.externalDownloadUrl)
+        : '';
 
     return (
       <div
@@ -152,15 +148,21 @@ export const HostPrerequisitesStep: React.FC<HostPrerequisitesStepProps> = ({
 
           <div className="flex items-center gap-2 shrink-0">
             {renderStatusPill(comp)}
-            {!isReady && comp.requiresExternalDownload && comp.externalDownloadUrl && (
-              <button
-                type="button"
-                onClick={() => handleOpenExternal(comp.externalDownloadUrl)}
+            {safeExternalDownloadUrl && (
+              <a
+                href={safeExternalDownloadUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={(e) => {
+                  if (openSetupExternalUrlViaElectron(safeExternalDownloadUrl)) {
+                    e.preventDefault();
+                  }
+                }}
                 className="min-h-6 inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-[#131c27] hover:bg-[#2a475e] border border-[#2a475e] text-[11px] font-semibold text-[#66c0f4] hover:text-white transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#66c0f4]"
               >
                 <ExternalLink className="w-3 h-3" aria-hidden="true" />
                 <span>Download</span>
-              </button>
+              </a>
             )}
             {isReady && isRepairCapableMode && comp.canAutoInstall && (
               <button

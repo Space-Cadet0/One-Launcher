@@ -1,33 +1,45 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { CanonicalGame } from '../../contracts/game';
-import { acquireModalOverlayLock } from '../../utils/modalOverlayLock';
 import { ModalShell } from '../Common/ModalShell';
-import { StorefrontId, STOREFRONT_REGISTRY } from '../../contracts/platform';
+import { StorefrontId } from '../../contracts/platform';
 import {
-  CompatibilityLayerInfo,
   CompatibilityLayerType,
   DiskSpaceInfo,
   DownloadTaskState,
   GameInstallInfo,
   resolveDefaultBottleForLayer,
 } from '../../contracts/launcher';
+import {
+  getDefaultBottleNameForRunner,
+  isBottleNameCompatibleWithRunner,
+  resolveInstallBottleForRunner,
+} from '../../services/launcher/bottleArchitectureUtils';
 import { launcherService } from '../../services/launcher/launcherService';
 import { environmentSetupService } from '../../services/launcher/environmentSetupService';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
+import { useIsRealClientRenderer, useSafeId } from '../../utils/useSafeId';
+import { Download, Loader2, X } from 'lucide-react';
 import {
-  Download,
-  FolderOpen,
-  HardDrive,
-  X,
-  AlertCircle,
-  AlertTriangle,
-  Cpu,
-  Info,
-  Link2,
-  Loader2,
-  CheckCircle2,
-  Wrench,
-} from 'lucide-react';
+  buildGameInstallPayload,
+  computeInstallModalPlan,
+  deduplicateInstallers,
+  resolveHeaderImageMediaUrl,
+  resolveTargetSteamDisplayPath,
+} from './InstallModal/installModalHelpers';
+import {
+  InstallCompatibilityBanners,
+  InstallCompatibilityBannersBase,
+} from './InstallModal/InstallCompatibilityBanners';
+import {
+  InstallBuildAndBottleSection,
+  InstallBuildAndBottleSectionBase,
+  InstallStorefrontSelector,
+  InstallStorefrontSelectorBase,
+} from './InstallModal/InstallBuildAndBottleSection';
+import {
+  InstallDestinationAndDiskSection,
+  InstallDestinationAndDiskSectionBase,
+} from './InstallModal/InstallDestinationAndDiskSection';
 
 export interface GameInstallModalProps {
   isOpen: boolean;
@@ -37,316 +49,6 @@ export interface GameInstallModalProps {
   onInstallStarted?: (task?: DownloadTaskState) => void;
 }
 
-import { formatBytes, sanitizeGameInstallSizeBytes } from '../../utils/formatBytes';
-import {
-  detectKernelAntiCheatFromNotice,
-  detectStructuralKernelAntiCheatFromNotices,
-  isBattlEyeKernelAntiCheat,
-  normalizeChainedHandoffId,
-} from '../../services/integrations/catalogSanitizer';
-
-function formatVersion(v?: string): string {
-  if (!v) return '';
-  const cleaned = String(v).trim().replace(/^[vV]+/, '');
-  return cleaned ? `v${cleaned}` : '';
-}
-
-type InstallerItem = NonNullable<GameInstallInfo['availableInstallers']>[number];
-
-const CHAINED_INSTALLER_ID_RE = /-chained-(?:bottle|host|win)-launcher$/i;
-
-function isChainedInstallerItem(ins?: InstallerItem | null): boolean {
-  if (!ins) return false;
-  return Boolean(
-    ins.chainedLauncherHandoff ||
-      ins.externalStorefrontHandoff ||
-      CHAINED_INSTALLER_ID_RE.test(String(ins.id || ''))
-  );
-}
-
-function mapHandoffIdToLauncherName(id?: string): string | null {
-  switch (id) {
-    case 'ubisoft':
-      return 'Ubisoft Connect';
-    case 'ea':
-      return 'EA App';
-    case 'bnet':
-      return 'Battle.net';
-    case 'rockstar':
-      return 'Rockstar Games Launcher';
-    case 'riot':
-      return 'Riot Client';
-    default:
-      return null;
-  }
-}
-
-function resolveChainedPublisherLauncherName(params: {
-  selectedInstaller?: InstallerItem;
-  installInfo?: GameInstallInfo | null;
-  activePlatformObj?: CanonicalGame['platforms'][number];
-}): string {
-  const explicit =
-    params.selectedInstaller?.externalLauncher ||
-    params.installInfo?.externalLauncher ||
-    params.activePlatformObj?.externalLauncher ||
-    params.installInfo?.xboxCompatibility?.externalLauncher ||
-    params.installInfo?.xboxCompatibility?.externalStorefront;
-  if (explicit && explicit.trim()) {
-    const normalizedExplicit = normalizeChainedHandoffId(explicit);
-    const mappedExplicit = mapHandoffIdToLauncherName(normalizedExplicit);
-    if (mappedExplicit) return mappedExplicit;
-    return explicit.trim();
-  }
-  const rawKey =
-    params.selectedInstaller?.chainedLauncherHandoff ||
-    params.selectedInstaller?.externalStorefrontHandoff ||
-    params.installInfo?.chainedLauncherHandoff ||
-    params.installInfo?.externalStorefrontHandoff ||
-    params.installInfo?.xboxCompatibility?.chainedLauncherHandoff ||
-    params.installInfo?.xboxCompatibility?.externalStorefrontHandoff ||
-    params.activePlatformObj?.chainedLauncherHandoff ||
-    params.activePlatformObj?.externalStorefrontHandoff ||
-    '';
-  const normalizedKey =
-    normalizeChainedHandoffId(rawKey) || String(rawKey).trim().toLowerCase();
-  return mapHandoffIdToLauncherName(normalizedKey) || 'Publisher Launcher';
-}
-
-function deduplicateInstallers(
-  installers?: GameInstallInfo['availableInstallers'],
-  winHost = false
-): InstallerItem[] {
-  if (!installers || installers.length === 0) return [];
-
-  const normalizedInstallers = installers.map((ins) => {
-    if (CHAINED_INSTALLER_ID_RE.test(String(ins.id || ''))) {
-      return { ...ins, os: 'windows' as const };
-    }
-    if (ins.id === 'xbox-external-mac-launcher') {
-      return { ...ins, os: 'mac' as const };
-    }
-    return ins;
-  });
-
-  let filtered = normalizedInstallers;
-  if (winHost) {
-    const winOnly = normalizedInstallers.filter((i) => i.os === 'windows');
-    if (winOnly.length > 0) filtered = winOnly;
-  } else {
-    const nonLinux = normalizedInstallers.filter((i) => i.os !== 'linux');
-    if (nonLinux.length > 0) filtered = nonLinux;
-  }
-
-  const byGroup = new Map<string, InstallerItem[]>();
-  for (const ins of filtered) {
-    const groupKey = ins.os;
-    const list = byGroup.get(groupKey) || [];
-    list.push(ins);
-    byGroup.set(groupKey, list);
-  }
-
-  const bestPerGroup: InstallerItem[] = [];
-  for (const [, candidates] of byGroup.entries()) {
-    const sorted = [...candidates].sort((a, b) => {
-      const chainedDiff =
-        (isChainedInstallerItem(a) ? 0 : 1) - (isChainedInstallerItem(b) ? 0 : 1);
-      if (chainedDiff !== 0) return chainedDiff;
-      const langDiff =
-        (/^en/i.test(a.language || '') ? 0 : 1) - (/^en/i.test(b.language || '') ? 0 : 1);
-      if (langDiff !== 0) return langDiff;
-      return (
-        (sanitizeGameInstallSizeBytes(b.totalSizeBytes) || 0) -
-        (sanitizeGameInstallSizeBytes(a.totalSizeBytes) || 0)
-      );
-    });
-    bestPerGroup.push(sorted[0]);
-  }
-
-  const getSortRank = (item: InstallerItem): number => {
-    if (winHost) {
-      if (item.os === 'windows') return 0;
-      if (item.os === 'mac') return 1;
-      return 2;
-    }
-    if (item.os === 'mac') return 0;
-    if (item.os === 'windows') return 1;
-    return 2;
-  };
-
-  return bestPerGroup.sort((a, b) => getSortRank(a) - getSortRank(b));
-}
-
-function isInstallBottleCompatibleWithRunner(
-  bottleName: string,
-  layer: CompatibilityLayerInfo | undefined,
-  runnerType: string,
-  allLayers?: CompatibilityLayerInfo[]
-): boolean {
-  if (!bottleName) return true;
-  const arch =
-    layer?.bottleDetails?.[bottleName]?.wineArch ||
-    allLayers?.find((l) => l.bottleDetails?.[bottleName]?.wineArch)?.bottleDetails?.[bottleName]
-      ?.wineArch;
-  if (runnerType === 'crossover_preview_arm64') {
-    return arch ? arch === 'arm64' : !/^OneLauncher$/i.test(bottleName);
-  }
-  if (runnerType === 'crossover' || runnerType === 'crossover_preview') {
-    return arch ? arch === 'win64' : !/-arm64$/i.test(bottleName);
-  }
-  return true;
-}
-
-function resolveInstallBottleForRunner(params: {
-  savedBottleName?: string;
-  savedRunner?: string;
-  resolvedRunner: string;
-  hostLayers: CompatibilityLayerInfo[];
-  allLayers?: CompatibilityLayerInfo[];
-  hostArch?: string;
-}): string {
-  const { savedBottleName, savedRunner, resolvedRunner, hostLayers, allLayers, hostArch } = params;
-  const trimmedBottle = savedBottleName?.trim() || '';
-  if (!trimmedBottle) return '';
-
-  const resolvedLayer = hostLayers.find((l) => l.type === resolvedRunner) || hostLayers[0];
-  const availableBottles = resolvedLayer?.availableBottles || [];
-  const compatibleBottles = availableBottles.filter((b) =>
-    isInstallBottleCompatibleWithRunner(b, resolvedLayer, resolvedRunner, allLayers)
-  );
-  const fallbackBottle =
-    compatibleBottles.length > 0
-      ? resolveDefaultBottleForLayer(
-          {
-            type: resolvedRunner as CompatibilityLayerType,
-            availableBottles: compatibleBottles,
-            bottleDetails: resolvedLayer?.bottleDetails,
-          },
-          resolvedRunner
-        ) || ''
-      : '';
-
-  const isOrphanInSelect = !availableBottles.includes(trimmedBottle);
-  if (isOrphanInSelect) {
-    return fallbackBottle;
-  }
-
-  const bottleArchFromAnyLayer =
-    resolvedLayer?.bottleDetails?.[trimmedBottle]?.wineArch ||
-    allLayers?.find((l) => l.bottleDetails?.[trimmedBottle]?.wineArch)?.bottleDetails?.[
-      trimmedBottle
-    ]?.wineArch;
-
-  const isCompatibleWithResolved =
-    isInstallBottleCompatibleWithRunner(trimmedBottle, resolvedLayer, resolvedRunner, allLayers) &&
-    !(
-      (resolvedRunner === 'crossover' || resolvedRunner === 'crossover_preview') &&
-      bottleArchFromAnyLayer === 'arm64'
-    ) &&
-    !(resolvedRunner === 'crossover_preview_arm64' && bottleArchFromAnyLayer === 'win64');
-
-  const wasRunnerRejectedOrDowngraded = Boolean(
-    savedRunner && savedRunner !== 'native' && savedRunner !== resolvedRunner
-  );
-
-  if (!isCompatibleWithResolved && (wasRunnerRejectedOrDowngraded || hostArch !== 'arm64')) {
-    return fallbackBottle;
-  }
-
-  return trimmedBottle;
-}
-
-function resolveTargetSteamDisplayPath(params: {
-  isWindowsHost: boolean;
-  selectedOs: 'mac' | 'windows' | 'linux';
-  activeCompatLayer?: CompatibilityLayerInfo;
-  selectedBottleName: string;
-  winePrefixPath?: string;
-  installInfo: GameInstallInfo | null;
-  installDir: string;
-}): string {
-  const {
-    isWindowsHost,
-    selectedOs,
-    activeCompatLayer,
-    selectedBottleName,
-    winePrefixPath,
-    installInfo,
-    installDir,
-  } = params;
-
-  if (!isWindowsHost && selectedOs === 'windows') {
-    const isCrossOverLayer =
-      !activeCompatLayer ||
-      activeCompatLayer.type === 'crossover' ||
-      activeCompatLayer.type === 'crossover_preview' ||
-      activeCompatLayer.type === 'crossover_preview_arm64' ||
-      Boolean(selectedBottleName);
-    if (isCrossOverLayer) {
-      const isPreviewLayer =
-        activeCompatLayer?.type === 'crossover_preview' ||
-        activeCompatLayer?.type === 'crossover_preview_arm64';
-      const defaultBottlesRoot = isPreviewLayer
-        ? '~/Library/Application Support/CrossOver Preview/Bottles'
-        : '~/Library/Application Support/CrossOver/Bottles';
-      const bottlesRoot = (
-        activeCompatLayer?.bottlesDir || defaultBottlesRoot
-      ).replace(/\/+$/, '');
-      const compatibleBottles = (activeCompatLayer?.availableBottles || []).filter((b) =>
-        isInstallBottleCompatibleWithRunner(
-          b,
-          activeCompatLayer,
-          activeCompatLayer?.type || ''
-        )
-      );
-      const fallbackBottle =
-        activeCompatLayer?.type === 'crossover_preview_arm64' ? 'OneLauncher-arm64' : 'OneLauncher';
-      const defaultResolvedBottle =
-        resolveDefaultBottleForLayer(
-          activeCompatLayer
-            ? {
-                type: activeCompatLayer.type,
-                availableBottles: compatibleBottles,
-                bottleDetails: activeCompatLayer.bottleDetails,
-              }
-            : undefined,
-          activeCompatLayer?.type
-        ) || fallbackBottle;
-      const bottleName = selectedBottleName || defaultResolvedBottle;
-      return `${bottlesRoot}/${bottleName}/drive_c/Program Files (x86)/Steam/steamapps/common`;
-    }
-    const prefixRoot = (
-      (activeCompatLayer as (CompatibilityLayerInfo & { prefixPath?: string }) | undefined)
-        ?.prefixPath ||
-      winePrefixPath ||
-      '~/Games/OneLauncher/Prefixes/default'
-    ).replace(/\/+$/, '');
-    return `${prefixRoot}/drive_c/Program Files (x86)/Steam/steamapps/common`;
-  }
-
-  if (!isWindowsHost) {
-    const nativeCandidates = [
-      ...(installInfo?.availableInstallDirs || []),
-      installInfo?.defaultInstallDir,
-      installDir,
-    ].filter(
-      (d): d is string =>
-        typeof d === 'string' &&
-        d.length > 0 &&
-        !/\/Bottles\//i.test(d) &&
-        !/\/drive_c\//i.test(d)
-    );
-    return nativeCandidates[0] || '~/Library/Application Support/Steam/steamapps/common';
-  }
-
-  return (
-    installDir ||
-    installInfo?.defaultInstallDir ||
-    installInfo?.availableInstallDirs?.[0] ||
-    'C:\\Program Files (x86)\\Steam\\steamapps\\common'
-  );
-}
-
 export const GameInstallModal: React.FC<GameInstallModalProps> = ({
   isOpen,
   game,
@@ -354,6 +56,8 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
   onClose,
   onInstallStarted,
 }) => {
+  const isRealClientRenderer = useIsRealClientRenderer();
+  const idPrefix = useSafeId('install-modal');
   const diskSpaceReqSeqRef = useRef<number>(0);
   const diskSpaceDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -366,6 +70,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
       }
     };
   }, []);
+
   const [selectedPlatformId, setSelectedPlatformId] = useState<StorefrontId>(() => {
     return (
       initialPlatformId ||
@@ -449,12 +154,10 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
     compatLayers.find((l) => l.type === selectedCompatRunner) || compatLayers[0];
   const effectiveCompatRunner = activeCompatLayer?.type || selectedCompatRunner;
   const compatibleInstallBottles = (activeCompatLayer?.availableBottles || []).filter((b) =>
-    isInstallBottleCompatibleWithRunner(
-      b,
-      activeCompatLayer,
-      effectiveCompatRunner,
-      allRawCompatLayers
-    )
+    isBottleNameCompatibleWithRunner(b, effectiveCompatRunner, {
+      layer: activeCompatLayer,
+      allLayers: allRawCompatLayers,
+    })
   );
   const defaultResolvedBottleName =
     resolveDefaultBottleForLayer(
@@ -466,10 +169,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           }
         : undefined,
       effectiveCompatRunner
-    ) ||
-    (activeCompatLayer?.type === 'crossover_preview_arm64'
-      ? 'OneLauncher-arm64'
-      : 'OneLauncher');
+    ) || getDefaultBottleNameForRunner(activeCompatLayer?.type || '');
 
   const isWindowsHost =
     (installInfo as { hostPlatform?: string } | null)?.hostPlatform === 'win32' ||
@@ -569,7 +269,8 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         if (!active) return;
         const winHost =
           (info as { hostPlatform?: string })?.hostPlatform === 'win32' ||
-          (typeof launcherService.isWindowsHost === 'function' && launcherService.isWindowsHost()) ||
+          (typeof launcherService.isWindowsHost === 'function' &&
+            launcherService.isWindowsHost()) ||
           (typeof window !== 'undefined' && window.electronAPI?.platform === 'win32') ||
           /^[A-Za-z]:\\/.test(info.defaultInstallDir || '');
 
@@ -713,12 +414,14 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
     querySteamDiskSpaceIfChanged(effectiveSteamDisplayPath);
   }, [isOpen, selectedPlatformId, effectiveSteamDisplayPath, isLoadingInfo, installInfo]);
 
-  useEffect(() => {
-    if (!isOpen) return;
-    return acquireModalOverlayLock();
-  }, [isOpen]);
-
   if (!isOpen) return null;
+
+  const renderSection = <P extends object>(
+    MemoComp: React.ComponentType<P>,
+    BaseFn: (props: P) => React.ReactElement | null,
+    props: P
+  ): React.ReactElement | null =>
+    isRealClientRenderer ? React.createElement(MemoComp, props) : BaseFn(props);
 
   const handleDirectoryChange = async (newDir: string, debounce = false) => {
     setInstallDir(newDir);
@@ -753,22 +456,29 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
     }
   };
 
-  const activePlatformObj =
-    game.platforms.find((p) => p.platformId === selectedPlatformId) || game.platforms[0];
+  const plan = computeInstallModalPlan({
+    game,
+    selectedPlatformId,
+    selectedInstallerId,
+    selectedOs,
+    isWindowsHost,
+    installInfo,
+    diskSpace,
+    includeDlcs,
+    preferClientlessExtraction,
+    compatLayers,
+    allRawCompatLayers,
+    activeCompatLayer,
+    effectiveCompatRunner,
+    selectedBottleName,
+  });
 
-  const uniqueInstallers = deduplicateInstallers(installInfo?.availableInstallers, isWindowsHost);
-  const hasMacBuildOption = uniqueInstallers.some((i) => i.os === 'mac');
-  const macInstaller = uniqueInstallers.find((i) => i.os === 'mac');
-  const winInstaller = uniqueInstallers.find((i) => i.os === 'windows');
-  const selectedInstaller =
-    uniqueInstallers.find((i) => i.id === selectedInstallerId) || uniqueInstallers[0];
-
-  const envSnapshot = isOpen ? environmentSetupService.getLastSnapshot() : null;
+  const envSnapshot = environmentSetupService.getLastSnapshot();
   const isWinSteamTarget =
     !isWindowsHost &&
     (selectedOs === 'windows' ||
-      selectedInstaller?.os === 'windows' ||
-      selectedInstaller?.id === 'steam-win-compat');
+      plan.selectedInstaller?.os === 'windows' ||
+      plan.selectedInstaller?.id === 'steam-win-compat');
   const targetSteamLogin =
     selectedPlatformId === 'steam'
       ? envSnapshot?.clientLogins?.[isWinSteamTarget ? 'bottle_steam' : 'host_steam']
@@ -778,178 +488,124 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
       (!targetSteamLogin.authenticated || targetSteamLogin.accountMatchesOneLauncher === false)
   );
 
-  const baseEstimatedBytes =
-    sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes) ??
-    sanitizeGameInstallSizeBytes(installInfo?.estimatedSizeBytes) ??
-    (activePlatformObj?.installed
-      ? sanitizeGameInstallSizeBytes(activePlatformObj?.installSize)
-      : undefined) ??
-    0;
-  const knownDlcBytes =
-    sanitizeGameInstallSizeBytes(selectedInstaller?.dlcSizeBytes) ??
-    sanitizeGameInstallSizeBytes(installInfo?.dlcSizeBytes) ??
-    0;
-  const estimatedSizeBytes =
-    baseEstimatedBytes +
-    (includeDlcs && (selectedPlatformId === 'epic' || selectedPlatformId === 'gog')
-      ? knownDlcBytes
-      : 0);
+  const handleSelectPlatform = (platformId: StorefrontId) => {
+    userChangedCompatInSessionRef.current = false;
+    setSelectedPlatformId(platformId);
+    setIncludeDlcs(platformId === 'epic' || platformId === 'gog');
+    setPreferClientlessExtraction(false);
+    setErrorMsg(null);
+  };
 
-  const freeBytes = diskSpace?.freeBytes || 0;
-  const totalBytes = diskSpace?.totalBytes || 1;
-  const usedBytes = diskSpace?.usedBytes || Math.max(0, totalBytes - freeBytes);
-  const usedPercent =
-    diskSpace && diskSpace.totalBytes > 0
-      ? Math.min(100, Math.round((usedBytes / totalBytes) * 100))
-      : 0;
-  const installPercent =
-    estimatedSizeBytes > 0 && (!diskSpace || diskSpace.totalBytes > 0)
-      ? Math.min(100 - usedPercent, Math.max(1, Math.round((estimatedSizeBytes / totalBytes) * 100)))
-      : 0;
+  const handleSelectOsAndSyncSteamSpace = (
+    nextOs: 'mac' | 'windows' | 'linux',
+    installerId?: string
+  ) => {
+    if (installerId !== undefined) {
+      setSelectedInstallerId(installerId);
+    }
+    setSelectedOs(nextOs);
+    if (selectedPlatformId === 'steam') {
+      querySteamDiskSpaceIfChanged(
+        resolveTargetSteamDisplayPath({
+          isWindowsHost,
+          selectedOs: nextOs,
+          activeCompatLayer,
+          selectedBottleName,
+          winePrefixPath: existingLaunchCfg?.winePrefixPath,
+          installInfo,
+          installDir,
+        })
+      );
+    }
+  };
 
-  const isVolumeMissing = Boolean(diskSpace?.volumeMissing);
-  const hasEnoughSpaceOnTargetVolume =
-    !isVolumeMissing &&
-    (estimatedSizeBytes === 0 || freeBytes === 0 || freeBytes >= estimatedSizeBytes);
-  const isXboxStoreManagedInstall =
-    selectedPlatformId === 'xbox' && isWindowsHost && !preferClientlessExtraction;
-  const isExternalClientManagedDriveSelection =
-    selectedPlatformId === 'steam' ||
-    isXboxStoreManagedInstall ||
-    Boolean(installInfo?.requiresStoreClientFallback && !preferClientlessExtraction);
-  const isInstallBlockedByDiskSpace =
-    !isExternalClientManagedDriveSelection && !hasEnoughSpaceOnTargetVolume;
-  const xboxCompat = selectedPlatformId === 'xbox' ? installInfo?.xboxCompatibility : undefined;
-  const rawHandoffCandidate =
-    selectedInstaller?.chainedLauncherHandoff ||
-    selectedInstaller?.externalStorefrontHandoff ||
-    installInfo?.chainedLauncherHandoff ||
-    installInfo?.externalStorefrontHandoff ||
-    xboxCompat?.chainedLauncherHandoff ||
-    xboxCompat?.externalStorefrontHandoff ||
-    activePlatformObj?.chainedLauncherHandoff ||
-    activePlatformObj?.externalStorefrontHandoff ||
-    '';
-  const handoffKeyLower =
-    normalizeChainedHandoffId(rawHandoffCandidate) ||
-    String(rawHandoffCandidate).trim().toLowerCase();
-  const hasStoreChainedHandoff = Boolean(
-    handoffKeyLower &&
-      handoffKeyLower !== String(selectedPlatformId || '').toLowerCase() &&
-      (selectedPlatformId === 'xbox' || selectedPlatformId === 'epic')
-  );
-  const isCrossPlatformMacLauncher =
-    !isWindowsHost && selectedInstaller?.id === 'xbox-external-mac-launcher';
-  const showPreinstallCompatConfig =
-    !isWindowsHost &&
-    selectedOs === 'windows' &&
-    !isCrossPlatformMacLauncher &&
-    compatLayers.length > 0;
-  const hasSelectedBottleArchMismatch = Boolean(
-    showPreinstallCompatConfig &&
-      selectedBottleName &&
-      !isInstallBottleCompatibleWithRunner(
-        selectedBottleName,
-        activeCompatLayer,
-        effectiveCompatRunner,
-        allRawCompatLayers
-      )
-  );
-  const isRiotKernelAntiCheat = handoffKeyLower === 'riot';
-  const hasChainedBottleInstaller =
-    !isRiotKernelAntiCheat &&
-    (uniqueInstallers.some((i) => isChainedInstallerItem(i)) ||
-      (!isCrossPlatformMacLauncher && hasStoreChainedHandoff));
-  const isChainedBottleInstaller =
-    !isWindowsHost &&
-    !isCrossPlatformMacLauncher &&
-    !isRiotKernelAntiCheat &&
-    (isChainedInstallerItem(selectedInstaller) ||
-      (selectedOs === 'windows' && hasStoreChainedHandoff));
-  const isChainedWinInstaller =
-    isWindowsHost &&
-    (isChainedInstallerItem(selectedInstaller) || hasStoreChainedHandoff);
-  const chainedLauncherName = resolveChainedPublisherLauncherName({
-    selectedInstaller,
-    installInfo,
-    activePlatformObj,
-  });
-  const rawNoticeText =
-    game.enrichedMetadata?.drmNotice ||
-    (game as { drmNotice?: string }).drmNotice ||
-    null;
-  const drmAntiCheatInfo = detectKernelAntiCheatFromNotice(rawNoticeText);
-  const structuralAntiCheatInfo = detectStructuralKernelAntiCheatFromNotices(
-    rawNoticeText,
-    activePlatformObj?.xboxBottleCompatibilityReason,
-    installInfo?.xboxBottleCompatibilityReason
-  );
-  const detectedAntiCheatName =
-    selectedInstaller?.kernelAntiCheatName ||
-    installInfo?.kernelAntiCheatName ||
-    selectedInstaller?.antiCheatName ||
-    installInfo?.antiCheatName ||
-    xboxCompat?.antiCheatName ||
-    activePlatformObj?.kernelAntiCheatName ||
-    activePlatformObj?.antiCheatName ||
-    game.kernelAntiCheatName ||
-    game.antiCheatName ||
-    drmAntiCheatInfo?.antiCheatName ||
-    structuralAntiCheatInfo?.kernelAntiCheatName ||
-    (isRiotKernelAntiCheat ? 'Riot Vanguard' : undefined);
-  const hasKernelAntiCheatRequirement = Boolean(
-    activePlatformObj?.requiresKernelAntiCheat ||
-      game.requiresKernelAntiCheat ||
-      installInfo?.requiresKernelAntiCheat ||
-      selectedInstaller?.requiresKernelAntiCheat ||
-      xboxCompat?.antiCheatDetected ||
-      xboxCompat?.tier === 'tier_c_kernel_anticheat' ||
-      drmAntiCheatInfo ||
-      structuralAntiCheatInfo ||
-      isRiotKernelAntiCheat
-  );
-  const isBattlEyeAntiCheat = isBattlEyeKernelAntiCheat(detectedAntiCheatName);
-  const isMacBottleTarget =
-    !isWindowsHost &&
-    !isCrossPlatformMacLauncher &&
-    (selectedOs === 'windows' || selectedPlatformId === 'xbox');
-  const showMacKernelAntiCheatWarning = Boolean(
-    isMacBottleTarget && hasKernelAntiCheatRequirement
-  );
-  const isCaseSensitiveTargetVolume = Boolean(
-    !isWindowsHost &&
-      isMacBottleTarget &&
-      (diskSpace?.caseSensitive === true ||
-        (diskSpace === null && installInfo?.diskSpace?.caseSensitive === true))
-  );
-  const showXboxPublisherAccountLinkCallout = Boolean(
-    selectedPlatformId === 'xbox' &&
-      !isCrossPlatformMacLauncher &&
-      (handoffKeyLower === 'ea' ||
-        handoffKeyLower === 'ubisoft' ||
-        handoffKeyLower === 'bnet' ||
-        handoffKeyLower === 'rockstar' ||
-        handoffKeyLower === 'riot')
-  );
-  const isXboxMacBlocked =
-    selectedPlatformId === 'xbox' &&
-    !isWindowsHost &&
-    Boolean(
-      isRiotKernelAntiCheat ||
-        (xboxCompat &&
-          (xboxCompat.tier === 'tier_c_kernel_anticheat' ||
-            (xboxCompat.tier === 'tier_c_external_launcher' &&
-              !hasChainedBottleInstaller &&
-              xboxCompat.canExtractAndRun !== true &&
-              xboxCompat.supportedOnMacBottle !== true)))
+  const handleSelectInstallerFromDropdown = (id: string) => {
+    setSelectedInstallerId(id);
+    const found = plan.uniqueInstallers.find((i) => i.id === id);
+    if (found) {
+      handleSelectOsAndSyncSteamSpace(found.os);
+    }
+  };
+
+  const handleChangeCompatRunner = (nextRunner: string) => {
+    userChangedCompatInSessionRef.current = true;
+    selectedCompatRunnerRef.current = nextRunner;
+    setSelectedCompatRunner(nextRunner);
+    const nextLayer = compatLayers.find((l) => l.type === nextRunner) || compatLayers[0];
+    const nextAvailableBottles = nextLayer?.availableBottles || [];
+    let nextBottleName = selectedBottleNameRef.current || selectedBottleName;
+    const isBottleCompatibleWithNext = isBottleNameCompatibleWithRunner(
+      nextBottleName,
+      nextRunner,
+      {
+        layer: nextLayer,
+        allLayers: allRawCompatLayers,
+      }
     );
+    if (
+      nextBottleName &&
+      (!isBottleCompatibleWithNext || !nextAvailableBottles.includes(nextBottleName))
+    ) {
+      const nextCompatBottles = nextAvailableBottles.filter((b) =>
+        isBottleNameCompatibleWithRunner(b, nextRunner, {
+          layer: nextLayer,
+          allLayers: allRawCompatLayers,
+        })
+      );
+      nextBottleName =
+        nextCompatBottles.length > 0
+          ? resolveDefaultBottleForLayer(
+              {
+                type: nextRunner as CompatibilityLayerType,
+                availableBottles: nextCompatBottles,
+                bottleDetails: nextLayer?.bottleDetails,
+              },
+              nextRunner
+            ) || ''
+          : '';
+      selectedBottleNameRef.current = nextBottleName;
+      setSelectedBottleName(nextBottleName);
+    }
+    if (selectedPlatformId === 'steam') {
+      querySteamDiskSpaceIfChanged(
+        resolveTargetSteamDisplayPath({
+          isWindowsHost,
+          selectedOs,
+          activeCompatLayer: nextLayer,
+          selectedBottleName: nextBottleName,
+          winePrefixPath: existingLaunchCfg?.winePrefixPath,
+          installInfo,
+          installDir,
+        })
+      );
+    }
+  };
+
+  const handleChangeBottleName = (nextBottle: string) => {
+    userChangedCompatInSessionRef.current = true;
+    selectedBottleNameRef.current = nextBottle;
+    setSelectedBottleName(nextBottle);
+    if (selectedPlatformId === 'steam') {
+      querySteamDiskSpaceIfChanged(
+        resolveTargetSteamDisplayPath({
+          isWindowsHost,
+          selectedOs,
+          activeCompatLayer,
+          selectedBottleName: nextBottle,
+          winePrefixPath: existingLaunchCfg?.winePrefixPath,
+          installInfo,
+          installDir,
+        })
+      );
+    }
+  };
 
   const handleStartInstall = async () => {
     if (
       isStarting ||
-      isInstallBlockedByDiskSpace ||
-      isXboxMacBlocked ||
-      hasSelectedBottleArchMismatch
+      plan.isInstallBlockedByDiskSpace ||
+      plan.isXboxMacBlocked ||
+      plan.hasSelectedBottleArchMismatch
     ) {
       return;
     }
@@ -962,16 +618,14 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
       if (!isWindowsHost) {
         if (
           selectedOs === 'windows' ||
-          (selectedPlatformId === 'xbox' && !isCrossPlatformMacLauncher)
+          (selectedPlatformId === 'xbox' && !plan.isCrossPlatformMacLauncher)
         ) {
           const safeBottleName =
             selectedBottleName.trim() &&
-            isInstallBottleCompatibleWithRunner(
-              selectedBottleName.trim(),
-              activeCompatLayer,
-              effectiveCompatRunner,
-              allRawCompatLayers
-            )
+            isBottleNameCompatibleWithRunner(selectedBottleName.trim(), effectiveCompatRunner, {
+              layer: activeCompatLayer,
+              allLayers: allRawCompatLayers,
+            })
               ? selectedBottleName.trim()
               : undefined;
           await launcherService.saveLaunchConfig(
@@ -987,8 +641,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           );
         } else if (
           selectedOs === 'mac' &&
-          (existingLaunchCfg?.launchMethod === 'compatibility_layer' ||
-            game.platforms.length > 1)
+          (existingLaunchCfg?.launchMethod === 'compatibility_layer' || game.platforms.length > 1)
         ) {
           await launcherService.saveLaunchConfig(
             {
@@ -1019,112 +672,25 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         );
       }
 
-      type InstallReq = Parameters<typeof launcherService.startInstall>[0] & {
-        xboxProductId?: string;
-        packageFamilyName?: string;
-        appUserModelId?: string;
-        xboxTitleId?: string;
-        scid?: string;
-        msaAppId?: string;
-        preferClientlessExtraction?: boolean;
-        totalBytes?: number;
-        compatibilityLayer?: CompatibilityLayerType;
-        wineBottleName?: string;
-      };
-      const resolvedExternalLauncher =
-        selectedInstaller?.externalLauncher || installInfo?.externalLauncher;
-      const resolvedExternalLauncherUrl =
-        selectedInstaller?.externalLauncherUrl || installInfo?.externalLauncherUrl;
-      const rawExternalHandoff =
-        selectedInstaller?.externalStorefrontHandoff ||
-        installInfo?.externalStorefrontHandoff ||
-        activePlatformObj?.externalStorefrontHandoff;
-      const rawChainedHandoff =
-        selectedInstaller?.chainedLauncherHandoff ||
-        installInfo?.chainedLauncherHandoff ||
-        activePlatformObj?.chainedLauncherHandoff;
-      const normalizedPayloadHandoff = normalizeChainedHandoffId(
-        rawChainedHandoff || rawExternalHandoff
-      );
-      const resolvedExternalHandoff = normalizedPayloadHandoff || rawExternalHandoff;
-      const resolvedChainedHandoff = normalizedPayloadHandoff || rawChainedHandoff;
-      const resolvedChainedExternalId =
-        selectedInstaller?.chainedExternalInstallId ||
-        installInfo?.chainedExternalInstallId ||
-        activePlatformObj?.chainedExternalInstallId;
-      const resolvedChainedTopology =
-        selectedInstaller?.chainedHandoffTopology ||
-        installInfo?.chainedHandoffTopology ||
-        activePlatformObj?.chainedHandoffTopology;
-      const resolvedEpicRegistryPath =
-        selectedInstaller?.epicPartnerRegistryPath ||
-        installInfo?.epicPartnerRegistryPath ||
-        activePlatformObj?.epicPartnerRegistryPath;
-      const installPayload: InstallReq = {
-        gameId: game.id,
-        title: game.title,
-        platformId: selectedPlatformId,
-        platformGameId:
-          installInfo?.platformGameId ||
-          activePlatformObj?.xboxProductId ||
-          activePlatformObj?.platformGameId ||
-          String(game.steamAppId || game.id),
-        xboxProductId: activePlatformObj?.xboxProductId,
-        packageFamilyName: activePlatformObj?.packageFamilyName,
-        appUserModelId: activePlatformObj?.appUserModelId,
-        xboxTitleId: activePlatformObj?.xboxTitleId,
-        scid: activePlatformObj?.scid,
-        msaAppId: activePlatformObj?.msaAppId,
-        ...(resolvedExternalLauncher ? { externalLauncher: resolvedExternalLauncher } : {}),
-        ...(resolvedExternalLauncherUrl
-          ? { externalLauncherUrl: resolvedExternalLauncherUrl }
-          : {}),
-        ...(resolvedExternalHandoff
-          ? { externalStorefrontHandoff: resolvedExternalHandoff }
-          : {}),
-        ...(resolvedChainedHandoff
-          ? { chainedLauncherHandoff: resolvedChainedHandoff }
-          : {}),
-        ...(resolvedChainedExternalId
-          ? { chainedExternalInstallId: resolvedChainedExternalId }
-          : {}),
-        ...(resolvedChainedTopology
-          ? { chainedHandoffTopology: resolvedChainedTopology }
-          : {}),
-        ...(resolvedEpicRegistryPath
-          ? { epicPartnerRegistryPath: resolvedEpicRegistryPath }
-          : {}),
-        preferClientlessExtraction:
-          selectedPlatformId === 'xbox'
-            ? isWindowsHost
-              ? preferClientlessExtraction
-              : !isChainedBottleInstaller && !isCrossPlatformMacLauncher
-            : undefined,
-        steamAppId: selectedPlatformId === 'steam' ? game.steamAppId : undefined,
-        headerImage: game.headerImage,
-        installDir:
-          installDir.trim() || (isWindowsHost ? 'C:\\Games\\OneLauncher' : '~/Games/OneLauncher'),
-        installerId: selectedInstallerId,
-        os: isWindowsHost
-          ? 'windows'
-          : isCrossPlatformMacLauncher
-            ? 'mac'
-            : selectedPlatformId === 'xbox'
-              ? 'windows'
-              : selectedOs,
+      const installPayload = buildGameInstallPayload({
+        game,
+        selectedPlatformId,
+        activePlatformObj: plan.activePlatformObj,
+        installInfo,
+        selectedInstaller: plan.selectedInstaller,
+        selectedInstallerId,
+        selectedOs,
+        isWindowsHost,
+        isChainedBottleInstaller: plan.isChainedBottleInstaller,
+        isCrossPlatformMacLauncher: plan.isCrossPlatformMacLauncher,
+        preferClientlessExtraction,
+        installDir,
         createShortcut,
-        includeDlcs: selectedPlatformId === 'epic' || selectedPlatformId === 'gog' ? includeDlcs : false,
-        estimatedSizeBytes: estimatedSizeBytes > 0 ? estimatedSizeBytes : undefined,
-        totalBytes: estimatedSizeBytes > 0 ? estimatedSizeBytes : undefined,
-        ...(!isWindowsHost &&
-        (selectedOs === 'windows' ||
-          (selectedPlatformId === 'xbox' && !isCrossPlatformMacLauncher))
-          ? {
-              compatibilityLayer: (effectiveCompatRunner || 'crossover') as CompatibilityLayerType,
-              wineBottleName: selectedBottleName.trim() || undefined,
-            }
-          : {}),
-      };
+        includeDlcs,
+        estimatedSizeBytes: plan.estimatedSizeBytes,
+        effectiveCompatRunner,
+        selectedBottleName,
+      });
       const res = await launcherService.startInstall(installPayload);
 
       if (res.success) {
@@ -1142,111 +708,14 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
     }
   };
 
-  const getMethodDescription = (platId: StorefrontId) => {
-    switch (platId) {
-      case 'gog':
-        return {
-          title: 'Native gogdl CLI + GOG Direct Installer Pipeline',
-          desc: isWindowsHost
-            ? 'Downloads official DRM-free Windows game files directly from GOG CDN via bundled gogdl with automatic credential bridging.'
-            : 'Installs via native gogdl integration with automatic credential bridging from your authenticated GOG session, or downloads and extracts DRM-free offline installer packages (.pkg / .dmg / .exe) directly into your target directory.',
-        };
-      case 'epic':
-        if (isWindowsHost && isChainedWinInstaller) {
-          return {
-            title: `Chained ${chainedLauncherName} + Epic Partner Link Pipeline (Windows)`,
-            desc: `One Launcher will set up or open ${chainedLauncherName} on Windows so you can sign in with your linked account and install ${game.title}.`,
-          };
-        }
-        if (!isWindowsHost && isChainedBottleInstaller) {
-          return {
-            title: `Chained ${chainedLauncherName} Bottle Pipeline (CrossOver / Wine)`,
-            desc: `One Launcher will automatically set up ${chainedLauncherName} inside your bottle if needed and open it so you can sign in with your linked account and install ${game.title}.`,
-          };
-        }
-        return {
-          title: 'Native Legendary CLI / Epic Games Store Pipeline',
-          desc: isWindowsHost
-            ? 'Downloads and verifies native Windows game files directly from Epic Games CDN via bundled Legendary CLI.'
-            : 'Installs directly via native legendary integration with automatic credential bridging from your authenticated Epic session (or Heroic / Epic Games Launcher fallback) while monitoring real-time manifest progress.',
-        };
-      case 'xbox':
-        if (isWindowsHost) {
-          if (isChainedWinInstaller) {
-            return {
-              title: `Chained ${chainedLauncherName} Pipeline (Windows)`,
-              desc: `One Launcher will set up or open ${chainedLauncherName} on Windows so you can sign in with your linked account and install ${game.title}.`,
-            };
-          }
-          if (preferClientlessExtraction && installInfo?.canDirectDownload) {
-            return {
-              title: 'Clientless MSIXVC Extraction Pipeline (Advanced)',
-              desc: 'Streams and extracts unencrypted Win32 GDK game files directly from Xbox Content Delivery CDN into your chosen folder without GamingServices.',
-            };
-          }
-          return {
-            title: 'Microsoft Store / GamingServices Native Pipeline',
-            desc: 'Triggers official Microsoft Store / Xbox App installation (ms-windows-store://pdp/?ProductId=...) and monitors GamingServices .GamingRoot drives (such as C:\\XboxGames) for completion.',
-          };
-        }
-        if (isXboxMacBlocked) {
-          return {
-            title: hasKernelAntiCheatRequirement
-              ? `Blocked on macOS (${detectedAntiCheatName || 'Kernel Anti-Cheat'})`
-              : 'Native Windows Required (Blocked on macOS)',
-            desc: hasKernelAntiCheatRequirement
-              ? `Bottle installation is disabled on macOS because ${detectedAntiCheatName || 'this title'} requires a Windows ring-0 kernel driver that cannot load under Wine / CrossOver.`
-              : 'Bottle installation is disabled on macOS because this title requires native Windows components unavailable inside Wine / CrossOver.',
-          };
-        }
-        if (isChainedBottleInstaller) {
-          return {
-            title: `Chained ${chainedLauncherName} Bottle Pipeline (CrossOver / Wine)`,
-            desc: `One Launcher will automatically set up ${chainedLauncherName} inside your bottle if needed and open it so you can sign in with your linked account and install ${game.title}.`,
-          };
-        }
-        if (isCrossPlatformMacLauncher) {
-          return {
-            title: `Native macOS ${chainedLauncherName} Pipeline`,
-            desc: `Sets up the official macOS ${chainedLauncherName} client so you can sign in with your linked account and play natively on your Mac.`,
-          };
-        }
-        return {
-          title: 'Clientless MSIXVC Extraction + CrossOver / Wine Pipeline',
-          desc: 'Downloads and extracts standard Win32 GDK files from Xbox Content Delivery packages into your target folder and configures CrossOver / Wine execution.',
-        };
-      case 'steam':
-        if (!isWindowsHost && selectedOs === 'windows') {
-          return {
-            title: 'CrossOver Windows Steam Bottle + Live ACF Progress Monitor',
-            desc: 'Installs the Windows build inside your CrossOver bottle via Windows Steam (automatically bootstrapping Windows Steam if needed) and tracks real-time download progress via appmanifest_*.acf.',
-          };
-        }
-        return {
-          title: 'Steam Client Protocol + Live ACF Progress Monitor',
-          desc: isWindowsHost
-            ? 'Triggers Steam Client installation (steam://install/) and monitors real-time download progress via steamapps/appmanifest_*.acf.'
-            : 'Triggers native Steam installation (`steam://install`) and tracks real-time `BytesDownloaded` / `BytesToDownload` directly from local `appmanifest_*.acf` files.',
-        };
-      default:
-        return {
-          title: 'Universal Game Installer',
-          desc: 'Downloads and configures game files in your selected installation directory.',
-        };
-    }
-  };
-
-  const methodInfo = getMethodDescription(selectedPlatformId);
-  const compatRunnerSelectId = `preinstall-compat-runner-${game.id}`;
-  const compatBottleSelectId = `preinstall-compat-bottle-${game.id}`;
-  const installDirInputId = `install-dir-input-${game.id}`;
+  const installDirInputId = `${idPrefix}-dir-input`;
+  const resolvedHeaderImage = resolveHeaderImageMediaUrl(game);
 
   return (
     <ModalShell
       isOpen={isOpen}
       onClose={onClose}
       preventClose={isStarting}
-      lockOverlay={false}
       closeOnBackdrop={!isStarting}
       ariaLabel={`Install ${game.title}`}
       className="w-full max-w-xl"
@@ -1260,11 +729,12 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           data-testid="install-modal-scrim"
           className="sr-only pointer-events-none"
         />
+
         {/* Top Game Banner Header */}
         <div className="relative h-36 w-full bg-[#0b1017] overflow-hidden">
-          {game.headerImage && (
+          {resolvedHeaderImage && (
             <img
-              src={game.headerImage}
+              src={resolvedHeaderImage}
               alt={game.title}
               className="w-full h-full object-cover opacity-55"
             />
@@ -1275,7 +745,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             type="button"
             onClick={onClose}
             disabled={isStarting}
-            className="absolute top-3 right-3 min-w-6 min-h-6 p-1.5 rounded-lg bg-black/60 hover:bg-black/80 text-steam-subtext hover:text-white border border-white/10 transition-colors cursor-pointer disabled:opacity-50"
+            className="absolute top-3 right-3 min-w-6 min-h-6 p-1.5 rounded-lg bg-black/60 hover:bg-black/80 text-steam-subtext hover:text-white border border-white/10 transition-colors cursor-pointer disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
             aria-label="Close install modal"
           >
             <X className="w-4 h-4" aria-hidden="true" />
@@ -1284,7 +754,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           <div className="absolute bottom-3 left-5 right-5 flex items-end justify-between gap-3">
             <div className="min-w-0">
               <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-sky-400">
-                <Download className="w-3.5 h-3.5" />
+                <Download className="w-3.5 h-3.5" aria-hidden="true" />
                 <span>Install Game</span>
               </div>
               <h2 className="text-xl font-extrabold text-white truncate drop-shadow">
@@ -1292,7 +762,6 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
               </h2>
             </div>
 
-            {/* Single Storefront Badge if owned on 1 platform */}
             {game.platforms.length <= 1 && (
               <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-black/70 border border-white/15 text-xs font-semibold text-white shrink-0">
                 <StorefrontIcon
@@ -1310,1128 +779,99 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
 
         {/* Modal Body */}
         <div className="p-5 space-y-5 max-h-[75vh] overflow-y-auto overscroll-contain bg-[#131b26] modal-scroll-body">
-          {/* Storefront Selector if owned on > 1 platform */}
-          {game.platforms.length > 1 && (
-            <div className="space-y-1.5">
-              <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
-                Select Storefront Source ({game.platforms.length} Owned)
-              </label>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                {game.platforms.map((plat) => {
-                  const isSelected = plat.platformId === selectedPlatformId;
-                  const reg = STOREFRONT_REGISTRY[plat.platformId];
-                  return (
-                    <button
-                      key={plat.platformId}
-                      type="button"
-                      onClick={() => {
-                        userChangedCompatInSessionRef.current = false;
-                        setSelectedPlatformId(plat.platformId);
-                        setIncludeDlcs(plat.platformId === 'epic' || plat.platformId === 'gog');
-                        setPreferClientlessExtraction(false);
-                        setErrorMsg(null);
-                      }}
-                      className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-colors cursor-pointer ${
-                        isSelected
-                          ? plat.platformId === 'xbox'
-                            ? 'bg-[#107c10]/25 border-[#52d652] text-white shadow-[0_0_12px_rgba(82,214,82,0.22)]'
-                            : 'bg-sky-500/20 border-sky-400 text-white shadow-[0_0_12px_rgba(56,189,248,0.25)]'
-                          : 'bg-[#17212e] border-[#26384d] text-steam-subtext hover:text-white hover:bg-[#1d2a3a]'
-                      }`}
-                    >
-                      <StorefrontIcon
-                        storefrontId={plat.platformId}
-                        decorative
-                        className={`w-4 h-4 ${
-                          isSelected
-                            ? plat.platformId === 'xbox'
-                              ? 'text-[#52d652]'
-                              : 'text-sky-400'
-                            : 'text-steam-subtext'
-                        }`}
-                      />
-                      <span className="truncate">
-                        {reg?.name || getStorefrontDisplayName(plat.platformId)}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
+          {renderSection(InstallStorefrontSelector, InstallStorefrontSelectorBase, {
+            idPrefix,
+            game,
+            selectedPlatformId,
+            onSelectPlatform: handleSelectPlatform,
+          })}
 
-          {/* Xbox / MSIXVC Compatibility Tier Banner on macOS */}
-          {selectedPlatformId === 'xbox' && !isWindowsHost && xboxCompat && (() => {
-            const isTierASupportedWithoutAntiCheat =
-              xboxCompat.tier === 'tier_a_supported' && !hasKernelAntiCheatRequirement;
-            const isChainedBottleSupportedTier =
-              xboxCompat.tier === 'tier_c_external_launcher' &&
-              hasChainedBottleInstaller &&
-              !isRiotKernelAntiCheat &&
-              !hasKernelAntiCheatRequirement;
-            const isAmberTier =
-              xboxCompat.tier === 'tier_b_legacy_uwp' ||
-              (hasKernelAntiCheatRequirement && isBattlEyeAntiCheat);
-            return (
-              <div
-                data-testid="xbox-compat-tier-banner"
-                role={isXboxMacBlocked ? 'alert' : 'status'}
-                className={`rounded-lg border p-3.5 space-y-1.5 text-xs ${
-                  isTierASupportedWithoutAntiCheat
-                    ? 'bg-emerald-950/40 border-emerald-500/45 text-emerald-100'
-                    : isChainedBottleSupportedTier
-                      ? 'bg-sky-950/45 border-sky-500/45 text-sky-100'
-                      : isAmberTier
-                        ? 'bg-amber-950/55 border-amber-400/55 text-amber-100'
-                        : 'bg-rose-950/55 border-rose-500/55 text-rose-100'
-                }`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span
-                    className={`inline-flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider ${
-                      isTierASupportedWithoutAntiCheat
-                        ? 'text-emerald-300'
-                        : isChainedBottleSupportedTier
-                          ? 'text-sky-300'
-                          : isAmberTier
-                            ? 'text-amber-200'
-                            : 'text-rose-200'
-                    }`}
-                  >
-                    {isTierASupportedWithoutAntiCheat ? (
-                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                    ) : isChainedBottleSupportedTier ? (
-                      <Cpu className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                    ) : (
-                      <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                    )}
-                    <span>
-                      {isTierASupportedWithoutAntiCheat
-                        ? 'Tier A • Win32 GDK Package (CrossOver / Wine Supported)'
-                        : isChainedBottleSupportedTier
-                          ? `Chained Partner Launcher • Bottle Setup Supported (${chainedLauncherName})`
-                          : hasKernelAntiCheatRequirement && isBattlEyeAntiCheat
-                            ? 'Kernel Anti-Cheat Notice • BattlEye Online Multiplayer Blocked on macOS'
-                            : hasKernelAntiCheatRequirement ||
-                                xboxCompat.tier === 'tier_c_kernel_anticheat'
-                              ? `Tier C • Kernel Anti-Cheat Blocker on macOS${
-                                  detectedAntiCheatName ? ` (${detectedAntiCheatName})` : ''
-                                }`
-                              : xboxCompat.tier === 'tier_b_legacy_uwp'
-                                ? 'Tier B • Legacy UWP / AppContainer Warning'
-                                : 'Tier C • External Partner Launcher Required (Windows Only)'}
-                    </span>
-                  </span>
-                  {(xboxCompat.externalStorefront || xboxCompat.externalLauncher) && (
-                    <span className="text-[10px] px-2 py-0.5 rounded bg-black/35 border border-white/15 font-bold uppercase tracking-wider">
-                      {xboxCompat.externalStorefront || xboxCompat.externalLauncher}
-                    </span>
-                  )}
-                </div>
-                {(xboxCompat.label || xboxCompat.summary) && !hasKernelAntiCheatRequirement && (
-                  <p className="font-semibold leading-snug">
-                    {xboxCompat.label || xboxCompat.summary}
-                  </p>
-                )}
-                {xboxCompat.detail && !hasKernelAntiCheatRequirement && (
-                  <p className="text-[11px] opacity-90 leading-relaxed">{xboxCompat.detail}</p>
-                )}
-              </div>
-            );
-          })()}
+          {renderSection(InstallCompatibilityBanners, InstallCompatibilityBannersBase, {
+            gameTitle: game.title,
+            selectedPlatformId,
+            isWindowsHost,
+            xboxCompat: plan.xboxCompat,
+            isXboxMacBlocked: plan.isXboxMacBlocked,
+            hasChainedBottleInstaller: plan.hasChainedBottleInstaller,
+            isRiotKernelAntiCheat: plan.isRiotKernelAntiCheat,
+            hasKernelAntiCheatRequirement: plan.hasKernelAntiCheatRequirement,
+            isBattlEyeAntiCheat: plan.isBattlEyeAntiCheat,
+            detectedAntiCheatName: plan.detectedAntiCheatName,
+            isChainedWinInstaller: plan.isChainedWinInstaller,
+            chainedLauncherName: plan.chainedLauncherName,
+            showXboxPublisherAccountLinkCallout: plan.showXboxPublisherAccountLinkCallout,
+            handoffKeyLower: plan.handoffKeyLower,
+            showMacKernelAntiCheatWarning: plan.showMacKernelAntiCheatWarning,
+          })}
 
-          {/* Windows Chained Publisher Launcher Notice */}
-          {isWindowsHost && isChainedWinInstaller && (
-            <div
-              data-testid="chained-launcher-install-notice"
-              role="status"
-              className="rounded-lg bg-[#101e2e] border border-sky-500/45 p-3.5 space-y-1 text-xs text-slate-100"
-            >
-              <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-sky-300">
-                <Info className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                <span>Chained Publisher Launcher ({chainedLauncherName})</span>
-              </div>
-              <p className="text-xs text-slate-200 leading-relaxed">
-                {`One Launcher will set up or open ${chainedLauncherName} on Windows so you can sign in with your linked account and install ${game.title}.`}
-              </p>
-            </div>
-          )}
+          {renderSection(InstallBuildAndBottleSection, InstallBuildAndBottleSectionBase, {
+            idPrefix,
+            game,
+            selectedPlatformId,
+            isWindowsHost,
+            isLoadingInfo,
+            uniqueInstallers: plan.uniqueInstallers,
+            hasMacBuildOption: plan.hasMacBuildOption,
+            macInstaller: plan.macInstaller,
+            winInstaller: plan.winInstaller,
+            selectedInstaller: plan.selectedInstaller,
+            selectedInstallerId,
+            selectedOs,
+            onSelectMacBuild: (installerId) => handleSelectOsAndSyncSteamSpace('mac', installerId),
+            onSelectWinBuild: (installerId) =>
+              handleSelectOsAndSyncSteamSpace('windows', installerId),
+            onSelectInstallerFromDropdown: handleSelectInstallerFromDropdown,
+            isCrossPlatformMacLauncher: plan.isCrossPlatformMacLauncher,
+            isXboxMacBlocked: plan.isXboxMacBlocked,
+            hasKernelAntiCheatRequirement: plan.hasKernelAntiCheatRequirement,
+            detectedAntiCheatName: plan.detectedAntiCheatName,
+            isChainedBottleInstaller: plan.isChainedBottleInstaller,
+            chainedLauncherName: plan.chainedLauncherName,
+            showPreinstallCompatConfig: plan.showPreinstallCompatConfig,
+            compatLayers,
+            allRawCompatLayers,
+            activeCompatLayer,
+            effectiveCompatRunner,
+            selectedBottleName,
+            defaultResolvedBottleName,
+            hasSelectedBottleArchMismatch: plan.hasSelectedBottleArchMismatch,
+            onChangeCompatRunner: handleChangeCompatRunner,
+            onChangeBottleName: handleChangeBottleName,
+          })}
 
-          {/* Xbox <-> Publisher Account-Link Guidance (EA App / Ubisoft Connect / Battle.net / Rockstar / Riot) */}
-          {showXboxPublisherAccountLinkCallout && (
-            <div
-              data-testid="xbox-publisher-account-link-callout"
-              role="note"
-              className="rounded-lg bg-sky-950/60 border border-sky-400/55 p-3.5 space-y-1 text-xs text-sky-100"
-            >
-              <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-sky-200">
-                <Link2 className="w-3.5 h-3.5 text-sky-300 shrink-0" aria-hidden="true" />
-                <span>{`Xbox ↔ ${chainedLauncherName} Account Link Required`}</span>
-              </div>
-              <p className="text-xs text-sky-100 leading-relaxed">
-                {`Xbox Game Pass unlocks this title inside ${chainedLauncherName} via server-side account linking. Sign in to ${chainedLauncherName} with the account linked to your Xbox profile to download and play.`}
-              </p>
-            </div>
-          )}
-
-          {/* EA Account SSO Linking Guidance (Epic / Steam -> EA App) */}
-          {handoffKeyLower === 'ea' &&
-            selectedPlatformId !== 'ea' &&
-            selectedPlatformId !== 'xbox' && (
-              <div
-                data-testid="ea-sso-linking-guidance"
-                role="note"
-                className="rounded-lg bg-sky-950/55 border border-sky-400/50 px-3.5 py-2.5 flex items-start gap-2 text-xs text-sky-100"
-              >
-                <Info className="w-4 h-4 text-sky-300 shrink-0 mt-0.5" aria-hidden="true" />
-                <p className="leading-relaxed">
-                  Sign in to EA App with the EA Account linked to your Xbox / Epic / Steam account so your game entitlement activates.
-                </p>
-              </div>
-            )}
-
-          {/* macOS Bottled Kernel Anti-Cheat Pre-Download Compatibility Warning (never shown on win32 native) */}
-          {showMacKernelAntiCheatWarning && (
-            <div
-              data-testid="macos-kernel-anticheat-warning"
-              role={isXboxMacBlocked ? 'note' : 'status'}
-              className={
-                isBattlEyeAntiCheat
-                  ? 'rounded-lg bg-amber-950/65 border border-amber-400/60 p-3.5 space-y-1.5 text-xs text-amber-100'
-                  : 'rounded-lg bg-rose-950/65 border border-rose-500/60 p-3.5 space-y-1.5 text-xs text-rose-100'
-              }
-            >
-              <div
-                className={`flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider ${
-                  isBattlEyeAntiCheat ? 'text-amber-200' : 'text-rose-200'
-                }`}
-              >
-                <AlertCircle
-                  className={`w-4 h-4 shrink-0 ${
-                    isBattlEyeAntiCheat ? 'text-amber-300' : 'text-rose-300'
-                  }`}
-                  aria-hidden="true"
-                />
-                <span>
-                  {isBattlEyeAntiCheat
-                    ? 'BattlEye Online Anti-Cheat Warning (macOS Bottle)'
-                    : `Kernel Anti-Cheat Compatibility Warning${
-                        detectedAntiCheatName ? ` (${detectedAntiCheatName})` : ''
-                      }`}
-                </span>
-              </div>
-              <p
-                className={`text-xs leading-relaxed ${
-                  isBattlEyeAntiCheat ? 'text-amber-100' : 'text-rose-100'
-                }`}
-              >
-                {isBattlEyeAntiCheat
-                  ? 'Online multiplayer sessions requiring BattlEye (BEDaisy.sys Windows kernel driver) cannot load inside macOS Wine / CrossOver bottles, while offline single-player Story Mode (-nobattleye) remains playable where supported. Review compatibility before starting a large bottle download.'
-                  : `This Windows title requires ${
-                      detectedAntiCheatName || 'kernel-level anti-cheat'
-                    }, whose Windows ring-0 kernel driver cannot load inside macOS Wine / CrossOver bottles. Review compatibility before starting a large bottle download, as startup or online play is blocked on macOS.`}
-              </p>
-            </div>
-          )}
-
-          {/* Available Installer / OS Selector (hidden on Windows host since Windows builds are always native) */}
-          {!isWindowsHost && (
-            <div className="space-y-1.5">
-              <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
-                Platform & Installer Build
-              </label>
-              {isLoadingInfo ? (
-                <div className="flex items-center gap-2 text-xs text-steam-subtext bg-[#17212e] border border-[#26384d] rounded-lg px-3.5 py-2.5">
-                  <Loader2 className="w-4 h-4 animate-spin text-sky-400" />
-                  <span>Querying {getStorefrontDisplayName(selectedPlatformId)} build manifest...</span>
-                </div>
-              ) : uniqueInstallers.length === 1 ? (
-                <div className="space-y-2">
-                  {selectedOs === 'mac' ? (
-                    <div className="rounded-lg bg-emerald-950/40 border border-emerald-500/40 p-3 space-y-1">
-                      <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-emerald-400">
-                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                        <span>
-                          {isCrossPlatformMacLauncher
-                            ? `★ AUTO-DETECTED • NATIVE MACOS LAUNCHER (${chainedLauncherName.toUpperCase()})`
-                            : '★ AUTO-DETECTED • NATIVE MACOS BUILD'}
-                        </span>
-                      </div>
-                      <p className="text-xs text-emerald-100/90 leading-relaxed">
-                        {isCrossPlatformMacLauncher
-                          ? `Official macOS ${chainedLauncherName} build — runs natively on your Mac without translation layers.`
-                          : `Official macOS build${formatVersion(selectedInstaller?.version) ? ` (${formatVersion(selectedInstaller?.version)})` : ''}${sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes) ? ` • ${formatBytes(sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes))}` : ''} — runs natively on your Mac without translation layers.`}
-                      </p>
-                    </div>
-                  ) : selectedOs === 'windows' ? (
-                    <div
-                      data-testid={
-                        isChainedBottleInstaller ? 'chained-launcher-install-notice' : undefined
-                      }
-                      className={
-                        isXboxMacBlocked
-                          ? 'rounded-lg bg-rose-950/45 border border-rose-500/45 p-3 space-y-1'
-                          : 'rounded-lg bg-amber-950/50 border border-amber-500/40 p-3 space-y-1'
-                      }
-                    >
-                      <div
-                        className={`flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider ${
-                          isXboxMacBlocked ? 'text-rose-200' : 'text-amber-400'
-                        }`}
-                      >
-                        {isXboxMacBlocked ? (
-                          <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                        ) : (
-                          <Cpu className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                        )}
-                        <span>
-                          {isXboxMacBlocked
-                            ? hasKernelAntiCheatRequirement
-                              ? `WINDOWS BUILD • BLOCKED ON MACOS (${(detectedAntiCheatName || 'KERNEL ANTI-CHEAT').toUpperCase()})`
-                              : 'WINDOWS BUILD • NATIVE WINDOWS REQUIRED'
-                            : isChainedBottleInstaller
-                              ? `WINDOWS BUILD • CHAINED BOTTLE LAUNCHER (${chainedLauncherName.toUpperCase()})`
-                              : 'AUTO-DETECTED • WINDOWS BUILD (CROSSOVER / WINE)'}
-                        </span>
-                      </div>
-                      <p
-                        className={`text-xs leading-relaxed ${
-                          isXboxMacBlocked ? 'text-rose-100/95' : 'text-amber-100/90'
-                        }`}
-                      >
-                        {isXboxMacBlocked
-                          ? hasKernelAntiCheatRequirement
-                            ? `This Windows build requires ${detectedAntiCheatName || 'a Windows ring-0 kernel driver'} and cannot run inside macOS Wine / CrossOver bottles. Install and play on native Windows instead.`
-                            : 'This Windows title cannot be installed or launched inside a macOS CrossOver / Wine bottle. Install and play on native Windows instead.'
-                          : isChainedBottleInstaller
-                            ? `One Launcher will automatically set up ${chainedLauncherName} inside your bottle if needed and open it so you can sign in with your linked account and install ${game.title}.`
-                            : `No native macOS build exists for this game on ${getStorefrontDisplayName(selectedPlatformId)}. One Launcher will automatically install the Windows build${formatVersion(selectedInstaller?.version) ? ` (${formatVersion(selectedInstaller?.version)})` : ''}${sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes) ? ` • ${formatBytes(sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes))}` : ''} and run it via CrossOver / Wine.`}
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="rounded-lg bg-sky-950/40 border border-sky-500/40 p-3 space-y-1">
-                      <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-sky-400">
-                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                        <span>AUTO-DETECTED • LINUX BUILD</span>
-                      </div>
-                      <p className="text-xs text-sky-100/90 leading-relaxed">
-                        {`Linux build${formatVersion(selectedInstaller?.version) ? ` (${formatVersion(selectedInstaller?.version)})` : ''}${sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes) ? ` • ${formatBytes(sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes))}` : ''}.`}
-                      </p>
-                    </div>
-                  )}
-                </div>
-              ) : uniqueInstallers.length > 1 ? (
-                <div className="space-y-2.5">
-                  {macInstaller && winInstaller && (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                      <button
-                        type="button"
-                        data-testid="install-option-mac-native"
-                        aria-pressed={selectedOs === 'mac'}
-                        onClick={() => {
-                          setSelectedInstallerId(macInstaller.id);
-                          setSelectedOs('mac');
-                          if (selectedPlatformId === 'steam') {
-                            querySteamDiskSpaceIfChanged(
-                              resolveTargetSteamDisplayPath({
-                                isWindowsHost,
-                                selectedOs: 'mac',
-                                activeCompatLayer,
-                                selectedBottleName,
-                                winePrefixPath: existingLaunchCfg?.winePrefixPath,
-                                installInfo,
-                                installDir,
-                              })
-                            );
-                          }
-                        }}
-                        className={`text-left rounded-lg p-3 border transition-colors cursor-pointer space-y-1.5 ${
-                          selectedOs === 'mac'
-                            ? 'bg-emerald-950/50 border-emerald-400 shadow-[0_0_14px_rgba(16,185,129,0.22)]'
-                            : 'bg-[#17212e] border-[#26384d] hover:border-emerald-500/40 hover:bg-[#1b2736]'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-1.5">
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-[10px] font-extrabold uppercase tracking-wider text-emerald-300">
-                            <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
-                            <span>★ Recommended • Native macOS</span>
-                          </span>
-                        </div>
-                        <div className="text-xs font-bold text-white">Native macOS Build</div>
-                        <p className="text-[11px] text-steam-subtext leading-relaxed">
-                          Official macOS build — runs natively on your Mac without translation layers.
-                          {formatVersion(macInstaller.version)
-                            ? ` (${formatVersion(macInstaller.version)})`
-                            : ''}
-                          {sanitizeGameInstallSizeBytes(macInstaller.totalSizeBytes)
-                            ? ` • ${formatBytes(sanitizeGameInstallSizeBytes(macInstaller.totalSizeBytes))}`
-                            : ''}
-                        </p>
-                      </button>
-
-                      <button
-                        type="button"
-                        data-testid="install-option-win-compat"
-                        aria-pressed={selectedOs === 'windows'}
-                        onClick={() => {
-                          setSelectedInstallerId(winInstaller.id);
-                          setSelectedOs('windows');
-                          if (selectedPlatformId === 'steam') {
-                            querySteamDiskSpaceIfChanged(
-                              resolveTargetSteamDisplayPath({
-                                isWindowsHost,
-                                selectedOs: 'windows',
-                                activeCompatLayer,
-                                selectedBottleName,
-                                winePrefixPath: existingLaunchCfg?.winePrefixPath,
-                                installInfo,
-                                installDir,
-                              })
-                            );
-                          }
-                        }}
-                        className={`text-left rounded-lg p-3 border transition-colors cursor-pointer space-y-1.5 ${
-                          selectedOs === 'windows'
-                            ? 'bg-amber-950/50 border-amber-400 shadow-[0_0_14px_rgba(245,158,11,0.22)]'
-                            : 'bg-[#17212e] border-[#26384d] hover:border-amber-500/40 hover:bg-[#1b2736]'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-1.5">
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-[10px] font-extrabold uppercase tracking-wider text-amber-300">
-                            <Cpu className="w-3 h-3 text-amber-400 shrink-0" />
-                            <span>Compatibility / Translation Layer</span>
-                          </span>
-                        </div>
-                        <div className="text-xs font-bold text-white">
-                          Windows Build (CrossOver / Wine)
-                        </div>
-                        <p className="text-[11px] text-steam-subtext leading-relaxed">
-                          Installs the Windows build and runs via CrossOver, GPTK, or Wine translation.
-                          {formatVersion(winInstaller.version)
-                            ? ` (${formatVersion(winInstaller.version)})`
-                            : ''}
-                          {sanitizeGameInstallSizeBytes(winInstaller.totalSizeBytes)
-                            ? ` • ${formatBytes(sanitizeGameInstallSizeBytes(winInstaller.totalSizeBytes))}`
-                            : ''}
-                        </p>
-                      </button>
-                    </div>
-                  )}
-                  {!(macInstaller && winInstaller && uniqueInstallers.length <= 2) && (
-                    <select
-                      aria-label="Installer Build"
-                      value={selectedInstallerId || ''}
-                      onChange={(e) => {
-                        const id = e.target.value;
-                        setSelectedInstallerId(id);
-                        const found = uniqueInstallers.find((i) => i.id === id);
-                        if (found) {
-                          setSelectedOs(found.os);
-                          if (selectedPlatformId === 'steam') {
-                            querySteamDiskSpaceIfChanged(
-                              resolveTargetSteamDisplayPath({
-                                isWindowsHost,
-                                selectedOs: found.os,
-                                activeCompatLayer,
-                                selectedBottleName,
-                                winePrefixPath: existingLaunchCfg?.winePrefixPath,
-                                installInfo,
-                                installDir,
-                              })
-                            );
-                          }
-                        }
-                      }}
-                      className="w-full rounded-lg bg-[#17212e] border border-[#2a475e] px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-400"
-                    >
-                      {uniqueInstallers.map((ins) => {
-                        const ver = formatVersion(ins.version);
-                        const validInsBytes = sanitizeGameInstallSizeBytes(ins.totalSizeBytes);
-                        const sizeSuffix = validInsBytes ? ` • ${formatBytes(validInsBytes)}` : '';
-                        const verSuffix = ver ? ` (${ver})` : '';
-                        let optionLabel: string;
-                        if (ins.os === 'mac') {
-                          optionLabel = `★ Recommended: Native macOS Build${verSuffix}${sizeSuffix}`;
-                        } else if (ins.os === 'windows') {
-                          optionLabel = `${hasMacBuildOption ? 'Alternative: ' : ''}Windows Build via CrossOver / Wine${verSuffix}${sizeSuffix}`;
-                        } else {
-                          optionLabel = `Linux Build${verSuffix}${sizeSuffix}`;
-                        }
-                        return (
-                          <option key={ins.id} value={ins.id}>
-                            {optionLabel}
-                          </option>
-                        );
-                      })}
-                    </select>
-                  )}
-                  {selectedOs === 'mac' && (
-                    <div className="flex items-start gap-2 text-[11px] text-emerald-300 bg-emerald-950/40 border border-emerald-500/40 rounded-lg px-3 py-2 leading-relaxed">
-                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" />
-                      <span>
-                        ✓ Recommended: Official macOS build is available and auto-selected. Only choose the Windows (CrossOver / Wine) alternative if this game is an older 32-bit Mac port that won&apos;t launch on Apple Silicon.
-                      </span>
-                    </div>
-                  )}
-                  {selectedOs === 'windows' && (
-                    <div className="flex items-start gap-2 text-[11px] text-amber-300 bg-amber-950/50 border border-amber-500/40 rounded-lg px-3 py-2 leading-relaxed">
-                      <Cpu className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
-                      <span>
-                        {hasMacBuildOption
-                          ? 'Windows Compatibility Mode selected: Will install the Windows x64 build and run it through CrossOver / Wine instead of the native macOS build.'
-                          : `No native macOS build exists for this game on ${getStorefrontDisplayName(selectedPlatformId)}. One Launcher will install the Windows build and run it via CrossOver / Wine.`}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSelectedOs('mac');
-                      if (selectedPlatformId === 'steam') {
-                        querySteamDiskSpaceIfChanged(
-                          resolveTargetSteamDisplayPath({
-                            isWindowsHost,
-                            selectedOs: 'mac',
-                            activeCompatLayer,
-                            selectedBottleName,
-                            winePrefixPath: existingLaunchCfg?.winePrefixPath,
-                            installInfo,
-                            installDir,
-                          })
-                        );
-                      }
-                    }}
-                    className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-colors cursor-pointer ${
-                      selectedOs === 'mac'
-                        ? 'bg-sky-500/20 border-sky-400 text-white'
-                        : 'bg-[#17212e] border-[#26384d] text-steam-subtext hover:text-white'
-                    }`}
-                  >
-                    <span>macOS / Auto-Detect</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSelectedOs('windows');
-                      if (selectedPlatformId === 'steam') {
-                        querySteamDiskSpaceIfChanged(
-                          resolveTargetSteamDisplayPath({
-                            isWindowsHost,
-                            selectedOs: 'windows',
-                            activeCompatLayer,
-                            selectedBottleName,
-                            winePrefixPath: existingLaunchCfg?.winePrefixPath,
-                            installInfo,
-                            installDir,
-                          })
-                        );
-                      }
-                    }}
-                    className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-colors cursor-pointer ${
-                      selectedOs === 'windows'
-                        ? 'bg-amber-500/20 border-amber-400 text-amber-200'
-                        : 'bg-[#17212e] border-[#26384d] text-steam-subtext hover:text-white'
-                    }`}
-                  >
-                    <Cpu className="w-3.5 h-3.5" />
-                    <span>Windows (via CrossOver / Wine)</span>
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Pre-Install Compatibility Runner & Bottle Selector (shown only on macOS when installing a Windows build) */}
-          {showPreinstallCompatConfig && (
-            <div
-              data-testid="preinstall-compat-config"
-              className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2.5"
-            >
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-1.5">
-                  <Cpu className="w-3.5 h-3.5 text-amber-400" />
-                  <span className="text-[11px] font-bold uppercase tracking-wider text-white">
-                    Compatibility Runner &amp; Target Bottle
-                  </span>
-                </div>
-                <span className="text-[10px] text-steam-subtext">
-                  Saved to game launch profile
-                </span>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                <div className="space-y-1">
-                  <label
-                    htmlFor={compatRunnerSelectId}
-                    className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
-                  >
-                    Compatibility Runner
-                  </label>
-                  <select
-                    id={compatRunnerSelectId}
-                    data-testid="preinstall-compat-runner"
-                    aria-label="Compatibility Runner"
-                    value={effectiveCompatRunner}
-                    onChange={(e) => {
-                      const nextRunner = e.target.value;
-                      userChangedCompatInSessionRef.current = true;
-                      selectedCompatRunnerRef.current = nextRunner;
-                      setSelectedCompatRunner(nextRunner);
-                      const nextLayer =
-                        compatLayers.find((l) => l.type === nextRunner) || compatLayers[0];
-                      const nextAvailableBottles = nextLayer?.availableBottles || [];
-                      let nextBottleName = selectedBottleNameRef.current || selectedBottleName;
-                      const isBottleCompatibleWithNext = isInstallBottleCompatibleWithRunner(
-                        nextBottleName,
-                        nextLayer,
-                        nextRunner,
-                        allRawCompatLayers
-                      );
-                      if (
-                        nextBottleName &&
-                        (!isBottleCompatibleWithNext ||
-                          !nextAvailableBottles.includes(nextBottleName))
-                      ) {
-                        const nextCompatBottles = nextAvailableBottles.filter((b) =>
-                          isInstallBottleCompatibleWithRunner(
-                            b,
-                            nextLayer,
-                            nextRunner,
-                            allRawCompatLayers
-                          )
-                        );
-                        nextBottleName =
-                          nextCompatBottles.length > 0
-                            ? resolveDefaultBottleForLayer(
-                                {
-                                  type: nextRunner as CompatibilityLayerType,
-                                  availableBottles: nextCompatBottles,
-                                  bottleDetails: nextLayer?.bottleDetails,
-                                },
-                                nextRunner
-                              ) || ''
-                            : '';
-                        selectedBottleNameRef.current = nextBottleName;
-                        setSelectedBottleName(nextBottleName);
-                      }
-                      if (selectedPlatformId === 'steam') {
-                        querySteamDiskSpaceIfChanged(
-                          resolveTargetSteamDisplayPath({
-                            isWindowsHost,
-                            selectedOs,
-                            activeCompatLayer: nextLayer,
-                            selectedBottleName: nextBottleName,
-                            winePrefixPath: existingLaunchCfg?.winePrefixPath,
-                            installInfo,
-                            installDir,
-                          })
-                        );
-                      }
-                    }}
-                    className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
-                  >
-                    {compatLayers.map((layer) => (
-                      <option key={layer.type} value={layer.type}>
-                        {layer.name}
-                        {layer.version ? ` (v${layer.version})` : ''}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="space-y-1">
-                  <label
-                    htmlFor={compatBottleSelectId}
-                    className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
-                  >
-                    Target Bottle
-                  </label>
-                  <select
-                    id={compatBottleSelectId}
-                    data-testid="preinstall-compat-bottle"
-                    aria-label="Target Bottle"
-                    aria-invalid={hasSelectedBottleArchMismatch || undefined}
-                    aria-describedby={
-                      hasSelectedBottleArchMismatch ? 'preinstall-bottle-arch-warning' : undefined
-                    }
-                    value={selectedBottleName}
-                    onChange={(e) => {
-                      const nextBottle = e.target.value;
-                      userChangedCompatInSessionRef.current = true;
-                      selectedBottleNameRef.current = nextBottle;
-                      setSelectedBottleName(nextBottle);
-                      if (selectedPlatformId === 'steam') {
-                        querySteamDiskSpaceIfChanged(
-                          resolveTargetSteamDisplayPath({
-                            isWindowsHost,
-                            selectedOs,
-                            activeCompatLayer,
-                            selectedBottleName: nextBottle,
-                            winePrefixPath: existingLaunchCfg?.winePrefixPath,
-                            installInfo,
-                            installDir,
-                          })
-                        );
-                      }
-                    }}
-                    className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
-                  >
-                    <option value="">Default Bottle ({defaultResolvedBottleName})</option>
-                    {(activeCompatLayer?.availableBottles || []).map((bottle) => {
-                      const bottleArch = activeCompatLayer?.bottleDetails?.[bottle]?.wineArch;
-                      const isCompatible = isInstallBottleCompatibleWithRunner(
-                        bottle,
-                        activeCompatLayer,
-                        effectiveCompatRunner,
-                        allRawCompatLayers
-                      );
-                      const archLabel =
-                        bottleArch === 'arm64'
-                          ? ' (arm64 / FEX)'
-                          : bottleArch === 'win64'
-                            ? ' (Intel / win64)'
-                            : '';
-                      return (
-                        <option key={bottle} value={bottle} disabled={!isCompatible}>
-                          {bottle}
-                          {archLabel}
-                          {!isCompatible ? ' — incompatible' : ''}
-                        </option>
-                      );
-                    })}
-                  </select>
-                  {hasSelectedBottleArchMismatch && (
-                    <div
-                      id="preinstall-bottle-arch-warning"
-                      data-testid="preinstall-bottle-arch-warning"
-                      role="alert"
-                      className="flex items-start gap-1.5 rounded bg-amber-950/45 border border-amber-500/45 px-2 py-1 text-[10px] text-amber-200 mt-1"
-                    >
-                      <AlertTriangle
-                        className="w-3 h-3 text-amber-400 shrink-0 mt-0.5"
-                        aria-hidden="true"
-                      />
-                      <span>
-                        Bottle &ldquo;{selectedBottleName}&rdquo; is incompatible with{' '}
-                        {effectiveCompatRunner === 'crossover_preview_arm64'
-                          ? 'CrossOver Preview (arm64 / FEX) — choose an arm64 bottle like "OneLauncher-arm64".'
-                          : 'this Intel/Rosetta runner — choose a win64 bottle like "OneLauncher".'}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {!isWindowsHost && selectedOs === 'windows' && compatLayers.length === 0 && (
-            <div
-              data-testid="missing-compat-runner-setup-callout"
-              role="status"
-              aria-live="polite"
-              className="rounded-lg bg-amber-950/50 border border-amber-500/45 p-3.5 flex flex-wrap items-center justify-between gap-3"
-            >
-              <div className="flex items-start gap-2.5 min-w-0 flex-1">
-                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" aria-hidden="true" />
-                <div className="space-y-0.5 min-w-0">
-                  <div className="text-xs font-bold text-amber-200">
-                    Windows game support isn&rsquo;t set up yet
-                  </div>
-                  <p className="text-[11px] text-amber-100/90 leading-relaxed">
-                    Install CrossOver or Wine in Setup Wizard to play Windows games on your Mac.
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                data-testid="open-setup-wizard-from-install-btn"
-                onClick={() =>
-                  environmentSetupService.openWizard({
-                    mode: 'repair',
-                    initialStep: 'compatibility',
-                  })
-                }
-                className="min-h-6 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/25 hover:bg-amber-500/35 border border-amber-400 text-xs font-bold text-amber-100 hover:text-white transition-colors cursor-pointer shrink-0"
-              >
-                <Wrench className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>Setup Wizard...</span>
-              </button>
-            </div>
-          )}
-
-          {/* Target Installation Directory */}
-          {selectedPlatformId === 'steam' ? (
-            <>
-              {showSteamSignInHint && targetSteamLogin && (
-                <div
-                  data-testid="steam-client-signin-hint-banner"
-                  className="rounded-lg bg-sky-950/50 border border-sky-400/45 p-3.5 flex flex-wrap items-center justify-between gap-3"
-                >
-                  <div className="flex items-start gap-2.5 min-w-0 flex-1">
-                    <Info
-                      className="w-4 h-4 text-sky-400 shrink-0 mt-0.5"
-                      aria-hidden="true"
-                    />
-                    <div className="space-y-0.5 min-w-0">
-                      <div className="text-xs font-bold text-white">
-                        {targetSteamLogin.accountMatchesOneLauncher === false
-                          ? `${targetSteamLogin.label} is signed into a different account`
-                          : `${targetSteamLogin.label} isn’t signed in yet`}
-                      </div>
-                      <p className="text-[11px] text-slate-200 leading-relaxed">
-                        {targetSteamLogin.accountMatchesOneLauncher === false
-                          ? 'Switch to your connected Steam account first, or click Install and switch when Steam opens.'
-                          : 'Sign in first, or click Install and sign in when Steam opens.'}
-                      </p>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    data-testid="open-guided-signin-from-install-btn"
-                    onClick={() =>
-                      environmentSetupService.openWizard({
-                        mode: 'health_check',
-                        initialStep: 'client_logins',
-                      })
-                    }
-                    className="min-h-6 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400 text-xs font-bold text-sky-100 hover:text-white transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 shrink-0"
-                  >
-                    <span>Sign In to Steam...</span>
-                  </button>
-                </div>
-              )}
-
-              <div
-                data-testid="steam-managed-install-location"
-                className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5">
-                    <FolderOpen className="w-3.5 h-3.5 text-sky-400 shrink-0" aria-hidden="true" />
-                    <span className="text-[11px] font-bold uppercase tracking-wider text-white">
-                      Steam Library Location
-                    </span>
-                  </div>
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-[10px] font-bold uppercase tracking-wider text-sky-300">
-                    Managed by Steam Client (steamapps/common)
-                  </span>
-                </div>
-
-                <div
-                  data-testid="steam-library-location-display"
-                  className="min-w-0 max-w-full overflow-hidden rounded-lg border border-white/10 bg-[#141821] px-3 py-2.5 space-y-1"
-                >
-                  <code
-                    title={effectiveSteamDisplayPath}
-                    className="truncate block text-xs font-mono text-gray-200"
-                  >
-                    {effectiveSteamDisplayPath}
-                  </code>{' '}
-                  <div className="text-[10px] text-steam-subtext truncate">
-                    {!isWindowsHost && selectedOs === 'windows'
-                      ? `CrossOver / Wine Bottle Steam Library (${
-                          selectedBottleName || defaultResolvedBottleName
-                        })`
-                      : 'Native Steam Library'}
-                  </div>
-                </div>
-
-                <p className="text-[11px] text-steam-subtext leading-relaxed">
-                  Steam manages the installation folder for Steam games. You will select or confirm your target Steam Library drive inside the Steam installation dialog when it opens.
-                </p>
-              </div>
-            </>
-          ) : (
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label
-                  htmlFor={installDirInputId}
-                  className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext"
-                >
-                  Installation Directory
-                </label>
-                {installInfo?.availableInstallDirs && installInfo.availableInstallDirs.length > 1 && (
-                  <select
-                    aria-label="Preset Installation Locations"
-                    value={
-                      installInfo.availableInstallDirs
-                        .filter((dir) => isWindowsHost || selectedOs !== 'windows' || dir !== '/Applications')
-                        .includes(installDir)
-                        ? installDir
-                        : ''
-                    }
-                    onChange={(e) => {
-                      if (e.target.value) handleDirectoryChange(e.target.value);
-                    }}
-                    className="text-[11px] bg-[#17212e] border border-[#2a475e] rounded px-2 py-0.5 text-sky-300 focus:outline-none"
-                  >
-                    <option value="" disabled>
-                      Preset Locations...
-                    </option>
-                    {installInfo.availableInstallDirs
-                      .filter((dir) => isWindowsHost || selectedOs !== 'windows' || dir !== '/Applications')
-                      .map((dir) => (
-                        <option key={dir} value={dir}>
-                          {dir}
-                        </option>
-                      ))}
-                  </select>
-                )}
-              </div>
-
-              <div className="flex items-center gap-2">
-                <input
-                  id={installDirInputId}
-                  type="text"
-                  value={installDir}
-                  onChange={(e) => handleDirectoryChange(e.target.value, true)}
-                  placeholder="~/Games/OneLauncher"
-                  autoComplete="off"
-                  spellCheck={false}
-                  autoCorrect="off"
-                  autoCapitalize="off"
-                  className="flex-1 rounded-lg bg-[#0e151f] border border-[#2a475e] px-3 py-2 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
-                />
-                <button
-                  type="button"
-                  onClick={handleBrowseFolder}
-                  className="inline-flex items-center gap-1.5 min-h-6 px-3 py-2 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0"
-                >
-                  <FolderOpen className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span>Browse...</span>
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Live Disk Space Indicator Bar */}
-          <div className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2">
-            <div className="flex items-center justify-between text-xs">
-              <div className="flex items-center gap-1.5 text-steam-subtext font-medium">
-                <HardDrive className="w-3.5 h-3.5 text-sky-400" aria-hidden="true" />
-                <span>Disk Space</span>
-              </div>
-              <div className="flex items-center gap-3">
-                <span className="text-steam-subtext">
-                  Estimated Size:{' '}
-                  <strong className="text-white">
-                    {estimatedSizeBytes > 0 ? formatBytes(estimatedSizeBytes) : 'Store Managed'}
-                  </strong>
-                </span>
-                <span className="text-steam-subtext">
-                  Free Space:{' '}
-                  <strong
-                    className={
-                      hasEnoughSpaceOnTargetVolume
-                        ? 'text-emerald-400'
-                        : isExternalClientManagedDriveSelection
-                          ? 'text-amber-400'
-                          : 'text-red-400'
-                    }
-                  >
-                    {isVolumeMissing
-                      ? 'Not Mounted'
-                      : diskSpace
-                        ? formatBytes(diskSpace.freeBytes)
-                        : 'Checking...'}
-                  </strong>
-                </span>
-              </div>
-            </div>
-
-            {/* Storage Progress Bar */}
-            <progress
-              className="sr-only"
-              max={100}
-              value={Math.min(100, usedPercent + installPercent)}
-              aria-label="Target volume storage usage"
-            />
-            <div
-              aria-hidden="true"
-              className="w-full h-2 rounded-full bg-[#1b2838] overflow-hidden flex"
-            >
-              <div
-                className="h-full bg-slate-600"
-                style={{ width: `${usedPercent}%` }}
-                title={`Used Space: ${usedPercent}%`}
-              />
-              {installPercent > 0 && (
-                <div
-                  className={`h-full ${
-                    hasEnoughSpaceOnTargetVolume
-                      ? 'bg-sky-400'
-                      : isExternalClientManagedDriveSelection
-                        ? 'bg-amber-400'
-                        : 'bg-red-500'
-                  }`}
-                  style={{ width: `${installPercent}%` }}
-                  title={`Required for Install: ${formatBytes(estimatedSizeBytes)}`}
-                />
-              )}
-            </div>
-
-            {isVolumeMissing && !isExternalClientManagedDriveSelection ? (
-              <div
-                role="alert"
-                className="flex items-center gap-1.5 text-[11px] text-red-400 pt-0.5"
-              >
-                <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                <span>Selected target drive or volume is not currently mounted.</span>
-              </div>
-            ) : !hasEnoughSpaceOnTargetVolume && isExternalClientManagedDriveSelection ? (
-              <div
-                role="status"
-                aria-live="polite"
-                className="flex items-center gap-1.5 text-[11px] text-amber-300 pt-0.5"
-              >
-                <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" aria-hidden="true" />
-                <span>
-                  {selectedPlatformId === 'steam'
-                    ? 'Default library volume has less free space than estimated. You can select another drive with sufficient space inside Steam when prompted.'
-                    : `Default library volume has less free space than estimated. You can select another drive with sufficient space inside ${getStorefrontDisplayName(selectedPlatformId)} when prompted.`}
-                </span>
-              </div>
-            ) : !hasEnoughSpaceOnTargetVolume ? (
-              <div
-                role="alert"
-                className="flex items-center gap-1.5 text-[11px] text-red-400 pt-0.5"
-              >
-                <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                <span>Insufficient disk space on target volume for this installation.</span>
-              </div>
-            ) : null}
-            {(selectedPlatformId === 'epic' || selectedPlatformId === 'gog') && includeDlcs && (
-              <div
-                data-testid="dlc-disk-space-note"
-                className="flex items-center gap-1.5 text-[11px] text-steam-subtext pt-0.5"
-              >
-                <Info className="w-3.5 h-3.5 text-sky-400 shrink-0" aria-hidden="true" />
-                <span>
-                  {knownDlcBytes > 0
-                    ? `Includes +${formatBytes(knownDlcBytes)} for owned DLCs & expansions alongside the ${formatBytes(baseEstimatedBytes)} base game.`
-                    : 'Base game size shown above; total required disk space may increase when owned DLCs & expansions are included.'}
-                </span>
-              </div>
-            )}
-            {isCaseSensitiveTargetVolume && (
-              <div
-                data-testid="macos-case-sensitive-volume-warning"
-                role="status"
-                className="mt-1.5 rounded-lg bg-amber-950/60 border border-amber-400/55 p-2.5 flex items-start gap-2 text-xs text-amber-100"
-              >
-                <AlertTriangle
-                  className="w-4 h-4 text-amber-300 shrink-0 mt-0.5"
-                  aria-hidden="true"
-                />
-                <div className="space-y-0.5 leading-relaxed">
-                  <div className="font-bold text-amber-200 uppercase tracking-wider text-[10px]">
-                    Case-Sensitive APFS Volume Detected
-                  </div>
-                  <p className="text-[11px] text-amber-100">
-                    This target drive uses Case-Sensitive APFS. Many Windows games and publisher
-                    launchers expect case-insensitive paths and may fail to locate assets inside
-                    Wine / CrossOver. Selecting a standard case-insensitive APFS volume is
-                    recommended.
-                  </p>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Installation Method Notice */}
-          <div className="rounded-lg bg-[#162231]/90 border border-[#2a475e]/70 p-3 flex items-start gap-2.5 text-xs">
-            <Info className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" aria-hidden="true" />
-            <div className="space-y-0.5">
-              <div className="font-semibold text-white flex items-center gap-1.5">
-                <span>{methodInfo.title}</span>
-                {selectedPlatformId === 'gog' && (
-                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold">
-                    DRM-Free Direct
-                  </span>
-                )}
-              </div>
-              <p className="text-[11px] text-steam-subtext leading-relaxed">{methodInfo.desc}</p>
-            </div>
-          </div>
-
-          {/* Owned DLCs & Expansions Toggle (GOG & Epic) */}
-          {(selectedPlatformId === 'gog' || selectedPlatformId === 'epic') && (
-            <label className="flex items-start gap-2.5 rounded-lg bg-[#0e151f] border border-[#223447] p-3 text-xs text-steam-text cursor-pointer hover:border-[#2a475e] transition-colors">
-              <input
-                type="checkbox"
-                data-testid="toggle-include-dlcs"
-                checked={includeDlcs}
-                aria-checked={includeDlcs}
-                onChange={(e) =>
-                  setIncludeDlcs(
-                    typeof e?.target?.checked === 'boolean' ? e.target.checked : !includeDlcs
-                  )
-                }
-                className="mt-0.5 rounded border-steam-border bg-[#0e151f] text-sky-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
-              />
-              <div className="space-y-0.5 min-w-0">
-                <div className="font-semibold text-white">Include Owned DLCs &amp; Expansions</div>
-                <div className="text-[11px] text-steam-subtext leading-snug">
-                  {knownDlcBytes > 0
-                    ? `Downloads owned expansions, season pass content, and bonus DLC depots alongside the base game (+${formatBytes(knownDlcBytes)})`
-                    : 'Downloads owned expansions, season pass content, and bonus DLC depots alongside the base game'}
-                </div>
-              </div>
-            </label>
-          )}
-
-          {/* Advanced Clientless MSIXVC Extraction Option (Windows Xbox when supported) */}
-          {selectedPlatformId === 'xbox' && isWindowsHost && installInfo?.canDirectDownload && (
-            <div className="flex items-start gap-2.5 rounded-lg bg-[#0e151f] border border-[#223447] p-3 text-xs text-steam-text hover:border-[#2a475e] transition-colors">
-              <input
-                id="xbox-prefer-clientless-extraction"
-                type="checkbox"
-                data-testid="toggle-xbox-clientless-extraction"
-                checked={preferClientlessExtraction}
-                aria-describedby="xbox-prefer-clientless-desc"
-                onChange={(e) => setPreferClientlessExtraction(e.target.checked)}
-                className="mt-0.5 rounded border-steam-border bg-[#0e151f] text-emerald-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 cursor-pointer"
-              />
-              <div className="space-y-0.5 min-w-0">
-                <label
-                  htmlFor="xbox-prefer-clientless-extraction"
-                  className="font-semibold text-white cursor-pointer block"
-                >
-                  Prefer Clientless MSIXVC Extraction (Advanced)
-                </label>
-                <div
-                  id="xbox-prefer-clientless-desc"
-                  className="text-[11px] text-steam-subtext leading-snug"
-                >
-                  Extracts standard Win32 GDK files directly into your custom directory instead of delegating installation to Microsoft Store / GamingServices.
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Options Checkbox */}
-          <label className="flex items-center gap-2 text-xs text-steam-text cursor-pointer">
-            <input
-              type="checkbox"
-              checked={createShortcut}
-              onChange={(e) => setCreateShortcut(e.target.checked)}
-              className="rounded border-steam-border bg-[#0e151f] text-sky-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
-            />
-            <span>Automatically register executable & launch configuration on completion</span>
-          </label>
-
-          {errorMsg && (
-            <div
-              role="alert"
-              className="rounded-lg bg-red-950/70 border border-red-500/50 p-3 text-xs text-red-200 flex items-center gap-2"
-            >
-              <AlertCircle className="w-4 h-4 text-red-400 shrink-0" aria-hidden="true" />
-              <span>{errorMsg}</span>
-            </div>
-          )}
+          {renderSection(InstallDestinationAndDiskSection, InstallDestinationAndDiskSectionBase, {
+            installDirInputId,
+            selectedPlatformId,
+            isWindowsHost,
+            selectedOs,
+            selectedBottleName,
+            defaultResolvedBottleName,
+            effectiveSteamDisplayPath,
+            showSteamSignInHint,
+            targetSteamLogin,
+            installInfo,
+            installDir,
+            onDirectoryChange: (newDir, debounce) => void handleDirectoryChange(newDir, debounce),
+            onBrowseFolder: () => void handleBrowseFolder(),
+            diskSpace,
+            baseEstimatedBytes: plan.baseEstimatedBytes,
+            knownDlcBytes: plan.knownDlcBytes,
+            estimatedSizeBytes: plan.estimatedSizeBytes,
+            usedPercent: plan.usedPercent,
+            installPercent: plan.installPercent,
+            isVolumeMissing: plan.isVolumeMissing,
+            hasEnoughSpaceOnTargetVolume: plan.hasEnoughSpaceOnTargetVolume,
+            isExternalClientManagedDriveSelection: plan.isExternalClientManagedDriveSelection,
+            isCaseSensitiveTargetVolume: plan.isCaseSensitiveTargetVolume,
+            methodInfo: plan.methodInfo,
+            includeDlcs,
+            onChangeIncludeDlcs: setIncludeDlcs,
+            preferClientlessExtraction,
+            onChangePreferClientlessExtraction: setPreferClientlessExtraction,
+            createShortcut,
+            onChangeCreateShortcut: setCreateShortcut,
+            errorMsg,
+          })}
         </div>
 
         {/* Footer Actions */}
@@ -2440,7 +880,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             type="button"
             onClick={onClose}
             disabled={isStarting}
-            className="min-h-6 px-4 py-2 rounded-lg bg-[#1b2838] hover:bg-[#24354a] text-xs font-semibold text-steam-text hover:text-white transition-colors cursor-pointer disabled:opacity-50"
+            className="min-h-6 px-4 py-2 rounded-lg bg-[#1b2838] hover:bg-[#24354a] text-xs font-semibold text-steam-text hover:text-white transition-colors cursor-pointer disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
           >
             Cancel
           </button>
@@ -2449,14 +889,14 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             onClick={handleStartInstall}
             disabled={
               isStarting ||
-              isInstallBlockedByDiskSpace ||
-              isXboxMacBlocked ||
-              hasSelectedBottleArchMismatch
+              plan.isInstallBlockedByDiskSpace ||
+              plan.isXboxMacBlocked ||
+              plan.hasSelectedBottleArchMismatch
             }
             aria-describedby={
-              hasSelectedBottleArchMismatch ? 'preinstall-bottle-arch-warning' : undefined
+              plan.hasSelectedBottleArchMismatch ? 'preinstall-bottle-arch-warning' : undefined
             }
-            className="inline-flex items-center gap-2 min-h-6 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+            className="inline-flex items-center gap-2 min-h-6 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
             style={{
               background: 'linear-gradient(to right, #0284c7 0%, #1d4ed8 100%)',
               boxShadow: '0 0 18px rgba(14, 165, 233, 0.4)',
@@ -2470,7 +910,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             ) : (
               <>
                 <Download className="w-4 h-4" aria-hidden="true" />
-                <span>Start Download & Install</span>
+                <span>Start Download &amp; Install</span>
               </>
             )}
           </button>

@@ -6,6 +6,7 @@ import type {
   EnvironmentSetupTaskOutcome,
   EnvironmentSetupTaskRequest,
 } from '../../../../contracts/environmentSetup';
+import { getDefaultBottleNameForRunner } from '../../../../services/launcher/bottleArchitectureUtils';
 import { formatBytes } from '../../../../utils/formatBytes';
 import {
   AlertCircle,
@@ -44,8 +45,7 @@ function describeTaskAction(
         ? `Update ${compTitle}`
         : `Install ${compTitle}`;
     case 'ensure_bottle': {
-      const fallbackBottle =
-        task.runnerType === 'crossover_preview_arm64' ? 'OneLauncher-arm64' : 'OneLauncher';
+      const fallbackBottle = getDefaultBottleNameForRunner(task.runnerType || 'crossover');
       return task.bottleMode === 'reuse_existing'
         ? `Set up existing "${task.bottleName || fallbackBottle}" bottle`
         : `Create "${task.bottleName || fallbackBottle}" bottle`;
@@ -140,18 +140,27 @@ export const ProvisioningProgressPanel: React.FC<ProvisioningProgressPanelProps>
           ? `${plannedTasks.length} item${plannedTasks.length === 1 ? '' : 's'} ready to install.`
           : 'Everything you selected is already installed.';
 
+  const showProgressCard = isRunning || outcomes.length > 0 || hasFailure;
+
   return (
     <div className="space-y-3.5" data-testid="provisioning-progress-panel">
-      {/* Live Progress Bar & Polite Status Region */}
-      {(isRunning || outcomes.length > 0 || hasFailure) && (
-        <div className="rounded-lg bg-[#16202d] border border-[#2a475e]/80 p-3.5 space-y-2.5">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div
-              role="status"
-              aria-live="polite"
-              className="flex items-center gap-2 text-xs font-semibold text-white min-w-0"
-            >
-              {isRunning ? (
+      {/* Persistent Live-Region Wrapper & Progress Card (stays mounted across idle -> running -> done) */}
+      <div
+        className={
+          showProgressCard
+            ? 'rounded-lg bg-[#16202d] border border-[#2a475e]/80 p-3.5 space-y-2.5'
+            : 'sr-only'
+        }
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            className="flex items-center gap-2 text-xs font-semibold text-white min-w-0"
+          >
+            {showProgressCard &&
+              (isRunning ? (
                 <Loader2
                   className="w-4 h-4 text-[#66c0f4] shrink-0 ol-guided-spinner"
                   aria-hidden="true"
@@ -162,10 +171,11 @@ export const ProvisioningProgressPanel: React.FC<ProvisioningProgressPanelProps>
                 <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
               ) : (
                 <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" aria-hidden="true" />
-              )}
-              <span className="truncate">{statusAnnouncement}</span>
-            </div>
+              ))}
+            <span className="truncate">{statusAnnouncement}</span>
+          </div>
 
+          {showProgressCard && (
             <div className="flex items-center gap-2.5 shrink-0">
               {latestProgress && latestProgress.totalSteps > 0 && isRunning && (
                 <span className="text-[11px] text-slate-300">
@@ -190,50 +200,47 @@ export const ProvisioningProgressPanel: React.FC<ProvisioningProgressPanelProps>
                 </button>
               )}
             </div>
-          </div>
-
-          <progress
-            className="ol-setup-progress w-full h-2.5 block"
-            max={100}
-            value={determinatePercent}
-            aria-label="Installation progress"
-            aria-valuetext={
-              isRunning && latestProgress?.message ? latestProgress.message : undefined
-            }
-          />
-
-          {latestProgress &&
-            isRunning &&
-            typeof latestProgress.bytesDownloaded === 'number' &&
-            latestProgress.bytesDownloaded > 0 && (
-              <div className="text-[11px] font-mono text-slate-300 flex items-center justify-end">
-                <span>
-                  {formatBytes(latestProgress.bytesDownloaded)}
-                  {typeof latestProgress.totalBytes === 'number' && latestProgress.totalBytes > 0
-                    ? ` / ${formatBytes(latestProgress.totalBytes)}`
-                    : ''}
-                </span>
-              </div>
-            )}
-
-          {lastRunError && !isRunning && (
-            <div
-              role="alert"
-              className="rounded bg-rose-950/60 border border-rose-500/50 px-3 py-2 text-xs text-rose-200 flex items-center gap-2"
-            >
-              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" aria-hidden="true" />
-              <span>{lastRunError}</span>
-            </div>
           )}
         </div>
-      )}
 
-      {/* Polite status announcer when idle before run */}
-      {!isRunning && outcomes.length === 0 && !hasFailure && (
-        <div role="status" aria-live="polite" className="sr-only">
-          {statusAnnouncement}
-        </div>
-      )}
+        {showProgressCard && (
+          <>
+            <progress
+              className="ol-setup-progress w-full h-2.5 block"
+              max={100}
+              value={determinatePercent}
+              aria-label="Installation progress"
+              aria-valuetext={
+                isRunning && latestProgress?.message ? latestProgress.message : undefined
+              }
+            />
+
+            {latestProgress &&
+              isRunning &&
+              typeof latestProgress.bytesDownloaded === 'number' &&
+              latestProgress.bytesDownloaded > 0 && (
+                <div className="text-[11px] font-mono text-slate-300 flex items-center justify-end">
+                  <span>
+                    {formatBytes(latestProgress.bytesDownloaded)}
+                    {typeof latestProgress.totalBytes === 'number' && latestProgress.totalBytes > 0
+                      ? ` / ${formatBytes(latestProgress.totalBytes)}`
+                      : ''}
+                  </span>
+                </div>
+              )}
+
+            {lastRunError && !isRunning && (
+              <div
+                role="alert"
+                className="rounded bg-rose-950/60 border border-rose-500/50 px-3 py-2 text-xs text-rose-200 flex items-center gap-2"
+              >
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" aria-hidden="true" />
+                <span>{lastRunError}</span>
+              </div>
+            )}
+          </>
+        )}
+      </div>
 
       {/* Task Outcomes (Post-Run or Partial Run) */}
       {outcomes.length > 0 && (
