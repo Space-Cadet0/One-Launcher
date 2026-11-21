@@ -1,10 +1,16 @@
-import type { InstalledGameRecord } from '../../contracts/launcher';
-import type { StorefrontId } from '../../contracts/platform';
+import type { ChainedHandoffTopology } from '../../contracts/game';
+import type { GameInstallInfo, InstalledGameRecord } from '../../contracts/launcher';
+import { STOREFRONT_REGISTRY, type StorefrontId } from '../../contracts/platform';
+import { sanitizeGameInstallSizeBytes } from '../../utils/formatBytes';
 
 export type ScannedInstalledGameItem = InstalledGameRecord & {
   appId: number;
   name?: string;
   installPath: string;
+  xboxCompatibility?: GameInstallInfo['xboxCompatibility'];
+  packageFormat?: string;
+  xboxBottleCompatibilityTier?: string;
+  bottleName?: string;
 };
 
 export interface LocalSystemScanResult {
@@ -44,17 +50,51 @@ interface RawScannedInstalledGame {
   xboxTitleId?: string;
   scid?: string;
   msaAppId?: string;
+  isCrossPlatformLauncherRuntime?: boolean;
+  externalStorefrontHandoff?: StorefrontId | 'riot' | string;
+  chainedLauncherHandoff?: string;
+  chainedExternalInstallId?: string;
+  chainedHandoffTopology?: ChainedHandoffTopology;
+  epicPartnerRegistryPath?: string;
+  requiresKernelAntiCheat?: boolean;
+  antiCheatName?: string;
+  xboxCompatibility?: GameInstallInfo['xboxCompatibility'];
+  packageFormat?: string;
+  xboxBottleCompatibilityTier?: string;
+  bottleName?: string;
   runner?: InstalledGameRecord['runner'];
   launchArguments?: string;
   isWindowsBinaryOnMac?: boolean;
+  executableArchitecture?: string;
+  is32BitExecutable?: boolean;
 }
+
+const SCANNED_PLATFORM_ALIASES: Readonly<Record<string, StorefrontId>> = {
+  'ea app': 'ea',
+  ea_app: 'ea',
+  origin: 'ea',
+  'battle.net': 'bnet',
+  battlenet: 'bnet',
+  uplay: 'ubisoft',
+  'ubisoft connect': 'ubisoft',
+  'itch.io': 'itch',
+  'epic games': 'epic',
+  'gog galaxy': 'gog',
+  'amazon prime': 'amazon',
+  'rockstar games': 'rockstar',
+  'humble bundle': 'humble',
+};
 
 function normalizeScannedPlatformId(raw?: string): StorefrontId {
   const lower = (raw || '').trim().toLowerCase();
-  if (lower === 'steam' || lower === 'gog' || lower === 'epic' || lower === 'xbox' || lower === 'custom') {
-    return lower;
+  if (!lower) return 'custom';
+  if (Object.hasOwn(STOREFRONT_REGISTRY, lower)) {
+    return lower as StorefrontId;
   }
-  return 'steam';
+  if (Object.hasOwn(SCANNED_PLATFORM_ALIASES, lower)) {
+    return SCANNED_PLATFORM_ALIASES[lower];
+  }
+  return 'custom';
 }
 
 function normalizeInstalledGamesList(
@@ -72,7 +112,7 @@ function normalizeInstalledGamesList(
       name: item.name || item.title,
       installPath: item.installPath || '',
       executablePath: item.executablePath,
-      installSize: item.installSize,
+      installSize: sanitizeGameInstallSizeBytes(item.installSize),
       version: item.version,
       manifestPath: item.manifestPath,
       xboxProductId: item.xboxProductId,
@@ -81,9 +121,23 @@ function normalizeInstalledGamesList(
       xboxTitleId: item.xboxTitleId,
       scid: item.scid,
       msaAppId: item.msaAppId,
+      isCrossPlatformLauncherRuntime: item.isCrossPlatformLauncherRuntime,
+      externalStorefrontHandoff: item.externalStorefrontHandoff,
+      chainedLauncherHandoff: item.chainedLauncherHandoff,
+      chainedExternalInstallId: item.chainedExternalInstallId,
+      chainedHandoffTopology: item.chainedHandoffTopology,
+      epicPartnerRegistryPath: item.epicPartnerRegistryPath,
+      requiresKernelAntiCheat: item.requiresKernelAntiCheat,
+      antiCheatName: item.antiCheatName,
+      xboxCompatibility: item.xboxCompatibility,
+      packageFormat: item.packageFormat,
+      xboxBottleCompatibilityTier: item.xboxBottleCompatibilityTier,
+      bottleName: item.bottleName,
       runner: item.runner,
       launchArguments: item.launchArguments,
       isWindowsBinaryOnMac: item.isWindowsBinaryOnMac,
+      executableArchitecture: item.executableArchitecture,
+      is32BitExecutable: item.is32BitExecutable,
     };
   });
 }
@@ -105,7 +159,9 @@ export async function scanLocalInstalledGames(): Promise<LocalSystemScanResult |
             installedSteamAppIds: Array.isArray(electronRes.installedSteamAppIds)
               ? electronRes.installedSteamAppIds
               : [],
-            installedGames: normalizeInstalledGamesList(electronRes.installedGames || []),
+            installedGames: normalizeInstalledGamesList(
+              (electronRes.installedGames || []) as RawScannedInstalledGame[]
+            ),
             scannedAt: new Date().toISOString(),
           };
         }
@@ -138,7 +194,9 @@ export async function scanLocalInstalledGames(): Promise<LocalSystemScanResult |
     return {
       success: !!data.success,
       installedSteamAppIds: Array.isArray(data.installedSteamAppIds) ? data.installedSteamAppIds : [],
-      installedGames: normalizeInstalledGamesList(data.installedGames || []),
+      installedGames: normalizeInstalledGamesList(
+        (data.installedGames || []) as RawScannedInstalledGame[]
+      ),
       scannedAt: data.scannedAt,
     };
   } catch (err) {

@@ -83,15 +83,36 @@ class OnlineLifecycleManager {
   }
 
   private handleWindowOnline = (): void => {
-    const wasOffline = !this.onlineState;
     this.onlineState = true;
-    if (wasOffline) {
-      this.onlineGeneration += 1;
-    } else {
-      this.onlineGeneration += 1;
-    }
+    this.onlineGeneration += 1;
     this.emitConnectivity(true);
   };
+
+  /**
+   * Detaches all window event listeners, Electron IPC subscriptions, and registered callbacks.
+   * Subsequent subscriptions automatically re-initialize cleanly via `ensureInitialized()`.
+   */
+  public dispose(): void {
+    if (this.initialized && typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      try {
+        window.removeEventListener('online', this.handleWindowOnline);
+        window.removeEventListener('offline', this.handleWindowOffline);
+      } catch {}
+    }
+    this.initialized = false;
+
+    for (const unsub of this.ipcUnsubscribers) {
+      try {
+        unsub();
+      } catch {}
+    }
+    this.ipcUnsubscribers = [];
+
+    this.connectivityListeners.clear();
+    this.healthListeners.clear();
+    this.gameHydratedListeners.clear();
+    this.progressListeners.clear();
+  }
 
   private handleWindowOffline = (): void => {
     this.onlineState = false;

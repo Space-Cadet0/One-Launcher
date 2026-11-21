@@ -270,6 +270,5 @@ export function buildTagFacetCounts(
     result.push({ key, label: data.label, count: data.count });
   }
 
-  result.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
-  return result;
+  return result.toSorted((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 }

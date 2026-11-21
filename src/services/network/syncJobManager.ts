@@ -1,611 +1,63 @@
-import { CanonicalGame } from '../../contracts/game';
-import { MediaSyncOutcome } from '../../contracts/steam';
-import { steamMatcher } from '../steam/steamMatcher';
-import { steamApi } from '../steam/steamApi';
-import {
-  fallbackMetadataProvider,
-  isGenericPlaceholderSynopsis,
-} from '../steam/fallbackMetadataProvider';
-import { getOpenCriticData, criticScoreService } from '../critic/criticScoreService';
-import { getReviewSourceAuthorityRank } from '../critic/criticUtils';
-import { buildVerifiedSteamMetacriticAnchor } from '../critic/reviewScoreResolver';
-import { wikidataBridge, normalizeWikidataGogSlug, type WikidataBatchStoreItem } from '../critic/wikidataBridge';
-import { requestScheduler, RequestPriority } from './requestScheduler';
-import {
-  getUserOverrideForGame,
-  inferMetadataRouteFromOverride,
-  inferReviewRouteFromOverride,
-  updateRoutedMetadataSnapshot,
-} from '../storage/userOverrideStorage';
-import {
-  MEDIA_ATTEMPT_KEY_PREFIX,
-  loadStagedCache,
-  hasFreshMediaSyncAttempt,
-  recordMediaSyncAttempt,
-  whenStagedCacheHydrated,
-} from '../storage/stagedCacheService';
-import { flushPendingCatalogSave } from '../integrations/integrationStorage';
-import {
-  pickBestEnrichedMetadata,
-  pickPreferredCapsuleImage,
-  pickPreferredDetailedDescription,
-  pickPreferredHeaderImage,
-  pickPreferredReleaseDate,
-} from '../storage/librarySync';
-import { isUserActivelyScrolling, waitUntilScrollIdle } from '../../utils/scrollActivityTracker';
+import type { CanonicalGame } from '../../contracts/game';
+import { requestScheduler } from './requestScheduler';
 import { onlineLifecycleManager } from './onlineLifecycleManager';
-import { unwrapOlMediaUrl } from '../../contracts/network';
-import { fetchAndCacheHltb, hasAttemptedHltbLookup } from '../hltb/howLongToBeat';
 import {
-  isGogCroppedHorizontalCover,
-  isUnsuitableCoverUrl,
-} from '../igdb/igdbCoverService';
-import { getCoverCandidates } from '../../components/Library/Grid/gridCoverUtils';
-import { getNativeOsPlatforms } from '../platform/nativeOsService';
+  computeMediaRepairPriority,
+  evaluateGameNeedsStoreMediaSync,
+  hasActiveMediaSyncCooldown,
+  MAX_PASSIVE_REPAIR_PER_BOOT,
+  MEDIA_SYNC_DOMAINS,
+  type MediaRepairPriorityTier,
+  type StoreMediaSyncEvalOptions,
+  type StoreMediaSyncOptions,
+} from './sync/mediaSyncEligibility';
 import {
-  clearDurableEmptySynopsisProbe,
-  hasGenuineStoreSynopsis,
-  isLikelyNonStoreOrTestBranchTitle,
-} from '../../components/Library/MatchManager/matchManagerDiagnostics';
+  buildP2CoverHydrationBatch,
+  extractStaticHydrationAssets,
+  type HydrationQueueGameEntry,
+} from './sync/hydrationAssetExtractor';
+import {
+  buildSyncHeadline,
+  CATEGORY_SHORT_LABELS,
+  CATEGORY_SINGLE_HEADLINES,
+  drainResolverQueue,
+  type PriorityScopeEntry,
+  type SyncCategory,
+  type SyncJobHandle,
+  type SyncJobState,
+  type TrackedCategoryStats,
+} from './sync/syncStateMachine';
+import {
+  type CriticScoreSyncOptions,
+  executeCriticScoreSyncJob,
+} from './sync/criticScoreSyncRunner';
+import { executeStoreMediaSyncJob } from './sync/storeMediaSyncRunner';
 
-export interface StoreMediaSyncEvalOptions {
-  isManualSync?: boolean;
-  isPostHydration?: boolean;
-}
-
-export type MediaRepairPriorityTier = 0 | 1 | 2 | 3;
-
-export const MAX_PASSIVE_REPAIR_PER_BOOT = 45;
-
-export interface StoreMediaSyncOptions {
-  forceRefresh?: boolean;
-  incremental?: boolean;
-  isBackgroundWarmup?: boolean;
-  isManualSync?: boolean;
-  isPostHydration?: boolean;
-  maxRepairTier?: MediaRepairPriorityTier;
-  maxBatchSize?: number;
-  onGameAttempted?: (gameId: string) => void;
-}
-
-function resolveSyncHostPlatform(): 'darwin' | 'win32' | 'linux' {
-  if (typeof window !== 'undefined') {
-    const plat = window.electronAPI?.platform;
-    if (plat === 'win32' || plat === 'linux' || plat === 'darwin') {
-      return plat;
-    }
-    const navPlat = String(window.navigator?.platform || '').toLowerCase();
-    if (navPlat.includes('win')) return 'win32';
-    if (navPlat.includes('linux')) return 'linux';
-  }
-  return 'darwin';
-}
-
-function isOwnedNativeMacGame(g: CanonicalGame): boolean {
-  try {
-    return getNativeOsPlatforms(g).includes('mac');
-  } catch {
-    return false;
-  }
-}
-
-function hasFreshNegativeMediaSyncAttempt(
-  gameId: string,
-  meta?: CanonicalGame['enrichedMetadata'] | null,
-  minAttemptedAt?: number
-): boolean {
-  const minTs = typeof minAttemptedAt === 'number' && minAttemptedAt > 0 ? minAttemptedAt : 0;
-  if (gameId) {
-    const staged = loadStagedCache<{ attemptedAt?: number; outcome?: MediaSyncOutcome }>(
-      `${MEDIA_ATTEMPT_KEY_PREFIX}${gameId}`
-    );
-    if (staged.valid) {
-      const attemptedAt = staged.data?.attemptedAt ?? staged.entry?.cachedAt ?? 0;
-      const outcome = staged.data?.outcome;
-      if (
-        attemptedAt >= minTs &&
-        (outcome === 'unavailable_404' || outcome === 'transient_error')
-      ) {
-        return true;
-      }
-    }
-  }
-  if (
-    meta &&
-    typeof meta.lastMediaSyncAttemptAt === 'number' &&
-    meta.lastMediaSyncAttemptAt >= minTs &&
-    (meta.mediaSyncOutcome === 'unavailable_404' || meta.mediaSyncOutcome === 'transient_error')
-  ) {
-    const ttlMs =
-      meta.mediaSyncOutcome === 'unavailable_404'
-        ? 14 * 24 * 60 * 60 * 1000
-        : 12 * 60 * 60 * 1000;
-    if (Date.now() - meta.lastMediaSyncAttemptAt < ttlMs) {
-      return true;
-    }
-  }
-  return false;
-}
-
-export function computeMediaRepairPriority(
-  g: CanonicalGame,
-  explicitOverride?: ReturnType<typeof getUserOverrideForGame>,
-  hostPlatform?: 'darwin' | 'win32' | 'linux'
-): MediaRepairPriorityTier {
-  const ov = explicitOverride !== undefined ? explicitOverride : getUserOverrideForGame(g);
-  const meta = g.enrichedMetadata;
-  const activeHost = hostPlatform ?? resolveSyncHostPlatform();
-
-  // Tier 0: Missing genuine store synopsis OR missing/unsuitable cover artwork
-  const hasGenuineSynopsis = hasGenuineStoreSynopsis(g, ov, undefined, null);
-  const missingSynopsis = !hasGenuineSynopsis && !isLikelyNonStoreOrTestBranchTitle(g.title);
-  const missingOrUnsuitableCover =
-    !ov?.capsuleImage &&
-    (!g.capsuleImage ||
-      isUnsuitableCoverUrl(g.capsuleImage) ||
-      isGogCroppedHorizontalCover(g.capsuleImage, g.headerImage));
-  if (missingSynopsis || missingOrUnsuitableCover) {
-    return 0;
-  }
-
-  const hasFetchedAt = typeof meta?.fetchedAt === 'number' && meta.fetchedAt > 0;
-  const hasSysReq = Boolean(
-    meta?.systemRequirements?.minimum?.trim() || meta?.systemRequirements?.recommended?.trim()
-  );
-  const hasMacReq = Boolean(
-    meta?.macRequirements?.minimum?.trim() || meta?.macRequirements?.recommended?.trim()
-  );
-  const favGame = g as FavoritableGame;
-  const isInstalledOrFavorited = Boolean(
-    g.platforms?.some((p) => p?.installed) ||
-      favGame.isFavorite ||
-      favGame.favorited ||
-      favGame.isFavorited
-  );
-
-  // Tier 1: Active-host native OS spec gap OR installed/favorited slimmed row
-  const hasActiveHostSpecGap =
-    activeHost === 'darwin'
-      ? isOwnedNativeMacGame(g) && !hasMacReq && !hasFetchedAt
-      : activeHost === 'win32'
-        ? !hasSysReq && !hasFetchedAt
-        : false;
-  if (hasActiveHostSpecGap || (meta?.__quotaSlimmed === true && isInstalledOrFavorited)) {
-    return 1;
-  }
-
-  // Tier 2: Remaining persisted slimmed rows or un-upgraded / screenshot-less records
-  if (
-    meta?.__quotaSlimmed === true ||
-    !meta ||
-    meta.metadataQuality === 'skeleton_fallback' ||
-    meta.metadataQuality === 'storefront_native' ||
-    meta.metadataQuality === 'local_federated' ||
-    (meta.screenshots?.length || 0) === 0
-  ) {
-    return 2;
-  }
-
-  // Tier 3: Non-slimmed Frankenstein backfill (valid synopsis, cover, screenshots, and active-host specs)
-  return 3;
-}
-
-export function evaluateGameNeedsStoreMediaSync(
-  g: CanonicalGame,
-  forceRefresh: boolean,
-  options: StoreMediaSyncEvalOptions = {}
-): { eligible: boolean; alreadyEnriched: boolean } {
-  const ov = getUserOverrideForGame(g);
-  const route = inferMetadataRouteFromOverride(ov);
-  const effectiveSteamId = steamMatcher.getEffectiveSteamAppId(g);
-  const gameExtended = g as CanonicalGame & {
-    platform?: string;
-    xboxProductId?: string;
-  };
-  const hasXboxPlat =
-    gameExtended.platform === 'xbox' ||
-    Boolean(gameExtended.xboxProductId) ||
-    Boolean(
-      g.platforms?.some((p) =>
-        typeof p === 'string'
-          ? p === 'xbox'
-          : p?.platformId === 'xbox' || Boolean(p?.xboxProductId)
-      )
-    );
-
-  let hasMediaRoute = false;
-  if (effectiveSteamId) {
-    hasMediaRoute = true;
-  } else if (
-    hasXboxPlat ||
-    g.platforms?.some((p) =>
-      typeof p === 'string'
-        ? p === 'gog' || p === 'epic'
-        : p?.platformId === 'gog' || p?.platformId === 'epic'
-    )
-  ) {
-    hasMediaRoute = true;
-  } else {
-    hasMediaRoute = Boolean(
-      route &&
-        route.mode === 'routed' &&
-        (route.source === 'steam' ||
-          route.source === 'gog' ||
-          route.source === 'epic' ||
-          route.source === 'igdb' ||
-          (route.source === 'custom' && String(route.matchedId || '').startsWith('xbox-')))
-    );
-  }
-
-  if (!hasMediaRoute) {
-    return { eligible: false, alreadyEnriched: false };
-  }
-
-  if (forceRefresh) {
-    return { eligible: true, alreadyEnriched: false };
-  }
-
-  const isManualSync = Boolean(options.isManualSync);
-  const isPostHydration = Boolean(options.isPostHydration);
-  const meta = g.enrichedMetadata;
-  const ovUpdatedAtMs = ov?.updatedAt ? Date.parse(ov.updatedAt) || 0 : 0;
-
-  // Backward-compatible fast-path for fresh transient localStorage slim projections
-  // (where slimGameForLocalStorageQuota deleted top-level `shortDescription` leaving `undefined`)
-  // when neither `isManualSync` nor `isPostHydration` is asserted.
-  const isFreshLocalStorageSlimProjection = Boolean(
-    meta?.__quotaSlimmed === true &&
-      !isManualSync &&
-      !isPostHydration &&
-      g.shortDescription === undefined &&
-      (meta.hasScreenshotsCount || 0) > 0
-  );
-  const isPersistedSlim = Boolean(
-    meta?.__quotaSlimmed === true && !isFreshLocalStorageSlimProjection
-  );
-
-  const hasGenuineSynopsis = hasGenuineStoreSynopsis(g, ov, undefined, null);
-  const needsSynopsisRepair = Boolean(
-    !isFreshLocalStorageSlimProjection &&
-      !hasGenuineSynopsis &&
-      !isLikelyNonStoreOrTestBranchTitle(g.title)
-  );
-
-  const hasSysReq = Boolean(
-    meta?.systemRequirements?.minimum?.trim() || meta?.systemRequirements?.recommended?.trim()
-  );
-  const hasMacReq = Boolean(
-    meta?.macRequirements?.minimum?.trim() || meta?.macRequirements?.recommended?.trim()
-  );
-  const hasFetchedAt = typeof meta?.fetchedAt === 'number' && meta.fetchedAt > 0;
-
-  const needsSysReqRepair = Boolean(
-    (isManualSync || isPostHydration) &&
-      meta &&
-      !meta.__quotaSlimmed &&
-      meta.metadataQuality === 'authoritative' &&
-      Boolean(effectiveSteamId && effectiveSteamId > 0) &&
-      !hasSysReq &&
-      !hasFetchedAt
-  );
-  const needsMacReqRepair = Boolean(
-    (isManualSync || isPostHydration) &&
-      meta &&
-      !meta.__quotaSlimmed &&
-      meta.metadataQuality !== 'skeleton_fallback' &&
-      isOwnedNativeMacGame(g) &&
-      !hasMacReq &&
-      !hasFetchedAt
-  );
-
-  const hasMetadataCorruptionOrGap =
-    isPersistedSlim || needsSynopsisRepair || needsSysReqRepair || needsMacReqRepair;
-
-  if (hasFreshMediaSyncAttempt(g.id, meta, ovUpdatedAtMs)) {
-    const canBypassFreshAttempt =
-      hasMetadataCorruptionOrGap &&
-      (isManualSync ||
-        (!hasFreshNegativeMediaSyncAttempt(g.id, meta, ovUpdatedAtMs) &&
-          (isPersistedSlim || !hasFetchedAt)));
-    if (!canBypassFreshAttempt) {
-      return {
-        eligible: false,
-        alreadyEnriched: Boolean(
-          meta && meta.metadataQuality !== 'skeleton_fallback' && !isPersistedSlim
-        ),
-      };
-    }
-  }
-
-  const hasScreenshots =
-    (meta?.screenshots?.length || 0) > 0 || isFreshLocalStorageSlimProjection;
-  const metaAlreadyFromSteam = Boolean(
-    meta &&
-      !meta.__quotaSlimmed &&
-      Number(meta.appId) > 0 &&
-      meta.enrichedSource !== 'xbox' &&
-      meta.metadataQuality !== 'skeleton_fallback'
-  );
-  const canStillMatchSteam =
-    !g.isExplicitNonSteam &&
-    g.steamAppId !== null &&
-    ov?.steamAppId !== null &&
-    !metaAlreadyFromSteam &&
-    (Boolean(effectiveSteamId) || !steamMatcher.hasAttemptedMatch(g.title));
-  const isStorefrontNativeMeta = Boolean(
-    meta &&
-      !meta.__quotaSlimmed &&
-      (meta.metadataQuality === 'storefront_native' ||
-        meta.metadataQuality === 'local_federated' ||
-        meta.enrichedSource === 'xbox' ||
-        (!g.steamAppId &&
-          meta.metadataQuality !== 'scraped' &&
-          hasXboxPlat &&
-          (!meta.appId || Number(meta.appId) <= 0)))
-  );
-  const needsRichSteamUpgrade = isStorefrontNativeMeta && canStillMatchSteam;
-  const needsAuthoritativeArtworkBackfill = Boolean(
-    meta &&
-      !meta.__quotaSlimmed &&
-      meta.metadataQuality === 'authoritative' &&
-      !ov?.capsuleImage &&
-      (!g.capsuleImage ||
-        isUnsuitableCoverUrl(g.capsuleImage) ||
-        isGogCroppedHorizontalCover(g.capsuleImage, g.headerImage))
-  );
-
-  if (
-    meta &&
-    meta.metadataQuality !== 'skeleton_fallback' &&
-    hasScreenshots &&
-    !hasMetadataCorruptionOrGap &&
-    !needsRichSteamUpgrade &&
-    !needsAuthoritativeArtworkBackfill
-  ) {
-    return { eligible: false, alreadyEnriched: true };
-  }
-
-  if (
-    meta &&
-    meta.metadataQuality !== 'skeleton_fallback' &&
-    !hasScreenshots &&
-    !hasMetadataCorruptionOrGap &&
-    !needsRichSteamUpgrade &&
-    !needsAuthoritativeArtworkBackfill &&
-    typeof meta.enrichedAt === 'number' &&
-    Date.now() - meta.enrichedAt < 30 * 24 * 60 * 60 * 1000
-  ) {
-    return { eligible: false, alreadyEnriched: true };
-  }
-
-  return { eligible: true, alreadyEnriched: false };
-}
-
-function normalizeStaticHydrationAssetUrl(raw?: string | null): string | null {
-  if (!raw || typeof raw !== 'string') return null;
-  const clean = unwrapOlMediaUrl(raw).trim();
-  if (!clean || !/^https?:\/\//i.test(clean)) return null;
-  if (/\.(?:mp4|webm|m3u8|mpd|mov|avi|mkv|ogv)(?:[?#]|$)/i.test(clean)) return null;
-  if (
-    /steamstatic\.com\/store_trailers\/.*\/movie/i.test(clean) &&
-    !/\.(?:jpg|jpeg|png|webp|gif|avif)(?:[?#]|$)/i.test(clean)
-  ) {
-    return null;
-  }
-  return clean;
-}
-
-export function extractStaticHydrationAssets(
-  game: CanonicalGame,
-  meta?: CanonicalGame['enrichedMetadata']
-): Array<{ role: string; ordinal?: number; url: string }> {
-  const assets: Array<{ role: string; ordinal?: number; url: string }> = [];
-  const seen = new Set<string>();
-
-  const addAsset = (role: string, rawUrl?: string | null, ordinal?: number) => {
-    const url = normalizeStaticHydrationAssetUrl(rawUrl);
-    if (!url) return;
-    const dedupeKey = `${role}:${url}`;
-    if (seen.has(dedupeKey)) return;
-    seen.add(dedupeKey);
-    assets.push(ordinal !== undefined ? { role, ordinal, url } : { role, url });
-  };
-
-  const candidateGame: CanonicalGame =
-    meta && meta !== game.enrichedMetadata ? { ...game, enrichedMetadata: meta } : game;
-  const alignedCoverUrl =
-    getCoverCandidates(candidateGame, undefined, undefined, {
-      scheduleSwrReprobe: false,
-    })[0] ||
-    game.capsuleImage ||
-    meta?.capsuleImage;
-
-  addAsset('cover', alignedCoverUrl, 0);
-  addAsset('header', meta?.headerImage || game.headerImage, 0);
-  addAsset('icon', game.iconUrl, 0);
-
-  const topScreenshots = (meta?.screenshots || []).slice(0, 5);
-  for (let idx = 0; idx < topScreenshots.length; idx++) {
-    const shot = topScreenshots[idx];
-    addAsset('screenshot_thumb', shot?.pathThumbnail || shot?.pathFull, idx);
-  }
-
-  const htmlSource = meta?.detailedDescription || meta?.aboutTheGame || '';
-  if (htmlSource.trim()) {
-    const imgRegex = /<img\b[^>]*?\bsrc=["']([^"']+)["']/gi;
-    let imgMatch: RegExpExecArray | null;
-    let imgOrd = 0;
-    while ((imgMatch = imgRegex.exec(htmlSource)) !== null && imgOrd < 12) {
-      addAsset('inline_img', imgMatch[1], imgOrd);
-      imgOrd++;
-    }
-
-    const posterRegex = /<video\b[^>]*?\bposter=["']([^"']+)["']/gi;
-    let posterMatch: RegExpExecArray | null;
-    let posterOrd = 0;
-    while ((posterMatch = posterRegex.exec(htmlSource)) !== null && posterOrd < 6) {
-      addAsset('inline_poster', posterMatch[1], posterOrd);
-      posterOrd++;
-    }
-  }
-
-  return assets;
-}
-
-type FavoritableGame = CanonicalGame & {
-  isFavorite?: boolean;
-  favorited?: boolean;
-  isFavorited?: boolean;
-};
-
-export interface HydrationQueueGameEntry {
-  gameId: string;
-  title?: string;
-  steamAppId?: number | null;
-  gogId?: string | null;
-  epicAppName?: string | null;
-  xboxProductId?: string | null;
-  packageFamilyName?: string | null;
-  isInstalled?: boolean;
-  isFavorited?: boolean;
-  priority?: number;
-  assets: Array<{ role: string; ordinal?: number; url: string }>;
-}
-
-/**
- * Builds a polite P2 background hydration batch (cover + icon ONLY) aligned with
- * `getCoverCandidates(game)[0]` so `MediaHydrationEngine` pre-warms the exact cover
- * URL requested by `GameCardCover`.
- */
-export function buildP2CoverHydrationBatch(
-  games: CanonicalGame[]
-): HydrationQueueGameEntry[] {
-  const batch: HydrationQueueGameEntry[] = [];
-  for (const g of games) {
-    if (!g?.id) continue;
-    const gogPlat = g.platforms?.find((p) => p.platformId === 'gog');
-    const epicPlat = g.platforms?.find((p) => p.platformId === 'epic');
-    const xboxPlat = g.platforms?.find((p) => p.platformId === 'xbox');
-    const isInstalled = Boolean(g.platforms?.some((p) => p.installed));
-    const isFavorited = Boolean(
-      (g as FavoritableGame).isFavorite || (g as FavoritableGame).favorited
-    );
-    const p2Assets = extractStaticHydrationAssets(g, g.enrichedMetadata).filter(
-      (a) => a.role === 'cover' || a.role === 'icon'
-    );
-    if (p2Assets.length === 0) continue;
-    batch.push({
-      gameId: g.id,
-      title: g.title,
-      steamAppId: g.steamAppId ?? null,
-      gogId: gogPlat?.platformGameId ?? null,
-      epicAppName: epicPlat?.platformGameId ?? null,
-      xboxProductId: xboxPlat?.xboxProductId ?? xboxPlat?.platformGameId ?? null,
-      packageFamilyName: xboxPlat?.packageFamilyName ?? null,
-      isInstalled,
-      isFavorited,
-      priority: 2,
-      assets: p2Assets,
-    });
-  }
-  return batch;
-}
-
-interface MediaSyncRateError {
-  isRateLimited?: boolean;
-  status?: number;
-  cooldownRemaining?: number;
-  message?: string;
-  response?: {
-    status?: number;
-  };
-}
-
-export const MEDIA_SYNC_DOMAINS = [
-  'store.steampowered.com',
-  'api.steampowered.com',
-  'catalog.gog.com',
-  'api.gog.com',
-  'launcher.store.epicgames.com',
-  'store-content.ak.epicgames.com',
-  'api.igdb.com',
-] as const;
-
-export function hasActiveMediaSyncCooldown(): boolean {
-  return requestScheduler.getMaxCooldownRemaining(MEDIA_SYNC_DOMAINS) > 0;
-}
-
-const MAX_RATE_LIMIT_RETRIES = 3;
-
-async function yieldToMainThread(): Promise<void> {
-  const sched: unknown =
-    typeof globalThis !== 'undefined' ? Reflect.get(globalThis, 'scheduler') : undefined;
-  if (sched && typeof sched === 'object' && 'yield' in sched && typeof sched.yield === 'function') {
-    await sched.yield();
-  } else {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
-}
-
-export type SyncCategory =
-  | 'storefront_libraries'
-  | 'cover_art'
-  | 'critic_scores'
-  | 'store_media'
-  | 'achievements';
-
-export interface SyncJobState {
-  id: string;
-  type: 'store_media' | 'critic_scores' | 'achievements' | 'cover_art' | 'storefront_libraries' | 'multi';
-  title: string;
-  headline?: string;
-  activeCategories?: string[];
-  total: number;
-  current: number;
-  currentItemName?: string;
-  status: 'idle' | 'running' | 'paused' | 'completed' | 'cancelled' | 'rate_limited';
-  isPreempted?: boolean;
-  priorityHeadline?: string;
-  priorityItemName?: string;
-  cooldownSecondsRemaining?: number;
-  startedAt?: number;
-  error?: string;
-}
-
-interface TrackedCategoryStats {
-  total: number;
-  completed: number;
-  inFlight: number;
-  lastItemName?: string;
-}
-
-interface PriorityScopeEntry {
-  id: string;
-  headline: string;
-  itemName?: string;
-}
-
-const CATEGORY_SHORT_LABELS: Record<SyncCategory, string> = {
-  storefront_libraries: 'Storefronts',
-  cover_art: 'Cover Art',
-  critic_scores: 'Review Scores',
-  store_media: 'Store Media',
-  achievements: 'Achievements',
-};
-
-const CATEGORY_SINGLE_HEADLINES: Record<SyncCategory, string> = {
-  storefront_libraries: 'Syncing Storefront Libraries',
-  cover_art: 'Syncing Cover Art',
-  critic_scores: 'Syncing Review Scores',
-  store_media: 'Syncing Official Store Media',
-  achievements: 'Syncing Achievements',
+export {
+  type StoreMediaSyncEvalOptions,
+  type MediaRepairPriorityTier,
+  MAX_PASSIVE_REPAIR_PER_BOOT,
+  type StoreMediaSyncOptions,
+  computeMediaRepairPriority,
+  evaluateGameNeedsStoreMediaSync,
+  extractStaticHydrationAssets,
+  type HydrationQueueGameEntry,
+  buildP2CoverHydrationBatch,
+  MEDIA_SYNC_DOMAINS,
+  hasActiveMediaSyncCooldown,
+  type SyncCategory,
+  type SyncJobState,
+  type SyncJobHandle,
 };
 
 export class SyncJobManager {
   private state: SyncJobState | null = null;
   private listeners = new Set<(state: SyncJobState | null) => void>();
   private isCancelled = false;
-  private pausePromiseResolve: (() => void) | null = null;
+
+  // P0-1: Multi-waiter pause queue (replaces scalar pausePromiseResolve so concurrent
+  // critic/media chunk workers NEVER drop waiters and deadlock backgroundWarmupChain)
+  private pauseResolvers: Array<() => void> = [];
 
   // Multi-category background activity tracking (e.g. Cover Art + Review Scores + Achievements)
   private categoryStats = new Map<SyncCategory, TrackedCategoryStats>();
@@ -615,10 +67,12 @@ export class SyncJobManager {
   private priorityScopes = new Map<string, PriorityScopeEntry>();
   private preemptionResolvers: Array<() => void> = [];
   private priorityCompleteTimer: ReturnType<typeof setTimeout> | null = null;
+  private trophyCompleteTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Active background critic score & store media loop cancellation tokens
+  // Active background critic score, store media, and trophy sync loop cancellation tokens
   private criticLoopToken = 0;
   private mediaSyncLoopToken = 0;
+  private trophyLoopToken = 0;
 
   // Serialized FIFO coordination lane for background warmup jobs (critic_scores <-> store_media)
   // so sibling warmups queue/chain cleanly instead of cancelling each other during hydration waits.
@@ -636,6 +90,54 @@ export class SyncJobManager {
     );
   }
 
+  private clearCategoryTimer(): void {
+    if (this.categoryClearTimer) {
+      clearTimeout(this.categoryClearTimer);
+      this.categoryClearTimer = null;
+    }
+  }
+
+  private clearPriorityTimer(): void {
+    if (this.priorityCompleteTimer) {
+      clearTimeout(this.priorityCompleteTimer);
+      this.priorityCompleteTimer = null;
+    }
+  }
+
+  private clearTrophyTimer(): void {
+    if (this.trophyCompleteTimer) {
+      clearTimeout(this.trophyCompleteTimer);
+      this.trophyCompleteTimer = null;
+    }
+  }
+
+  private createJobHandle(
+    kind: 'store_media' | 'critic_scores' | 'achievements',
+    jobId: string,
+    loopToken: number
+  ): SyncJobHandle {
+    const isStale = (): boolean => {
+      const activeToken =
+        kind === 'store_media'
+          ? this.mediaSyncLoopToken
+          : kind === 'critic_scores'
+            ? this.criticLoopToken
+            : this.trophyLoopToken;
+      return activeToken !== loopToken || this.state?.id !== jobId;
+    };
+    return {
+      jobId,
+      kind,
+      loopToken,
+      isStale,
+      safeUpdateState: (partial: Partial<SyncJobState>): boolean => {
+        if (isStale()) return false;
+        this.updateState(partial);
+        return true;
+      },
+    };
+  }
+
   private enqueueBackgroundWarmup(
     kind: 'critic_scores' | 'store_media',
     runner: () => Promise<void>
@@ -646,10 +148,7 @@ export class SyncJobManager {
     this.queuedBackgroundWarmups.add(kind);
     const myEpoch = this.backgroundWarmupEpoch;
     const prevTail = this.backgroundWarmupChain;
-    let releaseSlot!: () => void;
-    const slotDone = new Promise<void>((resolve) => {
-      releaseSlot = resolve;
-    });
+    const { promise: slotDone, resolve: releaseSlot } = Promise.withResolvers<void>();
     this.backgroundWarmupChain = prevTail.then(() => slotDone);
 
     return (async () => {
@@ -715,41 +214,36 @@ export class SyncJobManager {
     if (
       this.state &&
       !this.state.id.startsWith('priority-') &&
-      (this.state.status === 'running' || this.state.status === 'paused' || this.state.status === 'rate_limited')
+      (this.state.status === 'running' ||
+        this.state.status === 'paused' ||
+        this.state.status === 'rate_limited')
     ) {
       const primaryType = this.state.type;
-      if (
-        primaryType !== 'multi' &&
-        !active.includes(primaryType as SyncCategory)
-      ) {
+      if (primaryType !== 'multi' && !active.includes(primaryType as SyncCategory)) {
         active.unshift(primaryType as SyncCategory);
       }
     }
     return active;
   }
 
-  private buildHeadline(activeCats: SyncCategory[], fallbackTitle: string): string {
-    if (activeCats.length === 0) return fallbackTitle;
-    if (activeCats.length === 1) {
-      if (activeCats[0] === 'store_media' && fallbackTitle) {
-        return fallbackTitle;
-      }
-      return CATEGORY_SINGLE_HEADLINES[activeCats[0]] || fallbackTitle;
-    }
-    const labels = activeCats.map((c) => CATEGORY_SHORT_LABELS[c]);
-    if (labels.length === 2) {
-      return `Syncing ${labels[0]} & ${labels[1]}`;
-    }
-    return `Syncing ${labels.slice(0, -1).join(', ')} & ${labels[labels.length - 1]}`;
-  }
-
   private syncHeadlineAndPriorityFields(): void {
     if (!this.state) return;
     const activeCats = this.getActiveCategories();
     const activeLabels = activeCats.map((c) => CATEGORY_SHORT_LABELS[c]);
-    const latestPriority = Array.from(this.priorityScopes.values()).pop();
+
+    // P0-3: Prevent trophy sync from marking itself `isPreempted: true` if a caller wrapped
+    // `startTrophySync` inside a matching `beginPriorityScope('Syncing Storefront Trophies')`.
+    const isSelfTrophyJob =
+      this.state.type === 'achievements' && this.state.id.startsWith('trophy-sync-');
+    const scopes = Array.from(this.priorityScopes.values());
+    const latestPriority = (
+      isSelfTrophyJob
+        ? scopes.filter((s) => s.headline !== this.state?.title)
+        : scopes
+    ).pop();
 
     this.state.activeCategories = activeLabels;
+    this.state.activeCategoryKeys = activeCats;
     this.state.isPreempted = Boolean(latestPriority);
     this.state.priorityHeadline = latestPriority?.headline;
     this.state.priorityItemName = latestPriority?.itemName;
@@ -760,9 +254,9 @@ export class SyncJobManager {
       this.state.headline = latestPriority.headline;
       this.state.currentItemName = latestPriority.itemName;
     } else if (activeCats.length > 1) {
-      this.state.headline = this.buildHeadline(activeCats, this.state.title);
+      this.state.headline = buildSyncHeadline(activeCats, this.state.title);
     } else if (activeCats.length === 1 && this.state.id.startsWith('auto-')) {
-      const single = this.buildHeadline(activeCats, this.state.title);
+      const single = buildSyncHeadline(activeCats, this.state.title);
       this.state.title = single;
       this.state.headline = single;
     } else {
@@ -776,15 +270,17 @@ export class SyncJobManager {
    * When endPriorityScope is called, background syncs automatically resume where they left off.
    */
   public beginPriorityScope(headline: string, itemName?: string): string {
-    if (this.priorityCompleteTimer) {
-      clearTimeout(this.priorityCompleteTimer);
-      this.priorityCompleteTimer = null;
-    }
+    this.clearPriorityTimer();
 
     const scopeId = requestScheduler.beginInteractiveScope();
     this.priorityScopes.set(scopeId, { id: scopeId, headline, itemName });
 
-    if (!this.state || this.state.status === 'idle' || this.state.status === 'completed' || this.state.status === 'cancelled') {
+    if (
+      !this.state ||
+      this.state.status === 'idle' ||
+      this.state.status === 'completed' ||
+      this.state.status === 'cancelled'
+    ) {
       this.state = {
         id: `priority-${scopeId}`,
         type: 'store_media',
@@ -815,16 +311,11 @@ export class SyncJobManager {
     requestScheduler.endInteractiveScope(scopeId);
 
     if (this.priorityScopes.size === 0) {
-      const resolvers = [...this.preemptionResolvers];
-      this.preemptionResolvers = [];
-      for (const resolve of resolvers) {
-        resolve();
-      }
+      drainResolverQueue(this.preemptionResolvers);
     }
 
     if (this.state) {
       if (this.state.id.startsWith('priority-') && this.priorityScopes.size === 0) {
-        // Standalone priority action finished; check if background categories are still active
         const activeCats = this.getActiveCategories();
         if (activeCats.length > 0) {
           this.recomputeAggregateStateFromCategories();
@@ -839,9 +330,7 @@ export class SyncJobManager {
             priorityItemName: undefined,
           };
           this.notify();
-          if (this.priorityCompleteTimer) {
-            clearTimeout(this.priorityCompleteTimer);
-          }
+          this.clearPriorityTimer();
           this.priorityCompleteTimer = setTimeout(() => {
             this.priorityCompleteTimer = null;
             if (
@@ -866,21 +355,13 @@ export class SyncJobManager {
    * Ends all active priority scopes immediately and resumes any preempted background syncs.
    */
   public endAllPriorityScopes(): void {
-    if (this.priorityCompleteTimer) {
-      clearTimeout(this.priorityCompleteTimer);
-      this.priorityCompleteTimer = null;
-    }
+    this.clearPriorityTimer();
 
     for (const scopeId of this.priorityScopes.keys()) {
       requestScheduler.endInteractiveScope(scopeId);
     }
     this.priorityScopes.clear();
-
-    const resolvers = [...this.preemptionResolvers];
-    this.preemptionResolvers = [];
-    for (const r of resolvers) {
-      r();
-    }
+    drainResolverQueue(this.preemptionResolvers);
 
     if (this.state) {
       if (this.state.id.startsWith('priority-')) {
@@ -934,6 +415,7 @@ export class SyncJobManager {
 
   /**
    * Waits while the job is manually paused by the user OR preempted by an on-demand priority action.
+   * Uses `Promise.withResolvers<void>()` and multi-waiter queues so concurrent workers never deadlock.
    */
   private async waitWhilePausedOrPreempted(shouldAbort?: () => boolean): Promise<void> {
     while (
@@ -941,15 +423,15 @@ export class SyncJobManager {
       !this.isCancelled &&
       !(shouldAbort && shouldAbort())
     ) {
+      const { promise, resolve } = Promise.withResolvers<void>();
       if (this.state?.status === 'paused') {
-        await new Promise<void>((resolve) => {
-          this.pausePromiseResolve = resolve;
-        });
+        this.pauseResolvers.push(resolve);
       } else if (this.priorityScopes.size > 0) {
-        await new Promise<void>((resolve) => {
-          this.preemptionResolvers.push(resolve);
-        });
+        this.preemptionResolvers.push(resolve);
+      } else {
+        break;
       }
+      await promise;
     }
   }
 
@@ -962,10 +444,7 @@ export class SyncJobManager {
     itemName: string | undefined,
     fn: () => Promise<T>
   ): Promise<T> {
-    if (this.categoryClearTimer) {
-      clearTimeout(this.categoryClearTimer);
-      this.categoryClearTimer = null;
-    }
+    this.clearCategoryTimer();
 
     const existing = this.categoryStats.get(category) || {
       total: 0,
@@ -1031,18 +510,20 @@ export class SyncJobManager {
 
     const activeCats = this.getActiveCategories();
     const primaryCat = activeCats[0] || latestCategory || 'cover_art';
-    const headline = this.buildHeadline(
+    const headline = buildSyncHeadline(
       activeCats.length > 0 ? activeCats : [primaryCat],
       CATEGORY_SINGLE_HEADLINES[primaryCat]
     );
 
     if (inFlight > 0 || completed < total) {
+      this.clearCategoryTimer();
       this.state = {
         id: this.state?.id.startsWith('auto-') ? this.state.id : `auto-sync-${Date.now()}`,
         type: activeCats.length > 1 ? 'multi' : primaryCat,
         title: headline,
         headline,
         activeCategories: activeCats.map((c) => CATEGORY_SHORT_LABELS[c]),
+        activeCategoryKeys: activeCats,
         total,
         current: completed,
         currentItemName,
@@ -1063,7 +544,9 @@ export class SyncJobManager {
         this.syncHeadlineAndPriorityFields();
         this.notify();
       }
+      this.clearCategoryTimer();
       this.categoryClearTimer = setTimeout(() => {
+        this.categoryClearTimer = null;
         this.categoryStats.clear();
       }, 4500);
     }
@@ -1080,10 +563,7 @@ export class SyncJobManager {
     if (!this.state || this.state.id !== id) return;
     if (this.state.status === 'paused') {
       this.updateState({ status: 'running' });
-      if (this.pausePromiseResolve) {
-        this.pausePromiseResolve();
-        this.pausePromiseResolve = null;
-      }
+      drainResolverQueue(this.pauseResolvers);
     }
   }
 
@@ -1096,19 +576,17 @@ export class SyncJobManager {
     this.isCancelled = true;
     this.criticLoopToken++;
     this.mediaSyncLoopToken++;
+    this.trophyLoopToken++;
     this.backgroundWarmupEpoch++;
+    this.clearCategoryTimer();
+    this.clearTrophyTimer();
     this.categoryStats.clear();
     this.updateState({
       status: 'cancelled',
       currentItemName: undefined,
     });
-    if (this.pausePromiseResolve) {
-      this.pausePromiseResolve();
-      this.pausePromiseResolve = null;
-    }
-    const resolvers = [...this.preemptionResolvers];
-    this.preemptionResolvers = [];
-    for (const r of resolvers) r();
+    drainResolverQueue(this.pauseResolvers);
+    drainResolverQueue(this.preemptionResolvers);
   }
 
   /**
@@ -1118,29 +596,20 @@ export class SyncJobManager {
     this.isCancelled = true;
     this.criticLoopToken++;
     this.mediaSyncLoopToken++;
+    this.trophyLoopToken++;
     this.backgroundWarmupEpoch++;
     this.queuedBackgroundWarmups.clear();
     this.backgroundWarmupChain = Promise.resolve();
-    if (this.categoryClearTimer) {
-      clearTimeout(this.categoryClearTimer);
-      this.categoryClearTimer = null;
-    }
-    if (this.priorityCompleteTimer) {
-      clearTimeout(this.priorityCompleteTimer);
-      this.priorityCompleteTimer = null;
-    }
+    this.clearCategoryTimer();
+    this.clearPriorityTimer();
+    this.clearTrophyTimer();
     this.categoryStats.clear();
     for (const scopeId of this.priorityScopes.keys()) {
       requestScheduler.endInteractiveScope(scopeId);
     }
     this.priorityScopes.clear();
-    if (this.pausePromiseResolve) {
-      this.pausePromiseResolve();
-      this.pausePromiseResolve = null;
-    }
-    const resolvers = [...this.preemptionResolvers];
-    this.preemptionResolvers = [];
-    for (const r of resolvers) r();
+    drainResolverQueue(this.pauseResolvers);
+    drainResolverQueue(this.preemptionResolvers);
     this.state = null;
     this.notify();
   }
@@ -1152,12 +621,7 @@ export class SyncJobManager {
    */
   public async startCriticScoreSync(
     games: CanonicalGame[],
-    options?: {
-      forceRefresh?: boolean;
-      deepReverify?: boolean;
-      isBackgroundWarmup?: boolean;
-      isBackground?: boolean;
-    }
+    options?: CriticScoreSyncOptions
   ): Promise<void> {
     const isBackground = Boolean(options?.isBackgroundWarmup || options?.isBackground);
 
@@ -1169,7 +633,6 @@ export class SyncJobManager {
       return;
     }
 
-    // If a manual batch job is already running and this is just a passive background warmup, don't overwrite it
     if (isBackground && this.hasActiveManualJob()) {
       return;
     }
@@ -1184,437 +647,49 @@ export class SyncJobManager {
     return this.executeCriticScoreSync(games, options, false);
   }
 
-  private extractGameGogSlugForWikidata(game: CanonicalGame): string | undefined {
-    const gogPlat = game.platforms?.find((p) => p?.platformId?.toLowerCase() === 'gog');
-    if (gogPlat) {
-      const fromPlat =
-        normalizeWikidataGogSlug(gogPlat.platformGameId) ||
-        normalizeWikidataGogSlug(gogPlat.storefrontAppId);
-      if (fromPlat) return fromPlat;
-    }
-    if (game.enrichedMetadata?.website && /gog\.com\//i.test(game.enrichedMetadata.website)) {
-      const fromSite = normalizeWikidataGogSlug(game.enrichedMetadata.website);
-      if (fromSite) return fromSite;
-    }
-    if (game.id?.startsWith('gog-')) {
-      const fromId = normalizeWikidataGogSlug(game.id.slice(4));
-      if (fromId) return fromId;
-    }
-    return undefined;
-  }
-
   private async executeCriticScoreSync(
     games: CanonicalGame[],
-    options:
-      | {
-          forceRefresh?: boolean;
-          deepReverify?: boolean;
-          isBackgroundWarmup?: boolean;
-          isBackground?: boolean;
-        }
-      | undefined,
+    options: CriticScoreSyncOptions | undefined,
     isBackground: boolean
   ): Promise<void> {
-    if (isBackground) {
-      await whenStagedCacheHydrated();
-      if (!onlineLifecycleManager.isOnline()) {
-        return;
-      }
-      if (this.state?.type === 'critic_scores' && this.state?.status === 'running') {
-        return;
-      }
-      if (this.hasActiveManualJob()) {
-        return;
-      }
-    }
-
-    if (options?.forceRefresh) {
-      if (options?.deepReverify) {
-        criticScoreService.clearCache();
-      } else {
-        criticScoreService.prepareForIncrementalRefresh();
-      }
-    }
-    criticScoreService.purgeStaleNullScores();
-
-    const shouldSkipFreshVerifiedMcOnForceRefresh = Boolean(
-      options?.forceRefresh && !options?.deepReverify && games.length > 25
+    return executeCriticScoreSyncJob(
+      {
+        getState: () => this.state,
+        setState: (next) => {
+          this.state = next;
+        },
+        notify: () => this.notify(),
+        syncHeadlineAndPriorityFields: () => this.syncHeadlineAndPriorityFields(),
+        hasActiveManualJob: () => this.hasActiveManualJob(),
+        getCriticLoopToken: () => this.criticLoopToken,
+        getBackgroundWarmupEpoch: () => this.backgroundWarmupEpoch,
+        isCancelled: () => this.isCancelled,
+        setCancelled: (cancelled) => {
+          this.isCancelled = cancelled;
+        },
+        preemptExistingForManualJob: () => {
+          this.mediaSyncLoopToken++;
+          this.trophyLoopToken++;
+          this.clearTrophyTimer();
+          drainResolverQueue(this.pauseResolvers);
+        },
+        allocateCriticJobHandle: (bg) => {
+          const myToken = ++this.criticLoopToken;
+          const jobId = bg
+            ? `auto-critic-scores-${Date.now()}-${myToken}`
+            : `sync-critic-scores-${Date.now()}-${myToken}`;
+          return this.createJobHandle('critic_scores', jobId, myToken);
+        },
+        getCategoryStats: () => this.categoryStats,
+        getActiveCategories: () => this.getActiveCategories(),
+        recomputeAggregateStateFromCategories: (cat, name) =>
+          this.recomputeAggregateStateFromCategories(cat, name),
+        waitWhilePausedOrPreempted: (abort) => this.waitWhilePausedOrPreempted(abort),
+      },
+      games,
+      options,
+      isBackground
     );
-
-    // Pass skipBackgroundTrigger = true so filtering does NOT fire simultaneous background requests!
-    const filteredGames = options?.forceRefresh
-      ? shouldSkipFreshVerifiedMcOnForceRefresh
-        ? games.filter((g) => {
-            const targetSteamId = steamMatcher.getEffectiveSteamAppId(g);
-            const ov = getUserOverrideForGame(g);
-            const route = ov ? inferReviewRouteFromOverride(ov) : undefined;
-            if (route?.mode === 'unrated' || route?.mode === 'static') {
-              return false;
-            }
-            return !criticScoreService.hasFreshVerifiedPressCriticScore(g.title, {
-              steamAppId: targetSteamId,
-              gameId: g.id,
-              platforms: g.platforms,
-              metacriticOnly: true,
-            });
-          })
-        : games
-      : games.filter((g) => {
-          const targetSteamId = steamMatcher.getEffectiveSteamAppId(g);
-          const ov = getUserOverrideForGame(g) as
-            | (ReturnType<typeof getUserOverrideForGame> & {
-                reviewRoute?: { mode?: 'routed' | 'static' };
-              })
-            | undefined;
-          if (
-            ov &&
-            (ov.reviewRoute?.mode === 'routed' ||
-              (ov.reviewScoreOverride &&
-                ov.reviewScoreOverride.source !== 'custom' &&
-                ov.reviewRoute?.mode !== 'static'))
-          ) {
-            const cacheKey = targetSteamId
-              ? `id:${targetSteamId}`
-              : `title:${g.title.toLowerCase().trim()}`;
-            const staged = loadStagedCache(`antigravity_critic_v8_${cacheKey}`, false);
-            if (!staged.valid) return true;
-          }
-          if (isBackground && criticScoreService.hasValidCachedResolution(targetSteamId, g.title)) {
-            return false;
-          }
-          const score = getOpenCriticData(
-            targetSteamId || undefined,
-            g.title,
-            g.reviewSummary?.positivePercent ?? g.enrichedMetadata?.reviewSummary?.positivePercent,
-            g.releaseDate,
-            buildVerifiedSteamMetacriticAnchor(g),
-            false,
-            true,
-            { gameId: g.id, platforms: g.platforms }
-          );
-          if (isBackground && criticScoreService.hasValidCachedResolution(targetSteamId, g.title)) {
-            return false;
-          }
-          if (criticScoreService.hasAttemptedDynamicResolution(targetSteamId, g.title)) {
-            return false;
-          }
-          if (score && score.score > 0) {
-            if (!criticScoreService.hasValidCachedResolution(targetSteamId, g.title)) {
-              const cacheKey = targetSteamId
-                ? `id:${targetSteamId}`
-                : `title:${g.title.toLowerCase().trim()}`;
-              const staged = loadStagedCache(`antigravity_critic_v8_${cacheKey}`, false);
-              if (staged.stale) {
-                return true;
-              }
-            }
-            if (
-              score.isSynthetic &&
-              (!isBackground || !criticScoreService.hasValidCachedResolution(targetSteamId, g.title))
-            ) {
-              return true;
-            }
-            return false;
-          }
-          return true;
-        });
-
-    // Stage 2 Priority Ordering:
-    // 0: null / uncached -> 1: upgradeable non-critic fallbacks (GOG/XBX/EGS/STM/MCU) -> 2: stale OC -> 3: stale MC
-    const targetGames = filteredGames
-      .map((g, origIdx) => {
-        const targetSteamId = steamMatcher.getEffectiveSteamAppId(g);
-        const existingScore = getOpenCriticData(
-          targetSteamId || undefined,
-          g.title,
-          undefined,
-          g.releaseDate,
-          undefined,
-          false,
-          true,
-          { gameId: g.id, platforms: g.platforms }
-        );
-        let bucket = 0;
-        let subRank = 0;
-        if (existingScore && existingScore.score > 0) {
-          if (existingScore.source === 'metacritic') {
-            bucket = 3;
-            subRank = 4;
-          } else if (existingScore.source === 'opencritic') {
-            bucket = 2;
-            subRank = 3;
-          } else if (existingScore.source === 'custom') {
-            bucket = 3;
-            subRank = 5;
-          } else {
-            bucket = 1;
-            subRank = getReviewSourceAuthorityRank(existingScore);
-          }
-        }
-        return { game: g, bucket, subRank, origIdx };
-      })
-      .sort((a, b) => a.bucket - b.bucket || a.subRank - b.subRank || a.origIdx - b.origIdx)
-      .map((entry) => entry.game);
-
-    if (targetGames.length === 0) {
-      if (!isBackground) {
-        this.state = {
-          id: `sync-critic-scores-${Date.now()}`,
-          type: 'critic_scores',
-          title: 'Syncing Review Scores',
-          headline: 'Syncing Review Scores',
-          total: 0,
-          current: 0,
-          status: 'completed',
-          startedAt: Date.now(),
-        };
-        this.notify();
-      }
-      return;
-    }
-
-    const myToken = ++this.criticLoopToken;
-    this.isCancelled = false;
-
-    const jobId = isBackground
-      ? `auto-critic-scores-${Date.now()}`
-      : `sync-critic-scores-${Date.now()}`;
-
-    // Prune any already-finished single-shot categories (e.g. startup achievement check)
-    // so they don't pollute the count or currentItemName of this batch sync
-    for (const [cat, stat] of this.categoryStats.entries()) {
-      if (stat.inFlight === 0 && stat.completed >= stat.total) {
-        this.categoryStats.delete(cat);
-      }
-    }
-
-    this.categoryStats.set('critic_scores', {
-      total: targetGames.length,
-      completed: 0,
-      inFlight: 1,
-      lastItemName: targetGames[0]?.title,
-    });
-
-    this.state = {
-      id: jobId,
-      type: 'critic_scores',
-      title: 'Syncing Review Scores',
-      headline: 'Syncing Review Scores',
-      total: targetGames.length,
-      current: 0,
-      currentItemName: targetGames[0]?.title,
-      status: 'running',
-      startedAt: Date.now(),
-    };
-    this.syncHeadlineAndPriorityFields();
-    this.notify();
-
-    // Stage 1: Polite Batch Wikidata SPARQL Pre-Pass for upgrade-eligible games with Steam AppIDs or GOG slugs.
-    // Guarded in try/catch so isolated unit tests without network/router mocks never throw.
-    if (onlineLifecycleManager.isOnline() && !this.isCancelled && this.criticLoopToken === myToken) {
-      const wikidataBatchItems: WikidataBatchStoreItem[] = [];
-      for (const game of targetGames) {
-        const steamAppId = steamMatcher.getEffectiveSteamAppId(game);
-        const gogSlug = this.extractGameGogSlugForWikidata(game);
-        if (!steamAppId && !gogSlug) continue;
-        if (
-          criticScoreService.hasFreshVerifiedPressCriticScore(game.title, {
-            steamAppId,
-            gameId: game.id,
-            platforms: game.platforms,
-            metacriticOnly: true,
-          })
-        ) {
-          continue;
-        }
-        wikidataBatchItems.push({
-          key: game.id || `${steamAppId ?? ''}:${gogSlug ?? ''}:${game.title}`,
-          steamAppId: steamAppId ?? null,
-          gogSlug: gogSlug ?? null,
-          title: game.title,
-        });
-      }
-      if (wikidataBatchItems.length > 0) {
-        try {
-          await wikidataBridge.batchResolveByStoreIds(wikidataBatchItems, {
-            priority: isBackground ? RequestPriority.P2_BACKGROUND : RequestPriority.P1_VIEWPORT,
-          });
-        } catch {
-          // Non-fatal: individual game resolution still cascades through Metacritic / OpenCritic / Steam
-        }
-      }
-    }
-
-    const chunkSize = isBackground ? 2 : 3;
-    let completedCount = 0;
-
-    try {
-      for (let i = 0; i < targetGames.length; i += chunkSize) {
-        if (this.isCancelled || this.criticLoopToken !== myToken || this.state?.status === 'cancelled') {
-          break;
-        }
-
-        await this.waitWhilePausedOrPreempted();
-        if (
-          isBackground &&
-          isUserActivelyScrolling() &&
-          !(typeof process !== 'undefined' && process.env.VITEST)
-        ) {
-          await waitUntilScrollIdle(1500);
-        }
-        if (this.isCancelled || this.criticLoopToken !== myToken) break;
-
-        const chunk = targetGames.slice(i, i + chunkSize);
-        const activeTitles = new Set<string>();
-        const firstTitle = chunk[0]?.title;
-
-        const stat = this.categoryStats.get('critic_scores');
-        if (stat) {
-          stat.completed = completedCount;
-          if (firstTitle) stat.lastItemName = firstTitle;
-        }
-
-        if (this.state && (this.state.id === jobId || this.state.id.startsWith('auto-'))) {
-          const activeCats = this.getActiveCategories();
-          if (activeCats.length > 1) {
-            this.recomputeAggregateStateFromCategories('critic_scores', firstTitle);
-          } else {
-            this.updateState({
-              current: completedCount,
-              total: targetGames.length,
-              currentItemName: firstTitle,
-            });
-          }
-        }
-
-        await Promise.all(
-          chunk.map(async (game) => {
-            if (this.isCancelled || this.criticLoopToken !== myToken) return;
-            await this.waitWhilePausedOrPreempted();
-            if (this.isCancelled || this.criticLoopToken !== myToken) return;
-            if (game.title) {
-              activeTitles.add(game.title);
-            }
-            try {
-              let targetSteamId = steamMatcher.getEffectiveSteamAppId(game);
-              if (!targetSteamId && !game.isExplicitNonSteam) {
-                try {
-                  const matchedId = await steamMatcher.matchGameToSteam(game.title, {
-                    releaseYear: game.releaseDate,
-                    developers: game.developers,
-                  });
-                  if (matchedId) targetSteamId = matchedId;
-                } catch {}
-              }
-              const storefrontAnchor = buildVerifiedSteamMetacriticAnchor(game) ?? undefined;
-              const resolvedScore = await criticScoreService.resolveDynamicScore(
-                game.title,
-                targetSteamId,
-                game.releaseDate,
-                storefrontAnchor ?? undefined,
-                {
-                  bypassAttempted: Boolean(options?.forceRefresh),
-                  platforms: game.platforms,
-                  gameId: game.id,
-                  genres: game.genres,
-                  steamPositivePercent:
-                    game.reviewSummary?.positivePercent ??
-                    game.enrichedMetadata?.reviewSummary?.positivePercent,
-                }
-              );
-              if (
-                resolvedScore &&
-                typeof window !== 'undefined' &&
-                window.electronAPI?.offlineVault?.saveGameDetail
-              ) {
-                try {
-                  void window.electronAPI.offlineVault
-                    .saveGameDetail({
-                      gameId: game.id,
-                      steamAppId: targetSteamId ?? game.steamAppId ?? null,
-                      canonicalTitle: game.title,
-                      criticScore: { ...resolvedScore } as Record<string, unknown>,
-                    })
-                    ?.catch?.(() => {});
-                } catch {}
-              }
-            } catch {} finally {
-              activeTitles.delete(game.title);
-              if (!this.isCancelled && this.criticLoopToken === myToken) {
-                completedCount = Math.min(targetGames.length, completedCount + 1);
-                const nextActiveTitle = activeTitles.values().next().value as string | undefined;
-                const nextItemName = nextActiveTitle ?? (stat?.lastItemName || this.state?.currentItemName);
-                if (stat) {
-                  stat.completed = completedCount;
-                  if (nextItemName) stat.lastItemName = nextItemName;
-                }
-                if (this.state && (this.state.id === jobId || this.state.id.startsWith('auto-'))) {
-                  const activeCats = this.getActiveCategories();
-                  if (activeCats.length > 1) {
-                    this.recomputeAggregateStateFromCategories('critic_scores', nextItemName);
-                  } else {
-                    this.updateState({
-                      current: completedCount,
-                      total: targetGames.length,
-                      currentItemName: nextItemName,
-                    });
-                  }
-                }
-              }
-            }
-          })
-        );
-
-        await yieldToMainThread();
-
-        if (
-          isBackground &&
-          completedCount < targetGames.length &&
-          !this.isCancelled &&
-          this.criticLoopToken === myToken &&
-          !(typeof process !== 'undefined' && process.env.VITEST)
-        ) {
-          await new Promise((r) => setTimeout(r, 300));
-        }
-      }
-
-      if (this.criticLoopToken !== myToken) return;
-
-      const stat = this.categoryStats.get('critic_scores');
-      if (stat) {
-        stat.inFlight = 0;
-        stat.completed = stat.total;
-      }
-
-      if (this.isCancelled || this.state?.status === 'cancelled') {
-        this.categoryStats.delete('critic_scores');
-        this.updateState({
-          status: 'cancelled',
-          currentItemName: undefined,
-        });
-      } else {
-        const remainingCats = this.getActiveCategories().filter((c) => c !== 'critic_scores');
-        if (remainingCats.length > 0) {
-          this.categoryStats.delete('critic_scores');
-          this.recomputeAggregateStateFromCategories(remainingCats[0]);
-        } else {
-          this.categoryStats.delete('critic_scores');
-          this.updateState({
-            status: 'completed',
-            current: targetGames.length,
-            total: targetGames.length,
-            currentItemName: undefined,
-          });
-        }
-      }
-    } finally {
-      try {
-        flushPendingCatalogSave();
-        if (typeof window !== 'undefined') {
-          window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
-        }
-      } catch {}
-    }
   }
 
   /**
@@ -1663,735 +738,45 @@ export class SyncJobManager {
     onGameUpdated: (updated: CanonicalGame) => void,
     options?: StoreMediaSyncOptions
   ): Promise<void> {
-    const isBackgroundWarmup = Boolean(options?.isBackgroundWarmup);
-    const forceRefresh = Boolean(options?.forceRefresh);
-    const isManualSync = Boolean(options?.isManualSync);
-    const isPostHydration = Boolean(options?.isPostHydration);
-    const shouldWarmHltb = Boolean(options?.isBackgroundWarmup || options?.incremental);
-
-    if (isBackgroundWarmup) {
-      const entryMediaToken = this.mediaSyncLoopToken;
-      const entryWarmupEpoch = this.backgroundWarmupEpoch;
-      await whenStagedCacheHydrated();
-      if (
-        this.mediaSyncLoopToken !== entryMediaToken ||
-        this.backgroundWarmupEpoch !== entryWarmupEpoch ||
-        !onlineLifecycleManager.isOnline() ||
-        hasActiveMediaSyncCooldown() ||
-        (this.state?.type === 'store_media' && this.state?.status === 'running') ||
-        this.hasActiveManualJob()
-      ) {
-        return;
-      }
-    }
-
-    // Only manual user-triggered syncs preempt/cancel an existing running job;
-    // passive background warmups are serialized via `backgroundWarmupChain`.
-    const shouldYieldAfterCancel = Boolean(
-      !isBackgroundWarmup &&
-        this.state &&
-        (this.state.status === 'running' ||
-          this.state.status === 'paused' ||
-          this.state.status === 'rate_limited')
+    return executeStoreMediaSyncJob(
+      {
+        getState: () => this.state,
+        setState: (next) => {
+          this.state = next;
+        },
+        notify: () => this.notify(),
+        syncHeadlineAndPriorityFields: () => this.syncHeadlineAndPriorityFields(),
+        hasActiveManualJob: () => this.hasActiveManualJob(),
+        getMediaSyncLoopToken: () => this.mediaSyncLoopToken,
+        getBackgroundWarmupEpoch: () => this.backgroundWarmupEpoch,
+        isCancelled: () => this.isCancelled,
+        setCancelled: (cancelled) => {
+          this.isCancelled = cancelled;
+        },
+        cancelJob: (id) => this.cancelJob(id),
+        bumpMediaSyncLoopToken: () => ++this.mediaSyncLoopToken,
+        bumpCriticLoopToken: () => {
+          this.criticLoopToken++;
+          this.trophyLoopToken++;
+          this.clearTrophyTimer();
+        },
+        drainPauseWaiters: () => {
+          drainResolverQueue(this.pauseResolvers);
+        },
+        createMediaJobHandle: (jobId, myToken) =>
+          this.createJobHandle('store_media', jobId, myToken),
+        waitWhilePausedOrPreempted: (abort) => this.waitWhilePausedOrPreempted(abort),
+      },
+      games,
+      onGameUpdated,
+      options
     );
-    if (shouldYieldAfterCancel && this.state) {
-      this.cancelJob(this.state.id);
-    }
-
-    const myToken = ++this.mediaSyncLoopToken;
-    if (shouldYieldAfterCancel) {
-      // Brief yield to allow clean loop termination of the preempted run
-      await new Promise((r) => setTimeout(r, 10));
-      if (this.mediaSyncLoopToken !== myToken) {
-        return;
-      }
-    }
-
-    const alreadyEnrichedForHydration: CanonicalGame[] = [];
-    const evalOptions: StoreMediaSyncEvalOptions = {
-      isManualSync,
-      isPostHydration,
-    };
-    const hostPlatform = resolveSyncHostPlatform();
-    const maxRepairTier: MediaRepairPriorityTier =
-      options?.maxRepairTier ?? (isBackgroundWarmup ? 2 : 3);
-
-    const eligibleEntries: Array<{
-      game: CanonicalGame;
-      priority: MediaRepairPriorityTier;
-      index: number;
-    }> = [];
-    for (let idx = 0; idx < games.length; idx++) {
-      const g = games[idx];
-      const evalResult = evaluateGameNeedsStoreMediaSync(g, forceRefresh, evalOptions);
-      if (evalResult.alreadyEnriched) {
-        alreadyEnrichedForHydration.push(g);
-      }
-      if (evalResult.eligible) {
-        const priority = computeMediaRepairPriority(g, undefined, hostPlatform);
-        if (!forceRefresh && priority > maxRepairTier) {
-          alreadyEnrichedForHydration.push(g);
-          continue;
-        }
-        eligibleEntries.push({ game: g, priority, index: idx });
-      }
-    }
-
-    // Sort ascending by urgency tier (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
-    eligibleEntries.sort((a, b) => a.priority - b.priority || a.index - b.index);
-    const effectiveBatchCap =
-      typeof options?.maxBatchSize === 'number' && options.maxBatchSize > 0
-        ? options.maxBatchSize
-        : isBackgroundWarmup && isPostHydration
-          ? MAX_PASSIVE_REPAIR_PER_BOOT
-          : eligibleEntries.length;
-    const eligibleGames = eligibleEntries.slice(0, effectiveBatchCap).map((entry) => entry.game);
-
-    if (
-      alreadyEnrichedForHydration.length > 0 &&
-      typeof window !== 'undefined' &&
-      window.electronAPI?.offlineVault?.queueHydration
-    ) {
-      try {
-        const hydrationBatch = alreadyEnrichedForHydration.map((g) => {
-          const gogPlat = g.platforms?.find((p) => p.platformId === 'gog');
-          const epicPlat = g.platforms?.find((p) => p.platformId === 'epic');
-          const xboxPlat = g.platforms?.find((p) => p.platformId === 'xbox');
-          const isInstalled = Boolean(g.platforms?.some((p) => p.installed));
-          return {
-            gameId: g.id,
-            title: g.title,
-            steamAppId: g.steamAppId ?? null,
-            gogId: gogPlat?.platformGameId ?? null,
-            epicAppName: epicPlat?.platformGameId ?? null,
-            xboxProductId: xboxPlat?.xboxProductId ?? xboxPlat?.platformGameId ?? null,
-            packageFamilyName: xboxPlat?.packageFamilyName ?? null,
-            isInstalled,
-            isFavorited: Boolean(
-              (g as FavoritableGame).isFavorite || (g as FavoritableGame).favorited
-            ),
-            assets: extractStaticHydrationAssets(g, g.enrichedMetadata),
-          };
-        });
-        void window.electronAPI.offlineVault.queueHydration({ games: hydrationBatch })?.catch?.(() => {});
-      } catch {}
-    }
-
-    if (this.mediaSyncLoopToken !== myToken) {
-      return;
-    }
-
-    const jobId = isBackgroundWarmup
-      ? `auto-store-media-${Date.now()}-${myToken}`
-      : `sync-store-media-${Date.now()}-${myToken}`;
-    const isPreemptedOrStale = (): boolean =>
-      this.mediaSyncLoopToken !== myToken || this.state?.id !== jobId;
-    const safeUpdateState = (partial: Partial<SyncJobState>): boolean => {
-      if (isPreemptedOrStale()) return false;
-      this.updateState(partial);
-      return true;
-    };
-
-    this.isCancelled = false;
-    this.pausePromiseResolve = null;
-
-    if (eligibleGames.length === 0) {
-      if (!isBackgroundWarmup) {
-        this.state = {
-          id: jobId,
-          type: 'store_media',
-          title: 'Sync Official Store Media',
-          headline: 'Sync Official Store Media',
-          total: 0,
-          current: 0,
-          status: 'completed',
-          startedAt: Date.now(),
-        };
-        this.notify();
-      }
-      return;
-    }
-
-    this.state = {
-      id: jobId,
-      type: 'store_media',
-      title: 'Syncing Official Store Media',
-      headline: 'Syncing Official Store Media',
-      total: eligibleGames.length,
-      current: 0,
-      currentItemName: eligibleGames[0]?.title,
-      status: 'running',
-      startedAt: Date.now(),
-    };
-    this.syncHeadlineAndPriorityFields();
-    this.notify();
-
-    try {
-      if (onlineLifecycleManager.isOnline()) {
-        const knownBatchAppIds: number[] = [];
-        for (const eg of eligibleGames) {
-          const effId = steamMatcher.getEffectiveSteamAppId(eg);
-          if (effId && effId > 0) {
-            knownBatchAppIds.push(effId);
-          }
-        }
-        if (knownBatchAppIds.length > 0) {
-          await steamApi
-            .fetchStoreBrowseAssetsBatch(knownBatchAppIds, RequestPriority.P2_BACKGROUND)
-            .catch(() => new Map());
-          if (isPreemptedOrStale()) {
-            return;
-          }
-        }
-      }
-
-      const retryCounts = new Map<string, number>();
-
-      for (let i = 0; i < eligibleGames.length; i++) {
-        if (isPreemptedOrStale()) {
-          return;
-        }
-        if (this.isCancelled || this.state?.status === 'cancelled') {
-          break;
-        }
-        if (isBackgroundWarmup && !onlineLifecycleManager.isOnline()) {
-          break;
-        }
-
-        const game = eligibleGames[i];
-        if (
-          !safeUpdateState({
-            current: i,
-            currentItemName: game.title,
-          })
-        ) {
-          return;
-        }
-
-        // 1. Pause & Priority Preemption handling
-        await this.waitWhilePausedOrPreempted(isPreemptedOrStale);
-        if (isPreemptedOrStale()) return;
-        if (
-          isBackgroundWarmup &&
-          isUserActivelyScrolling() &&
-          !(typeof process !== 'undefined' && process.env.VITEST)
-        ) {
-          await waitUntilScrollIdle(1500);
-          if (isPreemptedOrStale()) return;
-        }
-        if (this.isCancelled || isPreemptedOrStale()) break;
-
-        // 2. Multi-domain CDN / edge rate-limit cooldown handling
-        const activeCooldownSec = requestScheduler.getMaxCooldownRemaining(MEDIA_SYNC_DOMAINS);
-        if (activeCooldownSec > 0) {
-          if (isBackgroundWarmup) {
-            // C1: Abort passive background warmup immediately on any media domain cooldown
-            break;
-          }
-          if (
-            !safeUpdateState({
-              status: 'rate_limited',
-              cooldownSecondsRemaining: activeCooldownSec,
-            })
-          ) {
-            return;
-          }
-
-          while (
-            requestScheduler.getMaxCooldownRemaining(MEDIA_SYNC_DOMAINS) > 0 &&
-            !this.isCancelled &&
-            !isPreemptedOrStale()
-          ) {
-            await new Promise((r) => setTimeout(r, 1000));
-            if (isPreemptedOrStale()) return;
-            if (this.state && this.state.status === 'rate_limited') {
-              if (
-                !safeUpdateState({
-                  cooldownSecondsRemaining:
-                    requestScheduler.getMaxCooldownRemaining(MEDIA_SYNC_DOMAINS),
-                })
-              ) {
-                return;
-              }
-            }
-          }
-
-          if (isPreemptedOrStale()) return;
-          if (this.isCancelled) break;
-
-          if (
-            !safeUpdateState({
-              status: 'running',
-              cooldownSecondsRemaining: undefined,
-            })
-          ) {
-            return;
-          }
-        }
-
-        // 3. Perform fetch (respecting Step 4 MetadataSourceRoute)
-        const ov = getUserOverrideForGame(game);
-        const route = inferMetadataRouteFromOverride(ov);
-        const isNonSteamRouted =
-          route?.mode === 'routed' &&
-          (route.source === 'gog' ||
-            route.source === 'epic' ||
-            route.source === 'igdb' ||
-            (route.source === 'custom' && String(route.matchedId || '').startsWith('xbox-')));
-        let targetAppId =
-          route?.source === 'steam' && route.steamAppId
-            ? route.steamAppId
-            : steamMatcher.getEffectiveSteamAppId(game);
-        if (
-          !isNonSteamRouted &&
-          !targetAppId &&
-          !game.isExplicitNonSteam &&
-          game.steamAppId !== null &&
-          ov?.steamAppId !== null &&
-          onlineLifecycleManager.isOnline()
-        ) {
-          const dynamicallyMatchedId = await steamMatcher.matchGameToSteam(game.title, {
-            releaseYear: game.releaseDate,
-            developers: game.developers,
-            priority: RequestPriority.P2_BACKGROUND,
-          });
-          if (isPreemptedOrStale()) return;
-          if (dynamicallyMatchedId && dynamicallyMatchedId > 0) {
-            targetAppId = dynamicallyMatchedId;
-          }
-        }
-        const hasNonSteamPlatform = Boolean(
-          game.platforms?.some(
-            (p) => p.platformId === 'gog' || p.platformId === 'epic' || p.platformId === 'xbox'
-          )
-        );
-
-        let gameCompletedWithoutAbort = false;
-        if (isNonSteamRouted || targetAppId || hasNonSteamPlatform) {
-          try {
-            const existingMeta = game.enrichedMetadata;
-            const existingHasFetchedAt =
-              typeof existingMeta?.fetchedAt === 'number' && existingMeta.fetchedAt > 0;
-            const existingHasSysReq = Boolean(
-              existingMeta?.systemRequirements?.minimum?.trim() ||
-                existingMeta?.systemRequirements?.recommended?.trim()
-            );
-            const existingHasMacReq = Boolean(
-              existingMeta?.macRequirements?.minimum?.trim() ||
-                existingMeta?.macRequirements?.recommended?.trim()
-            );
-            const existingNeedsForceRefresh = Boolean(
-              forceRefresh ||
-                existingMeta?.__quotaSlimmed === true ||
-                (!hasGenuineStoreSynopsis(game, ov, undefined, null) &&
-                  !isLikelyNonStoreOrTestBranchTitle(game.title)) ||
-                (existingMeta &&
-                  !existingHasFetchedAt &&
-                  (!existingHasSysReq || (isOwnedNativeMacGame(game) && !existingHasMacReq)))
-            );
-            const refreshed =
-              isNonSteamRouted || !targetAppId
-                ? await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game, ov)
-                : await steamApi.fetchGameMetadata(targetAppId!, RequestPriority.P2_BACKGROUND, {
-                    forceRefresh: existingNeedsForceRefresh,
-                  });
-            if (isPreemptedOrStale()) return;
-
-            const isSkeletonRefreshed = refreshed?.metadataQuality === 'skeleton_fallback';
-            const hasRichExisting = Boolean(
-              game.enrichedMetadata &&
-                game.enrichedMetadata.metadataQuality !== 'skeleton_fallback'
-            );
-            const attemptNow = Date.now();
-            const outcome: MediaSyncOutcome =
-              !refreshed || isSkeletonRefreshed
-                ? onlineLifecycleManager.isOnline()
-                  ? 'unavailable_404'
-                  : 'transient_error'
-                : (refreshed.screenshots?.length || 0) === 0
-                ? 'partial_no_screenshots'
-                : (refreshed.movies?.length || 0) === 0
-                ? 'partial_no_trailers'
-                : 'complete';
-
-            if (onlineLifecycleManager.isOnline()) {
-              recordMediaSyncAttempt(game.id, outcome);
-            }
-
-            if (refreshed && !(isSkeletonRefreshed && (hasRichExisting || isBackgroundWarmup))) {
-              if (!isNonSteamRouted && targetAppId && ov && route?.mode === 'routed') {
-                updateRoutedMetadataSnapshot(game.id, {
-                  title: refreshed.name,
-                  shortDescription: refreshed.shortDescription,
-                  detailedDescription: refreshed.detailedDescription || refreshed.aboutTheGame,
-                  headerImage: refreshed.headerImage,
-                  developers: refreshed.developers,
-                  publishers: refreshed.publishers,
-                  genres: refreshed.genres,
-                  tags: refreshed.tags,
-                  releaseDate: refreshed.releaseDate,
-                });
-              }
-
-              const preservePinnedSynopsis = Boolean(ov && (route?.customSynopsisEdited || route?.mode === 'custom'));
-              const preservePinnedCover = Boolean(ov?.capsuleImage);
-              const preservePinnedHeader = Boolean(ov?.headerImage);
-              const validRefreshedShort =
-                refreshed.shortDescription &&
-                !isGenericPlaceholderSynopsis(refreshed.shortDescription, game.title)
-                  ? refreshed.shortDescription
-                  : undefined;
-              const validRefreshedDevs =
-                refreshed.developers?.filter((d) => d && d !== 'Unknown Developer') || [];
-              const validRefreshedPubs =
-                refreshed.publishers?.filter((p) => p && p !== 'Unknown Publisher') || [];
-
-              const cachedBrowse =
-                !isNonSteamRouted && targetAppId
-                  ? steamApi.peekCachedBrowseAssets(targetAppId)
-                  : null;
-              const effectiveHeaderForCover =
-                refreshed.headerImage || cachedBrowse?.headerImage || game.headerImage;
-              const rawCandidateCapsule = refreshed.capsuleImage || cachedBrowse?.capsuleImage;
-              const validRefreshedCapsule =
-                rawCandidateCapsule &&
-                !isUnsuitableCoverUrl(rawCandidateCapsule) &&
-                !isGogCroppedHorizontalCover(rawCandidateCapsule, effectiveHeaderForCover)
-                  ? rawCandidateCapsule
-                  : undefined;
-
-              const gogPlatForRecovery = game.platforms?.find((p) => p.platformId === 'gog');
-              const artworkRecoveryCtx = {
-                gameId: game.id,
-                title: game.title,
-                steamAppId: isNonSteamRouted ? game.steamAppId : (targetAppId || game.steamAppId),
-                gogId: gogPlatForRecovery?.platformGameId ?? null,
-                userOverrideCapsule: ov?.capsuleImage ?? null,
-                userOverrideHeader: ov?.headerImage ?? null,
-                headerUrl: effectiveHeaderForCover,
-              };
-
-              const rawMergedEnriched =
-                pickBestEnrichedMetadata(game.enrichedMetadata, refreshed) ||
-                refreshed ||
-                game.enrichedMetadata;
-              const mergedEnriched = rawMergedEnriched
-                ? {
-                    ...rawMergedEnriched,
-                    enrichedAt: rawMergedEnriched.enrichedAt || attemptNow,
-                    lastMediaSyncAttemptAt: attemptNow,
-                    mediaSyncOutcome: outcome,
-                  }
-                : rawMergedEnriched;
-
-              const updatedGame: CanonicalGame = {
-                ...game,
-                steamAppId: isNonSteamRouted ? game.steamAppId : (targetAppId || game.steamAppId),
-                enrichedMetadata: mergedEnriched,
-                headerImage: preservePinnedHeader
-                  ? ov!.headerImage!
-                  : pickPreferredHeaderImage(
-                      game.headerImage,
-                      refreshed.headerImage || cachedBrowse?.headerImage,
-                      artworkRecoveryCtx
-                    ) ||
-                    refreshed.headerImage ||
-                    game.headerImage,
-                capsuleImage: preservePinnedCover
-                  ? ov!.capsuleImage!
-                  : pickPreferredCapsuleImage(
-                      game.capsuleImage,
-                      validRefreshedCapsule,
-                      artworkRecoveryCtx
-                    ) ||
-                    validRefreshedCapsule ||
-                    game.capsuleImage,
-                shortDescription: preservePinnedSynopsis
-                  ? ov!.shortDescription || game.shortDescription
-                  : validRefreshedShort || game.shortDescription,
-                detailedDescription:
-                  pickPreferredDetailedDescription(
-                    game.detailedDescription,
-                    refreshed.detailedDescription || refreshed.aboutTheGame
-                  ) ||
-                  refreshed.detailedDescription ||
-                  refreshed.aboutTheGame ||
-                  game.detailedDescription,
-                developers: validRefreshedDevs.length ? validRefreshedDevs : game.developers,
-                publishers: validRefreshedPubs.length ? validRefreshedPubs : game.publishers,
-                genres: refreshed.genres?.length ? refreshed.genres : game.genres,
-                tags: refreshed.tags?.length ? refreshed.tags : game.tags,
-                releaseDate:
-                  pickPreferredReleaseDate(game.releaseDate, refreshed.releaseDate) ||
-                  game.releaseDate,
-                reviewSummary: refreshed.reviewSummary || game.reviewSummary,
-              };
-
-              const healedSynopsis = Boolean(
-                validRefreshedShort || hasGenuineStoreSynopsis(updatedGame, ov, undefined, null)
-              );
-              if (healedSynopsis) {
-                clearDurableEmptySynopsisProbe(updatedGame.id);
-              }
-
-              if (!isSkeletonRefreshed && typeof window !== 'undefined') {
-                if (
-                  (isNonSteamRouted ||
-                    !targetAppId ||
-                    updatedGame.id !== `steam-${targetAppId}`) &&
-                  window.electronAPI?.offlineVault?.saveGameDetail
-                ) {
-                  try {
-                    void window.electronAPI.offlineVault
-                      .saveGameDetail({
-                        gameId: updatedGame.id,
-                        steamAppId: updatedGame.steamAppId ?? null,
-                        canonicalTitle: updatedGame.title,
-                        enrichedMetadata: mergedEnriched || refreshed,
-                        metadataQuality:
-                          mergedEnriched?.metadataQuality ||
-                          refreshed.metadataQuality ||
-                          (targetAppId && !isNonSteamRouted ? 'authoritative' : 'scraped'),
-                        enrichedAt: mergedEnriched?.enrichedAt || attemptNow,
-                      })
-                      ?.catch?.(() => {});
-                  } catch {}
-                }
-
-                if (window.electronAPI?.offlineVault?.queueHydration) {
-                  try {
-                    const gogPlat = updatedGame.platforms?.find((p) => p.platformId === 'gog');
-                    const epicPlat = updatedGame.platforms?.find((p) => p.platformId === 'epic');
-                    const xboxPlat = updatedGame.platforms?.find((p) => p.platformId === 'xbox');
-                    const isInstalled = Boolean(updatedGame.platforms?.some((p) => p.installed));
-                    const assets = extractStaticHydrationAssets(updatedGame, refreshed);
-                    if (assets.length > 0) {
-                      void window.electronAPI.offlineVault
-                        .queueHydration({
-                          games: [
-                            {
-                              gameId: updatedGame.id,
-                              title: updatedGame.title,
-                              steamAppId: updatedGame.steamAppId ?? null,
-                              gogId: gogPlat?.platformGameId ?? null,
-                              epicAppName: epicPlat?.platformGameId ?? null,
-                              xboxProductId:
-                                xboxPlat?.xboxProductId ?? xboxPlat?.platformGameId ?? null,
-                              packageFamilyName: xboxPlat?.packageFamilyName ?? null,
-                              isInstalled,
-                              isFavorited: Boolean(
-                                (updatedGame as FavoritableGame).isFavorite ||
-                                  (updatedGame as FavoritableGame).favorited
-                              ),
-                              assets,
-                            },
-                          ],
-                        })
-                        ?.catch?.(() => {});
-                    }
-                  } catch {}
-                }
-              }
-
-              onGameUpdated(updatedGame);
-            } else if (onlineLifecycleManager.isOnline() && game.enrichedMetadata) {
-              const stampedExistingMeta = {
-                ...game.enrichedMetadata,
-                enrichedAt: game.enrichedMetadata.enrichedAt || attemptNow,
-                lastMediaSyncAttemptAt: attemptNow,
-                mediaSyncOutcome: outcome,
-              };
-              const stampedGame: CanonicalGame = {
-                ...game,
-                enrichedMetadata: stampedExistingMeta,
-              };
-              if (
-                stampedExistingMeta.metadataQuality !== 'skeleton_fallback' &&
-                typeof window !== 'undefined' &&
-                window.electronAPI?.offlineVault?.saveGameDetail
-              ) {
-                try {
-                  void window.electronAPI.offlineVault
-                    .saveGameDetail({
-                      gameId: stampedGame.id,
-                      steamAppId: stampedGame.steamAppId ?? null,
-                      canonicalTitle: stampedGame.title,
-                      enrichedMetadata: stampedExistingMeta,
-                      metadataQuality: stampedExistingMeta.metadataQuality || 'storefront_native',
-                      enrichedAt: stampedExistingMeta.enrichedAt,
-                    })
-                    ?.catch?.(() => {});
-                } catch {}
-              }
-              onGameUpdated(stampedGame);
-            }
-
-            gameCompletedWithoutAbort = true;
-            if (shouldWarmHltb && onlineLifecycleManager.isOnline() && !isPreemptedOrStale()) {
-              try {
-                const effectiveHltbAppId = targetAppId || game.steamAppId;
-                if (!hasAttemptedHltbLookup(game.title, effectiveHltbAppId)) {
-                  const liveHltb = await fetchAndCacheHltb(game.title, effectiveHltbAppId).catch(
-                    () => null
-                  );
-                  if (isPreemptedOrStale()) return;
-                  if (
-                    liveHltb &&
-                    typeof window !== 'undefined' &&
-                    window.electronAPI?.offlineVault?.saveGameDetail
-                  ) {
-                    void window.electronAPI.offlineVault
-                      .saveGameDetail({
-                        gameId: game.id,
-                        steamAppId: effectiveHltbAppId ?? null,
-                        canonicalTitle: game.title,
-                        hltb: { ...liveHltb } as Record<string, unknown>,
-                      })
-                      ?.catch?.(() => {});
-                  }
-                }
-              } catch {}
-            }
-          } catch (err: unknown) {
-            if (isPreemptedOrStale()) return;
-            const rateErr = (err && typeof err === 'object' ? err : {}) as MediaSyncRateError;
-            const is429 =
-              Boolean(rateErr.isRateLimited) ||
-              rateErr.status === 429 ||
-              rateErr.response?.status === 429;
-            if (is429) {
-              if (isBackgroundWarmup) {
-                // C1: Abort passive background warmup immediately on rate limit
-                break;
-              }
-              const attempt = (retryCounts.get(game.id) ?? 0) + 1;
-              retryCounts.set(game.id, attempt);
-              if (attempt <= MAX_RATE_LIMIT_RETRIES) {
-                const cooldownSec = Math.max(
-                  requestScheduler.getMaxCooldownRemaining(MEDIA_SYNC_DOMAINS),
-                  typeof rateErr.cooldownRemaining === 'number' ? rateErr.cooldownRemaining : 0
-                );
-                const waitMs = Math.max(
-                  cooldownSec * 1000,
-                  1000 * Math.pow(2, attempt - 1)
-                );
-                if (
-                  !safeUpdateState({
-                    status: 'rate_limited',
-                    cooldownSecondsRemaining: Math.ceil(waitMs / 1000),
-                  })
-                ) {
-                  return;
-                }
-                let remainingMs = waitMs;
-                while (remainingMs > 0 && !this.isCancelled && !isPreemptedOrStale()) {
-                  const sliceMs = Math.min(1000, remainingMs);
-                  await new Promise((r) => setTimeout(r, sliceMs));
-                  if (isPreemptedOrStale()) return;
-                  remainingMs -= sliceMs;
-                  if (!this.isCancelled && this.state?.status === 'rate_limited') {
-                    const nextSec = Math.max(
-                      Math.ceil(Math.max(0, remainingMs) / 1000),
-                      requestScheduler.getMaxCooldownRemaining(MEDIA_SYNC_DOMAINS)
-                    );
-                    if (
-                      !safeUpdateState({
-                        cooldownSecondsRemaining: nextSec,
-                      })
-                    ) {
-                      return;
-                    }
-                  }
-                }
-                if (isPreemptedOrStale()) return;
-                if (this.isCancelled) break;
-                if (
-                  !safeUpdateState({
-                    status: 'running',
-                    cooldownSecondsRemaining: undefined,
-                  })
-                ) {
-                  return;
-                }
-                i--;
-                await yieldToMainThread();
-                if (isPreemptedOrStale()) return;
-                continue;
-              }
-              console.warn(
-                `[SyncJobManager] Rate-limit retries exhausted (${MAX_RATE_LIMIT_RETRIES}) for ${game.title}; advancing.`
-              );
-            } else {
-              console.warn(
-                `[SyncJobManager] Media sync error for ${game.title}:`,
-                rateErr.message || err
-              );
-            }
-            if (!this.isCancelled && !isPreemptedOrStale() && onlineLifecycleManager.isOnline()) {
-              recordMediaSyncAttempt(game.id, 'transient_error');
-              gameCompletedWithoutAbort = true;
-            }
-          }
-        }
-
-        if (isPreemptedOrStale()) {
-          return;
-        }
-
-        if (gameCompletedWithoutAbort) {
-          options?.onGameAttempted?.(game.id);
-        }
-
-        if (isBackgroundWarmup && hasActiveMediaSyncCooldown()) {
-          // C1: Abort passive background warmup immediately if this request triggered a cooldown
-          break;
-        }
-
-        if (
-          !safeUpdateState({
-            current: i + 1,
-          })
-        ) {
-          return;
-        }
-        await yieldToMainThread();
-        if (isPreemptedOrStale()) {
-          return;
-        }
-      }
-
-      if (isPreemptedOrStale()) {
-        return;
-      }
-
-      if (this.isCancelled || this.state?.status === 'cancelled') {
-        safeUpdateState({
-          status: 'cancelled',
-          currentItemName: undefined,
-        });
-      } else {
-        safeUpdateState({
-          status: 'completed',
-          current: eligibleGames.length,
-          currentItemName: undefined,
-        });
-      }
-    } finally {
-      if (this.state?.id === jobId) {
-        try {
-          flushPendingCatalogSave();
-          steamApi.trimMemoryCache(30);
-          if (typeof window !== 'undefined') {
-            window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
-          }
-        } catch {}
-      }
-    }
   }
 
   /**
    * Starts a dedicated cross-storefront Trophy & Achievement synchronization job
-   * with live progress reporting in GlobalSyncProgressBar.
+   * with live progress reporting in GlobalSyncProgressBar, unified preemption guards,
+   * direct interactive scheduler priority, and a dedicated completion timer.
    */
   public async startTrophySync(
     totalSteps: number,
@@ -2400,10 +785,20 @@ export class SyncJobManager {
       checkCancelled: () => boolean
     ) => Promise<void>
   ): Promise<void> {
+    // P0-3: Bump sibling tokens AND backgroundWarmupEpoch, drain any waiting background workers
     this.mediaSyncLoopToken++;
+    this.criticLoopToken++;
+    this.backgroundWarmupEpoch++;
+    const myToken = ++this.trophyLoopToken;
+    this.clearTrophyTimer();
     this.isCancelled = false;
-    const jobId = `trophy-sync-${Date.now()}`;
+    drainResolverQueue(this.pauseResolvers);
+    drainResolverQueue(this.preemptionResolvers);
+
+    const jobId = `trophy-sync-${Date.now()}-${myToken}`;
+    const handle = this.createJobHandle('achievements', jobId, myToken);
     const safeTotal = Math.max(1, totalSteps);
+    const schedulerScopeId = requestScheduler.beginInteractiveScope(`trophy-sync-${myToken}`);
 
     this.state = {
       id: jobId,
@@ -2411,41 +806,44 @@ export class SyncJobManager {
       title: 'Syncing Storefront Trophies',
       headline: 'Syncing Storefront Trophies',
       activeCategories: [CATEGORY_SHORT_LABELS.achievements],
+      activeCategoryKeys: ['achievements'],
       total: safeTotal,
       current: 0,
       status: 'running',
       startedAt: Date.now(),
     };
+    this.syncHeadlineAndPriorityFields();
     this.notify();
 
     try {
       await runner(
         (current, total, currentItemName) => {
-          if (this.isCancelled || !this.state || this.state.id !== jobId) return;
-          this.updateState({
+          if (this.isCancelled || handle.isStale()) return;
+          handle.safeUpdateState({
             current: Math.min(Math.max(0, current), Math.max(1, total)),
             total: Math.max(1, total),
             currentItemName,
           });
         },
-        () => this.isCancelled || this.state?.status === 'cancelled'
+        () => this.isCancelled || handle.isStale() || this.state?.status === 'cancelled'
       );
 
-      if (this.state && this.state.id === jobId) {
-        if (this.isCancelled || this.state.status === 'cancelled') {
-          this.updateState({
+      if (!handle.isStale()) {
+        if (this.isCancelled || this.state?.status === 'cancelled') {
+          handle.safeUpdateState({
             status: 'cancelled',
             currentItemName: undefined,
           });
         } else {
-          this.updateState({
+          handle.safeUpdateState({
             status: 'completed',
-            current: this.state.total,
+            current: this.state?.total ?? safeTotal,
             currentItemName: undefined,
           });
-          if (this.priorityCompleteTimer) clearTimeout(this.priorityCompleteTimer);
-          this.priorityCompleteTimer = setTimeout(() => {
-            if (this.state && this.state.id === jobId && this.state.status === 'completed') {
+          this.clearTrophyTimer();
+          this.trophyCompleteTimer = setTimeout(() => {
+            this.trophyCompleteTimer = null;
+            if (!handle.isStale() && this.state?.status === 'completed') {
               this.state = null;
               this.notify();
             }
@@ -2454,15 +852,17 @@ export class SyncJobManager {
       }
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : undefined;
-      if (this.state && this.state.id === jobId) {
-        this.updateState({
+      if (!handle.isStale()) {
+        handle.safeUpdateState({
           status: 'completed',
-          current: this.state.total,
+          current: this.state?.total ?? safeTotal,
           currentItemName: undefined,
           error: errMsg,
         });
       }
       throw err;
+    } finally {
+      requestScheduler.endInteractiveScope(schedulerScopeId);
     }
   }
 }

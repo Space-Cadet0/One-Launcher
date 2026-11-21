@@ -1,5 +1,6 @@
 import type { CanonicalGame } from '../../contracts/game';
 import type { MediaSyncOutcome } from '../../contracts/steam';
+import { getSafeLocalStorage } from '../common/runtimeEnv';
 import {
   isIndexedDbAvailable,
   vaultDelete,
@@ -115,6 +116,68 @@ let bootHydrationPromise: Promise<number> | null = null;
 let stagedVaultHydrationComplete = false;
 let hasWrittenStagedToVaultInProcess = false;
 
+const VAULT_WRITE_CONCURRENCY = 4;
+const pendingVaultWrites = new Map<string, StagedCacheEntry<unknown>>();
+let vaultWriteFlushScheduled = false;
+let activeVaultWriteFlush: Promise<void> | null = null;
+
+async function drainPendingVaultWrites(): Promise<void> {
+  if (activeVaultWriteFlush) {
+    await activeVaultWriteFlush;
+  }
+  while (pendingVaultWrites.size > 0) {
+    const batch = Array.from(pendingVaultWrites.entries());
+    pendingVaultWrites.clear();
+    const run = (async () => {
+      for (let i = 0; i < batch.length; i += VAULT_WRITE_CONCURRENCY) {
+        const slice = batch.slice(i, i + VAULT_WRITE_CONCURRENCY);
+        await Promise.all(slice.map(([k, v]) => vaultSet(k, v)));
+      }
+    })();
+    activeVaultWriteFlush = run;
+    try {
+      await run;
+    } finally {
+      if (activeVaultWriteFlush === run) {
+        activeVaultWriteFlush = null;
+      }
+    }
+  }
+}
+
+function scheduleCoalescedVaultWrite(
+  stagedVaultKey: string,
+  entry: StagedCacheEntry<unknown>
+): void {
+  pendingVaultWrites.set(stagedVaultKey, entry);
+  if (vaultWriteFlushScheduled) return;
+  vaultWriteFlushScheduled = true;
+  queueMicrotask(() => {
+    vaultWriteFlushScheduled = false;
+    void drainPendingVaultWrites();
+  });
+}
+
+function isNegativeOrTransientTier(tier: unknown): boolean {
+  return tier === 'negative' || tier === 'transient_error';
+}
+
+function isNewerOrEqualFullMemoryEntry(
+  existing: StagedCacheEntry<unknown> | undefined,
+  incoming: StagedCacheEntry<unknown>
+): boolean {
+  if (!existing || typeof existing.cachedAt !== 'number' || typeof incoming.cachedAt !== 'number') {
+    return false;
+  }
+  if (existing.cachedAt > incoming.cachedAt) {
+    return true;
+  }
+  if (existing.cachedAt === incoming.cachedAt && existing.__vaultFull !== true) {
+    return true;
+  }
+  return false;
+}
+
 function addBoundedKey(set: Set<string>, key: string): void {
   if (set.has(key)) {
     set.delete(key);
@@ -146,6 +209,7 @@ export function clearStagedMemoryFallback(): void {
   localStorageMirroredKeys.clear();
   vaultHydratedKeys.clear();
   trackedCacheKeys.clear();
+  pendingVaultWrites.clear();
 }
 
 function compactDataPayloadForStub(data: unknown): unknown {
@@ -192,15 +256,6 @@ function buildCompactLocalStorageStub<T>(entry: StagedCacheEntry<T>): StagedCach
   if (entry.isVerified !== undefined) stub.isVerified = entry.isVerified;
   if (entry.failureReason !== undefined) stub.failureReason = entry.failureReason;
   if (entry.dynamicResolved !== undefined) stub.dynamicResolved = entry.dynamicResolved;
-  if (compactData && typeof compactData === 'object') {
-    Object.assign(stub, compactData);
-    stub.data = compactData;
-    stub.cachedAt = entry.cachedAt;
-    stub.ttlMs = entry.ttlMs;
-    stub.tier = entry.tier;
-    stub.version = entry.version;
-    stub.__vaultFull = true;
-  }
   return stub;
 }
 
@@ -212,13 +267,7 @@ function hasDurableVaultBackend(): boolean {
 }
 
 function getStorage(): Storage | null {
-  if (typeof window !== 'undefined' && window.localStorage) {
-    return window.localStorage;
-  }
-  if (typeof localStorage !== 'undefined') {
-    return localStorage;
-  }
-  return null;
+  return getSafeLocalStorage();
 }
 
 /**
@@ -417,15 +466,16 @@ export function createStagedCacheEntry<T>(
   if (options?.failureReason !== undefined) entry.failureReason = options.failureReason;
   if (options?.dynamicResolved !== undefined) entry.dynamicResolved = options.dynamicResolved;
 
-  // Shallow merge data properties for backward-compatibility with tests checking entry.score
-  if (data && typeof data === 'object') {
-    Object.assign(entry, data);
-    entry.data = data;
-    entry.version = options?.version ?? STAGED_CACHE_VERSION;
-    entry.tier = tier;
-    entry.cachedAt = cachedAt;
-    entry.ttlMs = ttlMs;
-    if (options?.dynamicResolved !== undefined) entry.dynamicResolved = options.dynamicResolved;
+  // Avoid duplicating full payload objects at top level (eliminates 2x JSON bloat);
+  // mirror ONLY tiny scalar score/url hints for legacy direct-JSON readers.
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    const rec = data as Record<string, unknown>;
+    if (typeof rec.score === 'number') {
+      entry.score = rec.score;
+      if (typeof rec.url === 'string' && rec.url.length <= MAX_STUB_STRING_CHARS) {
+        entry.url = rec.url;
+      }
+    }
   }
 
   return entry;
@@ -472,7 +522,7 @@ export function saveStagedCache<T>(
 
   setMemoryFallbackBounded(key, entry);
   hasWrittenStagedToVaultInProcess = true;
-  void vaultSet(`staged:${key}`, entry);
+  scheduleCoalescedVaultWrite(`staged:${key}`, entry as StagedCacheEntry<unknown>);
 
   const serialized = JSON.stringify(entry);
   const isBulkyWithVault =
@@ -516,6 +566,7 @@ export function saveStagedCache<T>(
 export async function hydrateStagedCacheKeyFromVault<T>(
   key: string
 ): Promise<StagedCacheEntry<T> | null> {
+  await drainPendingVaultWrites();
   const fromVault =
     (await vaultGet<StagedCacheEntry<T>>(`staged:${key}`)) ??
     (!key.startsWith('antigravity_staged_')
@@ -524,6 +575,10 @@ export async function hydrateStagedCacheKeyFromVault<T>(
   if (!fromVault || typeof fromVault !== 'object') return null;
   if (fromVault.tier === 'override' && (fromVault.ttlMs === null || fromVault.ttlMs === undefined)) {
     fromVault.ttlMs = Infinity;
+  }
+  const existingMem = memoryFallback.get(key);
+  if (isNewerOrEqualFullMemoryEntry(existingMem, fromVault as StagedCacheEntry<unknown>)) {
+    return existingMem as StagedCacheEntry<T>;
   }
   setMemoryFallbackBounded(key, fromVault);
   addBoundedKey(vaultHydratedKeys, key);
@@ -612,6 +667,7 @@ async function readStagedEntriesViaKeyFilteredIdb(): Promise<Array<[string, unkn
           upgradeDb.createObjectStore(STAGED_VAULT_STORE_NAME);
         }
       };
+      openReq.onblocked = () => reject(new Error('IndexedDB vault open blocked'));
       openReq.onsuccess = () => resolve(openReq.result);
       openReq.onerror = () => reject(openReq.error ?? new Error('Failed to open IndexedDB vault'));
     });
@@ -710,6 +766,7 @@ export async function hydrateAllStagedCacheFromVault(): Promise<number> {
 
   inFlightBulkVaultHydration = (async (): Promise<number> => {
     try {
+      await drainPendingVaultWrites();
       const filteredEntries = await readStagedEntriesViaKeyFilteredIdb();
       const allEntries: Array<[IDBValidKey, unknown]> =
         filteredEntries !== null ? filteredEntries : await vaultEntries<IDBValidKey, unknown>();
@@ -728,12 +785,16 @@ export async function hydrateAllStagedCacheFromVault(): Promise<number> {
           entry.ttlMs = Infinity;
         }
         if (
-          (entry.tier === 'negative' || entry.tier === 'transient_error') &&
+          isNegativeOrTransientTier(entry.tier) &&
           typeof entry.cachedAt === 'number' &&
           typeof entry.ttlMs === 'number' &&
           now - entry.cachedAt >= entry.ttlMs
         ) {
           void vaultDelete(rawKey);
+          continue;
+        }
+        // Do NOT overwrite newer (or equal-timestamp full) in-memory writes made during async hydration
+        if (isNewerOrEqualFullMemoryEntry(memoryFallback.get(cacheKey), entry)) {
           continue;
         }
         addBoundedKey(trackedCacheKeys, cacheKey);
@@ -923,6 +984,10 @@ export function evictStagedCache(key: string): void {
   }
   memoryFallback.delete(key);
   memoryFallback.delete(`${STAGED_CACHE_PREFIX}${key}`);
+  pendingVaultWrites.delete(`staged:${key}`);
+  if (!key.startsWith(STAGED_CACHE_PREFIX)) {
+    pendingVaultWrites.delete(`staged:${STAGED_CACHE_PREFIX}${key}`);
+  }
   void vaultDelete(`staged:${key}`);
   if (!key.startsWith(STAGED_CACHE_PREFIX)) {
     void vaultDelete(`staged:${STAGED_CACHE_PREFIX}${key}`);
@@ -935,7 +1000,7 @@ export function evictStagedCache(key: string): void {
  * ('immutable', 'mature', 'fresh', 'early_access', 'override') are retained past their
  * refresh TTL in localStorage to guarantee stale-while-offline availability, while
  * full quota-recovery sweeps evict expired non-override localStorage entries (which remain
- * persisted in IndexedDB vault).
+ * persisted in IndexedDB vault — ONLY expired negative & transient_error tiers are deleted from IDB).
  */
 export function clearExpiredStagedCache(options?: { onlyNegativeAndTransient?: boolean }): void {
   const onlyNegOrTransient = Boolean(options?.onlyNegativeAndTransient);
@@ -945,7 +1010,7 @@ export function clearExpiredStagedCache(options?: { onlyNegativeAndTransient?: b
 
   if (storage) {
     try {
-      const keysToRemove: string[] = [];
+      const keysToRemove: Array<{ key: string; shouldDeleteFromVault: boolean }> = [];
       for (let i = 0; i < storage.length; i++) {
         const key = storage.key(i);
         if (!key) continue;
@@ -970,29 +1035,31 @@ export function clearExpiredStagedCache(options?: { onlyNegativeAndTransient?: b
             if (parsed.tier === 'override' || parsed.ttlMs === Infinity) {
               continue;
             }
-            if (
-              onlyNegOrTransient &&
-              parsed.tier !== 'negative' &&
-              parsed.tier !== 'transient_error'
-            ) {
+            const isNegOrTransient = isNegativeOrTransientTier(parsed.tier);
+            if (onlyNegOrTransient && !isNegOrTransient) {
               continue;
             }
             if (now - parsed.cachedAt >= parsed.ttlMs) {
-              keysToRemove.push(key);
+              keysToRemove.push({ key, shouldDeleteFromVault: isNegOrTransient });
             }
           }
         } catch {
           // Skip unparseable non-cache entries
         }
       }
-      for (const k of keysToRemove) {
+      for (const { key: k, shouldDeleteFromVault } of keysToRemove) {
         storage.removeItem(k);
         trackedCacheKeys.delete(k);
         localStorageMirroredKeys.delete(k);
         vaultHydratedKeys.delete(k);
         parsedStagedMemo.delete(k);
         memoryFallback.delete(k);
-        expiredVaultKeys.add(k);
+        // P0-5: ONLY delete expired negative/transient_error entries from IndexedDB;
+        // preserve expired positive tiers ('fresh', 'early_access', 'mature', 'immutable')
+        // in IndexedDB for stale-while-offline fallback!
+        if (shouldDeleteFromVault) {
+          expiredVaultKeys.add(k);
+        }
       }
     } catch {}
   }
@@ -1005,11 +1072,8 @@ export function clearExpiredStagedCache(options?: { onlyNegativeAndTransient?: b
       typeof entry.ttlMs === 'number'
     ) {
       if (entry.tier === 'override' || entry.ttlMs === Infinity) continue;
-      if (
-        onlyNegOrTransient &&
-        entry.tier !== 'negative' &&
-        entry.tier !== 'transient_error'
-      ) {
+      const isNegOrTransient = isNegativeOrTransientTier(entry.tier);
+      if (onlyNegOrTransient && !isNegOrTransient) {
         continue;
       }
       if (now - entry.cachedAt >= entry.ttlMs) {
@@ -1018,13 +1082,17 @@ export function clearExpiredStagedCache(options?: { onlyNegativeAndTransient?: b
         vaultHydratedKeys.delete(key);
         localStorageMirroredKeys.delete(key);
         parsedStagedMemo.delete(key);
-        expiredVaultKeys.add(key);
+        if (isNegOrTransient) {
+          expiredVaultKeys.add(key);
+        }
       }
     }
   }
 
   for (const expiredKey of expiredVaultKeys) {
-    void vaultDelete(`${STAGED_VAULT_KEY_PREFIX}${expiredKey}`);
+    const vaultKey = `${STAGED_VAULT_KEY_PREFIX}${expiredKey}`;
+    pendingVaultWrites.delete(vaultKey);
+    void vaultDelete(vaultKey);
   }
 }
 
