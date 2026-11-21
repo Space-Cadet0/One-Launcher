@@ -1070,7 +1070,7 @@ describe('Wave 3A — Pass-2 Dual-OS Launch Engine, Clean-Room & 32-Bit Bottled 
       expect(winRes.success).toBe(true);
       expect(winSpawns).toHaveLength(1);
       expect(winSpawns[0].cmd).toBe(winUpcExe);
-      expect(winSpawns[0].args).toEqual(['uplay://launch/9901/0']);
+      expect(winSpawns[0].args).toEqual(['-minimized', 'uplay://launch/9901/0']);
       expect(winExecCalls.some((c) => /wine/i.test(c))).toBe(false);
 
       await supervisor.finalizeGameSession('ubisoft:syn-ubisoft-win32', {
@@ -1249,8 +1249,7 @@ describe('Wave 3A — Pass-2 Dual-OS Launch Engine, Clean-Room & 32-Bit Bottled 
 
       const launch3Spawn = steamSpawns[steamSpawns.length - 1];
       expect(launch3Spawn.env.CX_GRAPHICS_BACKEND).toBe('dxmt');
-      expect(launch3Spawn.args[0]).toBe('--dll');
-      expect(launch3Spawn.args[1]).toContain('version=n,b');
+      expect(launch3Spawn.args.join(' ')).not.toContain('version=n,b');
       expect(launch3Spawn.args.some((a) => /steam\.exe$/i.test(a))).toBe(true);
       expect(launch3Spawn.args).toContain('-applaunch');
       expect(launch3Spawn.args).toContain('990002');
