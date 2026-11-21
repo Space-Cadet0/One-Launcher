@@ -120,13 +120,6 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
       onOpenRunnerSetup();
       return;
     }
-    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-      window.dispatchEvent(
-        new CustomEvent('antigravity:open-setup-wizard', {
-          detail: { initialStep: 'compatibility' },
-        })
-      );
-    }
     environmentSetupService.openWizard({
       mode: 'health_check',
       initialStep: 'compatibility',
@@ -249,7 +242,6 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
       preventClose={isBusy || form.hasUnsavedChanges}
       closeOnBackdrop={!isBusy}
       onCloseAttemptWhilePrevented={handleCloseAttemptWhilePrevented}
-      lockOverlay={false}
       testId="launch-config-modal-overlay"
       ariaLabelledBy={dialogTitleId}
       className="w-full max-w-2xl"
