@@ -4,6 +4,8 @@ import {
   stripYearEditionPhrases,
   alignCompoundWordTokens,
   extractSequelIdentifier,
+  extractParentheticalReleaseYear,
+  isIntermediateNumeralSubtitleMatch,
   isSequelMismatch,
   ROMAN_TO_ARABIC,
   EDITION_TOKENS,
@@ -30,8 +32,6 @@ export interface EntityMatchEvaluation {
 
 const REMASTER_EDITION_REGEX =
   /\b(remastered|remaster|definitive|enhanced|anniversary|complete|goty|game of the year|director'?s cut|redux)\b/i;
-
-const PAREN_YEAR_REGEX = /\((19\d\d|20\d\d)\)/;
 
 const CORPORATE_STOP_WORDS = new Set<string>([
   'inc',
@@ -88,12 +88,7 @@ export function parseReleaseYear(val?: number | string | null): number | null {
 }
 
 function extractParentheticalYear(title: string): number | null {
-  if (!title) return null;
-  const maxAllowedYear = new Date().getFullYear() + 10;
-  const match = title.match(PAREN_YEAR_REGEX);
-  if (!match) return null;
-  const yr = parseInt(match[1], 10);
-  return yr >= 1975 && yr <= maxAllowedYear ? yr : null;
+  return extractParentheticalReleaseYear(title);
 }
 
 function extractOrgTokens(orgs?: string[]): Set<string> {
@@ -145,12 +140,43 @@ function computeBaseTitleSimilarity(source: string, candidate: string): number {
 
   const seq1 = extractSequelIdentifier(rawWords1);
   const seq2 = extractSequelIdentifier(rawWords2);
-  if (seq1 !== seq2) {
+  const isIntermediateSubtitleBypass =
+    seq1 !== seq2 && isIntermediateNumeralSubtitleMatch(cleanSource, cleanCandidate);
+  if (seq1 !== seq2 && !isIntermediateSubtitleBypass) {
     return 0;
   }
 
-  const mappedWords1 = seq1 !== null ? rawWords1.map((w) => ROMAN_TO_ARABIC[w] || w) : rawWords1;
-  const mappedWords2 = seq2 !== null ? rawWords2.map((w) => ROMAN_TO_ARABIC[w] || w) : rawWords2;
+  const mappedWords1Raw = rawWords1.map((w) => ROMAN_TO_ARABIC[w] || w);
+  const mappedWords2Raw = rawWords2.map((w) => ROMAN_TO_ARABIC[w] || w);
+  let mappedWords1 = seq1 !== null ? mappedWords1Raw : rawWords1;
+  let mappedWords2 = seq2 !== null ? mappedWords2Raw : rawWords2;
+
+  if (isIntermediateSubtitleBypass) {
+    const set1 = new Set(mappedWords1Raw);
+    const set2 = new Set(mappedWords2Raw);
+    const extraIn1 = seq1 !== null && !set2.has(seq1) ? seq1 : null;
+    const extraIn2 = seq2 !== null && !set1.has(seq2) ? seq2 : null;
+    if (extraIn1) {
+      let removed = false;
+      mappedWords1 = mappedWords1Raw.filter((w) => {
+        if (!removed && w === extraIn1) {
+          removed = true;
+          return false;
+        }
+        return true;
+      });
+    } else if (extraIn2) {
+      let removed = false;
+      mappedWords2 = mappedWords2Raw.filter((w) => {
+        if (!removed && w === extraIn2) {
+          removed = true;
+          return false;
+        }
+        return true;
+      });
+    }
+  }
+
   const [words1, words2] = alignCompoundWordTokens(mappedWords1, mappedWords2);
 
   if (words1.join(' ') === words2.join(' ')) {
@@ -273,9 +299,9 @@ function evaluateSingleTitlePair(
     isAccepted: false,
   };
 
-  // Strip parenthetical release years (e.g. "(2016)", "(1993)") and Year Pass suffixes for title token comparison
-  const cleanSrcTitle = stripYearEditionPhrases(srcTitle.replace(/\s*\((?:19|20)\d{2}\)/g, '')).trim();
-  const cleanCandTitle = stripYearEditionPhrases(candTitle.replace(/\s*\((?:19|20)\d{2}\)/g, '')).trim();
+  // Strip parenthetical release years (e.g. "(2016)", "[2023]", "(1993)") and Year Pass suffixes for title token comparison
+  const cleanSrcTitle = stripYearEditionPhrases(srcTitle.replace(/\s*[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]/g, '')).trim();
+  const cleanCandTitle = stripYearEditionPhrases(candTitle.replace(/\s*[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]/g, '')).trim();
 
   if (!cleanSrcTitle || !cleanCandTitle) {
     return zeroResult;

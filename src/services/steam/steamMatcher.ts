@@ -5,6 +5,10 @@ import {
   normalizeTitleKey,
   stripEditionSuffix,
   stripYearEditionPhrases,
+  stripPackagingEditionPhrases,
+  stripIntermediateSubtitleNumeral,
+  isIntermediateNumeralSubtitleMatch,
+  foldLatinLigaturesAndDiacritics,
   splitCamelCaseTitle,
   alignCompoundWordTokens,
   stripStorefrontPlatformDisambiguators,
@@ -156,8 +160,22 @@ const DISJOINT_STOP_WORDS = new Set<string>([
 export function computeTitleSimilarity(source: string, candidate: string): number {
   const cleanSource = stripYearEditionPhrases(source);
   const cleanCandidate = stripYearEditionPhrases(candidate);
-  const s1 = stripStorefrontMatchSuffixes(cleanSource).toLowerCase().replace(/['’‘"“”]/g, '').replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-  const s2 = stripStorefrontMatchSuffixes(cleanCandidate).toLowerCase().replace(/['’‘"“”]/g, '').replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  const s1 = foldLatinLigaturesAndDiacritics(stripStorefrontMatchSuffixes(cleanSource))
+    .toLowerCase()
+    .replace(/['’‘"“”]/g, '')
+    .replace(/(\d),(\d)/g, '$1$2')
+    .replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ')
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const s2 = foldLatinLigaturesAndDiacritics(stripStorefrontMatchSuffixes(cleanCandidate))
+    .toLowerCase()
+    .replace(/['’‘"“”]/g, '')
+    .replace(/(\d),(\d)/g, '$1$2')
+    .replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ')
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
   if (!s1 || !s2) return 0;
   if (s1 === s2) return 1.0;
@@ -167,10 +185,14 @@ export function computeTitleSimilarity(source: string, candidate: string): numbe
 
   // Strict sequel verification:
   // If one title has a sequel number (e.g. "Blood Omen 2") and the other does not ("Blood Omen"),
-  // or they have different sequel numbers ("Doom" vs "Doom II", "Witcher 2" vs "Witcher 3"), THEY NEVER MATCH!
+  // or they have different sequel numbers ("Doom" vs "Doom II", "Witcher 2" vs "Witcher 3"), THEY NEVER MATCH,
+  // unless they satisfy the exact bidirectional intermediate-numeral subtitle match predicate
+  // (e.g. "Deus Ex 2: Invisible War" <-> "Deus Ex: Invisible War").
   const seq1 = extractSequelIdentifier(rawWords1);
   const seq2 = extractSequelIdentifier(rawWords2);
-  if (seq1 !== seq2) {
+  const isIntermediateSubtitleBypass =
+    seq1 !== seq2 && isIntermediateNumeralSubtitleMatch(cleanSource, cleanCandidate);
+  if (seq1 !== seq2 && !isIntermediateSubtitleBypass) {
     return 0;
   }
 
@@ -178,8 +200,37 @@ export function computeTitleSimilarity(source: string, candidate: string): numbe
     return 0;
   }
 
-  const mappedWords1 = seq1 !== null ? rawWords1.map((w) => ROMAN_TO_ARABIC[w] || w) : rawWords1;
-  const mappedWords2 = seq2 !== null ? rawWords2.map((w) => ROMAN_TO_ARABIC[w] || w) : rawWords2;
+  const mappedWords1Raw = rawWords1.map((w) => ROMAN_TO_ARABIC[w] || w);
+  const mappedWords2Raw = rawWords2.map((w) => ROMAN_TO_ARABIC[w] || w);
+  let mappedWords1 = seq1 !== null ? mappedWords1Raw : rawWords1;
+  let mappedWords2 = seq2 !== null ? mappedWords2Raw : rawWords2;
+
+  if (isIntermediateSubtitleBypass) {
+    const set1 = new Set(mappedWords1Raw);
+    const set2 = new Set(mappedWords2Raw);
+    const extraIn1 = seq1 !== null && !set2.has(seq1) ? seq1 : null;
+    const extraIn2 = seq2 !== null && !set1.has(seq2) ? seq2 : null;
+    if (extraIn1) {
+      let removed = false;
+      mappedWords1 = mappedWords1Raw.filter((w) => {
+        if (!removed && w === extraIn1) {
+          removed = true;
+          return false;
+        }
+        return true;
+      });
+    } else if (extraIn2) {
+      let removed = false;
+      mappedWords2 = mappedWords2Raw.filter((w) => {
+        if (!removed && w === extraIn2) {
+          removed = true;
+          return false;
+        }
+        return true;
+      });
+    }
+  }
+
   const [words1, words2] = alignCompoundWordTokens(mappedWords1, mappedWords2);
 
   if (words1.join(' ') === words2.join(' ')) {
@@ -271,9 +322,12 @@ export const DISTINCT_EDITION_TOKEN_REGEX =
   /\b(remastered|remaster|remake|enhanced|definitive|redux|director'?s cut|anniversary)\b/i;
 
 function tokenizeSimilarityWords(text: string): string[] {
-  const cleaned = stripYearEditionPhrases(stripStorefrontMatchSuffixes(text))
+  const cleaned = foldLatinLigaturesAndDiacritics(
+    stripYearEditionPhrases(stripStorefrontMatchSuffixes(text))
+  )
     .toLowerCase()
     .replace(/['’‘"“”]/g, '')
+    .replace(/(\d),(\d)/g, '$1$2')
     .replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ')
     .replace(/[^a-z0-9 ]/g, ' ')
     .replace(/\s+/g, ' ')
@@ -292,6 +346,23 @@ interface EnrichedMatchEntry {
 }
 
 const MAX_MATCH_CACHE_ENTRIES = 2000;
+const NEGATIVE_SELF_HEAL_REV = 2;
+const NON_ASCII_CHAR_RE = /[^\x00-\x7f]/;
+const DIGIT_COMMA_RE = /\d,\d/;
+
+/**
+ * Identifies titles whose previously cached negative (`appId: null`) v5 entries should be
+ * lazily self-healed because newer matching passes cover intermediate-numeral subtitles,
+ * non-ASCII diacritics, digit-commas ("40,000"), and multi-word packaging edition phrases.
+ */
+function isNegativeCacheSelfHealCandidate(title: string): boolean {
+  if (!title) return false;
+  if (NON_ASCII_CHAR_RE.test(title)) return true;
+  if (DIGIT_COMMA_RE.test(title)) return true;
+  if (stripIntermediateSubtitleNumeral(title) !== null) return true;
+  if (stripPackagingEditionPhrases(title) !== title) return true;
+  return false;
+}
 
 interface PersistedPositiveMatchRecord {
   appId: number;
@@ -303,6 +374,7 @@ interface PersistedNegativeMatchRecord {
   id?: null;
   cachedAt: number;
   failureCount?: number;
+  healRev?: number;
 }
 
 type PersistedMatchRecord = number | PersistedPositiveMatchRecord | PersistedNegativeMatchRecord;
@@ -312,6 +384,7 @@ export class SteamMatcherService {
   private positiveTimestamps = new Map<string, number>();
   private negativeTimestamps = new Map<string, number>();
   private negativeFailureCounts = new Map<string, number>();
+  private negativeHealRevs = new Map<string, number>();
   private instantMemo = new Map<string, number | null>();
   private inFlightFailedKeys = new Set<string>();
   private enrichedEntries: EnrichedMatchEntry[] | null = null;
@@ -362,6 +435,26 @@ export class SteamMatcherService {
       this.positiveTimestamps.delete(oldest);
       this.negativeTimestamps.delete(oldest);
       this.negativeFailureCounts.delete(oldest);
+      this.negativeHealRevs.delete(oldest);
+    }
+  }
+
+  private shouldSelfHealNegativeCacheKey(lowerKey: string, rawTitle?: string): boolean {
+    const rev = this.negativeHealRevs.get(lowerKey) ?? 0;
+    if (rev >= NEGATIVE_SELF_HEAL_REV) return false;
+    return (
+      isNegativeCacheSelfHealCandidate(lowerKey) ||
+      (typeof rawTitle === 'string' && rawTitle.length > 0 && isNegativeCacheSelfHealCandidate(rawTitle))
+    );
+  }
+
+  private purgeNegativeCacheKey(lowerKey: string): void {
+    this.cache.delete(lowerKey);
+    this.negativeTimestamps.delete(lowerKey);
+    this.negativeFailureCounts.delete(lowerKey);
+    this.negativeHealRevs.delete(lowerKey);
+    if (this.instantMemo.get(lowerKey) === null) {
+      this.instantMemo.delete(lowerKey);
     }
   }
 
@@ -451,8 +544,9 @@ export class SteamMatcherService {
   private ingestPersistedMatchEntries(
     recordMap: Record<string, unknown>,
     options: { isLegacyV4: boolean; allowNegativeRecords: boolean; skipExistingPositives?: boolean }
-  ): boolean {
+  ): { ingestedAny: boolean; sweptStaleNegative: boolean } {
     let ingestedAny = false;
+    let sweptStaleNegative = false;
     const now = Date.now();
 
     for (const [rawKey, v] of Object.entries(recordMap)) {
@@ -512,6 +606,7 @@ export class SteamMatcherService {
         this.setCacheBounded(lk, positiveAppId, positiveCachedAt);
         this.negativeTimestamps.delete(lk);
         this.negativeFailureCounts.delete(lk);
+        this.negativeHealRevs.delete(lk);
         if (this.instantMemo.get(lk) === null) {
           this.instantMemo.delete(lk);
         }
@@ -527,6 +622,7 @@ export class SteamMatcherService {
       if (typeof v === 'object' && v !== null && options.allowNegativeRecords) {
         const negRec = v as Partial<PersistedNegativeMatchRecord>;
         const cachedAt = typeof negRec.cachedAt === 'number' ? negRec.cachedAt : 0;
+        const healRev = typeof negRec.healRev === 'number' ? negRec.healRev : 0;
         const existingNegTs = this.negativeTimestamps.get(lk) || 0;
         if (options.skipExistingPositives && existingVal === null && existingNegTs >= cachedAt) {
           continue;
@@ -542,12 +638,26 @@ export class SteamMatcherService {
             : NEGATIVE_MATCH_TTL_MS;
         const isExpired = now - cachedAt >= effectiveTtlMs;
         if (negRec.appId === null || negRec.id === null) {
+          // Targeted Null-Cache Self-Heal: treat pre-healRev negative entries whose title
+          // contains an intermediate-numeral subtitle, non-ASCII diacritics, digit-commas,
+          // or multi-word packaging edition phrases as expired/miss while preserving 100% of positives.
+          if (
+            healRev < NEGATIVE_SELF_HEAL_REV &&
+            (isNegativeCacheSelfHealCandidate(rawKey) || isNegativeCacheSelfHealCandidate(lk))
+          ) {
+            this.purgeNegativeCacheKey(lk);
+            sweptStaleNegative = true;
+            continue;
+          }
           if (failureCount !== undefined) {
             this.negativeFailureCounts.set(lk, failureCount);
           }
           if (!isExpired) {
             this.setCacheBounded(lk, null);
             this.setNegativeTimestampBounded(lk, cachedAt);
+            if (healRev > 0) {
+              this.negativeHealRevs.set(lk, healRev);
+            }
             this.instantMemo.delete(lk);
             ingestedAny = true;
           }
@@ -555,7 +665,7 @@ export class SteamMatcherService {
       }
     }
 
-    return ingestedAny;
+    return { ingestedAny, sweptStaleNegative };
   }
 
   private buildPersistedCachePayload(): Record<string, PersistedMatchRecord> {
@@ -570,10 +680,15 @@ export class SteamMatcherService {
       } else if (v === null) {
         const cachedAt = this.negativeTimestamps.get(k) || now;
         const failureCount = this.negativeFailureCounts.get(k);
-        obj[k] =
-          failureCount !== undefined
-            ? { appId: null, cachedAt, failureCount }
-            : { appId: null, cachedAt };
+        const healRev = this.negativeHealRevs.get(k);
+        const rec: PersistedNegativeMatchRecord = { appId: null, cachedAt };
+        if (failureCount !== undefined) {
+          rec.failureCount = failureCount;
+        }
+        if (healRev !== undefined && healRev > 0) {
+          rec.healRev = healRev;
+        }
+        obj[k] = rec;
       }
     }
     return obj;
@@ -592,10 +707,13 @@ export class SteamMatcherService {
       if (rawV5) {
         const parsedV5: unknown = JSON.parse(rawV5);
         if (parsedV5 && typeof parsedV5 === 'object' && !Array.isArray(parsedV5)) {
-          this.ingestPersistedMatchEntries(parsedV5 as Record<string, unknown>, {
+          const resV5 = this.ingestPersistedMatchEntries(parsedV5 as Record<string, unknown>, {
             isLegacyV4: false,
             allowNegativeRecords: true,
           });
+          if (resV5.sweptStaleNegative) {
+            needsPersistV5 = true;
+          }
         }
       }
 
@@ -638,36 +756,33 @@ export class SteamMatcherService {
       if (gen !== this.cacheGeneration) return;
 
       let hydratedAny = false;
+      let sweptAnyNegative = false;
       if (vaultDataV5 && typeof vaultDataV5 === 'object' && !Array.isArray(vaultDataV5)) {
-        if (
-          this.ingestPersistedMatchEntries(vaultDataV5, {
-            isLegacyV4: false,
-            allowNegativeRecords: true,
-            skipExistingPositives: true,
-          })
-        ) {
-          hydratedAny = true;
-        }
+        const resV5 = this.ingestPersistedMatchEntries(vaultDataV5, {
+          isLegacyV4: false,
+          allowNegativeRecords: true,
+          skipExistingPositives: true,
+        });
+        if (resV5.ingestedAny) hydratedAny = true;
+        if (resV5.sweptStaleNegative) sweptAnyNegative = true;
       }
 
       let migratedLegacyV4 = false;
       if (vaultDataV4 && typeof vaultDataV4 === 'object' && !Array.isArray(vaultDataV4)) {
-        if (
-          this.ingestPersistedMatchEntries(vaultDataV4, {
-            isLegacyV4: true,
-            allowNegativeRecords: true,
-            skipExistingPositives: true,
-          })
-        ) {
-          hydratedAny = true;
-        }
+        const resV4 = this.ingestPersistedMatchEntries(vaultDataV4, {
+          isLegacyV4: true,
+          allowNegativeRecords: true,
+          skipExistingPositives: true,
+        });
+        if (resV4.ingestedAny) hydratedAny = true;
+        if (resV4.sweptStaleNegative) sweptAnyNegative = true;
         migratedLegacyV4 = true;
         void vaultDelete(LEGACY_STORAGE_KEY_MATCHED_APP_IDS_V4);
       }
 
-      if (hydratedAny || migratedLegacyV4) {
+      if (hydratedAny || migratedLegacyV4 || sweptAnyNegative) {
         const obj = this.buildPersistedCachePayload();
-        if (migratedLegacyV4) {
+        if (migratedLegacyV4 || sweptAnyNegative) {
           void vaultSet(STORAGE_KEY_MATCHED_APP_IDS, obj);
         }
         try {
@@ -705,6 +820,7 @@ export class SteamMatcherService {
   ): void {
     this.setCacheBounded(key, null);
     this.setNegativeTimestampBounded(key, timestamp);
+    this.negativeHealRevs.set(key, NEGATIVE_SELF_HEAL_REV);
     if (typeof failureCount === 'number' && failureCount >= 1) {
       this.negativeFailureCounts.set(key, Math.floor(failureCount));
     }
@@ -722,6 +838,7 @@ export class SteamMatcherService {
     this.positiveTimestamps.clear();
     this.negativeTimestamps.clear();
     this.negativeFailureCounts.clear();
+    this.negativeHealRevs.clear();
     this.inFlightFailedKeys.clear();
     this.instantMemo.clear();
     this.enrichedEntries = null;
@@ -782,6 +899,10 @@ export class SteamMatcherService {
         this.positiveTimestamps.delete(lowerKey);
       }
       if (val === null) {
+        if (this.shouldSelfHealNegativeCacheKey(lowerKey, title)) {
+          this.purgeNegativeCacheKey(lowerKey);
+          return false;
+        }
         const cachedAt = this.negativeTimestamps.get(lowerKey);
         if (cachedAt && Date.now() - cachedAt < this.getNegativeMatchTtlMs(lowerKey)) {
           return true;
@@ -856,13 +977,16 @@ export class SteamMatcherService {
         this.positiveTimestamps.delete(lowerKey);
       }
       if (val === null) {
-        const cachedAt = this.negativeTimestamps.get(lowerKey);
-        if (cachedAt && Date.now() - cachedAt < this.getNegativeMatchTtlMs(lowerKey)) {
-          this.instantMemo.set(lowerKey, null);
-          return null;
+        if (this.shouldSelfHealNegativeCacheKey(lowerKey, title)) {
+          this.purgeNegativeCacheKey(lowerKey);
+        } else {
+          const cachedAt = this.negativeTimestamps.get(lowerKey);
+          if (cachedAt && Date.now() - cachedAt < this.getNegativeMatchTtlMs(lowerKey)) {
+            this.instantMemo.set(lowerKey, null);
+            return null;
+          }
+          this.purgeNegativeCacheKey(lowerKey);
         }
-        this.cache.delete(lowerKey);
-        this.negativeTimestamps.delete(lowerKey);
       }
     }
 
@@ -906,6 +1030,7 @@ export class SteamMatcherService {
     this.setCacheBounded(lowerKey, candidateId);
     this.negativeFailureCounts.delete(lowerKey);
     this.negativeTimestamps.delete(lowerKey);
+    this.negativeHealRevs.delete(lowerKey);
     this.inFlightFailedKeys.delete(lowerKey);
     this.instantMemo.set(lowerKey, candidateId);
     if (
@@ -916,6 +1041,7 @@ export class SteamMatcherService {
       this.setCacheBounded(normalized, candidateId);
       this.negativeFailureCounts.delete(normalized);
       this.negativeTimestamps.delete(normalized);
+      this.negativeHealRevs.delete(normalized);
       this.instantMemo.set(normalized, candidateId);
     }
     this.savePersistentCache();
@@ -989,10 +1115,32 @@ export class SteamMatcherService {
           title: candidateName,
         }
       );
+      const packagingStripped = stripPackagingEditionPhrases(cleanRaw);
+      const evalPackaging =
+        packagingStripped && packagingStripped !== cleanRaw
+          ? computeEntityMatchConfidence(
+              {
+                title: packagingStripped,
+                releaseYear: options?.releaseYear,
+                developers: options?.developers,
+              },
+              {
+                title: candidateName,
+              }
+            )
+          : null;
 
-      const isAccepted = evalNormalized.isAccepted || evalRaw.isAccepted;
-      const isRebootCollision = evalNormalized.isRebootCollision || evalRaw.isRebootCollision;
-      let score = Math.max(evalNormalized.confidence, evalRaw.confidence);
+      const isAccepted =
+        evalNormalized.isAccepted || evalRaw.isAccepted || Boolean(evalPackaging?.isAccepted);
+      const isRebootCollision =
+        evalNormalized.isRebootCollision ||
+        evalRaw.isRebootCollision ||
+        Boolean(evalPackaging?.isRebootCollision);
+      let score = Math.max(
+        evalNormalized.confidence,
+        evalRaw.confidence,
+        evalPackaging ? Math.max(0, evalPackaging.confidence - 2) : 0
+      );
 
       if (candLower === normalized && !isRebootCollision) {
         score = Math.min(100, score + 15);
@@ -1096,12 +1244,15 @@ export class SteamMatcherService {
         this.positiveTimestamps.delete(lowerKey);
       }
       if (val === null) {
-        const cachedAt = this.negativeTimestamps.get(lowerKey);
-        if (cachedAt && Date.now() - cachedAt < this.getNegativeMatchTtlMs(lowerKey)) {
-          return null;
+        if (this.shouldSelfHealNegativeCacheKey(lowerKey, title)) {
+          this.purgeNegativeCacheKey(lowerKey);
+        } else {
+          const cachedAt = this.negativeTimestamps.get(lowerKey);
+          if (cachedAt && Date.now() - cachedAt < this.getNegativeMatchTtlMs(lowerKey)) {
+            return null;
+          }
+          this.purgeNegativeCacheKey(lowerKey);
         }
-        this.cache.delete(lowerKey);
-        this.negativeTimestamps.delete(lowerKey);
       }
     }
 
@@ -1127,6 +1278,7 @@ export class SteamMatcherService {
         this.setCacheBounded(lowerKey, entry.appId);
         this.negativeFailureCounts.delete(lowerKey);
         this.negativeTimestamps.delete(lowerKey);
+        this.negativeHealRevs.delete(lowerKey);
         this.instantMemo.set(lowerKey, entry.appId);
         this.savePersistentCache();
         return entry.appId;
@@ -1151,11 +1303,40 @@ export class SteamMatcherService {
           .map((part) => normalizeGameTitle(part).toLowerCase())
           .filter((part) => part.length >= 3)
       : [];
+    const intermediateNumeralStripped = stripIntermediateSubtitleNumeral(cleanRaw);
+    const packagingStripped = stripPackagingEditionPhrases(cleanRaw);
+    const digitCommaStripped = DIGIT_COMMA_RE.test(cleanRaw)
+      ? cleanRaw.replace(/(\d),(\d)/g, '$1$2')
+      : null;
+    const diacriticFolded = NON_ASCII_CHAR_RE.test(cleanRaw)
+      ? foldLatinLigaturesAndDiacritics(cleanRaw)
+      : null;
 
     const searchStrategies = [
       ...(cleanHasDistinctEdition ? [cleanRaw] : []), // Preserve Remastered/Remake/Director's Cut on Pass 1
       normalized,                                     // Normalized clean title
       cleanRaw,                                       // Exact suffix-stripped title
+      ...(intermediateNumeralStripped
+        ? [
+            normalizeGameTitle(intermediateNumeralStripped).toLowerCase(),
+            intermediateNumeralStripped.toLowerCase(),
+          ]
+        : []),
+      ...(packagingStripped !== cleanRaw
+        ? [
+            normalizeGameTitle(packagingStripped).toLowerCase(),
+            packagingStripped.toLowerCase(),
+          ]
+        : []),
+      ...(digitCommaStripped
+        ? [
+            normalizeGameTitle(digitCommaStripped).toLowerCase(),
+            digitCommaStripped.toLowerCase(),
+          ]
+        : []),
+      ...(diacriticFolded && diacriticFolded !== cleanRaw
+        ? [normalizeGameTitle(diacriticFolded).toLowerCase()]
+        : []),
       strippedBase,                                   // Stripped base edition key
       normBaseKey,                                    // Normalized alphanumeric title key
       ...(camelSplit && camelSplit !== normalized ? [camelSplit] : []),

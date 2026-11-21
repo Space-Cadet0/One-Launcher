@@ -265,6 +265,97 @@ export function stripYearEditionPhrases(title: string): string {
     .trim();
 }
 
+const PAREN_RELEASE_YEAR_RE = /[\(\[]\s*(?:[^)\]]*?[,\s-])?((?:19|20)\d{2})\s*[\)\]]/g;
+
+/**
+ * Extracts a parenthesized or bracketed 4-digit disambiguation release year
+ * (e.g. "DOOM (2016)" -> 2016, "STAR WARS Battlefront II (Classic, 2005)" -> 2005,
+ * "Resident Evil 4 [2023]" -> 2023), preferring the last valid match in [1975, currentYear + 1].
+ * Strictly returns null for bare unparenthesized 4-digit title numbers ("Metro 2033 Redux",
+ * "Cyberpunk 2077", "Battlefield 2042", "SimCity 2000") and year-edition suffixes ("2026 Edition").
+ */
+export function extractParentheticalReleaseYear(title: string): number | null {
+  if (!title || typeof title !== 'string') return null;
+  const maxYear = new Date().getFullYear() + 1;
+  let found: number | null = null;
+  for (const m of title.matchAll(PAREN_RELEASE_YEAR_RE)) {
+    const yr = parseInt(m[1], 10);
+    if (yr >= 1975 && yr <= maxYear) {
+      found = yr;
+    }
+  }
+  return found;
+}
+
+const PACKAGING_EDITION_PHRASE_RE =
+  /\b(?:ea\s+play\s+edition|war\s+chest|planetary\s+pack|ultimate\s+evil\s+edition|trials\s+of\s+fear\s+edition|valhalla\s+edition|juggernaut\s+edition|maximum\s+edition|spacer['’]?s\s+choice\s+edition|20\s+year\s+celebration|(?:19|20)\d{2}\s+edition)\b/gi;
+const TRAILING_LAUNCHER_SUFFIX_RE = /\s*[-–—]\s*launcher\s*$/i;
+
+/**
+ * Strips exact multi-word SKU/packaging edition phrases and trailing store launcher suffixes
+ * without polluting single-word EDITION_TOKENS with content words ("war", "revolution", "valhalla", "evil", etc.).
+ * Returns the original title unchanged when no packaging phrase or launcher suffix matches.
+ */
+export function stripPackagingEditionPhrases(title: string): string {
+  if (!title || typeof title !== 'string') return '';
+  const workingInput = title.includes('&') ? decodeTitleHtmlEntities(title) : title;
+  let changed = false;
+  let cur = workingInput.replace(PACKAGING_EDITION_PHRASE_RE, () => {
+    changed = true;
+    return ' ';
+  });
+
+  if (TRAILING_LAUNCHER_SUFFIX_RE.test(cur)) {
+    const withoutLauncher = cur.replace(TRAILING_LAUNCHER_SUFFIX_RE, '').trim();
+    if (withoutLauncher.replace(/[^a-z0-9]/gi, '').length >= 1) {
+      cur = withoutLauncher;
+      changed = true;
+    }
+  }
+
+  if (!changed) {
+    return title;
+  }
+
+  cur = cur
+    .replace(/[\(\[]\s*[\)\]]/g, ' ')
+    .replace(/\s*[:\-–—]\s*$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return cur.replace(/[^a-z0-9]/gi, '').length >= 2 ? cur : title.trim();
+}
+
+/**
+ * Returns true ONLY when the given numeric token participates in an explicit year-edition or
+ * anniversary/season-pass phrase in `title` (e.g. "2026" in "Sea of Thieves: 2026 Edition",
+ * "20" in "20 Year Celebration", "1" in "Year 1 Edition"), never for bare title numbers
+ * ("2033" in "Metro 2033 Redux", "2077" in "Cyberpunk 2077: Ultimate Edition", "2000" in "SimCity 2000 Special Edition").
+ */
+export function isYearEditionToken(title: string, token: string): boolean {
+  if (!title || !token) return false;
+  const cleanToken = token.trim().toLowerCase();
+  if (!/^\d{1,4}(?:st|nd|rd|th)?$/.test(cleanToken)) return false;
+
+  const escaped = cleanToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (/^(?:19|20)\d{2}$/.test(cleanToken)) {
+    return new RegExp(
+      `\\b${escaped}[\\s\\-]+(?:edition|anniversary(?:[\\s\\-]+edition)?|celebration(?:[\\s\\-]+edition)?)\\b`,
+      'i'
+    ).test(title);
+  }
+
+  const numericOnly = cleanToken.replace(/(?:st|nd|rd|th)$/i, '');
+  return (
+    new RegExp(`\\byear[\\s\\-]+${numericOnly}[\\s\\-]+(?:edition|pass|bundle|pack|upgrade)\\b`, 'i').test(title) ||
+    new RegExp(
+      `\\b${numericOnly}(?:st|nd|rd|th)?[\\s\\-]*year[\\s\\-]+(?:anniversary|celebration)(?:[\\s\\-]+edition)?\\b`,
+      'i'
+    ).test(title) ||
+    new RegExp(`\\b${numericOnly}(?:st|nd|rd|th)[\\s\\-]+anniversary(?:[\\s\\-]+edition)?\\b`, 'i').test(title)
+  );
+}
+
 const MAX_TITLE_MEMO_ENTRIES = 32768;
 const normalizeTitleKeyMemo = new Map<string, string>();
 const stripEditionSuffixMemo = new Map<string, string>();
@@ -544,6 +635,225 @@ function getNormalizedSequelTokens(str: string): string[] {
   return tokens;
 }
 
+const WORD_TO_ARABIC: Record<string, string> = {
+  two: '2',
+  three: '3',
+  four: '4',
+  five: '5',
+  six: '6',
+  seven: '7',
+  eight: '8',
+  nine: '9',
+  ten: '10',
+};
+
+const GENERIC_SUBTITLE_TOKENS = new Set<string>([
+  'episode',
+  'season',
+  'chapter',
+  'online',
+  'classic',
+  'origins',
+  'legends',
+  'chronicles',
+  'reloaded',
+  'reborn',
+  'revolution',
+  'evolution',
+  'survival',
+  'multiplayer',
+  'deathmatch',
+  'campaign',
+  'mission',
+  'missions',
+  'deluxe',
+  'ultimate',
+  'remake',
+  'remaster',
+  'remastered',
+  'enhanced',
+  'definitive',
+  'edition',
+  'special',
+  'complete',
+  'anthology',
+  'collection',
+]);
+
+function toCanonicalNumericToken(token: string): string | null {
+  if (/^\d+$/.test(token)) return token;
+  if (ROMAN_TO_ARABIC[token]) return ROMAN_TO_ARABIC[token];
+  if (WORD_TO_ARABIC[token]) return WORD_TO_ARABIC[token];
+  if (token === 'i' || token === 'one') return '1';
+  if (token === 'zero') return '0';
+  return null;
+}
+
+function toSequelNumeralToken(token: string): string | null {
+  if (NUMERIC_SEQUELS.has(token)) return token;
+  if (ROMAN_TO_ARABIC[token]) return ROMAN_TO_ARABIC[token];
+  if (WORD_TO_ARABIC[token]) return WORD_TO_ARABIC[token];
+  return null;
+}
+
+function hasExplicitSubtitleDelimiter(rawTitle: string): boolean {
+  return rawTitle.includes(':') || /\s[-–—]\s/.test(rawTitle);
+}
+
+function cleanAndTokenizeForSubtitleNumeral(title: string): string[] {
+  let cleaned = stripPlatformAndDistributionNoise(title);
+  cleaned = stripYearEditionPhrases(cleaned);
+  cleaned = stripPackagingEditionPhrases(cleaned);
+  const maxYear = new Date().getFullYear() + 1;
+  cleaned = cleaned.replace(PAREN_RELEASE_YEAR_RE, (full, yrStr: string) => {
+    const yr = parseInt(yrStr, 10);
+    return yr >= 1975 && yr <= maxYear ? ' ' : full;
+  });
+  cleaned = foldLatinLigaturesAndDiacritics(cleaned)
+    .toLowerCase()
+    .replace(/['’‘ʼ`´"“”]/g, '')
+    .replace(/[•·𝄞★☆–—−‑]/g, ' ');
+  if (cleaned.includes('.')) {
+    cleaned = cleaned.replace(/\b(?:[a-z]\.){2,}[a-z]?\.?/g, (m) => m.replace(/\./g, ''));
+  }
+  return cleaned
+    .replace(/(\d),(\d)/g, '$1$2')
+    .replace(/([a-z])(\d)/g, '$1 $2')
+    .replace(/(\d)([a-z])/g, '$1 $2')
+    .replace(/[^a-z0-9]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function extractSubstantiveSubtitleTokens(tokens: string[]): string[] {
+  return tokens.filter(
+    (t) =>
+      !SEQUEL_STOP_WORDS.has(t) &&
+      !EDITION_TOKENS.has(t) &&
+      toCanonicalNumericToken(t) === null
+  );
+}
+
+/**
+ * Pure bidirectional predicate verifying whether two titles differ ONLY by a single intermediate
+ * sequel numeral (2..20 / II..XX / two..ten, never 1/I/one) sitting strictly between an identical
+ * leading franchise prefix and an identical distinctive subtitle:
+ *   "<Franchise> <N>: <Distinctive Subtitle>" <-> "<Franchise>: <Distinctive Subtitle>".
+ * Enforces exact bidirectional ordered substantive token equality (never one-directional subset inclusion)
+ * and a strict subtitle distinctiveness floor (|S_N| >= 2 OR single >=6-char non-generic token with explicit delimiters).
+ */
+export function isIntermediateNumeralSubtitleMatch(titleA: string, titleB: string): boolean {
+  if (!titleA || !titleB) return false;
+
+  const tokensA = cleanAndTokenizeForSubtitleNumeral(titleA);
+  const tokensB = cleanAndTokenizeForSubtitleNumeral(titleB);
+  if (tokensA.length < 3 && tokensB.length < 3) return false;
+
+  const seqCountsA = new Map<string, number>();
+  const seqCountsB = new Map<string, number>();
+  for (const t of tokensA) {
+    const seq = toSequelNumeralToken(t);
+    if (seq !== null) seqCountsA.set(seq, (seqCountsA.get(seq) || 0) + 1);
+  }
+  for (const t of tokensB) {
+    const seq = toSequelNumeralToken(t);
+    if (seq !== null) seqCountsB.set(seq, (seqCountsB.get(seq) || 0) + 1);
+  }
+
+  const allSeqKeys = new Set<string>([...seqCountsA.keys(), ...seqCountsB.keys()]);
+  const mismatched: string[] = [];
+  for (const k of allSeqKeys) {
+    if ((seqCountsA.get(k) || 0) !== (seqCountsB.get(k) || 0)) {
+      mismatched.push(k);
+    }
+  }
+  if (mismatched.length !== 1) return false;
+
+  const targetNum = mismatched[0];
+  const countA = seqCountsA.get(targetNum) || 0;
+  const countB = seqCountsB.get(targetNum) || 0;
+  if (!((countA === 1 && countB === 0) || (countB === 1 && countA === 0))) {
+    return false;
+  }
+
+  const numbered = countA === 1 ? tokensA : tokensB;
+  const unnumbered = countA === 1 ? tokensB : tokensA;
+
+  const numIdx = numbered.findIndex((t) => toSequelNumeralToken(t) === targetNum);
+  if (numIdx <= 0 || numIdx >= numbered.length - 1) return false;
+
+  // Verify no other mismatched numeric token exists anywhere in the pair
+  const numberedOtherNums: string[] = [];
+  for (let i = 0; i < numbered.length; i++) {
+    if (i === numIdx) continue;
+    const canon = toCanonicalNumericToken(numbered[i]);
+    if (canon !== null) numberedOtherNums.push(canon);
+  }
+  const unnumberedNums: string[] = [];
+  for (let i = 0; i < unnumbered.length; i++) {
+    const canon = toCanonicalNumericToken(unnumbered[i]);
+    if (canon !== null) unnumberedNums.push(canon);
+  }
+  if (numberedOtherNums.length !== unnumberedNums.length) return false;
+  for (let i = 0; i < numberedOtherNums.length; i++) {
+    if (numberedOtherNums[i] !== unnumberedNums[i]) return false;
+  }
+
+  const prefixN = numbered.slice(0, numIdx);
+  const subN = numbered.slice(numIdx + 1);
+  const substantivePrefix = extractSubstantiveSubtitleTokens(prefixN);
+  const substantiveSub = extractSubstantiveSubtitleTokens(subN);
+  if (substantivePrefix.length < 1 || substantiveSub.length < 1) return false;
+
+  const substantiveUnnumbered = extractSubstantiveSubtitleTokens(unnumbered);
+  if (substantiveUnnumbered.length !== substantivePrefix.length + substantiveSub.length) {
+    return false;
+  }
+  for (let i = 0; i < substantivePrefix.length; i++) {
+    if (substantiveUnnumbered[i] !== substantivePrefix[i]) return false;
+  }
+  for (let j = 0; j < substantiveSub.length; j++) {
+    if (substantiveUnnumbered[substantivePrefix.length + j] !== substantiveSub[j]) return false;
+  }
+
+  if (substantiveSub.length >= 2) {
+    return true;
+  }
+
+  return (
+    hasExplicitSubtitleDelimiter(titleA) &&
+    hasExplicitSubtitleDelimiter(titleB) &&
+    substantiveSub[0].length >= 6 &&
+    !GENERIC_SUBTITLE_TOKENS.has(substantiveSub[0])
+  );
+}
+
+const INTERMEDIATE_SUBTITLE_NUMERAL_RE =
+  /^(.+?)\s+((?:[2-9]|1[0-9]|20)|(?:xx|xix|xviii|xvii|xvi|xv|xiv|xiii|xii|xi|x|ix|viii|vii|vi|v|iv|iii|ii)|(?:two|three|four|five|six|seven|eight|nine|ten))(\s*:\s*|\s+[-–—]\s+)(.+)$/i;
+
+/**
+ * Removes an intermediate sequel numeral from "<Franchise> <2..20|II..XX>: <Distinctive Subtitle>"
+ * or "<Franchise> <2..20|II..XX> - <Distinctive Subtitle>" when the title satisfies the exact
+ * intermediate-numeral-with-distinctive-subtitle structure, returning null otherwise.
+ */
+export function stripIntermediateSubtitleNumeral(title: string): string | null {
+  if (!title || typeof title !== 'string') return null;
+  const cleaned = stripPlatformAndDistributionNoise(title).trim();
+  if (!cleaned) return null;
+
+  const match = cleaned.match(INTERMEDIATE_SUBTITLE_NUMERAL_RE);
+  if (!match) return null;
+
+  const prefix = match[1].trim();
+  const sep = match[3];
+  const subtitle = match[4].trim();
+  if (!prefix || !subtitle) return null;
+
+  const normalizedSep = sep.includes(':') ? ': ' : sep;
+  const candidate = `${prefix}${normalizedSep}${subtitle}`;
+  return isIntermediateNumeralSubtitleMatch(cleaned, candidate) ? candidate : null;
+}
+
 /**
  * Validates whether two game titles represent different numbered sequels or distinct variants.
  * Returns TRUE if there is a sequel/variant mismatch (i.e. DO NOT MATCH).
@@ -562,25 +872,8 @@ export function isSequelMismatch(query: string, candidateName: string): boolean 
       // If the number is part of an anniversary/celebration (e.g. '20 Year Celebration'), ignore
       if (num === '20' && (qTokens.includes('year') || cTokens.includes('year'))) continue;
 
-      // Check if this is an intermediate numeral before a distinctive subtitle
-      const hasNumeral = qHas ? qTokens : cTokens;
-      const noNumeral = qHas ? cTokens : qTokens;
-      const numIdx = hasNumeral.indexOf(num);
-      const afterNum = hasNumeral
-        .slice(numIdx + 1)
-        .filter((t) => !SEQUEL_STOP_WORDS.has(t) && !EDITION_TOKENS.has(t) && !NUMERIC_SEQUELS.has(t));
-
-      const hasSubtitleSyntax =
-        query.includes(':') ||
-        query.includes(' - ') ||
-        candidateName.includes(':') ||
-        candidateName.includes(' - ');
-
-      const subtitleMatches =
-        afterNum.length >= (hasSubtitleSyntax ? 1 : 2) && afterNum.every((t) => noNumeral.includes(t));
-
-      if (subtitleMatches) {
-        continue; // Permitted subtitle match (e.g. Deus Ex 2: Invisible War vs Deus Ex: Invisible War)
+      if (isIntermediateNumeralSubtitleMatch(query, candidateName)) {
+        continue; // Permitted intermediate-numeral subtitle match (e.g. Deus Ex 2: Invisible War vs Deus Ex: Invisible War)
       }
       return true;
     }

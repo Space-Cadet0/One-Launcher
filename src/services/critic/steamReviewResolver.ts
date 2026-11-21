@@ -3,9 +3,12 @@ import { classifyNetworkError, isWafOrChallengeResponse } from '../../contracts/
 import { calculateSyntheticSteamScore } from './criticUtils';
 import { steamMatcher } from '../steam/steamMatcher';
 import {
+  isIntermediateNumeralSubtitleMatch,
   isSequelMismatch,
   normalizeTitleForStoreSearch,
   normalizeTitleKey,
+  stripIntermediateSubtitleNumeral,
+  stripPackagingEditionPhrases,
 } from '../common/titleUtils';
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 import { requestScheduler, Priority } from '../network/requestScheduler';
@@ -200,16 +203,56 @@ export class SteamReviewResolver {
           normalizeTitleKey(title) ||
           title;
         const cleanNorm = normalizeTitleKey(clean);
-        const qWords = cleanNorm.split(' ').filter(Boolean);
+        const intermediateStripped = stripIntermediateSubtitleNumeral(title);
+        const packagingStripped = stripPackagingEditionPhrases(title);
+        const packagingNorm =
+          packagingStripped && packagingStripped !== title
+            ? normalizeTitleKey(packagingStripped)
+            : '';
+
+        const searchTerms: string[] = [];
+        const seenTerms = new Set<string>();
+        const pushTerm = (candidateTerm: string | null | undefined): void => {
+          const trimmed = (candidateTerm || '').trim();
+          if (!trimmed) return;
+          const lower = trimmed.toLowerCase();
+          if (seenTerms.has(lower)) return;
+          seenTerms.add(lower);
+          searchTerms.push(trimmed);
+        };
+
+        pushTerm(clean);
+        if (intermediateStripped) {
+          pushTerm(
+            normalizeTitleForStoreSearch(intermediateStripped, { stripEditions: false }) ||
+              intermediateStripped
+          );
+        }
+        if (packagingStripped && packagingStripped !== title) {
+          pushTerm(
+            normalizeTitleForStoreSearch(packagingStripped, { stripEditions: false }) ||
+              packagingStripped
+          );
+        }
+
         const searchUrls: string[] = [];
-        if (isViteBrowserDev()) {
-          searchUrls.push(`/api/steam-store/api/storesearch/?term=${encodeURIComponent(clean)}&l=english&cc=US`);
-          searchUrls.push(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(clean)}&l=english&cc=US`);
-        } else {
-          searchUrls.push(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(clean)}&l=english&cc=US`);
+        const viteDev = isViteBrowserDev();
+        for (const term of searchTerms) {
+          if (viteDev) {
+            searchUrls.push(`/api/steam-store/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`);
+            searchUrls.push(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`);
+          } else {
+            searchUrls.push(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`);
+          }
         }
 
         const stopWords = new Set(['the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'is', 'with', 'from', 'by']);
+        const queryVariants = [cleanNorm, ...(packagingNorm && packagingNorm !== cleanNorm ? [packagingNorm] : [])]
+          .filter(Boolean)
+          .map((norm) => ({
+            norm,
+            words: norm.split(' ').filter(Boolean),
+          }));
 
         for (const searchUrl of searchUrls) {
           try {
@@ -245,23 +288,43 @@ export class SteamReviewResolver {
 
               const itemNorm = normalizeTitleKey(item.name);
               const itemWords = itemNorm.split(' ').filter(Boolean);
+              const isIntermediateMatch = isIntermediateNumeralSubtitleMatch(title, item.name);
 
-              // Disjoint substantive token guard (e.g. 'Reckoning of New York' vs 'Coteries of New York')
-              const qSub = qWords.filter((w) => !/^\d+$/.test(w) && !stopWords.has(w));
-              const iSub = itemWords.filter((w) => !/^\d+$/.test(w) && !stopWords.has(w));
-              const qDisjoint = qSub.filter((w) => !itemWords.includes(w));
-              const iDisjoint = iSub.filter((w) => !qWords.includes(w));
-              if (qDisjoint.length >= 1 && iDisjoint.length >= 1) {
-                continue;
+              let candidateBaseScore = -1;
+              if (isIntermediateMatch) {
+                candidateBaseScore = 105;
+              } else {
+                for (let vIdx = 0; vIdx < queryVariants.length; vIdx++) {
+                  const variant = queryVariants[vIdx];
+                  const qWords = variant.words;
+                  const variantNorm = variant.norm;
+
+                  // Disjoint substantive token guard (e.g. 'Reckoning of New York' vs 'Coteries of New York')
+                  const qSub = qWords.filter((w) => !/^\d+$/.test(w) && !stopWords.has(w));
+                  const iSub = itemWords.filter((w) => !/^\d+$/.test(w) && !stopWords.has(w));
+                  const qDisjoint = qSub.filter((w) => !itemWords.includes(w));
+                  const iDisjoint = iSub.filter((w) => !qWords.includes(w));
+                  if (qDisjoint.length >= 1 && iDisjoint.length >= 1) {
+                    continue;
+                  }
+
+                  const matches = qWords.filter((w) => itemWords.includes(w));
+                  const ratio = qWords.length > 0 ? matches.length / qWords.length : 0;
+
+                  if (ratio >= 0.6 || (variantNorm && itemNorm.startsWith(variantNorm))) {
+                    const variantScore =
+                      ratio * 100 +
+                      (itemNorm === variantNorm ? 10 : variantNorm && itemNorm.startsWith(variantNorm) ? 5 : 0) -
+                      (vIdx > 0 ? 1 : 0);
+                    if (variantScore > candidateBaseScore) {
+                      candidateBaseScore = variantScore;
+                    }
+                  }
+                }
               }
 
-              const matches = qWords.filter((w) => itemWords.includes(w));
-              const ratio = qWords.length > 0 ? matches.length / qWords.length : 0;
-
-              if (ratio >= 0.6 || (cleanNorm && itemNorm.startsWith(cleanNorm))) {
-                let score =
-                  ratio * 100 +
-                  (itemNorm === cleanNorm ? 10 : cleanNorm && itemNorm.startsWith(cleanNorm) ? 5 : 0);
+              if (candidateBaseScore >= 0) {
+                let score = candidateBaseScore;
                 const candId = Number(item.id);
                 const candNormKey = itemNorm;
 
@@ -310,15 +373,16 @@ export class SteamReviewResolver {
       return null;
     }
 
-    // 2. Fetch live reviews summary from Steam
+    // 2. Fetch live all-time reviews summary from Steam (filter=all avoids 30-day rolling window, num_per_page=0 cuts payload >100x)
     try {
       // 2a. Try appreviews JSON endpoint
       const reviewsUrls: string[] = [];
+      const appreviewsQuery = 'json=1&filter=all&language=all&purchase_type=all&num_per_page=0';
       if (isViteBrowserDev()) {
-        reviewsUrls.push(`/api/steam-store/appreviews/${targetAppId}?json=1&purchase_type=all&language=all`);
-        reviewsUrls.push(`https://store.steampowered.com/appreviews/${targetAppId}?json=1&purchase_type=all&language=all`);
+        reviewsUrls.push(`/api/steam-store/appreviews/${targetAppId}?${appreviewsQuery}`);
+        reviewsUrls.push(`https://store.steampowered.com/appreviews/${targetAppId}?${appreviewsQuery}`);
       } else {
-        reviewsUrls.push(`https://store.steampowered.com/appreviews/${targetAppId}?json=1&purchase_type=all&language=all`);
+        reviewsUrls.push(`https://store.steampowered.com/appreviews/${targetAppId}?${appreviewsQuery}`);
       }
 
       let jsonSucceeded = false;
