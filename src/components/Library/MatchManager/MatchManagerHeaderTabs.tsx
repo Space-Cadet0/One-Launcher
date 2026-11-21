@@ -122,7 +122,7 @@ export function renderMatchManagerHeaderAndTabs(
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Filter by title, store, or ID..."
-              className="w-full pl-9 pr-8 py-1.5 rounded-md bg-[#121922] border border-steam-border text-xs text-white placeholder-slate-400 focus:outline-none focus:border-steam-accent transition-colors [&::-webkit-search-cancel-button]:hidden"
+              className="w-full pl-9 pr-8 py-1.5 rounded-md bg-[#121922] border border-steam-border text-xs text-white placeholder-slate-400 focus:outline-none focus:border-steam-accent focus-visible:ring-2 focus-visible:ring-steam-accent/60 transition-colors [&::-webkit-search-cancel-button]:hidden"
             />
             {searchQuery && (
               <button

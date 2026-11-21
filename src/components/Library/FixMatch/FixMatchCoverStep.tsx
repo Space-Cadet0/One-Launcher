@@ -88,7 +88,7 @@ export function renderFixMatchCoverStep({
               value={coverSearchTerm}
               onChange={(e) => onCoverSearchTermChange(e.target.value)}
               placeholder="Search cover art by game title across Steam, IGDB, GOG, Epic, Xbox..."
-              className="w-full pl-9 pr-8 py-1.5 rounded-md bg-[#16202d] border border-[#2a475e] text-white placeholder-slate-400 text-xs focus:outline-none focus:border-[#66c0f4] transition-colors"
+              className="w-full pl-9 pr-8 py-1.5 rounded-md bg-[#16202d] border border-[#2a475e] text-white placeholder-slate-400 text-xs focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60 transition-colors"
             />
             {coverSearchTerm && (
               <button
@@ -171,7 +171,7 @@ export function renderFixMatchCoverStep({
           </button>
         </div>
       ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 max-h-[44vh] overflow-y-auto pr-1 custom-scrollbar">
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 max-h-[44vh] overflow-y-auto pr-1">
           {combinedCovers.map((cover, idx) => {
             const isSelected = selectedCoverUrl === cover.url;
             const isXbxCover =

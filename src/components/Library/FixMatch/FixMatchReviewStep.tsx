@@ -12,6 +12,7 @@ import { SearchMatchCandidate } from '../../../contracts/override';
 import { CriticSource } from '../../../contracts/critic';
 import { ReviewCandidateOption } from '../../../services/scraper/reviewCandidateService';
 import { calculateTier, getTierColor } from '../../../services/critic/criticUtils';
+import { sanitizeAllowedStoreUri } from '../../../services/common/htmlSanitizer';
 import { openExternalStoreUrl } from './fixMatchTypes';
 import { isImeComposing } from '../../../utils/keyboardUtils';
 
@@ -120,7 +121,7 @@ export function renderFixMatchReviewStep({
             value={reviewSearchTerm}
             onChange={(e) => onReviewSearchTermChange(e.target.value)}
             placeholder="Search review scores by title across Metacritic, OpenCritic, Steam & GOG..."
-            className="w-full pl-9 pr-8 py-1.5 rounded-md bg-[#16202d] border border-[#2a475e] text-white placeholder-slate-400 text-xs focus:outline-none focus:border-[#66c0f4] transition-colors"
+            className="w-full pl-9 pr-8 py-1.5 rounded-md bg-[#16202d] border border-[#2a475e] text-white placeholder-slate-400 text-xs focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60 transition-colors"
           />
           {reviewSearchTerm && (
             <button
@@ -156,7 +157,7 @@ export function renderFixMatchReviewStep({
           </span>
         </div>
       ) : (
-        <div className="space-y-3 max-h-[45vh] overflow-y-auto pr-1 custom-scrollbar">
+        <div className="space-y-3 max-h-[45vh] overflow-y-auto pr-1">
           {/* Notice if no candidates discovered */}
           {reviewCandidates.length === 0 && (
             <div className="p-3 rounded-lg bg-[#16202d] border border-dashed border-[#2a475e] text-center text-xs text-slate-300">
@@ -271,17 +272,23 @@ export function renderFixMatchReviewStep({
                     {cand.starRatingRaw != null && (
                       <span>{`• Rating: ${cand.starRatingRaw}/5`}</span>
                     )}
-                    {cand.url && (
-                      <button
-                        type="button"
-                        onClick={(e) => openExternalStoreUrl(cand.url, e)}
-                        className="min-h-6 pointer-events-auto inline-flex items-center gap-1 px-1.5 text-[11px] text-[#66c0f4] hover:text-white hover:underline transition-colors ml-auto cursor-pointer"
-                        title="Open review page in browser"
-                      >
-                        <span>Source</span>
-                        <ExternalLink aria-hidden="true" className="w-3 h-3" />
-                      </button>
-                    )}
+                    {cand.url && (() => {
+                      const safeReviewUrl = sanitizeAllowedStoreUri(cand.url);
+                      if (!safeReviewUrl) return null;
+                      return (
+                        <a
+                          href={safeReviewUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={(e) => openExternalStoreUrl(safeReviewUrl, e)}
+                          className="min-h-6 pointer-events-auto inline-flex items-center gap-1 px-1.5 text-[11px] text-[#66c0f4] hover:text-white hover:underline transition-colors ml-auto cursor-pointer"
+                          title="Open review page in browser"
+                        >
+                          <span>Source</span>
+                          <ExternalLink aria-hidden="true" className="w-3 h-3" />
+                        </a>
+                      );
+                    })()}
                   </div>
 
                   {cand.summary && (
@@ -367,7 +374,7 @@ export function renderFixMatchReviewStep({
                           if (e.key === 'Enter' && !isImeComposing(e)) e.preventDefault();
                         }}
                         placeholder="e.g. 88"
-                        className="w-24 px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-sm text-white placeholder-slate-400 font-mono focus:outline-none focus:border-[#66c0f4]"
+                        className="w-24 px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-sm text-white placeholder-slate-400 font-mono focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60"
                       />
                       {isValidScore && liveTier && liveColors ? (
                         <div
@@ -392,7 +399,7 @@ export function renderFixMatchReviewStep({
                       id={customSourceSelectId}
                       value={customScoreSource}
                       onChange={(e) => onCustomSourceChange(e.target.value as CriticSource)}
-                      className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white focus:outline-none focus:border-[#66c0f4]"
+                      className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60"
                     >
                       <option value="metacritic">Metacritic</option>
                       <option value="opencritic">OpenCritic</option>
@@ -423,7 +430,7 @@ export function renderFixMatchReviewStep({
                         if (e.key === 'Enter' && !isImeComposing(e)) e.preventDefault();
                       }}
                       placeholder="e.g. 120"
-                      className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white placeholder-slate-400 font-mono focus:outline-none focus:border-[#66c0f4]"
+                      className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white placeholder-slate-400 font-mono focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60"
                     />
                   </div>
 
@@ -443,7 +450,7 @@ export function renderFixMatchReviewStep({
                         if (e.key === 'Enter' && !isImeComposing(e)) e.preventDefault();
                       }}
                       placeholder="https://..."
-                      className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white placeholder-slate-400 focus:outline-none focus:border-[#66c0f4]"
+                      className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white placeholder-slate-400 focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60"
                     />
                   </div>
                 </div>
@@ -464,7 +471,7 @@ export function renderFixMatchReviewStep({
                       if (e.key === 'Enter' && !isImeComposing(e)) e.preventDefault();
                     }}
                     placeholder="e.g. Universal acclaim based on critic reviews."
-                    className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white placeholder-slate-400 focus:outline-none focus:border-[#66c0f4]"
+                    className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white placeholder-slate-400 focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60"
                   />
                 </div>
               </div>

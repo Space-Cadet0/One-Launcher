@@ -13,21 +13,14 @@ import {
 import {
   LibraryFilterIndex,
   buildLibraryFilterIndex,
-  evaluateLibraryFilter,
   describeActiveFilterChips,
 } from '../../services/filter/libraryFilterIndex';
 import { VirtualGridRows } from '../Common/VirtualContainers';
-import { getReviewSourceAuthorityRank } from '../../services/critic/criticUtils';
 import { resolveGameReviewScore } from '../../services/critic/reviewScoreResolver';
 import { steamMatcher } from '../../services/steam/steamMatcher';
 import { steamApi } from '../../services/steam/steamApi';
 import { isUserActivelyScrolling } from '../../utils/scrollActivityTracker';
-import { parseTimestampMs } from '../../utils/dateUtils';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
-import {
-  igdbCoverService,
-  normalizeKey,
-} from '../../services/igdb/igdbCoverService';
 import { stripHtmlToPlainSynopsis } from '../../services/steam/fallbackMetadataProvider';
 import { GameContextMenu } from './GameContextMenu';
 import { loadUserOverrides } from '../../services/storage/userOverrideStorage';
@@ -44,9 +37,8 @@ import {
 import {
   isPlaceholderSynopsis,
   hasStoreSynopsis,
-  getReleaseYear,
-  globalAttemptedCoverLookups,
   clearAttemptedCoverLookups,
+  clearEmittedCoverSelfHealKeys,
   clearFailedCoverUrls,
   getCoverCandidates,
   GridSortOption,
@@ -57,20 +49,28 @@ import {
   loadPersistedReleaseYearOrder,
   computeResponsiveColumnCount,
 } from './Grid/gridCoverUtils';
-import {
-  getAlphabeticalTitleSortKey,
-  LIBRARY_TITLE_COLLATOR,
-  sortByTitleKey,
-} from '../../services/common/titleSortUtils';
 import { GameCardCover } from './Grid/GameCardCover';
-import { renderLibraryGridCard } from './Grid/LibraryGridCard';
+import {
+  LibraryGridCard,
+  renderLibraryGridCard,
+  resolveLibraryGridCardProps,
+} from './Grid/LibraryGridCard';
 import { renderGameHoverPopout } from './Grid/GameHoverPopout';
 import { renderLibraryGridToolbar } from './Grid/LibraryGridToolbar';
+import {
+  computeLauncherGridSignature,
+  extractOverrideResetCandidateIds,
+  sortAndFilterLibraryGridGames,
+} from './Grid/gridSortingUtils';
+import { useGridCoverLookup } from './Grid/useGridCoverLookup';
 
 export {
   GameCardCover,
+  LibraryGridCard,
+  renderLibraryGridCard,
   getCoverCandidates,
   clearAttemptedCoverLookups,
+  clearEmittedCoverSelfHealKeys,
   clearFailedCoverUrls,
   isCurrentlyFastScrolling,
   addPendingFastScrollMount,
@@ -117,11 +117,6 @@ interface LibraryGridViewProps {
   ignoreLeadingTheWhenSorting?: boolean;
 }
 
-interface IgdbCoverUpdatedDetail {
-  title?: string;
-  coverUrl?: string;
-}
-
 interface CriticUpdatedDetail {
   refreshedAll?: boolean;
   immediate?: boolean;
@@ -156,6 +151,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   isPreFiltered = false,
   ignoreLeadingTheWhenSorting,
 }) => {
+  // Ref index 0: gridContainerRef (preserved for VirtualGridRows test harness)
   const gridContainerRef = useRef<HTMLDivElement | null>(null);
 
   // State index 0: contextMenu
@@ -209,28 +205,10 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       }
     };
 
-    const getLauncherGridSignature = () => {
-      const running = launcherService
-        .getRunningGames()
-        .map((r) => `${r.gameId}:${r.platformId || ''}`)
-        .sort()
-        .join(',');
-      const installed = launcherService
-        .getInstalledRecords()
-        .map(
-          (i) => `${i.platformId}:${i.platformGameId || i.appId || ''}:${i.executablePath || ''}`
-        )
-        .sort()
-        .join(',');
-      const ignoreLeadingThe =
-        launcherService.getPerformanceSettings?.()?.ignoreLeadingTheWhenSorting ?? true;
-      return `${running}|${installed}|${ignoreLeadingThe}`;
-    };
-
-    let prevSig = getLauncherGridSignature();
+    let prevSig = computeLauncherGridSignature();
     window.addEventListener('antigravity_critic_updated', handleUpdate);
     const unsubLauncher = launcherService.subscribe(() => {
-      const nextSig = getLauncherGridSignature();
+      const nextSig = computeLauncherGridSignature();
       if (nextSig !== prevSig) {
         prevSig = nextSig;
         setCriticUpdateTick((t) => t + 1);
@@ -298,45 +276,14 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const gamesRef = useRef(games);
 
   const [dynamicBlurb, setDynamicBlurb] = useState<{ id: string; blurb: string } | null>(null);
-  const [coverOverrides, setCoverOverrides] = useState<Record<string, string | null>>({});
+  const { coverOverrides, handleNeedCoverLookup } = useGridCoverLookup(gamesRef);
 
   const [overrideVersion, setOverrideVersion] = useState(0);
   useEffect(() => {
     const handleOverrideChange = (e?: Event) => {
       const detail = (e as CustomEvent<Record<string, unknown> | undefined> | undefined)?.detail;
-      const eventType = typeof detail?.type === 'string' ? detail.type : undefined;
-      if (
-        eventType === 'confirmed-non-game' ||
-        eventType === 'confirmed-non-game-batch' ||
-        eventType === 'batch-confirmed-non-game' ||
-        eventType === 'unconfirmed-non-game'
-      ) {
-        return;
-      }
-      const candidateIds = new Set<string>();
-      const addId = (val: unknown) => {
-        if (typeof val === 'string' && val.trim()) {
-          candidateIds.add(val.trim());
-        }
-      };
-      addId(detail?.gameId);
-      addId(detail?.oldGameId);
-      const oldGameObj =
-        detail?.oldGame && typeof detail.oldGame === 'object'
-          ? (detail.oldGame as { id?: unknown; steamAppId?: unknown })
-          : undefined;
-      addId(oldGameObj?.id);
-      if (typeof oldGameObj?.steamAppId === 'number' && oldGameObj.steamAppId > 0) {
-        candidateIds.add(`steam-${oldGameObj.steamAppId}`);
-      }
-      const overrideObj =
-        detail?.override && typeof detail.override === 'object'
-          ? (detail.override as { gameId?: unknown; steamAppId?: unknown })
-          : undefined;
-      addId(overrideObj?.gameId);
-      if (typeof overrideObj?.steamAppId === 'number' && overrideObj.steamAppId > 0) {
-        candidateIds.add(`steam-${overrideObj.steamAppId}`);
-      }
+      const candidateIds = extractOverrideResetCandidateIds(detail);
+      if (candidateIds === null) return;
       if (candidateIds.size > 0) {
         for (const id of candidateIds) {
           clearFailedCoverUrls(id);
@@ -373,6 +320,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     rowHeight: 370,
   });
 
+  // LayoutEffect index 0: gridLayoutMetrics (preserved for VirtualGridRows test harness)
   useLayoutEffect(() => {
     const rootEl = gridContainerRef.current;
     if (!rootEl || typeof window === 'undefined') return undefined;
@@ -458,110 +406,6 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
   const userOverridesMap = useMemo(() => loadUserOverrides(), [games, overrideVersion]);
 
-  const handleNeedCoverLookup = useCallback((game: CanonicalGame) => {
-    if (!onlineLifecycleManager.isOnline()) {
-      const instant = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
-      if (instant) {
-        setCoverOverrides((prev) =>
-          prev[game.id] === instant ? prev : { ...prev, [game.id]: instant }
-        );
-      }
-      return;
-    }
-    const targetAppId = steamMatcher.getEffectiveSteamAppId(game);
-    const lookupKey = targetAppId ? `${game.id}:steam:${targetAppId}` : game.id;
-    if (globalAttemptedCoverLookups.has(lookupKey)) return;
-    globalAttemptedCoverLookups.add(lookupKey);
-
-    const releaseYear = getReleaseYear(game, targetAppId);
-    const isExplicitNonSteam = game.isExplicitNonSteam === true;
-
-    const triggerIgdbLookup = () => {
-      if (igdbCoverService.hasAttemptedIgdbCover(game.title, releaseYear)) {
-        const instant = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
-        if (instant) {
-          setCoverOverrides((prev) =>
-            prev[game.id] === instant ? prev : { ...prev, [game.id]: instant }
-          );
-        }
-        return;
-      }
-
-      igdbCoverService
-        .fetchIgdbCover(game.title, releaseYear, undefined, { trackInGlobalBar: false })
-        .then((resolvedCover) => {
-          if (resolvedCover) {
-            setCoverOverrides((prev) =>
-              prev[game.id] === resolvedCover ? prev : { ...prev, [game.id]: resolvedCover }
-            );
-          }
-        });
-    };
-
-    if (targetAppId && !isExplicitNonSteam) {
-      steamApi
-        .fetchStoreBrowseAssets(targetAppId)
-        .then((assets) => {
-          if (assets?.capsuleImage) {
-            setCoverOverrides((prev) =>
-              prev[game.id] === assets.capsuleImage!
-                ? prev
-                : { ...prev, [game.id]: assets.capsuleImage! }
-            );
-            return;
-          }
-          triggerIgdbLookup();
-        })
-        .catch(() => {
-          triggerIgdbLookup();
-        });
-      return;
-    }
-
-    if (!targetAppId && !isExplicitNonSteam && !steamMatcher.hasAttemptedMatch(game.title)) {
-      steamMatcher
-        .matchGameToSteam(game.title, {
-          releaseYear: game.releaseDate,
-          developers: game.developers,
-        })
-        .then((matchedId) => {
-          if (matchedId) {
-            steamApi.fetchStoreBrowseAssets(matchedId).catch(() => null);
-          }
-        })
-        .catch(() => null);
-    }
-
-    triggerIgdbLookup();
-  }, []);
-
-  useEffect(() => {
-    const handleCoverUpdate = (e: Event) => {
-      const detail = (e as CustomEvent<IgdbCoverUpdatedDetail | undefined>)?.detail;
-      const titleVal = detail?.title;
-      const coverUrl = detail?.coverUrl;
-      if (titleVal && coverUrl) {
-        setCoverOverrides((prev) => {
-          const normTitle = normalizeKey(titleVal);
-          let changed = false;
-          let next: Record<string, string | null> | null = null;
-          for (const g of gamesRef.current) {
-            if (normalizeKey(g.title) === normTitle && prev[g.id] !== coverUrl) {
-              if (!next) next = { ...prev };
-              next[g.id] = coverUrl;
-              changed = true;
-            }
-          }
-          return changed && next ? next : prev;
-        });
-      }
-    };
-    window.addEventListener('antigravity:igdb-cover-updated', handleCoverUpdate);
-    return () => {
-      window.removeEventListener('antigravity:igdb-cover-updated', handleCoverUpdate);
-    };
-  }, []);
-
   useEffect(() => {
     gamesRef.current = games;
   }, [games]);
@@ -572,6 +416,10 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   contextMenuOpenRef.current = contextMenu.isOpen;
   const onSelectGameRef = useRef(onSelectGame);
   onSelectGameRef.current = onSelectGame;
+
+  const handleSelectGame = useCallback((selected: CanonicalGame) => {
+    onSelectGameRef.current(selected);
+  }, []);
 
   const startHoverForCard = useCallback((game: CanonicalGame, cardEl: HTMLDivElement) => {
     const currentHovered = hoveredGameRef.current;
@@ -633,7 +481,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       }
     };
 
-    window.addEventListener('scroll', handleScrollOrWheel, true);
+    window.addEventListener('scroll', handleScrollOrWheel, { capture: true, passive: true });
     window.addEventListener('wheel', handleScrollOrWheel, { passive: true });
     window.addEventListener('resize', handleDismiss, { passive: true });
     window.addEventListener('blur', handleDismiss);
@@ -658,12 +506,15 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
     if (!hasStoreSynopsis(hoveredGame, targetAppId)) {
       let active = true;
-      steamApi.fetchGameMetadata(targetAppId).then((meta) => {
-        const plainBlurb = stripHtmlToPlainSynopsis(meta?.shortDescription, 280);
-        if (active && plainBlurb && !isPlaceholderSynopsis(plainBlurb, hoveredGame.title)) {
-          setDynamicBlurb({ id: hoveredGame.id, blurb: plainBlurb });
-        }
-      });
+      steamApi
+        .fetchGameMetadata(targetAppId)
+        .then((meta) => {
+          const plainBlurb = stripHtmlToPlainSynopsis(meta?.shortDescription, 280);
+          if (active && plainBlurb && !isPlaceholderSynopsis(plainBlurb, hoveredGame.title)) {
+            setDynamicBlurb({ id: hoveredGame.id, blurb: plainBlurb });
+          }
+        })
+        .catch(() => {});
       return () => {
         active = false;
       };
@@ -713,132 +564,16 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const ratingSortTick = sortBy === 'rating' ? criticUpdateTick : 0;
 
   const sortedGames = useMemo(() => {
-    const seenIds = new Set<string>();
-    const uniqueGames: CanonicalGame[] = [];
-    for (const g of games) {
-      if (!g || !g.id || seenIds.has(g.id)) continue;
-      seenIds.add(g.id);
-      uniqueGames.push(g);
-    }
-    const filteredUniqueGames = isPreFiltered
-      ? uniqueGames
-      : evaluateLibraryFilter(uniqueGames, effectiveFilterIndex, effectiveFilterState);
-
-    const compareDecoratedTitleTie = (
-      a: { game: CanonicalGame; sortKey: string; rawTitle: string },
-      b: { game: CanonicalGame; sortKey: string; rawTitle: string }
-    ): number => {
-      const keyCmp = LIBRARY_TITLE_COLLATOR.compare(a.sortKey, b.sortKey);
-      if (keyCmp !== 0) return keyCmp;
-      const rawCmp = LIBRARY_TITLE_COLLATOR.compare(a.rawTitle, b.rawTitle);
-      if (rawCmp !== 0) return rawCmp;
-      if (a.game.id !== b.game.id) return a.game.id < b.game.id ? -1 : 1;
-      return 0;
-    };
-
-    if (sortBy === 'rating') {
-      const decorated = new Array<{
-        game: CanonicalGame;
-        score: number;
-        authorityRank: number;
-        numReviews: number;
-        rec: number;
-        sortKey: string;
-        rawTitle: string;
-      }>(filteredUniqueGames.length);
-      for (let i = 0; i < filteredUniqueGames.length; i++) {
-        const g = filteredUniqueGames[i];
-        const oc = resolveGameCriticData(g);
-        const rawTitle = (g.title || '').trim();
-        decorated[i] = {
-          game: g,
-          score: oc?.score ?? -1,
-          authorityRank: getReviewSourceAuthorityRank(oc),
-          numReviews:
-            typeof oc?.numReviews === 'number' && Number.isFinite(oc.numReviews)
-              ? oc.numReviews
-              : 0,
-          rec: oc?.percentRecommended ?? -1,
-          sortKey: getAlphabeticalTitleSortKey(rawTitle, effectiveIgnoreLeadingThe),
-          rawTitle,
-        };
-      }
-      decorated.sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
-        if (b.authorityRank !== a.authorityRank) return b.authorityRank - a.authorityRank;
-        if (b.numReviews !== a.numReviews) return b.numReviews - a.numReviews;
-        if (b.rec !== a.rec) return b.rec - a.rec;
-        return compareDecoratedTitleTie(a, b);
-      });
-      return decorated.map((d) => d.game);
-    }
-
-    if (sortBy === 'playtime') {
-      const decorated = filteredUniqueGames.map((g) => {
-        const rawTitle = (g.title || '').trim();
-        return {
-          game: g,
-          playtime: g.platforms.reduce((acc, p) => acc + (p.playtimeMinutes || 0), 0),
-          sortKey: getAlphabeticalTitleSortKey(rawTitle, effectiveIgnoreLeadingThe),
-          rawTitle,
-        };
-      });
-      decorated.sort((a, b) => {
-        if (b.playtime !== a.playtime) return b.playtime - a.playtime;
-        return compareDecoratedTitleTie(a, b);
-      });
-      return decorated.map((d) => d.game);
-    }
-
-    if (sortBy === 'recent') {
-      const decorated = filteredUniqueGames.map((g) => {
-        let maxMs = 0;
-        for (const p of g.platforms) {
-          const ms = parseTimestampMs(p.lastPlayed);
-          if (ms && ms > maxMs) maxMs = ms;
-        }
-        const rawTitle = (g.title || '').trim();
-        return {
-          game: g,
-          recentMs: maxMs,
-          sortKey: getAlphabeticalTitleSortKey(rawTitle, effectiveIgnoreLeadingThe),
-          rawTitle,
-        };
-      });
-      decorated.sort((a, b) => {
-        if (b.recentMs !== a.recentMs) return b.recentMs - a.recentMs;
-        return compareDecoratedTitleTie(a, b);
-      });
-      return decorated.map((d) => d.game);
-    }
-
-    if (sortBy === 'release_year') {
-      const decorated = filteredUniqueGames.map((g) => {
-        const year =
-          effectiveFilterIndex.entriesById.get(g.id)?.releaseYear ??
-          (Number(getReleaseYear(g, steamMatcher.getEffectiveSteamAppId(g))) || null);
-        const rawTitle = (g.title || '').trim();
-        return {
-          game: g,
-          year,
-          sortKey: getAlphabeticalTitleSortKey(rawTitle, effectiveIgnoreLeadingThe),
-          rawTitle,
-        };
-      });
-      decorated.sort((a, b) => {
-        if (a.year === null && b.year !== null) return 1;
-        if (a.year !== null && b.year === null) return -1;
-        if (a.year !== null && b.year !== null && a.year !== b.year) {
-          return releaseYearOrder === 'asc' ? a.year - b.year : b.year - a.year;
-        }
-        return compareDecoratedTitleTie(a, b);
-      });
-      return decorated.map((d) => d.game);
-    }
-
-    return sortByTitleKey(filteredUniqueGames, (g) => g.title, {
-      ignoreLeadingThe: effectiveIgnoreLeadingThe,
-      getId: (g) => g.id,
+    void ratingSortTick;
+    return sortAndFilterLibraryGridGames({
+      games,
+      sortBy,
+      releaseYearOrder,
+      isPreFiltered,
+      effectiveFilterIndex,
+      effectiveFilterState,
+      effectiveIgnoreLeadingThe,
+      resolveGameCriticData,
     });
   }, [
     games,
@@ -916,10 +651,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     const gridRowClass =
       'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7 gap-4';
 
-    const renderCard = (game: CanonicalGame, idx: number, isVirtualized: boolean) =>
-      renderLibraryGridCard({
+    const renderCard = (game: CanonicalGame, idx: number, isVirtualized: boolean) => {
+      const cardProps = resolveLibraryGridCardProps({
         game,
         idx,
+        columns: gridLayoutMetrics.cols,
         isVirtualized,
         sortBy,
         userOverridesMap,
@@ -928,13 +664,15 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         effectiveFilterIndex,
         contextMenuOpenRef,
         onDismissContextMenu: handleDismissContextMenu,
-        onSelectGame: (selected) => onSelectGameRef.current(selected),
+        onSelectGame: handleSelectGame,
         onNeedCoverLookup: handleNeedCoverLookup,
         onMouseEnter: handleMouseEnter,
         onMouseLeave: handleCardMouseLeave,
         onContextMenu: handleCardContextMenu,
         resolveGameCriticData,
       });
+      return <LibraryGridCard key={game.id} {...cardProps} />;
+    };
 
     if (
       sortedGames.length > 80 &&
@@ -981,6 +719,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     criticUpdateTick,
     gridLayoutMetrics,
     handleDismissContextMenu,
+    handleSelectGame,
     handleNeedCoverLookup,
     handleMouseEnter,
     handleCardMouseLeave,
@@ -1057,7 +796,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
               <button
                 type="button"
                 onClick={onClearGroupFilter}
-                className="min-h-6 mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-steam-accent text-black font-semibold text-xs hover:brightness-110 transition-all shadow cursor-pointer"
+                className="min-h-6 mt-2 inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded bg-steam-accent text-black font-semibold text-xs hover:brightness-110 transition-all shadow cursor-pointer"
               >
                 <span>View All Games</span>
               </button>

@@ -244,7 +244,7 @@ const GameHoverPopoutContent: React.FC<RenderGameHoverPopoutArgs> = ({
         e.stopPropagation();
         onContextMenu(hoveredGame, e);
       }}
-      className="relative w-80 rounded-lg overflow-hidden bg-[#16202d] border border-steam-accent/70 shadow-[0_12px_40px_rgba(0,0,0,0.85)] pointer-events-auto cursor-pointer animate-in fade-in zoom-in-95 duration-150 text-steam-text"
+      className="relative w-80 rounded-lg overflow-hidden bg-[#16202d] border border-steam-accent/70 shadow-[0_12px_40px_rgba(0,0,0,0.85)] pointer-events-auto cursor-pointer motion-safe:transition-opacity motion-safe:duration-150 text-steam-text"
     >
       <button
         type="button"

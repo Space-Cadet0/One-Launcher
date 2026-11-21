@@ -23,6 +23,7 @@ import {
 export interface RenderLibraryGridCardArgs {
   game: CanonicalGame;
   idx: number;
+  columns?: number;
   isVirtualized?: boolean;
   sortBy: GridSortOption;
   userOverridesMap: Record<string, UserGameOverride>;
@@ -39,15 +40,86 @@ export interface RenderLibraryGridCardArgs {
   resolveGameCriticData?: (game: CanonicalGame) => OpenCriticData | null;
 }
 
-export function renderLibraryGridCard({
+export interface LibraryGridCardProps {
+  game: CanonicalGame;
+  idx: number;
+  columns?: number;
+  isVirtualized?: boolean;
+  sortBy: GridSortOption;
+  cardUserOverride?: UserGameOverride;
+  cardOverrideCover?: string | null;
+  criticData: OpenCriticData | null;
+  cardReleaseYear: string | number | null;
+  isRunning: boolean;
+  isInstalled: boolean;
+  connectedSet: Set<StorefrontId>;
+  contextMenuOpenRef: React.MutableRefObject<boolean>;
+  onDismissContextMenu: () => void;
+  onSelectGame: (game: CanonicalGame) => void;
+  onNeedCoverLookup: (game: CanonicalGame) => void;
+  onMouseEnter: (game: CanonicalGame, e: React.MouseEvent<HTMLDivElement>) => void;
+  onMouseLeave: (e: React.MouseEvent<HTMLDivElement>) => void;
+  onContextMenu: (game: CanonicalGame, e: React.MouseEvent) => void;
+  'data-game-id'?: string;
+}
+
+function areCriticScoresEqual(
+  a: OpenCriticData | null,
+  b: OpenCriticData | null
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.score === b.score &&
+    a.tier === b.tier &&
+    a.source === b.source &&
+    a.numReviews === b.numReviews &&
+    a.percentRecommended === b.percentRecommended &&
+    a.isVerified === b.isVerified &&
+    a.isSynthetic === b.isSynthetic
+  );
+}
+
+function areLibraryGridCardPropsEqual(
+  prev: LibraryGridCardProps,
+  next: LibraryGridCardProps
+): boolean {
+  return (
+    prev.game === next.game &&
+    prev.idx === next.idx &&
+    prev.columns === next.columns &&
+    prev.isVirtualized === next.isVirtualized &&
+    prev.sortBy === next.sortBy &&
+    prev.cardUserOverride === next.cardUserOverride &&
+    prev.cardOverrideCover === next.cardOverrideCover &&
+    areCriticScoresEqual(prev.criticData, next.criticData) &&
+    prev.cardReleaseYear === next.cardReleaseYear &&
+    prev.isRunning === next.isRunning &&
+    prev.isInstalled === next.isInstalled &&
+    prev.connectedSet === next.connectedSet &&
+    prev.contextMenuOpenRef === next.contextMenuOpenRef &&
+    prev.onDismissContextMenu === next.onDismissContextMenu &&
+    prev.onSelectGame === next.onSelectGame &&
+    prev.onNeedCoverLookup === next.onNeedCoverLookup &&
+    prev.onMouseEnter === next.onMouseEnter &&
+    prev.onMouseLeave === next.onMouseLeave &&
+    prev.onContextMenu === next.onContextMenu
+  );
+}
+
+function renderLibraryGridCardBody({
   game,
   idx,
+  columns = 6,
   isVirtualized = false,
   sortBy,
-  userOverridesMap,
-  coverOverrides,
+  cardUserOverride,
+  cardOverrideCover,
+  criticData: oc,
+  cardReleaseYear,
+  isRunning,
+  isInstalled,
   connectedSet,
-  effectiveFilterIndex,
   contextMenuOpenRef,
   onDismissContextMenu,
   onSelectGame,
@@ -55,15 +127,8 @@ export function renderLibraryGridCard({
   onMouseEnter,
   onMouseLeave,
   onContextMenu,
-  resolveGameCriticData,
-}: RenderLibraryGridCardArgs): React.ReactElement {
-  const isRunning = launcherService.isGameRunning(game.id);
-  const isInstalled =
-    game.platforms.some((p) => p.installed) || launcherService.isGameInstalled(game);
-  const cardUserOverride =
-    userOverridesMap[game.id] || getUserOverrideForGame(game, userOverridesMap);
-  const cardOverrideCover = cardUserOverride?.capsuleImage || coverOverrides[game.id];
-
+  includeKey,
+}: LibraryGridCardProps & { includeKey: boolean }): React.ReactElement {
   const xboxPlat = game.platforms.find((p) => p.platformId === 'xbox');
   const isXboxExpiredUnplayable = Boolean(
     xboxPlat &&
@@ -81,26 +146,19 @@ export function renderLibraryGridCard({
   const hasTopLeftBadge =
     isRunning || isInstalled || isXboxExpiredUnplayable || isXboxLeavingSoon;
 
-  const oc = resolveGameCriticData
-    ? resolveGameCriticData(game)
-    : resolveGameReviewScore(game, {
-        skipBackgroundTrigger: true,
-        userOverride: cardUserOverride,
-      });
-  const cardReleaseYear =
-    effectiveFilterIndex.entriesById.get(game.id)?.releaseYear ||
-    getReleaseYear(game, steamMatcher.getEffectiveSteamAppId(game));
   const playtimeLabel = formatPlaytime(game);
 
+  // Never apply content-visibility: auto to virtualized cards or above-the-fold cards (at minimum first row `idx < columns` and initial viewport `idx < 28`).
+  const aboveFoldThreshold = Math.max(28, columns);
   const cardContainmentClass = isVirtualized
     ? 'cv-card'
-    : idx >= 28
+    : idx >= aboveFoldThreshold
       ? 'cv-card cv-card-deferred perf-card-contain'
       : 'cv-card';
 
   return (
     <div
-      key={game.id}
+      key={includeKey ? game.id : undefined}
       data-game-id={game.id}
       onMouseEnter={(e) => onMouseEnter(game, e)}
       onMouseLeave={onMouseLeave}
@@ -267,4 +325,74 @@ export function renderLibraryGridCard({
       </div>
     </div>
   );
+}
+
+export const LibraryGridCard = React.memo<LibraryGridCardProps>(function LibraryGridCard(props) {
+  return renderLibraryGridCardBody({ ...props, includeKey: false });
+}, areLibraryGridCardPropsEqual);
+
+export function resolveLibraryGridCardProps({
+  game,
+  idx,
+  columns,
+  isVirtualized = false,
+  sortBy,
+  userOverridesMap,
+  coverOverrides,
+  connectedSet,
+  effectiveFilterIndex,
+  contextMenuOpenRef,
+  onDismissContextMenu,
+  onSelectGame,
+  onNeedCoverLookup,
+  onMouseEnter,
+  onMouseLeave,
+  onContextMenu,
+  resolveGameCriticData,
+}: RenderLibraryGridCardArgs): LibraryGridCardProps {
+  const isRunning = launcherService.isGameRunning(game.id);
+  const isInstalled =
+    game.platforms.some((p) => p.installed) || launcherService.isGameInstalled(game);
+  const cardUserOverride =
+    userOverridesMap[game.id] || getUserOverrideForGame(game, userOverridesMap);
+  const cardOverrideCover = cardUserOverride?.capsuleImage || coverOverrides[game.id];
+  const criticData = resolveGameCriticData
+    ? resolveGameCriticData(game)
+    : resolveGameReviewScore(game, {
+        skipBackgroundTrigger: true,
+        userOverride: cardUserOverride,
+      });
+  const cardReleaseYear =
+    effectiveFilterIndex.entriesById.get(game.id)?.releaseYear ||
+    getReleaseYear(game, steamMatcher.getEffectiveSteamAppId(game));
+
+  return {
+    game,
+    idx,
+    columns,
+    isVirtualized,
+    sortBy,
+    cardUserOverride,
+    cardOverrideCover,
+    criticData,
+    cardReleaseYear,
+    isRunning,
+    isInstalled,
+    connectedSet,
+    contextMenuOpenRef,
+    onDismissContextMenu,
+    onSelectGame,
+    onNeedCoverLookup,
+    onMouseEnter,
+    onMouseLeave,
+    onContextMenu,
+    'data-game-id': game.id,
+  };
+}
+
+export function renderLibraryGridCard(args: RenderLibraryGridCardArgs): React.ReactElement {
+  return renderLibraryGridCardBody({
+    ...resolveLibraryGridCardProps(args),
+    includeKey: true,
+  });
 }

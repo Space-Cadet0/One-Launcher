@@ -6,7 +6,6 @@ import {
 let unmountedImageCount = 0;
 let throttlePruneTimer: ReturnType<typeof setTimeout> | null = null;
 let idlePruneTimer1: ReturnType<typeof setTimeout> | null = null;
-let idlePruneTimer2: ReturnType<typeof setTimeout> | null = null;
 let lastPruneTimestamp = 0;
 
 export const FAST_SCROLL_CALM_MS = 75;
@@ -91,10 +90,6 @@ export function notifyImageUnmounted(): void {
 export function scheduleScrollIdleMemoryTrim(): void {
   if (typeof window === 'undefined') return;
   if (idlePruneTimer1) clearTimeout(idlePruneTimer1);
-  if (idlePruneTimer2) {
-    clearTimeout(idlePruneTimer2);
-    idlePruneTimer2 = null;
-  }
 
   // Deep-idle passive buffer trim only after 20s of complete scroll inactivity;
   // NEVER call webFrame.clearCache() or synchronous globalThis.gc() during or shortly after scrolling!

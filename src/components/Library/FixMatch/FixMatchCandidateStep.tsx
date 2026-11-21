@@ -15,6 +15,7 @@ import {
   buildCandidateStoreUrl,
   isXboxStoreCandidateId,
 } from '../../../services/scraper/metadataScraperService';
+import { sanitizeAllowedStoreUri } from '../../../services/common/htmlSanitizer';
 import { getStorefrontDisplayName } from '../../Common/StorefrontIcon';
 import {
   formatMatchPercentage,
@@ -83,7 +84,7 @@ export function renderFixMatchCandidateStep({
             value={searchTerm}
             onChange={(e) => onSearchTermChange(e.target.value)}
             placeholder="Search candidate game by title or keywords..."
-            className="w-full pl-10 pr-10 py-2 rounded-md bg-[#16202d] border border-[#2a475e] text-white placeholder-slate-400 text-sm focus:outline-none focus:border-[#66c0f4] transition-colors"
+            className="w-full pl-10 pr-10 py-2 rounded-md bg-[#16202d] border border-[#2a475e] text-white placeholder-slate-400 text-sm focus:outline-none focus:border-[#66c0f4] focus-visible:ring-2 focus-visible:ring-[#66c0f4]/60 transition-colors"
           />
           {searchTerm && (
             <button
@@ -222,7 +223,7 @@ export function renderFixMatchCandidateStep({
             </p>
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[50vh] overflow-y-auto pr-1 custom-scrollbar">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[50vh] overflow-y-auto pr-1">
             {candidates.map((cand) => {
               const isSelected = selectedCandidate?.id === cand.id;
               const isCurrentOverride = existingOverride?.matchedId === cand.id;
@@ -239,6 +240,7 @@ export function renderFixMatchCandidateStep({
                   igdbId: cand.igdbId ?? (cand.source === 'igdb' ? cand.id : undefined),
                   xboxProductId: isXboxCand ? cand.id : undefined,
                 });
+              const safeStoreUrl = storeUrl ? sanitizeAllowedStoreUri(storeUrl) : '';
 
               let sourceColor = 'bg-sky-950/80 border-sky-600/50 text-sky-200';
               if (isXboxCand) {
@@ -338,18 +340,20 @@ export function renderFixMatchCandidateStep({
                     )}
 
                     <div className="mt-2 flex items-center gap-2 flex-wrap relative z-20 pointer-events-none">
-                      {storeUrl && (
-                        <button
-                          type="button"
+                      {safeStoreUrl && (
+                        <a
+                          href={safeStoreUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
                           onClick={(e) => {
-                            openExternalStoreUrl(storeUrl, e);
+                            openExternalStoreUrl(safeStoreUrl, e);
                           }}
                           className="min-h-6 pointer-events-auto inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#131c27] hover:bg-[#2a475e] border border-[#2a475e] text-[10px] font-semibold text-[#66c0f4] hover:text-white transition-colors cursor-pointer"
                           title={`Open ${displaySource.toUpperCase()} store page for ${cand.title} in browser`}
                         >
                           <ExternalLink aria-hidden="true" className="w-2.5 h-2.5" />
                           <span>Store Page</span>
-                        </button>
+                        </a>
                       )}
 
                       {isCurrentOverride && (

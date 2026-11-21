@@ -21,6 +21,15 @@ import {
 } from '../../../services/steam/fallbackMetadataProvider';
 import { getUserOverrideForGame } from '../../../services/storage/userOverrideStorage';
 import { onlineLifecycleManager } from '../../../services/network/onlineLifecycleManager';
+import {
+  clearFailedCoverUrls as clearRegistryFailedCoverUrls,
+  clearFailedMediaUrls,
+  getFailedMediaUrlCount,
+  hasCoverUrlFailed,
+  markCoverUrlFailed,
+  MAX_FAILED_COVER_URLS,
+  subscribeFailedMediaUrlReset,
+} from '../../../services/media/failedMediaUrlRegistry';
 
 interface SteamEnrichedCacheEntry {
   shortDescription?: string;
@@ -268,7 +277,7 @@ export function hasUncheckedSteamBrowseAssets(appId: number): boolean {
   return !steamApi.getStoreBrowseAssetsInstant(appId)?.capsuleImage;
 }
 
-export const MAX_COVER_SET_ENTRIES = 8192;
+export const MAX_COVER_SET_ENTRIES = MAX_FAILED_COVER_URLS;
 
 class BoundedStringSet extends Set<string> {
   private readonly maxEntries: number;
@@ -293,11 +302,52 @@ class BoundedStringSet extends Set<string> {
   }
 }
 
+class RegistryBackedFailedCoverUrlSet extends Set<string> {
+  override get size(): number {
+    return getFailedMediaUrlCount('cover');
+  }
+
+  override has(value: string): boolean {
+    return hasCoverUrlFailed(value);
+  }
+
+  override add(value: string): this {
+    markCoverUrlFailed(value);
+    return this;
+  }
+
+  override delete(value: string): boolean {
+    if (!hasCoverUrlFailed(value)) return false;
+    clearFailedMediaUrls({ scope: 'cover', url: value });
+    return true;
+  }
+
+  override clear(): void {
+    clearRegistryFailedCoverUrls();
+  }
+}
+
 export const globalAttemptedCoverLookups: Set<string> = new BoundedStringSet(
   MAX_COVER_SET_ENTRIES
 );
-export const failedCoverUrls: Set<string> = new BoundedStringSet(MAX_COVER_SET_ENTRIES);
+export const failedCoverUrls: Set<string> = new RegistryBackedFailedCoverUrlSet();
 export const emittedCoverSelfHealKeys: Set<string> = new BoundedStringSet(MAX_COVER_SET_ENTRIES);
+
+subscribeFailedMediaUrlReset((event) => {
+  if ((event.scope !== 'cover' && event.scope !== 'all') || event.url) {
+    return;
+  }
+  if (event.gameId) {
+    globalAttemptedCoverLookups.delete(event.gameId);
+    for (const key of Array.from(globalAttemptedCoverLookups)) {
+      if (key.startsWith(`${event.gameId}:`)) {
+        globalAttemptedCoverLookups.delete(key);
+      }
+    }
+  } else {
+    globalAttemptedCoverLookups.clear();
+  }
+});
 
 export function clearAttemptedCoverLookups(): void {
   globalAttemptedCoverLookups.clear();
@@ -316,17 +366,7 @@ export function clearEmittedCoverSelfHealKeys(gameId?: string): void {
 }
 
 export function clearFailedCoverUrls(gameId?: string): void {
-  failedCoverUrls.clear();
-  if (gameId) {
-    globalAttemptedCoverLookups.delete(gameId);
-    for (const key of Array.from(globalAttemptedCoverLookups)) {
-      if (key.startsWith(`${gameId}:`)) {
-        globalAttemptedCoverLookups.delete(key);
-      }
-    }
-  } else {
-    globalAttemptedCoverLookups.clear();
-  }
+  clearRegistryFailedCoverUrls(gameId);
 }
 
 export function buildExplicitOverrideCoverUrlSet(
