@@ -887,8 +887,17 @@ describe('UAT Phase 3 Services & Hooks Remediation Suite', () => {
         ) => { success: boolean };
         saveGameDetail: (payload: Record<string, unknown>) => { success: boolean };
         getGameDetail: (gameId: string) => {
-          enrichedMetadata?: { releaseDate?: string } | null;
+          enrichedMetadata?: {
+            name?: string;
+            releaseDate?: string;
+            metadataQuality?: string;
+            appId?: number;
+          } | null;
           criticScore?: { id?: string; score?: number } | null;
+          achievements?: Record<string, unknown> | null;
+          hltb?: Record<string, unknown> | null;
+          metadataQuality?: string;
+          enrichedAt?: number;
         } | null;
         shutdown: () => void;
       }
@@ -910,6 +919,8 @@ describe('UAT Phase 3 Services & Hooks Remediation Suite', () => {
             source: 'metacritic',
             score: 78,
           },
+          achievements: { xbox: { total: 50, unlocked: 10 } },
+          hltb: { mainStoryHours: 42 },
         });
         // Saving MSFS 2020's override (pinned to xbox:9NRRJLLXM68V) MUST NOT overwrite xbox:9P38D19T7LRV's critic_json
         vault.saveUserOverride('steam-2537590', {
@@ -928,6 +939,107 @@ describe('UAT Phase 3 Services & Hooks Remediation Suite', () => {
         vault.upsertGames([msfs2020Game]);
         const detailAfterReplace = vault.getGameDetail('steam-2537590');
         expect(detailAfterReplace?.enrichedMetadata?.releaseDate).toBe('2021-07-27');
+
+        // Finding 2 regression A: Conflicting-product upsertGames with __quotaSlimmed MUST clear
+        // Product A's enriched_json to null instead of attaching Product A's blob to Product B!
+        const slimmedProductB: CanonicalGame = {
+          ...collidingHydrated2024,
+          enrichedMetadata: {
+            ...collidingHydrated2024.enrichedMetadata!,
+            __quotaSlimmed: true,
+          },
+        };
+        vault.upsertGames([slimmedProductB]);
+        const detailAfterSlimmedConflict = vault.getGameDetail('steam-2537590');
+        expect(detailAfterSlimmedConflict?.enrichedMetadata).toBeNull();
+        expect(detailAfterSlimmedConflict?.metadataQuality).toBe('skeleton_fallback');
+        expect(detailAfterSlimmedConflict?.enrichedAt).toBe(0);
+
+        // Re-seed Product A (MSFS 2020) rich storefront_native blob, then upsert Product B with
+        // non-slimmed skeleton_fallback -> MUST replace with Product B's skeleton instead of keeping Product A!
+        vault.upsertGames([msfs2020Game]);
+        expect(vault.getGameDetail('steam-2537590')?.enrichedMetadata?.releaseDate).toBe(
+          '2021-07-27'
+        );
+        const skeletonProductB: CanonicalGame = {
+          ...collidingHydrated2024,
+          enrichedMetadata: {
+            ...collidingHydrated2024.enrichedMetadata!,
+            name: 'Microsoft Flight Simulator 2024 Skeleton',
+            releaseDate: '2024-11-19',
+            metadataQuality: 'skeleton_fallback',
+          },
+        };
+        vault.upsertGames([skeletonProductB]);
+        const detailAfterSkeletonConflict = vault.getGameDetail('steam-2537590');
+        expect(detailAfterSkeletonConflict?.enrichedMetadata?.name).toBe(
+          'Microsoft Flight Simulator 2024 Skeleton'
+        );
+        expect(detailAfterSkeletonConflict?.enrichedMetadata?.releaseDate).toBe('2024-11-19');
+
+        // Finding 2 regression B: saveGameDetail with conflicting platforms MUST NOT carry forward
+        // Product B's existing achievements_json, hltb_json, critic_json, or enriched_json!
+        vault.saveGameDetail({
+          gameId: 'steam-2537590',
+          canonicalTitle: 'Microsoft Flight Simulator 2024',
+          platforms: collidingHydrated2024.platforms,
+          enrichedMetadata: {
+            ...collidingHydrated2024.enrichedMetadata!,
+            name: 'MSFS 2024 Full',
+            metadataQuality: 'storefront_native',
+          },
+          achievements: { xbox: { total: 60, unlocked: 12 } },
+          hltb: { mainStoryHours: 55 },
+          criticScore: {
+            id: 'mc-microsoft-flight-simulator-2024',
+            source: 'metacritic',
+            score: 78,
+          },
+        });
+        vault.saveGameDetail({
+          gameId: 'steam-2537590',
+          canonicalTitle: 'Microsoft Flight Simulator (2020)',
+          platforms: msfs2020Game.platforms,
+          enrichedMetadata: {
+            ...msfs2020Game.enrichedMetadata!,
+            __quotaSlimmed: true,
+          },
+        });
+        const detailAfterConflictingSaveDetail = vault.getGameDetail('steam-2537590');
+        expect(detailAfterConflictingSaveDetail?.enrichedMetadata).toBeNull();
+        expect(detailAfterConflictingSaveDetail?.achievements).toBeNull();
+        expect(detailAfterConflictingSaveDetail?.hltb).toBeNull();
+        expect(detailAfterConflictingSaveDetail?.criticScore).toBeNull();
+
+        // Obs 2 regression: saveUserOverride with explicit non-Steam override skips Steam-only rows!
+        const steamOnlyRow = makeCanonicalGame({
+          id: 'steam-999123',
+          title: 'Synthetic Steam Only Title',
+          steamAppId: 999123,
+          platforms: [{ platformId: 'steam', platformGameId: '999123', installed: false }],
+        });
+        vault.upsertGames([steamOnlyRow]);
+        vault.saveGameDetail({
+          gameId: 'steam-999123',
+          steamAppId: 999123,
+          canonicalTitle: 'Synthetic Steam Only Title',
+          criticScore: {
+            id: 'mc-steam-only-original',
+            source: 'metacritic',
+            score: 84,
+          },
+        });
+        vault.saveUserOverride('steam-999123', {
+          gameId: 'steam-999123',
+          platformId: 'xbox',
+          platformGameId: '9NRRJLLXM68V',
+          isExplicitNonSteam: true,
+          steamAppId: null,
+          reviewScoreOverride: msfs2020CriticOverride,
+        });
+        const steamOnlyAfterNonSteamOverride = vault.getGameDetail('steam-999123');
+        expect(steamOnlyAfterNonSteamOverride?.criticScore?.id).toBe('mc-steam-only-original');
+        expect(steamOnlyAfterNonSteamOverride?.criticScore?.score).toBe(84);
       } finally {
         vault.shutdown();
         fs.rmSync(tmpVaultDir, { recursive: true, force: true });
@@ -1388,7 +1500,30 @@ describe('UAT Phase 3 Services & Hooks Remediation Suite', () => {
       expect(urlsCase3.filter((u) => u.includes('/v1/catalog'))).toHaveLength(2);
       expect(warnSpy).not.toHaveBeenCalled();
 
-      // Case 4: Real server error (HTTP 500) still logs diagnostic warning
+      // Case 4: Mixed non-throwing HTTP 400 initial response + throwing HTTP 400 retry response ->
+      // strictly 1 retry (2 total /v1/catalog requests) with zero console.warn!
+      warnSpy.mockClear();
+      const urlsCase4Mixed: string[] = [];
+      vi.spyOn(axios, 'get').mockImplementation(async (url: string) => {
+        urlsCase4Mixed.push(url);
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes('/v1/catalog') && decoded.includes('query=like:Daggerfall Unity GOG Cut')) {
+          return { status: 400, data: {} };
+        }
+        if (decoded.includes('/v1/catalog')) {
+          throw Object.assign(new Error('Request failed with status code 400'), {
+            response: { status: 400 },
+          });
+        }
+        throw Object.assign(new Error('Not found'), { response: { status: 404 } });
+      });
+
+      const resCase4Mixed = await fetchGogProductMetadata('1782995089', 'Daggerfall Unity - GOG Cut');
+      expect(resCase4Mixed).toBeNull();
+      expect(urlsCase4Mixed.filter((u) => u.includes('/v1/catalog'))).toHaveLength(2);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      // Case 5: Real server error (HTTP 500) still logs diagnostic warning
       warnSpy.mockClear();
       vi.spyOn(axios, 'get').mockImplementation(async (url: string) => {
         if (url.includes('/v1/catalog')) {
@@ -1399,8 +1534,8 @@ describe('UAT Phase 3 Services & Hooks Remediation Suite', () => {
         throw Object.assign(new Error('Not found'), { response: { status: 404 } });
       });
 
-      const resCase4 = await fetchGogProductMetadata('1782995089', 'Daggerfall Unity - GOG Cut');
-      expect(resCase4).toBeNull();
+      const resCase5 = await fetchGogProductMetadata('1782995089', 'Daggerfall Unity - GOG Cut');
+      expect(resCase5).toBeNull();
       expect(warnSpy).toHaveBeenCalledTimes(1);
       expect(String(warnSpy.mock.calls[0]?.[0] || '')).toContain(
         '[Fallback Provider] GOG catalog search fallback failed'

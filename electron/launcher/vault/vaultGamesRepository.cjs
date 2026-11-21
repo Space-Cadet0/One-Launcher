@@ -32,18 +32,15 @@ const {
 } = require('./vaultMetadataLattice.cjs');
 
 /**
- * Returns true when persisted `existingEnrichedObj` came from a Steam App ID that is
- * explicitly incompatible with the incoming game/override route (explicitly unlinked
- * non-Steam game, re-matched to a different Steam App ID, or explicitly force-replaced).
+ * Returns true when persisted `existingEnrichedObj` came from a Steam App ID (`appId > 0`)
+ * that is structurally incompatible with the incoming game/override route (explicitly
+ * unlinked non-Steam game or re-matched to a different Steam App ID).
  *
  * @param {any} existingEnrichedObj
- * @param {{ isExplicitNonSteam?: boolean, steamAppId?: number | null, forceReplaceEnriched?: boolean }} ctx
+ * @param {{ isExplicitNonSteam?: boolean, steamAppId?: number | null }} ctx
  * @returns {boolean}
  */
-function isExistingVaultEnrichedInvalidated(existingEnrichedObj, ctx) {
-  if (ctx && ctx.forceReplaceEnriched === true) {
-    return true;
-  }
+function isExistingVaultSteamEnrichedInvalidated(existingEnrichedObj, ctx) {
   if (!existingEnrichedObj || typeof existingEnrichedObj !== 'object') {
     return false;
   }
@@ -638,11 +635,14 @@ function upsertGames(service, games) {
         incomingQuality = 'skeleton_fallback';
       }
 
-      const existingEnrichedInvalidated = isExistingVaultEnrichedInvalidated(existingEnrichedObj, {
-        isExplicitNonSteam: g.isExplicitNonSteam === true,
-        steamAppId,
-        forceReplaceEnriched: existingRowPlatformConflict || existingSummaryPolarityConflict,
-      });
+      const hardEnrichedInvalidated = Boolean(
+        existingRowPlatformConflict ||
+          existingSummaryPolarityConflict ||
+          isExistingVaultSteamEnrichedInvalidated(existingEnrichedObj, {
+            isExplicitNonSteam: g.isExplicitNonSteam === true,
+            steamAppId,
+          })
+      );
 
       if (
         incomingEnriched &&
@@ -652,7 +652,7 @@ function upsertGames(service, games) {
       ) {
         incomingEnriched.xboxDeliveryHints = existingEnrichedObj.xboxDeliveryHints;
       }
-      if (incomingEnriched && existingEnrichedObj && !existingEnrichedInvalidated) {
+      if (incomingEnriched && existingEnrichedObj && !hardEnrichedInvalidated) {
         carryForwardVaultRequirements(incomingEnriched, existingEnrichedObj);
         carryForwardVaultCriticAndReviewFields(incomingEnriched, existingEnrichedObj);
       }
@@ -660,6 +660,7 @@ function upsertGames(service, games) {
       const rawIncomingEnrichedJson = incomingEnriched ? JSON.stringify(incomingEnriched) : null;
 
       let keepExistingEnriched = false;
+      let clearInvalidatedEnriched = false;
       let finalQuality = incomingQuality;
       let finalEnrichedAt = rawIncomingEnrichedJson ? nowTs : 0;
 
@@ -687,22 +688,19 @@ function upsertGames(service, games) {
 
         const existingRank = METADATA_QUALITY_RANK[existingQuality] ?? 0;
         const incomingRank = METADATA_QUALITY_RANK[incomingQuality] ?? 0;
-        if (incomingIsSlimmed && existingEnrichedObj && !existingIsSlimmed) {
-          keepExistingEnriched = true;
-          finalQuality = existingQuality;
-          finalEnrichedAt = Number(existing.enriched_at || nowTs);
-        } else if (existingEnrichedInvalidated) {
-          if (rawIncomingEnrichedJson && incomingRank === 0) {
-            keepExistingEnriched = true;
-            finalQuality = existingQuality;
-            finalEnrichedAt = Number(existing.enriched_at || nowTs);
-          } else if (!rawIncomingEnrichedJson) {
-            // Explicitly unlinked / re-routed game whose mismatched Steam enrichedMetadata was wiped:
-            // clear the invalidated Steam blob in SQLite so cold boot never resurrects it.
-            keepExistingEnriched = false;
+        if (hardEnrichedInvalidated) {
+          // Structural invalidation (conflicting storefront product, explicit-non-Steam
+          // polarity flip, or mismatched/unlinked Steam App ID): NEVER retain existing.enriched_json.
+          keepExistingEnriched = false;
+          if (!rawIncomingEnrichedJson || incomingIsSlimmed) {
+            clearInvalidatedEnriched = true;
             finalQuality = 'skeleton_fallback';
             finalEnrichedAt = 0;
           }
+        } else if (incomingIsSlimmed && existingEnrichedObj && !existingIsSlimmed) {
+          keepExistingEnriched = true;
+          finalQuality = existingQuality;
+          finalEnrichedAt = Number(existing.enriched_at || nowTs);
         } else if (!rawIncomingEnrichedJson || existingRank > incomingRank) {
           keepExistingEnriched = true;
           finalQuality = existingQuality;
@@ -733,7 +731,9 @@ function upsertGames(service, games) {
           incomingTitle !== '' ? incomingTitle : String(existing.canonical_title || '');
         const effectiveEnrichedStr = keepExistingEnriched
           ? existingEnrichedStr
-          : rawIncomingEnrichedJson;
+          : clearInvalidatedEnriched
+            ? null
+            : rawIncomingEnrichedJson;
 
         isRowUnchanged =
           effectiveTitle === String(existing.canonical_title || '') &&
@@ -754,7 +754,7 @@ function upsertGames(service, games) {
         const platformsJson = rawPlatformsJson ? compressVaultJson(rawPlatformsJson) : null;
         const finalEnrichedJson = keepExistingEnriched
           ? compressVaultJson(existing.enriched_json)
-          : rawIncomingEnrichedJson
+          : !clearInvalidatedEnriched && rawIncomingEnrichedJson
             ? compressVaultJson(rawIncomingEnrichedJson)
             : null;
 
@@ -775,7 +775,11 @@ function upsertGames(service, games) {
         upserted++;
       }
 
-      const activeEnriched = keepExistingEnriched ? existingEnrichedObj : incomingEnriched;
+      const activeEnriched = keepExistingEnriched
+        ? existingEnrichedObj
+        : clearInvalidatedEnriched
+          ? null
+          : incomingEnriched;
       const coverCandidate = g.capsuleImage || activeEnriched?.capsuleImage;
       const headerCandidate = g.headerImage || activeEnriched?.headerImage;
       const iconCandidate = g.iconUrl || activeEnriched?.iconUrl;
@@ -1125,12 +1129,18 @@ function saveUserOverride(service, gameId, record = {}, extraKeys = []) {
           },
         ]
       : null;
-  const selectGamePlatformsStmt = pinnedOverridePlatformSpec
-    ? service.stmt(
-        'override.selectGamePlatformsById',
-        'SELECT platforms_json FROM vault_games WHERE game_id = ?'
-      )
-    : null;
+  const isExplicitNonSteamOverride = Boolean(
+    pinnedOverridePlatformId &&
+      pinnedOverridePlatformId !== 'steam' &&
+      (record?.isExplicitNonSteam === true || record?.steamAppId === null)
+  );
+  const selectGamePlatformsStmt =
+    pinnedOverridePlatformSpec || isExplicitNonSteamOverride
+      ? service.stmt(
+          'override.selectGamePlatformsById',
+          'SELECT platforms_json FROM vault_games WHERE game_id = ?'
+        )
+      : null;
 
   let invalidated = 0;
   db.exec('BEGIN IMMEDIATE');
@@ -1142,11 +1152,27 @@ function saveUserOverride(service, gameId, record = {}, extraKeys = []) {
       clearExactUrlCache404Stmt.run(nextHeaderNorm);
     }
     for (const cid of candidateIds) {
-      if (selectGamePlatformsStmt && pinnedOverridePlatformSpec) {
+      if (selectGamePlatformsStmt) {
         const rowMeta = selectGamePlatformsStmt.get(cid);
         if (rowMeta && rowMeta.platforms_json) {
           const rowPlatforms = parseVaultJson(rowMeta.platforms_json);
-          if (hasVaultSameStorefrontConflict(rowPlatforms, pinnedOverridePlatformSpec)) {
+          if (
+            pinnedOverridePlatformSpec &&
+            hasVaultSameStorefrontConflict(rowPlatforms, pinnedOverridePlatformSpec)
+          ) {
+            continue;
+          }
+          if (
+            isExplicitNonSteamOverride &&
+            Array.isArray(rowPlatforms) &&
+            rowPlatforms.length > 0 &&
+            rowPlatforms.every(
+              (/** @type {any} */ p) =>
+                p &&
+                typeof p === 'object' &&
+                String(p.platformId || '').trim().toLowerCase() === 'steam'
+            )
+          ) {
             continue;
           }
         }
@@ -1403,11 +1429,16 @@ function saveGameDetail(service, payload = {}) {
       typeof payload.steamAppId === 'number' && payload.steamAppId > 0
         ? payload.steamAppId
         : null;
-    const existingEnrichedInvalidated = isExistingVaultEnrichedInvalidated(existingEnrichedObj, {
-      isExplicitNonSteam: payload.isExplicitNonSteam === true,
-      steamAppId: incomingSteamAppId,
-      forceReplaceEnriched: payload.forceReplaceEnriched === true || detailPlatformConflict,
-    });
+    const hardEnrichedInvalidated = Boolean(
+      detailPlatformConflict ||
+        isExistingVaultSteamEnrichedInvalidated(existingEnrichedObj, {
+          isExplicitNonSteam: payload.isExplicitNonSteam === true,
+          steamAppId: incomingSteamAppId,
+        })
+    );
+    const forceReplaceEnrichedOnly =
+      !hardEnrichedInvalidated && payload.forceReplaceEnriched === true;
+    const existingEnrichedInvalidated = hardEnrichedInvalidated || forceReplaceEnrichedOnly;
 
     if (
       incomingEnrichedObj &&
@@ -1465,7 +1496,15 @@ function saveGameDetail(service, payload = {}) {
 
       const existingRank = METADATA_QUALITY_RANK[existingQuality] ?? 0;
       const incomingRank = METADATA_QUALITY_RANK[incomingQuality] ?? 0;
-      if (incomingIsSlimmed && existingEnrichedObj && !existingIsSlimmed) {
+      if (hardEnrichedInvalidated) {
+        // Structural invalidation (detailPlatformConflict or mismatched/unlinked Steam App ID):
+        // NEVER retain existing.enriched_json!
+        if (!incomingEnrichedJson || incomingIsSlimmed) {
+          finalEnrichedJson = null;
+          finalQuality = 'skeleton_fallback';
+          finalEnrichedAt = 0;
+        }
+      } else if (incomingIsSlimmed && existingEnrichedObj && !existingIsSlimmed) {
         finalEnrichedJson = compressVaultJson(existing.enriched_json);
         finalQuality = existingQuality;
         finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);
@@ -1473,7 +1512,7 @@ function saveGameDetail(service, payload = {}) {
         finalEnrichedJson = compressVaultJson(existing.enriched_json);
         finalQuality = existingQuality;
         finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);
-      } else if (existingEnrichedInvalidated) {
+      } else if (forceReplaceEnrichedOnly) {
         if (incomingRank === 0) {
           finalEnrichedJson = compressVaultJson(existing.enriched_json);
           finalQuality = existingQuality;
@@ -1493,13 +1532,13 @@ function saveGameDetail(service, payload = {}) {
     const finalAchievementsJson =
       payload.achievements !== undefined && payload.achievements !== null
         ? compressVaultJson(JSON.stringify(payload.achievements))
-        : existing?.achievements_json
+        : !detailPlatformConflict && existing?.achievements_json
           ? compressVaultJson(existing.achievements_json)
           : null;
     const finalHltbJson =
       payload.hltb !== undefined && payload.hltb !== null
         ? compressVaultJson(JSON.stringify(payload.hltb))
-        : existing?.hltb_json
+        : !detailPlatformConflict && existing?.hltb_json
           ? compressVaultJson(existing.hltb_json)
           : null;
     let finalCriticJson =
@@ -1531,8 +1570,10 @@ function saveGameDetail(service, payload = {}) {
           ? incomingEnrichedObj.name.trim()
           : existing?.canonical_title || '';
 
-    const steamAppId =
-      typeof payload.steamAppId === 'number' && payload.steamAppId > 0
+    const clearSteamAppId = payload.isExplicitNonSteam === true && payload.steamAppId === null;
+    const steamAppId = clearSteamAppId
+      ? null
+      : typeof payload.steamAppId === 'number' && payload.steamAppId > 0
         ? payload.steamAppId
         : existing?.steam_app_id ?? null;
 
@@ -1567,7 +1608,7 @@ function saveGameDetail(service, payload = {}) {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(game_id) DO UPDATE SET
           canonical_title = CASE WHEN excluded.canonical_title != '' THEN excluded.canonical_title ELSE vault_games.canonical_title END,
-          steam_app_id = COALESCE(excluded.steam_app_id, vault_games.steam_app_id),
+          steam_app_id = excluded.steam_app_id,
           is_installed = excluded.is_installed,
           is_favorited = excluded.is_favorited,
           archived_by_subscription_rotation = excluded.archived_by_subscription_rotation,
@@ -1596,7 +1637,7 @@ function saveGameDetail(service, payload = {}) {
         finalEnrichedJson ? finalEnrichedAt : 0
       );
 
-    if (incomingEnrichedObj) {
+    if (incomingEnrichedObj && !(hardEnrichedInvalidated && incomingIsSlimmed)) {
       const isHighPriorityDetailTier =
         isInstalled === 1 ||
         payload.promoteToP1 === true ||

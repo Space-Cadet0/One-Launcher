@@ -867,4 +867,165 @@ describe('UAT Boot Re-Sync Loop Fixes', () => {
       vault.close();
     }
   });
+
+  it('clears/replaces invalidated Steam blobs on explicit non-Steam skeleton_fallback or __quotaSlimmed upserts, clears steam_app_id on saveGameDetail, and preserves rank-0 guard for non-conflicting forceReplaceEnriched', () => {
+    const tmpDir = createTempDir('ol-boot-resync-hard-invalidation-');
+    const vault = new OfflineVaultService({ userDataDir: tmpDir, platform: 'darwin' });
+    try {
+      const gameId = 'steam-2537590';
+      const staleSteamGame: CanonicalGame = {
+        id: gameId,
+        title: 'Synthetic Unlinked Flight Sim',
+        sortTitle: 'synthetic unlinked flight sim',
+        steamAppId: 2537590,
+        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2537590/header.jpg',
+        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2537590/capsule.jpg',
+        shortDescription: 'Wrong Steam sequel description',
+        releaseDate: '2024-11-19',
+        developers: ['Steam Sequel Studio'],
+        publishers: ['Steam Sequel Pub'],
+        genres: ['Simulation'],
+        tags: ['Flight'],
+        platforms: [
+          {
+            platformId: 'xbox',
+            platformGameId: '9NRRJLLXM68V',
+            xboxProductId: '9NRRJLLXM68V',
+            installed: false,
+          },
+        ],
+        enrichedMetadata: {
+          appId: 2537590,
+          name: 'Wrong Steam Sequel',
+          shortDescription: 'Wrong Steam sequel description',
+          detailedDescription: '<p>Wrong Steam sequel detailed description with rich content exceeding threshold.</p>',
+          aboutTheGame: '<p>Wrong Steam sequel</p>',
+          headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2537590/header.jpg',
+          developers: ['Steam Sequel Studio'],
+          publishers: ['Steam Sequel Pub'],
+          releaseDate: '2024-11-19',
+          genres: ['Simulation'],
+          tags: ['Flight'],
+          categories: [],
+          supportedLanguages: 'English',
+          screenshots: [
+            {
+              id: 0,
+              pathThumbnail: 'https://shared.akamai.steamstatic.com/s1.jpg',
+              pathFull: 'https://shared.akamai.steamstatic.com/s1.jpg',
+            },
+          ],
+          movies: [],
+          systemRequirements: { minimum: 'Windows 10' },
+          reviewSummary: EMPTY_REVIEW_SUMMARY,
+          metadataQuality: 'authoritative',
+          fetchedAt: Date.now(),
+        },
+      };
+
+      // 1. Seed stale Steam authoritative blob on the row
+      vault.upsertGames([staleSteamGame]);
+      expect(vault.getGameDetail(gameId)?.enrichedMetadata?.appId).toBe(2537590);
+
+      // 2. Unlinked isExplicitNonSteam: true upsert with skeleton_fallback MUST replace the stale Steam blob!
+      const unlinkedSkeletonGame: CanonicalGame = {
+        ...staleSteamGame,
+        steamAppId: undefined,
+        isExplicitNonSteam: true,
+        enrichedMetadata: {
+          ...staleSteamGame.enrichedMetadata!,
+          appId: 0,
+          name: 'Delisted Non-Steam Skeleton',
+          shortDescription: 'Delisted title fallback synopsis',
+          screenshots: [],
+          metadataQuality: 'skeleton_fallback',
+        },
+      };
+      vault.upsertGames([unlinkedSkeletonGame]);
+      const afterUnlinkedSkeleton = vault.getGameDetail(gameId);
+      expect(afterUnlinkedSkeleton?.enrichedMetadata?.appId).toBe(0);
+      expect(afterUnlinkedSkeleton?.enrichedMetadata?.name).toBe('Delisted Non-Steam Skeleton');
+
+      // 3. Re-seed stale Steam blob, then upsert unlinked isExplicitNonSteam: true with __quotaSlimmed -> clears to null!
+      vault.upsertGames([staleSteamGame]);
+      const unlinkedSlimmedGame: CanonicalGame = {
+        ...staleSteamGame,
+        steamAppId: undefined,
+        isExplicitNonSteam: true,
+        enrichedMetadata: {
+          ...staleSteamGame.enrichedMetadata!,
+          appId: 0,
+          __quotaSlimmed: true,
+        },
+      };
+      vault.upsertGames([unlinkedSlimmedGame]);
+      const afterUnlinkedSlimmed = vault.getGameDetail(gameId);
+      expect(afterUnlinkedSlimmed?.enrichedMetadata).toBeNull();
+
+      // 4. Re-seed stale Steam blob + steam_app_id = 2537590, then call saveGameDetail with
+      // { isExplicitNonSteam: true, steamAppId: null } -> clears vault_games.steam_app_id to NULL
+      // AND clears stale Steam enriched_json!
+      vault.upsertGames([staleSteamGame]);
+      const beforeRow = vault.db
+        .prepare('SELECT steam_app_id, enriched_json FROM vault_games WHERE game_id = ?')
+        .get(gameId) as { steam_app_id: number | null; enriched_json: unknown } | undefined;
+      expect(beforeRow?.steam_app_id).toBe(2537590);
+      expect(beforeRow?.enriched_json).not.toBeNull();
+
+      vault.saveGameDetail({
+        gameId,
+        canonicalTitle: 'Synthetic Unlinked Flight Sim',
+        steamAppId: null,
+        isExplicitNonSteam: true,
+        forceReplaceEnriched: true,
+      });
+      const afterSaveDetailRow = vault.db
+        .prepare('SELECT steam_app_id, enriched_json, metadata_quality, enriched_at FROM vault_games WHERE game_id = ?')
+        .get(gameId) as
+        | {
+            steam_app_id: number | null;
+            enriched_json: unknown;
+            metadata_quality: string;
+            enriched_at: number;
+          }
+        | undefined;
+      expect(afterSaveDetailRow?.steam_app_id).toBeNull();
+      expect(afterSaveDetailRow?.enriched_json).toBeNull();
+      expect(afterSaveDetailRow?.metadata_quality).toBe('skeleton_fallback');
+      expect(afterSaveDetailRow?.enriched_at).toBe(0);
+
+      // 5. Non-conflicting forceReplaceEnriched: true (NO platform conflict, NO Steam appId conflict)
+      // still protects existing rich metadata against a rank-0 skeleton_fallback downgrade!
+      const gogGameId = 'gog-777001';
+      vault.saveGameDetail({
+        gameId: gogGameId,
+        canonicalTitle: 'Synthetic Non-Conflicting GOG Game',
+        steamAppId: null,
+        enrichedMetadata: {
+          ...staleSteamGame.enrichedMetadata!,
+          appId: 0,
+          name: 'Rich GOG Metadata',
+          metadataQuality: 'scraped',
+        },
+        metadataQuality: 'scraped',
+      });
+      vault.saveGameDetail({
+        gameId: gogGameId,
+        canonicalTitle: 'Synthetic Non-Conflicting GOG Game',
+        steamAppId: null,
+        forceReplaceEnriched: true,
+        enrichedMetadata: {
+          ...staleSteamGame.enrichedMetadata!,
+          appId: 0,
+          name: 'Empty Skeleton Downgrade',
+          screenshots: [],
+          metadataQuality: 'skeleton_fallback',
+        },
+        metadataQuality: 'skeleton_fallback',
+      });
+      expect(vault.getGameDetail(gogGameId)?.enrichedMetadata?.name).toBe('Rich GOG Metadata');
+    } finally {
+      vault.close();
+    }
+  });
 });

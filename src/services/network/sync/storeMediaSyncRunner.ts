@@ -593,6 +593,7 @@ export async function executeStoreMediaSyncJob(
                       gameId: updatedGame.id,
                       steamAppId: updatedGame.steamAppId ?? null,
                       canonicalTitle: updatedGame.title,
+                      platforms: updatedGame.platforms,
                       enrichedMetadata: mergedEnriched || refreshed,
                       metadataQuality:
                         mergedEnriched?.metadataQuality ||
@@ -644,6 +645,7 @@ export async function executeStoreMediaSyncJob(
                     gameId: stampedGame.id,
                     steamAppId: stampedGame.steamAppId ?? null,
                     canonicalTitle: stampedGame.title,
+                    platforms: stampedGame.platforms,
                     enrichedMetadata: stampedExistingMeta,
                     metadataQuality: stampedExistingMeta.metadataQuality || 'storefront_native',
                     enrichedAt: stampedExistingMeta.enrichedAt,
@@ -673,6 +675,7 @@ export async function executeStoreMediaSyncJob(
                       gameId: game.id,
                       steamAppId: effectiveHltbAppId ?? null,
                       canonicalTitle: game.title,
+                      platforms: game.platforms,
                       hltb: { ...liveHltb } as Record<string, unknown>,
                     })
                     ?.catch?.(() => {});

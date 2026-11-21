@@ -311,6 +311,7 @@ export function useGameDetailCritic({
             gameId: game.id,
             steamAppId: resolvedSteamAppId ?? null,
             canonicalTitle: game.title,
+            platforms: game.platforms,
             clearCriticScore: true,
           })
           ?.catch?.(() => {});
@@ -374,6 +375,7 @@ export function useGameDetailCritic({
           gameId: game.id,
           steamAppId: resolvedSteamAppId ?? null,
           canonicalTitle: game.title,
+          platforms: game.platforms,
           criticScore: { ...openCriticData },
           ...(isExplicitOverride ? { forceCriticScore: true } : {}),
           ...(persistableEnrichedMetadata
@@ -387,6 +389,7 @@ export function useGameDetailCritic({
   }, [
     activeReviewGame,
     game.id,
+    game.platforms,
     game.title,
     metadata,
     openCriticData,

@@ -1063,6 +1063,7 @@ function registerStorefrontCatalogIpcHandlers({
         let resolvedToken =
           (isRealSecretToken(accessToken) ? accessToken.trim() : '') ||
           (isRealSecretToken(savedEpic.access_token) ? savedEpic.access_token : '');
+        let resolvedRefreshToken = savedEpic.refresh_token || '';
         if (
           (!resolvedToken || !resolvedAccountId) &&
           !launcherEngine?.isStoreDisconnectedTombstoned?.('epic') &&
@@ -1072,6 +1073,7 @@ function registerStorefrontCatalogIpcHandlers({
             const legAuth = await launcherEngine.ensureLegendaryConfigAndAuth();
             resolvedToken = resolvedToken || legAuth?.accessToken;
             resolvedAccountId = resolvedAccountId || legAuth?.accountId;
+            resolvedRefreshToken = resolvedRefreshToken || legAuth?.refreshToken || '';
           } catch {}
         }
         const safeTargets = Array.isArray(targets)
@@ -1104,6 +1106,7 @@ function registerStorefrontCatalogIpcHandlers({
           ...(title ? { title } : {}),
           ...(safeTargets.length > 0 ? { targets: safeTargets } : {}),
           ...(forceRefresh === true ? { forceRefresh: true } : {}),
+          ...(resolvedRefreshToken ? { refreshToken: resolvedRefreshToken } : {}),
           ...(handlerOptions.userDataDir ? { userDataDir: handlerOptions.userDataDir } : {}),
         };
         const hasTargetOpts = Object.keys(targetOpts).length > 0;

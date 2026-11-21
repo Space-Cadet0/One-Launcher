@@ -209,6 +209,12 @@ function isEpicGraphqlAuthFailure(status, json) {
     if (paStatus === 401 || paStatus === 403) return true;
     if (paNode.__typename === 'ServiceError' && paStatus === 0) return true;
   }
+  const sumNode = json?.data?.PlayerProfile?.playerProfile?.achievementsSummaries;
+  if (sumNode && typeof sumNode === 'object') {
+    const sumStatus = Number(sumNode.status || 0);
+    if (sumStatus === 401 || sumStatus === 403) return true;
+    if (sumNode.__typename === 'ServiceError' && sumStatus === 0) return true;
+  }
   return false;
 }
 
@@ -1377,17 +1383,108 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
 
   try {
     const { locale } = resolveDefaultStoreLocaleAndCountry(options);
+    const vaultOpts = resolveStoreVaultOptions(options);
+    const canReadVault =
+      Object.keys(vaultOpts).length > 0 || typeof options?.fetchFn !== 'function';
+    let currentAccessToken = String(accessToken || '').trim();
+    let currentAccountId = String(accountId || '').trim();
+    let currentRefreshToken = String(options?.refreshToken || '').trim();
+    let hasAttemptedTokenRenewal = false;
+
     /** @type {Record<string, string>} */
     const headers = {
       'Content-Type': 'application/json',
       'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
     };
-    if (accessToken) {
-      headers['Authorization'] = accessToken.startsWith('bearer ')
-        ? accessToken
-        : `bearer ${accessToken}`;
-    }
+    /** @param {string} tokenStr */
+    const applyAuthHeader = (tokenStr) => {
+      const clean = String(tokenStr || '').trim();
+      if (clean) {
+        headers['Authorization'] = /^bearer\s+/i.test(clean) ? clean : `bearer ${clean}`;
+      }
+    };
+    applyAuthHeader(currentAccessToken);
     const fetchImpl = options.fetchFn || fetch;
+
+    /**
+     * Renew Epic OAuth token at most once per `fetchEpicAchievements` invocation when
+     * GraphQL fails with HTTP 401/403 or HTTP 200 `UNAUTHENTICATED` / auth `ServiceError`.
+     * Updates `headers.Authorization` and `currentAccountId` in-place so the retry runs
+     * before any zero-auth public-schema seeding.
+     *
+     * @returns {Promise<boolean>}
+     */
+    const tryRenewEpicTokenOnce = async () => {
+      if (hasAttemptedTokenRenewal) return false;
+      hasAttemptedTokenRenewal = true;
+      if (!currentRefreshToken && canReadVault) {
+        try {
+          const saved = await loadSavedTokensAsync(vaultOpts);
+          currentRefreshToken = String(saved?.epic?.refresh_token || '').trim();
+          if (!currentAccountId && saved?.epic?.account_id) {
+            currentAccountId = String(saved.epic.account_id).trim();
+          }
+        } catch {}
+      }
+      if (!currentRefreshToken) return false;
+      try {
+        const renewed = await renewEpicTokens(currentRefreshToken, {
+          ...options,
+          ...vaultOpts,
+          preferVaultRefreshToken: true,
+        });
+        const nextToken = String(renewed?.access_token || '').trim();
+        if (!nextToken) return false;
+        currentAccessToken = nextToken;
+        if (renewed?.account_id) {
+          currentAccountId = String(renewed.account_id).trim();
+        }
+        applyAuthHeader(currentAccessToken);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    /**
+     * Execute an Epic GraphQL POST and, on auth failure (`401`/`403` or HTTP `200`
+     * `UNAUTHENTICATED` / auth `ServiceError`), renew once via `renewEpicTokens` and retry.
+     *
+     * @param {string} queryStr
+     * @param {(acctId: string) => Record<string, any>} buildVariables
+     * @returns {Promise<{ ok: boolean, status: number, json: any }>}
+     */
+    const postEpicGraphqlWithRenewal = async (queryStr, buildVariables) => {
+      if (!currentAccessToken && currentRefreshToken) {
+        await tryRenewEpicTokenOnce();
+      }
+      const executeOnce = async () => {
+        const res = await fetchImpl('https://launcher.store.epicgames.com/graphql', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            query: queryStr,
+            variables: buildVariables(currentAccountId),
+          }),
+          signal: buildStoreFetchSignal(options.signal),
+        });
+        /** @type {any} */
+        let json = null;
+        try {
+          json = await res.json();
+        } catch {}
+        return { ok: res.ok, status: res.status, json };
+      };
+
+      let attempt = await executeOnce();
+      if (isEpicGraphqlAuthFailure(attempt.status, attempt.json)) {
+        const renewed = await tryRenewEpicTokenOnce();
+        if (renewed) {
+          attempt = await executeOnce();
+        }
+      }
+      return attempt;
+    };
 
     if (isSingleGameScoped && targetSandboxId) {
       const cachedProdId =
@@ -1398,9 +1495,10 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
       /**
        * @param {string} resolvedProductId
        * @param {any} [fallbackTotals]
+       * @returns {Promise<{ hit: boolean, authFailed: boolean }>}
        */
       const tryQueryByProductId = async (resolvedProductId, fallbackTotals = null) => {
-        if (!resolvedProductId) return false;
+        if (!resolvedProductId) return { hit: false, authFailed: false };
         const prodQuery = `query playerProductAchievements($epicAccountId: String!, $productId: String!) {
           PlayerProfile {
             playerProfile(epicAccountId: $epicAccountId) {
@@ -1433,28 +1531,25 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
             }
           }
         }`;
-        const prodRes = await fetchImpl('https://launcher.store.epicgames.com/graphql', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            query: prodQuery,
-            variables: {
-              epicAccountId: accountId,
-              productId: resolvedProductId,
-            },
-          }),
-          signal: buildStoreFetchSignal(options.signal),
-        });
-        if (!prodRes.ok) return false;
-        const prodJson = /** @type {any} */ (await prodRes.json());
+        const prodAttempt = await postEpicGraphqlWithRenewal(prodQuery, (acctId) => ({
+          epicAccountId: acctId,
+          productId: resolvedProductId,
+        }));
+        if (isEpicGraphqlAuthFailure(prodAttempt.status, prodAttempt.json)) {
+          return { hit: false, authFailed: true };
+        }
+        if (!prodAttempt.ok) return { hit: false, authFailed: false };
+        const prodJson = prodAttempt.json;
         const paNode = prodJson?.data?.PlayerProfile?.playerProfile?.productAchievements;
         const paData = paNode?.data;
         const isNotFoundZero = isEpicGraphqlPlayerNotFound(prodJson);
-        if (!isNotFoundZero && (!paData || paNode?.__typename === 'ServiceError')) return false;
+        if (!isNotFoundZero && (!paData || paNode?.__typename === 'ServiceError')) {
+          return { hit: false, authFailed: false };
+        }
         const totals =
           fallbackTotals || (await fetchEpicPublicAchievementSchema(targetSandboxId, options));
         const resolvedTotal = Number(totals?.totalAchievements || 0);
-        if (isNotFoundZero && resolvedTotal <= 0) return false;
+        if (isNotFoundZero && resolvedTotal <= 0) return { hit: false, authFailed: false };
         indexEpicAchievementItems([
           {
             sandboxId: paData?.sandboxId || targetSandboxId,
@@ -1467,13 +1562,13 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
             },
           },
         ]);
-        return true;
+        return { hit: true, authFailed: false };
       };
 
       if (cachedProdId) {
         try {
-          const hit = await tryQueryByProductId(cachedProdId);
-          if (hit) return achievementsMap;
+          const cachedQueryRes = await tryQueryByProductId(cachedProdId);
+          if (cachedQueryRes.hit || cachedQueryRes.authFailed) return achievementsMap;
         } catch {}
       }
 
@@ -1503,22 +1598,21 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
         }
       }`;
 
-      const singleRes = await fetchImpl('https://launcher.store.epicgames.com/graphql', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          query: singleQuery,
-          variables: {
-            epicAccountId: accountId,
-            sandboxId: targetSandboxId,
-            locale,
-          },
-        }),
-        signal: buildStoreFetchSignal(options.signal),
-      });
+      const singleAttempt = await postEpicGraphqlWithRenewal(singleQuery, (acctId) => ({
+        epicAccountId: acctId,
+        sandboxId: targetSandboxId,
+        locale,
+      }));
 
-      if (singleRes.ok) {
-        const singleJson = /** @type {any} */ (await singleRes.json());
+      if (isEpicGraphqlAuthFailure(singleAttempt.status, singleAttempt.json)) {
+        console.warn(
+          `Epic single-game achievements query returned auth failure (status ${singleAttempt.status})`
+        );
+        return achievementsMap;
+      }
+
+      if (singleAttempt.ok) {
+        const singleJson = singleAttempt.json;
         const profileNode = singleJson?.data?.PlayerProfile?.playerProfile;
         const targetedRaw = profileNode?.productAchievements?.data;
         const summaryFallbackRaw = profileNode?.achievementsSummaries?.data;
@@ -1534,16 +1628,13 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
             return achievementsMap;
           }
         }
-      } else if (singleRes.status === 401 || singleRes.status === 403) {
-        console.warn(`Epic single-game achievements query returned status ${singleRes.status}`);
-        return achievementsMap;
       }
 
       try {
         const publicSchema = await fetchEpicPublicAchievementSchema(targetSandboxId, options);
         if (publicSchema?.productId) {
-          const hit = await tryQueryByProductId(publicSchema.productId, publicSchema);
-          if (hit) return achievementsMap;
+          const prodQueryRes = await tryQueryByProductId(publicSchema.productId, publicSchema);
+          if (prodQueryRes.hit || prodQueryRes.authFailed) return achievementsMap;
         }
         if (publicSchema && Number(publicSchema.totalAchievements || 0) > 0) {
           const sbLower = targetSandboxId.toLowerCase();
@@ -1604,28 +1695,26 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
       }
     }`;
 
-    const res = await fetchImpl('https://launcher.store.epicgames.com/graphql', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        query,
-        variables: {
-          epicAccountId: accountId,
-          locale,
-        },
-      }),
-      signal: buildStoreFetchSignal(options.signal),
-    });
+    const bulkAttempt = await postEpicGraphqlWithRenewal(query, (acctId) => ({
+      epicAccountId: acctId,
+      locale,
+    }));
 
-    if (!res.ok) {
-      console.warn(`Epic achievements query returned status ${res.status}`);
+    const bulkAuthFailedUnresolved = isEpicGraphqlAuthFailure(
+      bulkAttempt.status,
+      bulkAttempt.json
+    );
+    if (!bulkAttempt.ok) {
+      console.warn(`Epic achievements query returned status ${bulkAttempt.status}`);
+    } else if (bulkAuthFailedUnresolved) {
+      console.warn('Epic achievements query returned GraphQL auth failure');
     } else {
-      const json = /** @type {any} */ (await res.json());
-      const dataList = json?.data?.PlayerProfile?.playerProfile?.achievementsSummaries?.data || [];
+      const dataList =
+        bulkAttempt.json?.data?.PlayerProfile?.playerProfile?.achievementsSummaries?.data || [];
       indexEpicAchievementItems(dataList);
     }
 
-    if (!isSingleGameScoped && bulkTargets.length > 0) {
+    if (!isSingleGameScoped && bulkTargets.length > 0 && !bulkAuthFailedUnresolved) {
       await enrichEpicPublicAchievementSummaries(bulkTargets, achievementsMap, {
         ...options,
         sandboxMetaLookup,

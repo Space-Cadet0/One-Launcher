@@ -454,6 +454,7 @@ export function useGameDetailMetadata({
                 gameId: game.id,
                 steamAppId: steamIdToSave ?? game.steamAppId ?? null,
                 canonicalTitle: game.title,
+                platforms: game.platforms,
                 enrichedMetadata: enrichedForVault,
                 ...(isExplicitNonSteamDetail
                   ? { isExplicitNonSteam: true, forceReplaceEnriched: true }

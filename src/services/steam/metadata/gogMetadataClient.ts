@@ -438,39 +438,40 @@ export async function fetchGogProductMetadata(
           return { product: matched, status: catRes?.status ?? 200 };
         };
 
+        let shouldRetryOn400 = false;
         try {
           const initialResult = await runCatalogLikeQuery(sanitizedCatalogQuery);
           catProd = initialResult.product;
           if (!catProd && initialResult.status === 400) {
-            const retryQuery = deriveGogCatalogRetryQuery(sanitizedCatalogQuery, lookupTitle);
-            if (retryQuery) {
-              const retryResult = await runCatalogLikeQuery(retryQuery);
-              catProd = retryResult.product;
-            }
+            shouldRetryOn400 = true;
           }
         } catch (catErr: unknown) {
           const status = extractGogHttpStatusCode(catErr);
           if (status === 400) {
-            const retryQuery = deriveGogCatalogRetryQuery(sanitizedCatalogQuery, lookupTitle);
-            if (retryQuery) {
-              try {
-                const retryResult = await runCatalogLikeQuery(retryQuery);
-                catProd = retryResult.product;
-              } catch (retryErr: unknown) {
-                const retryStatus = extractGogHttpStatusCode(retryErr);
-                if (!isBenignGogCatalogMissStatus(retryStatus)) {
-                  console.warn(
-                    `[Fallback Provider] GOG catalog search fallback failed for ${lookupTitle}:`,
-                    getErrorMessage(retryErr)
-                  );
-                }
-              }
-            }
+            shouldRetryOn400 = true;
           } else if (!isBenignGogCatalogMissStatus(status)) {
             console.warn(
               `[Fallback Provider] GOG catalog search fallback failed for ${lookupTitle}:`,
               getErrorMessage(catErr)
             );
+          }
+        }
+
+        if (!catProd && shouldRetryOn400) {
+          const retryQuery = deriveGogCatalogRetryQuery(sanitizedCatalogQuery, lookupTitle);
+          if (retryQuery) {
+            try {
+              const retryResult = await runCatalogLikeQuery(retryQuery);
+              catProd = retryResult.product;
+            } catch (retryErr: unknown) {
+              const retryStatus = extractGogHttpStatusCode(retryErr);
+              if (!isBenignGogCatalogMissStatus(retryStatus)) {
+                console.warn(
+                  `[Fallback Provider] GOG catalog search fallback failed for ${lookupTitle}:`,
+                  getErrorMessage(retryErr)
+                );
+              }
+            }
           }
         }
       }

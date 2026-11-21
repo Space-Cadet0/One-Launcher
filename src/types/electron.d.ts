@@ -287,6 +287,7 @@ export interface OfflineVaultBridge {
     payload: OfflineVaultGameDetail & {
       canonicalTitle?: string;
       steamAppId?: number | null;
+      platforms?: GamePlatformOwnership[];
       isExplicitNonSteam?: boolean;
       forceReplaceEnriched?: boolean;
       forceCriticScore?: boolean;

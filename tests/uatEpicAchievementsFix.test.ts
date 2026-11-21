@@ -929,4 +929,373 @@ describe('UAT Epic Games Achievements Fix — 0-Earned Trophies, Public Schema E
       'does not have Epic Achievements configured by the publisher'
     );
   });
+
+  it('renews expired Epic OAuth tokens on HTTP 401 and HTTP 200 UNAUTHENTICATED before public-schema enrichment in bulk & single-game fetchEpicAchievements and forwards refreshToken from IPC', async () => {
+    const userDataDir = makeTempDir('uat-epic-token-renew-');
+    const emptyLegDir = makeTempDir('uat-epic-token-renew-leg-');
+
+    const targets = [
+      { sandboxId: 'sb_played_live', appName: 'SynPlayedApp', title: 'Synthetic Played Title' },
+      { sandboxId: 'sb_unplayed_pub', appName: 'SynUnplayedApp', title: 'Synthetic Unplayed Title' },
+    ];
+
+    // 1. Bulk path: HTTP 401 on expired token -> renews once via oauth/token -> retries GraphQL ->
+    // returns live 59/88 alongside 0/49 public-schema enrichment for unplayed title!
+    let bulk401RenewCalls = 0;
+    let bulk401GqlCalls = 0;
+    const bulk401Fetch = vi.fn(
+      async (rawUrl: string, init?: { headers?: Record<string, string>; body?: string }) => {
+        const url = String(rawUrl);
+        if (url.includes('/account/api/oauth/token')) {
+          bulk401RenewCalls += 1;
+          expect(String(init?.body || '')).toContain('refresh_token=syn_rt_bulk_401');
+          return makeMockJsonResponse({
+            access_token: 'syn_fresh_tok_bulk_401',
+            refresh_token: 'syn_rt_bulk_401_next',
+            account_id: 'acct_renewed_401',
+          });
+        }
+        if (url === 'https://launcher.store.epicgames.com/graphql') {
+          bulk401GqlCalls += 1;
+          const authHeader = String(init?.headers?.Authorization || '');
+          const parsedBody = JSON.parse(String(init?.body || '{}')) as {
+            variables?: { epicAccountId?: string };
+          };
+          if (authHeader.includes('syn_expired_tok_401')) {
+            return makeMockJsonResponse({ error: 'invalid_token' }, 401);
+          }
+          expect(authHeader).toBe('bearer syn_fresh_tok_bulk_401');
+          expect(parsedBody.variables?.epicAccountId).toBe('acct_renewed_401');
+          return makeMockJsonResponse({
+            data: {
+              PlayerProfile: {
+                playerProfile: {
+                  achievementsSummaries: {
+                    data: [
+                      {
+                        totalUnlocked: 59,
+                        totalXP: 830,
+                        sandboxId: 'sb_played_live',
+                        product: { name: 'Synthetic Played Title', slug: 'synthetic-played-title' },
+                        productAchievements: { totalAchievements: 88, totalProductXP: 1360 },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          });
+        }
+        if (url.includes('/product/sb_unplayed_pub/locale/')) {
+          return makeMockJsonResponse({
+            productId: 'prod_unplayed_pub',
+            sandboxId: 'sb_unplayed_pub',
+            totalAchievements: 49,
+            totalProductXP: 1000,
+            achievements: [{ achievement: { name: 'ACH_PUB_1', XP: 1000 } }],
+          });
+        }
+        return makeMockJsonResponse({}, 404);
+      }
+    );
+
+    const bulk401Map = await storeSync.fetchEpicAchievements(
+      'syn_expired_tok_401',
+      'acct_stale_401',
+      {
+        targets,
+        refreshToken: 'syn_rt_bulk_401',
+        userDataDir,
+        legendaryBaseDirs: [emptyLegDir],
+        fetchFn: bulk401Fetch,
+      }
+    );
+
+    expect(bulk401RenewCalls).toBe(1);
+    expect(bulk401GqlCalls).toBe(2);
+    expect(bulk401Map['sb_played_live']).toMatchObject({
+      unlocked: 59,
+      total: 88,
+      source: 'live_cloud_graphql',
+    });
+    expect(bulk401Map['sb_unplayed_pub']).toMatchObject({
+      unlocked: 0,
+      total: 49,
+      source: 'local_client_cache',
+    });
+
+    // 2. Bulk path: HTTP 200 GraphQL UNAUTHENTICATED -> renews once -> retries GraphQL ->
+    // returns live 12/30 alongside 0/49 unplayed schema!
+    const userDataDir2 = makeTempDir('uat-epic-token-renew-gql200-');
+    let bulk200RenewCalls = 0;
+    let bulk200GqlCalls = 0;
+    const bulk200Fetch = vi.fn(
+      async (rawUrl: string, init?: { headers?: Record<string, string> }) => {
+        const url = String(rawUrl);
+        if (url.includes('/account/api/oauth/token')) {
+          bulk200RenewCalls += 1;
+          return makeMockJsonResponse({
+            access_token: 'syn_fresh_tok_bulk_200',
+            refresh_token: 'syn_rt_bulk_200_next',
+            account_id: 'acct_renewed_200',
+          });
+        }
+        if (url === 'https://launcher.store.epicgames.com/graphql') {
+          bulk200GqlCalls += 1;
+          const authHeader = String(init?.headers?.Authorization || '');
+          if (authHeader.includes('syn_expired_tok_200')) {
+            return makeMockJsonResponse({
+              errors: [
+                {
+                  message: 'Token verification failed',
+                  extensions: { code: 'UNAUTHENTICATED' },
+                },
+              ],
+              data: { PlayerProfile: { playerProfile: null } },
+            });
+          }
+          expect(authHeader).toBe('bearer syn_fresh_tok_bulk_200');
+          return makeMockJsonResponse({
+            data: {
+              PlayerProfile: {
+                playerProfile: {
+                  achievementsSummaries: {
+                    data: [
+                      {
+                        totalUnlocked: 12,
+                        totalXP: 320,
+                        sandboxId: 'sb_played_live',
+                        product: { name: 'Synthetic Played Title', slug: 'synthetic-played-title' },
+                        productAchievements: { totalAchievements: 30, totalProductXP: 1000 },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          });
+        }
+        if (url.includes('/product/sb_unplayed_pub/locale/')) {
+          return makeMockJsonResponse({
+            productId: 'prod_unplayed_pub',
+            sandboxId: 'sb_unplayed_pub',
+            totalAchievements: 49,
+            totalProductXP: 1000,
+            achievements: [{ achievement: { name: 'ACH_PUB_1', XP: 1000 } }],
+          });
+        }
+        return makeMockJsonResponse({}, 404);
+      }
+    );
+
+    const bulk200Map = await storeSync.fetchEpicAchievements(
+      'syn_expired_tok_200',
+      'acct_stale_200',
+      {
+        targets,
+        refreshToken: 'syn_rt_bulk_200',
+        userDataDir: userDataDir2,
+        legendaryBaseDirs: [emptyLegDir],
+        fetchFn: bulk200Fetch,
+      }
+    );
+
+    expect(bulk200RenewCalls).toBe(1);
+    expect(bulk200GqlCalls).toBe(2);
+    expect(bulk200Map['sb_played_live']).toMatchObject({
+      unlocked: 12,
+      total: 30,
+      source: 'live_cloud_graphql',
+    });
+    expect(bulk200Map['sb_unplayed_pub']).toMatchObject({
+      unlocked: 0,
+      total: 49,
+      source: 'local_client_cache',
+    });
+
+    // 3. Single-game scoped path: singleQuery returns HTTP 401 -> renews once -> returns live 15/40
+    const userDataDir3 = makeTempDir('uat-epic-single-401-');
+    let single401RenewCalls = 0;
+    const single401Fetch = vi.fn(
+      async (rawUrl: string, init?: { headers?: Record<string, string> }) => {
+        const url = String(rawUrl);
+        if (url.includes('/account/api/oauth/token')) {
+          single401RenewCalls += 1;
+          return makeMockJsonResponse({
+            access_token: 'syn_fresh_single_401',
+            refresh_token: 'syn_rt_single_401_next',
+            account_id: 'acct_single_401',
+          });
+        }
+        if (url === 'https://launcher.store.epicgames.com/graphql') {
+          const authHeader = String(init?.headers?.Authorization || '');
+          if (authHeader.includes('syn_expired_single_401')) {
+            return makeMockJsonResponse({ error: 'unauthorized' }, 401);
+          }
+          expect(authHeader).toBe('bearer syn_fresh_single_401');
+          return makeMockJsonResponse({
+            data: {
+              PlayerProfile: {
+                playerProfile: {
+                  productAchievements: {
+                    data: {
+                      totalUnlocked: 15,
+                      totalXP: 450,
+                      sandboxId: 'sb_single_401',
+                      product: { name: 'Synthetic Single 401', slug: 'synthetic-single-401' },
+                      productAchievements: { totalAchievements: 40, totalProductXP: 1000 },
+                    },
+                  },
+                },
+              },
+            },
+          });
+        }
+        return makeMockJsonResponse({}, 404);
+      }
+    );
+
+    const single401Map = await storeSync.fetchEpicAchievements(
+      'syn_expired_single_401',
+      'acct_stale_single',
+      {
+        sandboxId: 'sb_single_401',
+        appName: 'SynSingle401App',
+        refreshToken: 'syn_rt_single_401',
+        userDataDir: userDataDir3,
+        legendaryBaseDirs: [emptyLegDir],
+        fetchFn: single401Fetch,
+      }
+    );
+    expect(single401RenewCalls).toBe(1);
+    expect(single401Map['sb_single_401']).toMatchObject({
+      unlocked: 15,
+      total: 40,
+      source: 'live_cloud_graphql',
+    });
+
+    // 4. Single-game tryQueryByProductId path: singleQuery returns empty {}, then prodQuery returns
+    // HTTP 200 UNAUTHENTICATED -> renews once -> retries prodQuery -> returns live 7/49 instead of 0/49!
+    const userDataDir4 = makeTempDir('uat-epic-single-prod-200-');
+    let singleProdRenewCalls = 0;
+    const singleProdFetch = vi.fn(
+      async (rawUrl: string, init?: { headers?: Record<string, string>; body?: string }) => {
+        const url = String(rawUrl);
+        if (url.includes('/account/api/oauth/token')) {
+          singleProdRenewCalls += 1;
+          return makeMockJsonResponse({
+            access_token: 'syn_fresh_prod_200',
+            refresh_token: 'syn_rt_prod_200_next',
+            account_id: 'acct_prod_200',
+          });
+        }
+        if (url.includes('/product/sb_single_prod/locale/')) {
+          return makeMockJsonResponse({
+            productId: 'prod_single_200',
+            sandboxId: 'sb_single_prod',
+            totalAchievements: 49,
+            totalProductXP: 1000,
+            achievements: [{ achievement: { name: 'ACH_1', XP: 1000 } }],
+          });
+        }
+        if (url === 'https://launcher.store.epicgames.com/graphql') {
+          const authHeader = String(init?.headers?.Authorization || '');
+          const parsedBody = JSON.parse(String(init?.body || '{}')) as { query?: string };
+          if (parsedBody.query?.includes('productAchievements(sandboxId: $sandboxId)')) {
+            return makeMockJsonResponse({
+              data: { PlayerProfile: { playerProfile: { productAchievements: {} } } },
+            });
+          }
+          if (parsedBody.query?.includes('productAchievements(productId: $productId)')) {
+            if (authHeader.includes('syn_expired_prod_200')) {
+              return makeMockJsonResponse({
+                errors: [{ message: 'Expired', extensions: { code: 'UNAUTHENTICATED' } }],
+              });
+            }
+            expect(authHeader).toBe('bearer syn_fresh_prod_200');
+            return makeMockJsonResponse({
+              data: {
+                PlayerProfile: {
+                  playerProfile: {
+                    productAchievements: {
+                      __typename: 'PlayerProductAchievementsResponseSuccess',
+                      data: {
+                        sandboxId: 'sb_single_prod',
+                        epicAccountId: 'acct_prod_200',
+                        totalUnlocked: 7,
+                        totalXP: 250,
+                        playerAchievements: [],
+                      },
+                    },
+                  },
+                },
+              },
+            });
+          }
+        }
+        return makeMockJsonResponse({}, 404);
+      }
+    );
+
+    const singleProdMap = await storeSync.fetchEpicAchievements(
+      'syn_expired_prod_200',
+      'acct_stale_prod',
+      {
+        sandboxId: 'sb_single_prod',
+        appName: 'SynSingleProdApp',
+        refreshToken: 'syn_rt_prod_200',
+        userDataDir: userDataDir4,
+        legendaryBaseDirs: [emptyLegDir],
+        fetchFn: singleProdFetch,
+      }
+    );
+    expect(singleProdRenewCalls).toBe(1);
+    expect(singleProdMap['sb_single_prod']).toMatchObject({
+      unlocked: 7,
+      total: 49,
+      source: 'live_cloud_graphql',
+    });
+
+    // 5. IPC handler epic:fetch-achievements forwards savedEpic.refresh_token inside targetOpts
+    type IpcHandler = (event: unknown, payload?: unknown) => Promise<unknown>;
+    const ipcHandlers = new Map<string, IpcHandler>();
+    const ipcFetchSpy = vi.fn(async () => ({
+      sb_played_live: { unlocked: 59, total: 88, percentage: 67 },
+    }));
+    registerStoreSyncIpcHandlers({
+      ipcMain: {
+        handle: (ch: string, fn: IpcHandler) => ipcHandlers.set(ch, fn),
+        on: vi.fn(),
+        removeListener: vi.fn(),
+      },
+      BrowserWindow: vi.fn(),
+      session: {},
+      getMainWindow: () => null,
+      storeSync: {
+        loadSavedTokens: () => ({
+          epic: {
+            access_token: 'syn_ipc_expired_tok',
+            refresh_token: 'syn_ipc_vault_rt',
+            account_id: '00000000000000000000000000000042',
+          },
+        }),
+        fetchEpicAchievements: ipcFetchSpy,
+      },
+      launcherEngine: {},
+      options: { userDataDir },
+    });
+
+    const ipcHandler = ipcHandlers.get('epic:fetch-achievements');
+    expect(ipcHandler).toBeDefined();
+    await ipcHandler!({}, { targets, forceRefresh: true });
+    expect(ipcFetchSpy).toHaveBeenCalledWith(
+      'syn_ipc_expired_tok',
+      '00000000000000000000000000000042',
+      expect.objectContaining({
+        refreshToken: 'syn_ipc_vault_rt',
+        forceRefresh: true,
+        userDataDir,
+      })
+    );
+  });
 });

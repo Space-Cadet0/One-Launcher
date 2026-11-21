@@ -404,6 +404,7 @@ export async function executeCriticScoreSyncJob(
                     gameId: game.id,
                     steamAppId: targetSteamId ?? game.steamAppId ?? null,
                     canonicalTitle: game.title,
+                    platforms: game.platforms,
                     criticScore: { ...resolvedScore } as Record<string, unknown>,
                   })
                   ?.catch?.(() => {});
