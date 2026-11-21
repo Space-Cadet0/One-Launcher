@@ -284,7 +284,12 @@ export interface OfflineVaultBridge {
   ) => Promise<{ success: boolean; isPausedForModal?: boolean }>;
   getGameDetail: (gameId: string) => Promise<OfflineVaultGameDetail | null>;
   saveGameDetail: (
-    payload: OfflineVaultGameDetail & { canonicalTitle?: string; steamAppId?: number | null }
+    payload: OfflineVaultGameDetail & {
+      canonicalTitle?: string;
+      steamAppId?: number | null;
+      forceCriticScore?: boolean;
+      clearCriticScore?: boolean;
+    }
   ) => Promise<{ success: boolean; error?: string }>;
   resolveLocalMetadata: (payload: {
     gameId?: string;

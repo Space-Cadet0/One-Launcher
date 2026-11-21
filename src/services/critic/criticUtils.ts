@@ -142,18 +142,58 @@ export interface ReviewSourceDisplayMeta {
   ariaLabel: string;
 }
 
+const VALID_CRITIC_SOURCES: ReadonlySet<CriticSource> = new Set([
+  'opencritic',
+  'metacritic',
+  'metacritic_user',
+  'steam',
+  'gog',
+  'epic',
+  'xbox',
+  'custom',
+]);
+
+const VALID_CRITIC_TIERS: ReadonlySet<CriticTier> = new Set([
+  'Mighty',
+  'Strong',
+  'Fair',
+  'Weak',
+]);
+
 function isXboxStoreHostUrl(url?: string): boolean {
-  if (!url) return false;
+  if (!url || typeof url !== 'string') return false;
   try {
-    const host = new URL(url).hostname.toLowerCase();
+    const host = new URL(url.trim()).hostname.toLowerCase();
     return host === 'xbox.com' || host.endsWith('.xbox.com');
   } catch {
     return false;
   }
 }
 
+function isOpenCriticHostUrl(url?: string): boolean {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const host = new URL(url.trim()).hostname.toLowerCase();
+    return host === 'opencritic.com' || host.endsWith('.opencritic.com');
+  } catch {
+    return false;
+  }
+}
+
+function isMetacriticHostUrl(url?: string): boolean {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const host = new URL(url.trim()).hostname.toLowerCase();
+    return host === 'metacritic.com' || host.endsWith('.metacritic.com');
+  } catch {
+    return false;
+  }
+}
+
 function resolveCanonicalCriticSource(score: CriticScoreData): CriticSource {
-  switch (score.source) {
+  const rawSource =
+    typeof score.source === 'string' ? score.source.trim().toLowerCase() : '';
+  switch (rawSource) {
     case 'metacritic':
     case 'opencritic':
     case 'metacritic_user':
@@ -162,13 +202,92 @@ function resolveCanonicalCriticSource(score: CriticScoreData): CriticSource {
     case 'epic':
     case 'xbox':
     case 'custom':
-      return score.source;
+      return rawSource;
     default:
-      if (String(score.id || '').toLowerCase().startsWith('xbox-') || isXboxStoreHostUrl(score.url)) {
+      if (
+        String(score.id || '').toLowerCase().startsWith('xbox-') ||
+        isXboxStoreHostUrl(score.url)
+      ) {
         return 'xbox';
       }
-      return 'opencritic';
+      if (isOpenCriticHostUrl(score.url)) {
+        return 'opencritic';
+      }
+      return 'custom';
   }
+}
+
+/**
+ * Parses and normalizes a raw `critic_json` payload hydrated from SQLite `vault_games`.
+ * Preserves all numeric ratings, review counts, and verification flags losslessly while
+ * classifying unknown/untagged legacy entries consistently with authority ranking.
+ */
+export function parseVaultCriticScore(raw: unknown): CriticScoreData | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const candidate = raw as Record<string, unknown>;
+  const rawScore = candidate.score;
+  if (typeof rawScore !== 'number' || !Number.isFinite(rawScore) || rawScore <= 0) {
+    return null;
+  }
+
+  const rawId = candidate.id;
+  const rawUrl = typeof candidate.url === 'string' ? candidate.url.trim() : '';
+  const rawSource =
+    typeof candidate.source === 'string' ? candidate.source.trim().toLowerCase() : '';
+  const resolvedSource: CriticSource = VALID_CRITIC_SOURCES.has(rawSource as CriticSource)
+    ? (rawSource as CriticSource)
+    : String(rawId || '').toLowerCase().startsWith('xbox-') || isXboxStoreHostUrl(rawUrl)
+    ? 'xbox'
+    : isOpenCriticHostUrl(rawUrl)
+    ? 'opencritic'
+    : isMetacriticHostUrl(rawUrl)
+    ? 'metacritic'
+    : 'custom';
+
+  const rawPercent = candidate.percentRecommended;
+  const percentRecommended =
+    typeof rawPercent === 'number' && Number.isFinite(rawPercent) ? rawPercent : undefined;
+
+  const rawTier = candidate.tier;
+  const resolvedTier: CriticTier =
+    typeof rawTier === 'string' && VALID_CRITIC_TIERS.has(rawTier as CriticTier)
+      ? (rawTier as CriticTier)
+      : calculateTier(rawScore, percentRecommended);
+
+  const rawUserScore = candidate.userScoreRaw;
+  const rawStarRating = candidate.starRatingRaw;
+  const rawNumReviews = candidate.numReviews;
+  const rawPercentile = candidate.percentile;
+  const rawSummary = candidate.summary;
+  const rawVerified = candidate.isVerified;
+  const rawSynthetic = candidate.isSynthetic;
+
+  return {
+    ...(typeof rawId === 'string' || typeof rawId === 'number' ? { id: rawId } : {}),
+    source: resolvedSource,
+    score: rawScore,
+    tier: resolvedTier,
+    ...(typeof rawUserScore === 'number' && Number.isFinite(rawUserScore)
+      ? { userScoreRaw: rawUserScore }
+      : {}),
+    ...(typeof rawStarRating === 'number' && Number.isFinite(rawStarRating)
+      ? { starRatingRaw: rawStarRating }
+      : {}),
+    ...(typeof rawNumReviews === 'number' && Number.isFinite(rawNumReviews)
+      ? { numReviews: rawNumReviews }
+      : {}),
+    ...(percentRecommended !== undefined ? { percentRecommended } : {}),
+    ...(typeof rawPercentile === 'number' && Number.isFinite(rawPercentile)
+      ? { percentile: rawPercentile }
+      : {}),
+    url: rawUrl,
+    ...(typeof rawSummary === 'string' ? { summary: rawSummary } : {}),
+    isVerified:
+      typeof rawVerified === 'boolean'
+        ? rawVerified
+        : resolvedSource === 'metacritic' || resolvedSource === 'opencritic',
+    ...(typeof rawSynthetic === 'boolean' ? { isSynthetic: rawSynthetic } : {}),
+  };
 }
 
 /**
@@ -184,17 +303,41 @@ export function getReviewSourceAuthorityRank(
   score: CriticScoreData | null | undefined,
   options?: { isUserOverride?: boolean }
 ): number {
-  if (!score || typeof score.score !== 'number' || !Number.isFinite(score.score) || score.score <= 0) {
+  if (
+    !score ||
+    typeof score !== 'object' ||
+    Array.isArray(score) ||
+    typeof score.score !== 'number' ||
+    !Number.isFinite(score.score) ||
+    score.score <= 0
+  ) {
     return 0;
   }
-  if (options?.isUserOverride) {
+
+  const metaFields = score as unknown as {
+    isUserOverride?: unknown;
+    userOverride?: unknown;
+    tier?: unknown;
+    reviewCount?: unknown;
+  };
+  if (
+    Boolean(
+      options?.isUserOverride ||
+        metaFields.isUserOverride === true ||
+        metaFields.userOverride === true ||
+        metaFields.tier === 'override'
+    )
+  ) {
     return 5;
   }
 
-  const numReviews =
+  const rawReviews =
     typeof score.numReviews === 'number' && Number.isFinite(score.numReviews)
       ? score.numReviews
-      : 0;
+      : typeof metaFields.reviewCount === 'number' && Number.isFinite(metaFields.reviewCount)
+        ? metaFields.reviewCount
+        : 0;
+  const numReviews = rawReviews > 0 ? rawReviews : 0;
 
   switch (resolveCanonicalCriticSource(score)) {
     case 'metacritic':

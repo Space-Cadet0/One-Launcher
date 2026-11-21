@@ -561,32 +561,73 @@ function carryForwardVaultRequirements(incomingObj, existingObj) {
 }
 
 /**
+ * @param {unknown} url
+ * @returns {boolean}
+ */
+function isXboxCriticHostUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const host = new URL(url.trim()).hostname.toLowerCase();
+    return host === 'xbox.com' || host.endsWith('.xbox.com');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * @param {unknown} url
+ * @returns {boolean}
+ */
+function isOpenCriticHostUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const host = new URL(url.trim()).hostname.toLowerCase();
+    return host === 'opencritic.com' || host.endsWith('.opencritic.com');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Computes the monotonic review-source authority rank for a persisted `critic_json` object:
- * - 5: User override (`isUserOverride === true` / `userOverride === true` / `tier === 'override'`)
+ * - 5: User override (`options.isUserOverride === true` / `isUserOverride === true` / `userOverride === true` / `tier === 'override'`)
  * - 4: Metacritic press consensus (`source === 'metacritic'`)
- * - 3: OpenCritic press consensus (`source === 'opencritic'`)
+ * - 3: OpenCritic press consensus (`source === 'opencritic'`, or unknown source with OpenCritic host URL)
  * - 2: High-sample community consensus (`metacritic_user` with `numReviews >= 25`, or `steam` with `numReviews >= 10`)
- * - 1: Storefront/low-sample fallback (`gog`/`epic`/`xbox`/`custom`, or low-sample `metacritic_user`/`steam`)
+ * - 1: Storefront/low-sample fallback (`gog`/`epic`/`xbox`/`custom`, unknown/untagged legacy objects, or low-sample `metacritic_user`/`steam`)
  * - 0: Empty, null, or invalid (`score <= 0`)
  *
+ * Strictly mirrors `getReviewSourceAuthorityRank` in `src/services/critic/criticUtils.ts`.
+ *
  * @param {unknown} criticObj
+ * @param {{ isUserOverride?: boolean }} [options]
  * @returns {number}
  */
-function getCriticAuthorityRank(criticObj) {
+function getCriticAuthorityRank(criticObj, options) {
   if (!criticObj || typeof criticObj !== 'object' || Array.isArray(criticObj)) {
     return 0;
   }
   const obj = /** @type {Record<string, any>} */ (criticObj);
-  const score = Number(obj.score);
+  const score = typeof obj.score === 'number' ? obj.score : NaN;
   if (!Number.isFinite(score) || score <= 0) {
     return 0;
   }
-  if (obj.isUserOverride === true || obj.userOverride === true || obj.tier === 'override') {
+  if (
+    Boolean(options && options.isUserOverride) ||
+    obj.isUserOverride === true ||
+    obj.userOverride === true ||
+    obj.tier === 'override'
+  ) {
     return 5;
   }
-  const source = String(obj.source || '').trim().toLowerCase();
-  const rawReviews = Number(obj.numReviews ?? obj.reviewCount ?? 0);
-  const numReviews = Number.isFinite(rawReviews) && rawReviews > 0 ? rawReviews : 0;
+  const source = typeof obj.source === 'string' ? obj.source.trim().toLowerCase() : '';
+  const rawReviews =
+    typeof obj.numReviews === 'number' && Number.isFinite(obj.numReviews)
+      ? obj.numReviews
+      : typeof obj.reviewCount === 'number' && Number.isFinite(obj.reviewCount)
+        ? obj.reviewCount
+        : 0;
+  const numReviews = rawReviews > 0 ? rawReviews : 0;
 
   if (source === 'metacritic') {
     return 4;
@@ -602,6 +643,12 @@ function getCriticAuthorityRank(criticObj) {
   }
   if (source === 'gog' || source === 'epic' || source === 'xbox' || source === 'custom') {
     return 1;
+  }
+  if (String(obj.id || '').toLowerCase().startsWith('xbox-') || isXboxCriticHostUrl(obj.url)) {
+    return 1;
+  }
+  if (isOpenCriticHostUrl(obj.url)) {
+    return 3;
   }
   return 1;
 }
@@ -3192,7 +3239,54 @@ class OfflineVaultService {
     const nextCoverNorm = nextCoverUrl ? normalizeAssetIdentityUrl(nextCoverUrl) : '';
     const nextHeaderNorm = nextHeaderUrl ? normalizeAssetIdentityUrl(nextHeaderUrl) : '';
 
+    const hasReviewRoute = Boolean(
+      record &&
+        typeof record === 'object' &&
+        record.reviewRoute &&
+        typeof record.reviewRoute === 'object'
+    );
+    const reviewRouteMode = hasReviewRoute
+      ? String(record.reviewRoute.mode || '').trim().toLowerCase()
+      : '';
+    const hasExplicitReviewScoreProp = Boolean(
+      record &&
+        typeof record === 'object' &&
+        Object.prototype.hasOwnProperty.call(record, 'reviewScoreOverride') &&
+        record.reviewScoreOverride !== undefined
+    );
+    const explicitReviewScore =
+      hasExplicitReviewScoreProp &&
+      record.reviewScoreOverride &&
+      typeof record.reviewScoreOverride === 'object' &&
+      !Array.isArray(record.reviewScoreOverride) &&
+      typeof record.reviewScoreOverride.score === 'number' &&
+      Number.isFinite(record.reviewScoreOverride.score) &&
+      record.reviewScoreOverride.score > 0
+        ? record.reviewScoreOverride
+        : null;
+
+    // Reconcile vault_games.critic_json with explicit user review overrides:
+    // - 'unrated' or reviewScoreOverride === null -> clear critic_json = NULL
+    // - positive reviewScoreOverride -> overwrite critic_json directly (bypassing monotonic latch)
+    // - reviewRoute set without a resolved score yet (e.g. pending 'routed') -> clear stale critic_json = NULL
+    /** @type {'none' | 'clear' | 'write'} */
+    let criticUpdateMode = 'none';
+    /** @type {string | null} */
+    let nextCriticJson = null;
+    if (
+      reviewRouteMode === 'unrated' ||
+      (hasExplicitReviewScoreProp && record.reviewScoreOverride === null)
+    ) {
+      criticUpdateMode = 'clear';
+    } else if (explicitReviewScore) {
+      criticUpdateMode = 'write';
+      nextCriticJson = compressVaultJson(JSON.stringify(explicitReviewScore));
+    } else if (hasReviewRoute) {
+      criticUpdateMode = 'clear';
+    }
+
     const db = this.ensureOpen();
+    const nowTs = this.now();
     const selectRowsStmt = db.prepare(
       'SELECT url_key, game_id, asset_role, source_url, storage_kind, blob_sha256 FROM game_media_assets WHERE game_id = ?'
     );
@@ -3218,6 +3312,14 @@ class OfflineVaultService {
     const resetHydratedStmt = db.prepare(
       'UPDATE vault_games SET media_hydrated_at = 0 WHERE game_id = ?'
     );
+    const clearCriticStmt =
+      criticUpdateMode === 'clear'
+        ? db.prepare('UPDATE vault_games SET critic_json = NULL, updated_at = ? WHERE game_id = ?')
+        : null;
+    const writeCriticStmt =
+      criticUpdateMode === 'write'
+        ? db.prepare('UPDATE vault_games SET critic_json = ?, updated_at = ? WHERE game_id = ?')
+        : null;
     const clearUrlCache404Stmt = db.prepare(
       'DELETE FROM url_resolution_cache WHERE game_id = ? AND blob_sha256 IS NULL'
     );
@@ -3267,6 +3369,11 @@ class OfflineVaultService {
         if (touchedGame) {
           resetHydratedStmt.run(cid);
         }
+        if (clearCriticStmt) {
+          clearCriticStmt.run(nowTs, cid);
+        } else if (writeCriticStmt) {
+          writeCriticStmt.run(nextCriticJson, nowTs, cid);
+        }
       }
       db.exec('COMMIT');
     } catch (txErr) {
@@ -3281,8 +3388,9 @@ class OfflineVaultService {
   }
 
   /**
-   * Invalidates federated and cover/header media rows across `gameId` and any removed alias/rekey
-   * IDs when a user override is reset/removed, keeping `media_blobs` intact on disk.
+   * Invalidates federated and cover/header media rows and clears persisted `vault_games.critic_json`
+   * across `gameId` and any removed alias/rekey IDs when a user override is reset/removed,
+   * keeping `media_blobs` intact on disk so deleted overrides never resurrect on cold boot.
    *
    * @param {string} gameId
    * @param {string[]} [extraKeys]
@@ -3290,10 +3398,22 @@ class OfflineVaultService {
   removeUserOverride(gameId, extraKeys = []) {
     /** @type {Set<string>} */
     const candidateIds = new Set();
-    this.collectVaultGameIdVariants(candidateIds, gameId);
+    const collectWithNumericSteamVariant = (/** @type {unknown} */ rawKey) => {
+      this.collectVaultGameIdVariants(candidateIds, rawKey);
+      const trimmed =
+        typeof rawKey === 'string'
+          ? rawKey.trim()
+          : typeof rawKey === 'number' && Number.isInteger(rawKey) && rawKey > 0
+            ? String(rawKey)
+            : '';
+      if (/^\d+$/.test(trimmed)) {
+        this.collectVaultGameIdVariants(candidateIds, `steam-${trimmed}`);
+      }
+    };
+    collectWithNumericSteamVariant(gameId);
     if (Array.isArray(extraKeys)) {
       for (const ek of extraKeys) {
-        this.collectVaultGameIdVariants(candidateIds, ek);
+        collectWithNumericSteamVariant(ek);
       }
     }
     if (candidateIds.size === 0) {
@@ -3301,6 +3421,7 @@ class OfflineVaultService {
     }
 
     const db = this.ensureOpen();
+    const nowTs = this.now();
     const resetCoverHeaderStmt = db.prepare(`
       UPDATE game_media_assets
       SET storage_kind = 'pending',
@@ -3322,8 +3443,8 @@ class OfflineVaultService {
       WHERE game_id = ?
         AND storage_kind = 'federated'
     `);
-    const resetHydratedStmt = db.prepare(
-      'UPDATE vault_games SET media_hydrated_at = 0 WHERE game_id = ?'
+    const resetHydratedAndCriticStmt = db.prepare(
+      'UPDATE vault_games SET media_hydrated_at = 0, critic_json = NULL, updated_at = ? WHERE game_id = ?'
     );
     const clearUrlCache404Stmt = db.prepare(
       'DELETE FROM url_resolution_cache WHERE game_id = ? AND blob_sha256 IS NULL'
@@ -3340,7 +3461,7 @@ class OfflineVaultService {
         if (changes > 0) {
           invalidated += changes;
         }
-        resetHydratedStmt.run(cid);
+        resetHydratedAndCriticStmt.run(nowTs, cid);
       }
       db.exec('COMMIT');
     } catch (txErr) {

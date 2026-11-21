@@ -364,15 +364,6 @@ export default defineConfig({
           Referer: 'https://opencritic.com/',
         },
       },
-      '/api/opencritic': {
-        target: 'https://api.opencritic.com',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/opencritic/, ''),
-        headers: {
-          Referer: 'https://opencritic.com/',
-          Origin: 'https://opencritic.com',
-        },
-      },
       '/api/metacritic-backend': {
         target: 'https://backend.metacritic.com',
         changeOrigin: true,
