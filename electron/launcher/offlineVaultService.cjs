@@ -1,1479 +1,63 @@
+// @ts-check
 'use strict';
 
 const fs = require('node:fs');
-const path = require('node:path');
-const crypto = require('node:crypto');
-const zlib = require('node:zlib');
-const { DatabaseSync } = require('node:sqlite');
 const {
   StorefrontLocalCacheFederator,
-  detectImageMagicBytes,
   validateFederatedImageFile,
-  resolveFederatorUserDataDir,
 } = require('./storefrontLocalCacheFederator.cjs');
-const {
-  isContainedWithinRoot,
-  readSafeResponseBuffer,
-  safePublicHttpsFetch,
-} = require('./securityAndPathUtils.cjs');
-const { normalizePublisherLauncherId } = require('../utils/windowsRegistryDiscovery.cjs');
-const { classifyNonGameStorefrontItem } = require('../storefronts/nonGameClassifier.cjs');
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
 
-const STANDALONE_LAUNCHER_UTILITY_TITLE_RE =
-  /^(?:minecraft\s+launcher|ea\s+app|ubisoft\s+connect|rockstar\s+games\s+launcher|battle\.net|riot\s+client|gog\s+galaxy|epic\s+games\s+launcher)$/i;
-
-function isStandaloneStorefrontLauncherUtility(title, platforms) {
-  const cleanTitle = String(title || '').trim();
-  if (cleanTitle && STANDALONE_LAUNCHER_UTILITY_TITLE_RE.test(cleanTitle)) {
-    return Boolean(
-      classifyNonGameStorefrontItem({
-        title: cleanTitle,
-        platformId: String(platforms?.[0]?.platformId || '').toLowerCase() || 'xbox',
-        platformGameId: String(platforms?.[0]?.platformGameId || ''),
-        isDlc: false,
-      })
-    );
-  }
-  if (
-    Array.isArray(platforms) &&
-    platforms.length > 0 &&
-    platforms.every((ep) =>
-      String(ep?.packageFamilyName || '')
-        .trim()
-        .toLowerCase()
-        .startsWith('microsoft.4297127d64ec6')
-    )
-  ) {
-    return true;
-  }
-  return false;
-}
-
-let electron = {};
-try {
-  const reqElectron = require('electron');
-  if (reqElectron && typeof reqElectron === 'object') {
-    electron = reqElectron;
-  }
-} catch {
-  // Non-Electron CLI / Vitest context
-}
-
-function getLazyLauncherEngine() {
-  try {
-    return require('../launcherEngine.cjs');
-  } catch {
-    return null;
-  }
-}
-
-const OFFLINE_VAULT_TIER_CAPS = {
-  compact: 150 * 1024 * 1024, // 150 MB
-  balanced: 350 * 1024 * 1024, // 350 MB (default)
-  max_offline: 1536 * 1024 * 1024, // 1.5 GB
-  full_archive: 1536 * 1024 * 1024, // 1.5 GB legacy alias
-};
-
-const VALID_TIERS = new Set(['compact', 'balanced', 'max_offline', 'full_archive']);
-const MAX_P1_RECENT_DETAIL_GAMES = 40;
-const DEFAULT_SQLITE_COMPACTION_THRESHOLD_BYTES = 20 * 1024 * 1024; // 20 MB
-const DEFAULT_STARTUP_SWEEP_DELAY_MS = 25 * 1000; // 25s post-init automatic sweep
-const MIN_FREE_DISK_BYTES_FOR_BLOBS = 2 * 1024 * 1024 * 1024; // 2 GB
-const PASS_THROUGH_MAX_BYTES = 45 * 1024; // 45 KB zero-decode fast pass-through
-const UNRESIZED_STATIC_PASS_THROUGH_MAX_BYTES = 250 * 1024; // 250 KB cap when dimensions already fit ROLE_MAX_WIDTHS
-const TRANSPARENT_PNG_PASS_THROUGH_MAX_BYTES = 256 * 1024; // 256 KB alpha-preserving pass-through for icon/logo
-const GIF_PASS_THROUGH_MAX_BYTES = 128 * 1024; // 128 KB (single-frame static GIFs)
-const MAX_INLINE_ANIMATED_GIF_CACHE_BYTES = 1536 * 1024; // 1.5 MB animated GIF vault blob cap
-const MAX_DOWNLOAD_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MB hard cap per static image
-const MAX_ASSET_FETCH_BYTES = 32 * 1024 * 1024; // 32 MB fetch cap for inline animated GIFs
-
-const ROLE_MAX_WIDTHS = {
-  cover: 600,
-  capsule: 460,
-  icon: 128,
-  achievement_icon: 128,
-  logo: 640,
-  header: 800,
-  hero: 1920,
-  screenshot: 1280,
-  screenshot_thumb: 800,
-  screenshot_full: 1280,
-  inline_img: 800,
-  inline_poster: 800,
-};
-
-const VAULT_ZLIB_PREFIX = '__olz1:';
-const MIN_COMPRESS_JSON_CHARS = 512;
-
-/**
- * Compresses large JSON column payloads (`>= 512` chars) via `node:zlib` raw deflate (`__olz1:<base64>`)
- * so `catalog_metadata.sqlite` stays `< 25 MB` even for 1,000+ enriched games.
- *
- * @param {any} rawVal
- * @returns {string | null}
- */
-function compressVaultJson(rawVal) {
-  if (rawVal === null || rawVal === undefined) return null;
-  const jsonStr = typeof rawVal === 'string' ? rawVal : JSON.stringify(rawVal);
-  if (!jsonStr) return jsonStr;
-  if (jsonStr.startsWith(VAULT_ZLIB_PREFIX)) return jsonStr;
-  if (jsonStr.length < MIN_COMPRESS_JSON_CHARS) return jsonStr;
-  try {
-    const deflated = zlib.deflateRawSync(Buffer.from(jsonStr, 'utf8'), { level: 6 });
-    const encoded = `${VAULT_ZLIB_PREFIX}${deflated.toString('base64')}`;
-    return encoded.length < jsonStr.length ? encoded : jsonStr;
-  } catch {
-    return jsonStr;
-  }
-}
-
-/**
- * Transparently decompresses `__olz1:<base64>` (or raw deflate Buffer) back to a UTF-8 JSON string,
- * while passing plain uncompressed legacy JSON strings straight through untouched.
- *
- * @param {any} rawVal
- * @returns {string | null}
- */
-function decompressVaultJsonString(rawVal) {
-  if (rawVal === null || rawVal === undefined) return null;
-  if (Buffer.isBuffer(rawVal) || rawVal instanceof Uint8Array) {
-    const buf = Buffer.from(rawVal);
-    try {
-      return zlib.inflateRawSync(buf).toString('utf8');
-    } catch {
-      return buf.toString('utf8');
-    }
-  }
-  if (typeof rawVal !== 'string') return null;
-  if (!rawVal) return '';
-  if (rawVal.startsWith(VAULT_ZLIB_PREFIX)) {
-    try {
-      const compressed = Buffer.from(rawVal.slice(VAULT_ZLIB_PREFIX.length), 'base64');
-      return zlib.inflateRawSync(compressed).toString('utf8');
-    } catch {
-      return null;
-    }
-  }
-  return rawVal;
-}
-
-/**
- * Safely parses either plain JSON or `__olz1:` deflate-compressed JSON from SQLite.
- *
- * @param {any} rawVal
- * @returns {any}
- */
-function parseVaultJson(rawVal) {
-  const jsonStr = decompressVaultJsonString(rawVal);
-  if (!jsonStr || typeof jsonStr !== 'string') return null;
-  try {
-    return JSON.parse(jsonStr);
-  } catch {
-    return null;
-  }
-}
-
-function yieldEventLoop() {
-  return new Promise((resolve) => setImmediate(resolve));
-}
-
-const QUALITY_RANK = {
-  skeleton_fallback: 0,
-  local_federated: 1,
-  storefront_native: 2,
-  scraped: 3,
-  authoritative: 4,
-};
-const METADATA_QUALITY_RANK = QUALITY_RANK;
-
-const REJECTED_VIDEO_URL_RE = /\.(?:mp4|webm|m3u8|ts|mkv|mov|avi|mpd|ogv)(?:$|[?#])/i;
-const REJECTED_VIDEO_MIME_RE =
-  /^(?:video\/|application\/(?:vnd\.apple\.mpegurl|x-mpegurl|dash\+xml))/i;
-
-/**
- * Adaptive 404 retry schedule (NEVER Infinity so fixed/re-listed store pages always self-heal):
- * - 1st 404: 6 hours
- * - 2nd 404: 24 hours
- * - 3rd 404: 7 days
- * - 4th+ 404: 30 days
- *
- * @param {number} failureCount
- * @returns {number}
- */
-function computeAdaptive404DelayMs(failureCount) {
-  const count = Math.max(1, Math.floor(Number(failureCount) || 1));
-  if (count === 1) return 6 * 60 * 60 * 1000;
-  if (count === 2) return 24 * 60 * 60 * 1000;
-  if (count === 3) return 7 * 24 * 60 * 60 * 1000;
-  return 30 * 24 * 60 * 60 * 1000;
-}
-
-/**
- * Detects WAF / bot-protection challenge responses (Cloudflare, Akamai, PerimeterX, CAPTCHA)
- * or HTTP 429 / 403 blocks so transient blocks never poison 404 or metadata state.
- *
- * @param {number | undefined | null} status
- * @param {string | Buffer | null | undefined} bodySample
- * @param {Record<string, any> | Headers | null | undefined} headers
- * @returns {boolean}
- */
-function isWafOrChallengeResponse(status, bodySample, headers) {
-  const getHeader = (name) => {
-    if (!headers) return '';
-    if (typeof headers.get === 'function') {
-      return String(headers.get(name) || '');
-    }
-    return String(headers[name] || headers[name.toLowerCase()] || '');
-  };
-
-  if (getHeader('cf-mitigated')) return true;
-  if (status === 429) return true;
-
-  let sampleStr = '';
-  if (typeof bodySample === 'string') {
-    sampleStr = bodySample.slice(0, 4096);
-  } else if (Buffer.isBuffer(bodySample)) {
-    sampleStr = bodySample.subarray(0, 4096).toString('utf8');
-  }
-
-  if (
-    sampleStr &&
-    /cf-chl-bypass|cf-browser-verification|Just a moment\.\.\.|Attention Required! \| Cloudflare|Access Denied[\s\S]{0,200}Reference #|Reference #\d+\.\w+|PerimeterX|px-captcha|g-recaptcha|hcaptcha/i.test(
-      sampleStr
-    )
-  ) {
-    return true;
-  }
-
-  return status === 403;
-}
-
-function parseRetryAfterMs(headers) {
-  if (!headers) return 0;
-  let raw = '';
-  if (typeof headers.get === 'function') {
-    raw = String(headers.get('retry-after') || '');
-  } else {
-    raw = String(headers['retry-after'] || headers['Retry-After'] || '');
-  }
-  raw = raw.trim();
-  if (!raw) return 0;
-  const secs = Number(raw);
-  if (Number.isFinite(secs) && secs > 0) {
-    return Math.min(24 * 60 * 60 * 1000, Math.round(secs * 1000));
-  }
-  const parsedDate = Date.parse(raw);
-  if (!Number.isNaN(parsedDate)) {
-    const diff = parsedDate - Date.now();
-    if (diff > 0) {
-      return Math.min(24 * 60 * 60 * 1000, diff);
-    }
-  }
-  return 0;
-}
-
-function isRejectedVideoUrl(url) {
-  if (!url || typeof url !== 'string') return false;
-  return REJECTED_VIDEO_URL_RE.test(url.trim());
-}
-
-function normalizeComparableMediaUrl(url) {
-  const clean = String(url || '').trim();
-  if (!clean) return '';
-  return clean.replace(
-    /^https?:\/\/(?:shared\.(?:akamai|fastly)\.steamstatic\.com|cdn\.(?:cloudflare|akamai)\.steamstatic\.com|steamcdn-a\.akamaihd\.net)\//i,
-    'https://steamstatic.canonical/'
-  );
-}
-
-const ASSET_IDENTITY_QUERY_KEYS = new Set([
-  'url',
-  'w',
-  'h',
-  'width',
-  'height',
-  'mode',
-  'format',
-  'fmt',
-]);
-
-/**
- * Normalizes an asset source URL for identity comparison across sync cycles:
- * - Aliases Steam CDN mirror hosts to `steamstatic.canonical`
- * - Collapses Steam `/steam/apps/` path aliases to `/store_item_assets/steam/apps/`
- * - Preserves host + pathname + deterministic sizing/format parameters (`w`, `h`, `mode`)
- * - Strips volatile CDN signature / cache-buster query tokens (`t`, `sig`, `se`, `token`, etc.)
- */
-function normalizeAssetIdentityUrl(url) {
-  const comparable = normalizeComparableMediaUrl(url);
-  if (!comparable) return '';
-  try {
-    const parsed = new URL(comparable);
-    const host = parsed.hostname.toLowerCase();
-    let pathname =
-      parsed.pathname.length > 1 ? parsed.pathname.replace(/\/+$/, '') : parsed.pathname;
-    if (host === 'steamstatic.canonical' && /^\/steam\/apps\//i.test(pathname)) {
-      pathname = pathname.replace(/^\/steam\/apps\//i, '/store_item_assets/steam/apps/');
-    }
-    const keptParams = [];
-    for (const [k, v] of parsed.searchParams.entries()) {
-      const keyLower = k.toLowerCase();
-      if (ASSET_IDENTITY_QUERY_KEYS.has(keyLower)) {
-        keptParams.push(`${keyLower}=${v}`);
-      }
-    }
-    keptParams.sort();
-    return `https://${host}${pathname}${keptParams.length > 0 ? `?${keptParams.join('&')}` : ''}`;
-  } catch {
-    return comparable;
-  }
-}
-
-/**
- * Pure byte-level GIF87a/GIF89a multi-frame detector.
- * Walks the Logical Screen Descriptor, optional Global Color Table, Extension sub-blocks,
- * and Image Descriptors (`0x2C`) + LZW sub-blocks in O(frame-1 bytes), returning `true`
- * as soon as >= 2 frames are present so animated GIFs are NEVER flattened by `nativeImage.toJPEG`.
- *
- * @param {Buffer} buf
- * @returns {boolean}
- */
-function isAnimatedGifBuffer(buf) {
-  if (!Buffer.isBuffer(buf) || buf.length < 14) return false;
-  if (
-    buf[0] !== 0x47 ||
-    buf[1] !== 0x49 ||
-    buf[2] !== 0x46 ||
-    buf[3] !== 0x38 ||
-    (buf[4] !== 0x37 && buf[4] !== 0x39) ||
-    buf[5] !== 0x61
-  ) {
-    return false;
-  }
-
-  const len = buf.length;
-  const packed = buf[10];
-  let offset = 13;
-  if (packed & 0x80) {
-    offset += 3 * (1 << ((packed & 0x07) + 1));
-  }
-
-  const skipSubBlocks = (startPos) => {
-    let pos = startPos;
-    while (pos < len) {
-      const blockSize = buf[pos++];
-      if (blockSize === 0) return pos;
-      pos += blockSize;
-    }
-    return len;
-  };
-
-  let imageFrames = 0;
-  let gceBlocks = 0;
-  let parseClean = true;
-
-  while (offset < len) {
-    const introducer = buf[offset++];
-    if (introducer === 0x3b) {
-      break;
-    }
-    if (introducer === 0x21) {
-      if (offset >= len) break;
-      const extLabel = buf[offset++];
-      if (extLabel === 0xf9) {
-        gceBlocks++;
-      }
-      offset = skipSubBlocks(offset);
-      continue;
-    }
-    if (introducer === 0x2c) {
-      imageFrames++;
-      if (imageFrames >= 2) return true;
-      if (offset + 9 > len) break;
-      const localPacked = buf[offset + 8];
-      offset += 9;
-      if (localPacked & 0x80) {
-        offset += 3 * (1 << ((localPacked & 0x07) + 1));
-      }
-      if (offset >= len) break;
-      offset += 1; // LZW minimum code size byte
-      offset = skipSubBlocks(offset);
-      continue;
-    }
-    parseClean = false;
-    break;
-  }
-
-  if (imageFrames >= 2) return true;
-  if (!parseClean && gceBlocks >= 2) return true;
-
-  // Structural GCE fallback for truncated or synthetic buffers (`0x21 0xF9 0x04 <4 bytes> 0x00`)
-  let structuralGceCount = 0;
-  for (let i = 13; i + 7 < len; i++) {
-    if (buf[i] === 0x21 && buf[i + 1] === 0xf9 && buf[i + 2] === 0x04 && buf[i + 7] === 0x00) {
-      structuralGceCount++;
-      if (structuralGceCount >= 2) return true;
-      i += 7;
-    }
-  }
-
-  return false;
-}
-
-function hasXboxPlatform(game) {
-  if (!game || typeof game !== 'object') return false;
-  const gid = String(game.id || game.gameId || '').trim().toLowerCase();
-  if (gid.startsWith('xbox-') || gid.startsWith('xbox_')) return true;
-  if (String(game.platform || '').trim().toLowerCase() === 'xbox') return true;
-  if (game.xboxProductId) return true;
-  if (Array.isArray(game.platforms)) {
-    return game.platforms.some((p) =>
-      typeof p === 'string'
-        ? p.trim().toLowerCase() === 'xbox'
-        : Boolean(p && typeof p === 'object' && String(p.platformId || '').toLowerCase() === 'xbox')
-    );
-  }
-  return false;
-}
-
-function extractXboxBigIdsFromGame(gameObj, platformsArr) {
-  const found = new Set();
-  const addCandidate = (raw) => {
-    const clean = String(raw || '')
-      .replace(/^xbox[-_:]/i, '')
-      .trim()
-      .toUpperCase();
-    if (/^[A-Z0-9]{12}$/.test(clean)) {
-      found.add(clean);
-    }
-  };
-
-  if (gameObj && typeof gameObj === 'object') {
-    addCandidate(gameObj.xboxProductId);
-  }
-  const plats = Array.isArray(platformsArr)
-    ? platformsArr
-    : Array.isArray(gameObj?.platforms)
-      ? gameObj.platforms
-      : [];
-  for (const p of plats) {
-    if (!p || typeof p !== 'object') continue;
-    if (p.xboxProductId) addCandidate(p.xboxProductId);
-    if (String(p.platformId || '').toLowerCase() === 'xbox') {
-      addCandidate(p.platformGameId);
-      addCandidate(p.storefrontAppId);
-    }
-  }
-  return Array.from(found);
-}
-
-function hasVaultReqContent(req) {
-  return Boolean(
-    req &&
-      typeof req === 'object' &&
-      ((typeof req.minimum === 'string' && req.minimum.trim().length > 0) ||
-        (typeof req.recommended === 'string' && req.recommended.trim().length > 0))
-  );
-}
-
-function mergeVaultSystemRequirements(incomingReq, existingReq) {
-  if (!hasVaultReqContent(existingReq)) return incomingReq;
-  if (!hasVaultReqContent(incomingReq)) return existingReq;
-  const nextMin =
-    typeof incomingReq.minimum === 'string' && incomingReq.minimum.trim().length > 0
-      ? incomingReq.minimum
-      : existingReq.minimum;
-  const nextRec =
-    typeof incomingReq.recommended === 'string' && incomingReq.recommended.trim().length > 0
-      ? incomingReq.recommended
-      : existingReq.recommended;
-  if (nextMin === incomingReq.minimum && nextRec === incomingReq.recommended) {
-    return incomingReq;
-  }
-  return {
-    ...(nextMin !== undefined ? { minimum: nextMin } : {}),
-    ...(nextRec !== undefined ? { recommended: nextRec } : {}),
-  };
-}
-
-function carryForwardVaultRequirements(incomingObj, existingObj) {
-  if (
-    !incomingObj ||
-    typeof incomingObj !== 'object' ||
-    !existingObj ||
-    typeof existingObj !== 'object' ||
-    incomingObj.__quotaSlimmed === true ||
-    existingObj.__quotaSlimmed === true
-  ) {
-    return;
-  }
-
-  const mergedWin = mergeVaultSystemRequirements(
-    incomingObj.systemRequirements,
-    existingObj.systemRequirements
-  );
-  if (mergedWin && mergedWin !== incomingObj.systemRequirements) {
-    incomingObj.systemRequirements = mergedWin;
-  }
-  if (!incomingObj.pcRequirementsHtml && existingObj.pcRequirementsHtml) {
-    incomingObj.pcRequirementsHtml = existingObj.pcRequirementsHtml;
-  }
-
-  const samePositiveAppId =
-    Number(incomingObj.appId) > 0 &&
-    Number(existingObj.appId) > 0 &&
-    Number(incomingObj.appId) === Number(existingObj.appId);
-  const sameSource =
-    Boolean(incomingObj.enrichedSource) &&
-    incomingObj.enrichedSource === existingObj.enrichedSource;
-  const canCarryMac =
-    samePositiveAppId ||
-    sameSource ||
-    (incomingObj.enrichedSource !== 'xbox' &&
-      (incomingObj.platforms?.mac === true ||
-        (!incomingObj.platforms && existingObj.platforms?.mac === true)));
-  const canCarryLinux =
-    samePositiveAppId ||
-    sameSource ||
-    (incomingObj.enrichedSource !== 'xbox' &&
-      (incomingObj.platforms?.linux === true ||
-        (!incomingObj.platforms && existingObj.platforms?.linux === true)));
-
-  if (canCarryMac) {
-    const mergedMac = mergeVaultSystemRequirements(
-      incomingObj.macRequirements,
-      existingObj.macRequirements
-    );
-    if (mergedMac && mergedMac !== incomingObj.macRequirements) {
-      incomingObj.macRequirements = mergedMac;
-    }
-  }
-  if (canCarryLinux) {
-    const mergedLinux = mergeVaultSystemRequirements(
-      incomingObj.linuxRequirements,
-      existingObj.linuxRequirements
-    );
-    if (mergedLinux && mergedLinux !== incomingObj.linuxRequirements) {
-      incomingObj.linuxRequirements = mergedLinux;
-    }
-  }
-}
-
-/**
- * @param {unknown} url
- * @returns {boolean}
- */
-function isXboxCriticHostUrl(url) {
-  if (!url || typeof url !== 'string') return false;
-  try {
-    const host = new URL(url.trim()).hostname.toLowerCase();
-    return host === 'xbox.com' || host.endsWith('.xbox.com');
-  } catch {
-    return false;
-  }
-}
-
-/**
- * @param {unknown} url
- * @returns {boolean}
- */
-function isOpenCriticHostUrl(url) {
-  if (!url || typeof url !== 'string') return false;
-  try {
-    const host = new URL(url.trim()).hostname.toLowerCase();
-    return host === 'opencritic.com' || host.endsWith('.opencritic.com');
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Computes the monotonic review-source authority rank for a persisted `critic_json` object:
- * - 5: User override (`options.isUserOverride === true` / `isUserOverride === true` / `userOverride === true` / `tier === 'override'`)
- * - 4: Metacritic press consensus (`source === 'metacritic'`)
- * - 3: OpenCritic press consensus (`source === 'opencritic'`, or unknown source with OpenCritic host URL)
- * - 2: High-sample community consensus (`metacritic_user` with `numReviews >= 25`, or `steam` with `numReviews >= 10`)
- * - 1: Storefront/low-sample fallback (`gog`/`epic`/`xbox`/`custom`, unknown/untagged legacy objects, or low-sample `metacritic_user`/`steam`)
- * - 0: Empty, null, or invalid (`score <= 0`)
- *
- * Strictly mirrors `getReviewSourceAuthorityRank` in `src/services/critic/criticUtils.ts`.
- *
- * @param {unknown} criticObj
- * @param {{ isUserOverride?: boolean }} [options]
- * @returns {number}
- */
-function getCriticAuthorityRank(criticObj, options) {
-  if (!criticObj || typeof criticObj !== 'object' || Array.isArray(criticObj)) {
-    return 0;
-  }
-  const obj = /** @type {Record<string, any>} */ (criticObj);
-  const score = typeof obj.score === 'number' ? obj.score : NaN;
-  if (!Number.isFinite(score) || score <= 0) {
-    return 0;
-  }
-  if (
-    Boolean(options && options.isUserOverride) ||
-    obj.isUserOverride === true ||
-    obj.userOverride === true ||
-    obj.tier === 'override'
-  ) {
-    return 5;
-  }
-  const source = typeof obj.source === 'string' ? obj.source.trim().toLowerCase() : '';
-  const rawReviews =
-    typeof obj.numReviews === 'number' && Number.isFinite(obj.numReviews)
-      ? obj.numReviews
-      : typeof obj.reviewCount === 'number' && Number.isFinite(obj.reviewCount)
-        ? obj.reviewCount
-        : 0;
-  const numReviews = rawReviews > 0 ? rawReviews : 0;
-
-  if (source === 'metacritic') {
-    return 4;
-  }
-  if (source === 'opencritic') {
-    return 3;
-  }
-  if (source === 'metacritic_user') {
-    return numReviews >= 25 ? 2 : 1;
-  }
-  if (source === 'steam') {
-    return numReviews >= 10 ? 2 : 1;
-  }
-  if (source === 'gog' || source === 'epic' || source === 'xbox' || source === 'custom') {
-    return 1;
-  }
-  if (String(obj.id || '').toLowerCase().startsWith('xbox-') || isXboxCriticHostUrl(obj.url)) {
-    return 1;
-  }
-  if (isOpenCriticHostUrl(obj.url)) {
-    return 3;
-  }
-  return 1;
-}
-
-/**
- * Validates that an `enriched_json` object carries a trustworthy Metacritic score anchor
- * (`score > 0`) and is NOT a legacy `local_federated` GOG star-rating masquerading as Metacritic.
- *
- * @param {unknown} enrichedObj
- * @returns {boolean}
- */
-function isTrustedEnrichedMetacritic(enrichedObj) {
-  if (!enrichedObj || typeof enrichedObj !== 'object' || Array.isArray(enrichedObj)) {
-    return false;
-  }
-  const obj = /** @type {Record<string, any>} */ (enrichedObj);
-  if (!obj.metacritic || typeof obj.metacritic !== 'object') {
-    return false;
-  }
-  const score = Number(obj.metacritic.score);
-  if (!Number.isFinite(score) || score <= 0) {
-    return false;
-  }
-  const mcUrl = typeof obj.metacritic.url === 'string' ? obj.metacritic.url.trim() : '';
-  const hasRealMetacriticUrl = /metacritic\.com/i.test(mcUrl);
-  if (hasRealMetacriticUrl) {
-    return true;
-  }
-  const isGogLocalFederated =
-    obj.metadataQuality === 'local_federated' &&
-    (Boolean(obj.gogId) || obj.enrichedSource === 'gog' || !(Number(obj.appId) > 0));
-  if (isGogLocalFederated) {
-    return false;
-  }
-  if (obj.enrichedSource === 'gog' && !hasRealMetacriticUrl) {
-    return false;
-  }
-  return true;
-}
-
-/**
- * Checks whether an `enriched_json.reviewSummary` carries actual review counts or positive percentage.
- *
- * @param {unknown} summary
- * @returns {boolean}
- */
-function hasMeaningfulVaultReviewSummary(summary) {
-  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
-    return false;
-  }
-  const s = /** @type {Record<string, any>} */ (summary);
-  const totalReviews = Number(s.totalReviews ?? 0);
-  const reviewScore = Number(s.reviewScore ?? 0);
-  const positivePercent = Number(s.positivePercent ?? 0);
-  return (
-    (Number.isFinite(totalReviews) && totalReviews > 0) ||
-    (Number.isFinite(reviewScore) &&
-      reviewScore > 0 &&
-      Number.isFinite(positivePercent) &&
-      positivePercent > 0)
-  );
-}
-
-/**
- * Carries forward existing trusted `enriched_json.metacritic` (excluding legacy GOG local_federated
- * star ratings) and meaningful `enriched_json.reviewSummary` across same-rank or lower-rank upserts
- * whenever incoming `enrichedMetadata` omits them (and does not remap to a different Steam AppID).
- *
- * @param {Record<string, any>} incomingObj
- * @param {Record<string, any>} existingObj
- */
-function carryForwardVaultCriticAndReviewFields(incomingObj, existingObj) {
-  if (
-    !incomingObj ||
-    typeof incomingObj !== 'object' ||
-    !existingObj ||
-    typeof existingObj !== 'object' ||
-    incomingObj.__quotaSlimmed === true ||
-    existingObj.__quotaSlimmed === true
-  ) {
-    return;
-  }
-
-  const hasDifferentPositiveAppId =
-    Number(incomingObj.appId) > 0 &&
-    Number(existingObj.appId) > 0 &&
-    Number(incomingObj.appId) !== Number(existingObj.appId);
-  if (hasDifferentPositiveAppId) {
-    return;
-  }
-
-  if (!isTrustedEnrichedMetacritic(incomingObj) && isTrustedEnrichedMetacritic(existingObj)) {
-    incomingObj.metacritic = existingObj.metacritic;
-  }
-
-  if (
-    !hasMeaningfulVaultReviewSummary(incomingObj.reviewSummary) &&
-    hasMeaningfulVaultReviewSummary(existingObj.reviewSummary)
-  ) {
-    incomingObj.reviewSummary = existingObj.reviewSummary;
-  }
-}
-
-function hasVaultNonPlaceholderStrings(list, placeholder) {
-  return Boolean(
-    Array.isArray(list) &&
-      list.some((item) => typeof item === 'string' && item.trim().length > 0 && item !== placeholder)
-  );
-}
-
-/**
- * Infers truthful `MetadataQuality` for `OfflineVaultService`, preventing Xbox DisplayCatalog
- * baseline synopses (`enrichedSource: 'xbox'` or missing `appId`) and `__quotaSlimmed`
- * projections from poisoning `vault_games` as `'authoritative'` (rank 4).
- */
-function inferVaultMetadataQuality(game, enriched) {
-  if (!enriched || typeof enriched !== 'object') {
-    const explicitGameQuality = String(game?.metadataQuality || '').trim();
-    if (
-      explicitGameQuality &&
-      Object.prototype.hasOwnProperty.call(QUALITY_RANK, explicitGameQuality)
-    ) {
-      return explicitGameQuality;
-    }
-    return 'skeleton_fallback';
-  }
-
-  // Universal C8 Lattice Invariant: __quotaSlimmed projections are ALWAYS Rank 0 (`skeleton_fallback`)
-  if (enriched.__quotaSlimmed === true) {
-    return 'skeleton_fallback';
-  }
-
-  const explicitQuality = String(
-    enriched.metadataQuality || game?.metadataQuality || ''
-  ).trim();
-  const enrichedSource = String(enriched.enrichedSource || '').trim().toLowerCase();
-  const gameId = String(game?.id || game?.gameId || '').trim();
-  const numericAppId = Number(enriched.appId);
-  const hasPositiveAppId = Number.isFinite(numericAppId) && numericAppId > 0;
-
-  if (explicitQuality === 'storefront_native' || enrichedSource === 'xbox') {
-    return 'storefront_native';
-  }
-
-  if (
-    explicitQuality === 'skeleton_fallback' ||
-    explicitQuality === 'local_federated' ||
-    explicitQuality === 'scraped'
-  ) {
-    return explicitQuality;
-  }
-
-  if (explicitQuality === 'authoritative') {
-    if ((!gameId.startsWith('steam-') || hasPositiveAppId) && (!hasXboxPlatform(game) || hasPositiveAppId)) {
-      return 'authoritative';
-    }
-    return 'storefront_native';
-  }
-
-  if (
-    hasPositiveAppId &&
-    ((Array.isArray(enriched.screenshots) && enriched.screenshots.length > 0) ||
-      (typeof enriched.detailedDescription === 'string' && enriched.detailedDescription.length > 120))
-  ) {
-    return 'authoritative';
-  }
-
-  if (!hasPositiveAppId && (hasXboxPlatform(game) || gameId.startsWith('steam-'))) {
-    return 'storefront_native';
-  }
-
-  if (enriched.shortDescription || enriched.detailedDescription) {
-    return 'scraped';
-  }
-
-  return 'skeleton_fallback';
-}
-
-function buildAssetUrlKey(gameId, role, ordinal, sourceUrl) {
-  const cleanGameId = String(gameId || '').trim();
-  const cleanRole = String(role || 'cover').trim();
-  const cleanOrd = Math.max(0, Math.floor(Number(ordinal) || 0));
-  const cleanUrl = String(sourceUrl || '').trim();
-  const isUrlKeyedRole =
-    cleanUrl &&
-    (cleanRole === 'inline_img' ||
-      cleanRole === 'inline_poster' ||
-      cleanRole === 'achievement_icon' ||
-      (cleanRole === 'icon' && cleanOrd > 0));
-  if (isUrlKeyedRole) {
-    const urlHash = crypto.createHash('sha256').update(cleanUrl).digest('hex').slice(0, 32);
-    return `${cleanGameId || 'url'}::${cleanRole}::${urlHash}`;
-  }
-  if (cleanGameId) {
-    return `${cleanGameId}::${cleanRole}::${cleanOrd}`;
-  }
-  const urlHash = crypto.createHash('sha256').update(cleanUrl).digest('hex').slice(0, 32);
-  return `url::${cleanRole}::${urlHash}`;
-}
-
-/**
- * Normalizes an explicit user media override flag (`ov`) from `ol-media://` or IPC params.
- * @param {unknown} rawOv
- * @returns {boolean}
- */
-function isExplicitOverrideParam(rawOv) {
-  if (rawOv === true || rawOv === 1) return true;
-  if (typeof rawOv === 'number') return rawOv > 0;
-  if (typeof rawOv === 'string') {
-    const norm = rawOv.trim().toLowerCase();
-    return Boolean(
-      norm && norm !== '0' && norm !== 'false' && norm !== 'null' && norm !== 'undefined'
-    );
-  }
-  return false;
-}
-
-/**
- * @param {string} hostname
- * @param {string[]} allowedDomains
- * @returns {boolean}
- */
-function matchesCdnHost(hostname, allowedDomains) {
-  const clean = String(hostname || '').trim().toLowerCase();
-  if (!clean) return false;
-  for (const dom of allowedDomains) {
-    if (clean === dom || clean.endsWith(`.${dom}`)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-const WINDOWS_ONLY_CHAINED_HANDOFFS = new Set(['ea', 'ubisoft', 'rockstar', 'riot']);
-const EPIC_EA_DRM_NOTICE_RE =
-  /\b(?:(?:The\s+)?EA\s+app|Origin(?:\s+client)?)\s+software\s+installation\s+and\s+background\s+use\s+required/i;
-
-/**
- * Normalize raw publisher handoff strings stored in vault platform/game records.
- *
- * @param {unknown} raw
- * @returns {'ubisoft' | 'ea' | 'bnet' | 'rockstar' | 'riot' | null}
- */
-function normalizeVaultChainedHandoffId(raw) {
-  if (typeof raw !== 'string') return null;
-  return normalizePublisherLauncherId(raw);
-}
-
-const CANONICAL_XBOX_CHAINED_PUBLISHER_META = Object.freeze({
-  ea: Object.freeze({
-    externalLauncher: 'EA App',
-    externalLauncherUrl: 'https://www.ea.com/ea-app',
-  }),
-  ubisoft: Object.freeze({
-    externalLauncher: 'Ubisoft Connect',
-    externalLauncherUrl: 'https://www.ubisoft.com/ubisoft-connect',
-  }),
-  bnet: Object.freeze({
-    externalLauncher: 'Battle.net',
-    externalLauncherUrl: 'https://download.battle.net/',
-  }),
-  rockstar: Object.freeze({
-    externalLauncher: 'Rockstar Games Launcher',
-    externalLauncherUrl: 'https://socialclub.rockstargames.com/rockstar-games-launcher',
-  }),
-  riot: Object.freeze({
-    externalLauncher: 'Riot Client',
-    externalLauncherUrl: 'https://www.riotgames.com/',
-  }),
-});
-
-/**
- * Pure self-healing sanitizer for a single storefront platform entry in `vault_games`.
- * Bi-directionally syncs `chainedLauncherHandoff` <-> `externalStorefrontHandoff`,
- * preserves `chainedHandoffTopology`, `chainedExternalInstallId`, `epicPartnerRegistryPath`,
- * `isExternalLauncherStubPackage`, `externalLauncher`, `externalLauncherUrl`,
- * `xboxBottleCompatibilityReason`, `maxDownloadSizeBytes`, `pcMaxInstallSizeBytes`,
- * `requiresKernelAntiCheat`, and `kernelAntiCheatName`, self-heals legacy Xbox chained
- * entries (`chainedHandoffTopology = 'publisher_managed'` + canonical `externalLauncher` /
- * `externalLauncherUrl` backfill) and Epic EA DRM-notice entries, and enforces `mac: false`
- * on Windows-only chained handoffs while never stripping `mac: true` from GOG or native Mac builds.
- *
- * @param {any} p
- * @param {{
- *   hasEnrichedJson?: boolean,
- *   drmNotice?: string | null,
- *   isSinglePlatform?: boolean,
- *   gameChainedLauncherHandoff?: string | null,
- *   gameExternalStorefrontHandoff?: string | null,
- *   gameExternalLauncher?: string | null,
- *   gameExternalLauncherUrl?: string | null,
- *   gameIsExternalLauncherStubPackage?: boolean,
- *   gameXboxBottleCompatibilityReason?: string | null,
- *   gameMaxDownloadSizeBytes?: number | null,
- *   gamePcMaxInstallSizeBytes?: number | null,
- *   gameRequiresKernelAntiCheat?: boolean,
- *   gameKernelAntiCheatName?: string | null
- * } | null} [context=null]
- * @returns {{ entry: any, repaired: boolean }}
- */
-function sanitizeVaultPlatformEntry(p, context = null) {
-  if (!p || typeof p !== 'object') {
-    return { entry: p, repaired: false };
-  }
-  const pid = String(p.platformId || p.id || '').trim().toLowerCase();
-  const hasEnrichedJson = Boolean(context?.hasEnrichedJson);
-  let current = p;
-  let repaired = false;
-  const ensureCloned = () => {
-    if (current === p) {
-      current = { ...p };
-    }
-  };
-
-  const isPhysicallyInstalled = Boolean(
-    current.installed ||
-      (typeof current.installPath === 'string' && current.installPath.trim()) ||
-      (typeof current.executablePath === 'string' && current.executablePath.trim())
-  );
-  if (!isPhysicallyInstalled && pid === 'xbox') {
-    if (current.ownershipType === 'subscription' && current.subscriptionExpired === true) {
-      return { entry: null, repaired: true };
-    }
-    if (current.version !== undefined) {
-      ensureCloned();
-      delete current.version;
-      repaired = true;
-    }
-  }
-
-  let canonicalHandoff =
-    normalizeVaultChainedHandoffId(p.chainedLauncherHandoff) ||
-    normalizeVaultChainedHandoffId(p.chainedRequiresLauncherHandoff) ||
-    normalizeVaultChainedHandoffId(p.externalStorefrontHandoff) ||
-    (pid === 'xbox' ? normalizeVaultChainedHandoffId(p.externalLauncher) : null) ||
-    ((pid === 'xbox' || pid === 'epic') && context?.isSinglePlatform
-      ? normalizeVaultChainedHandoffId(
-          context?.gameChainedLauncherHandoff ||
-            context?.gameExternalStorefrontHandoff ||
-            (pid === 'xbox' ? context?.gameExternalLauncher : null)
-        )
-      : null);
-
-  let inferredEpicPartnerLink = false;
-  if (pid === 'epic' && !canonicalHandoff) {
-    const effectiveDrmNotice = String(p.drmNotice || context?.drmNotice || '').trim();
-    if (effectiveDrmNotice && EPIC_EA_DRM_NOTICE_RE.test(effectiveDrmNotice)) {
-      canonicalHandoff = 'ea';
-      inferredEpicPartnerLink = true;
-    }
-  }
-
-  // Preserve and backfill platform-level delivery, compatibility, size, and anti-cheat metadata
-  if (context?.isSinglePlatform) {
-    if (
-      typeof current.isExternalLauncherStubPackage !== 'boolean' &&
-      typeof context.gameIsExternalLauncherStubPackage === 'boolean'
-    ) {
-      ensureCloned();
-      current.isExternalLauncherStubPackage = context.gameIsExternalLauncherStubPackage;
-      repaired = true;
-    }
-    if (
-      (!current.externalLauncher || !String(current.externalLauncher).trim()) &&
-      typeof context.gameExternalLauncher === 'string' &&
-      context.gameExternalLauncher.trim()
-    ) {
-      ensureCloned();
-      current.externalLauncher = context.gameExternalLauncher.trim();
-      repaired = true;
-    }
-    if (
-      (!current.externalLauncherUrl || !String(current.externalLauncherUrl).trim()) &&
-      typeof context.gameExternalLauncherUrl === 'string' &&
-      /^https:\/\//i.test(context.gameExternalLauncherUrl.trim())
-    ) {
-      ensureCloned();
-      current.externalLauncherUrl = context.gameExternalLauncherUrl.trim();
-      repaired = true;
-    }
-    if (
-      (!current.xboxBottleCompatibilityReason ||
-        !String(current.xboxBottleCompatibilityReason).trim()) &&
-      typeof context.gameXboxBottleCompatibilityReason === 'string' &&
-      context.gameXboxBottleCompatibilityReason.trim()
-    ) {
-      ensureCloned();
-      current.xboxBottleCompatibilityReason = context.gameXboxBottleCompatibilityReason.trim();
-      repaired = true;
-    }
-    if (
-      !(Number(current.maxDownloadSizeBytes) > 0) &&
-      typeof context.gameMaxDownloadSizeBytes === 'number' &&
-      Number.isFinite(context.gameMaxDownloadSizeBytes) &&
-      context.gameMaxDownloadSizeBytes > 0
-    ) {
-      ensureCloned();
-      current.maxDownloadSizeBytes = Math.round(context.gameMaxDownloadSizeBytes);
-      repaired = true;
-    }
-    if (
-      !(Number(current.pcMaxInstallSizeBytes) > 0) &&
-      typeof context.gamePcMaxInstallSizeBytes === 'number' &&
-      Number.isFinite(context.gamePcMaxInstallSizeBytes) &&
-      context.gamePcMaxInstallSizeBytes > 0
-    ) {
-      ensureCloned();
-      current.pcMaxInstallSizeBytes = Math.round(context.gamePcMaxInstallSizeBytes);
-      repaired = true;
-    }
-    if (
-      typeof current.requiresKernelAntiCheat !== 'boolean' &&
-      typeof context.gameRequiresKernelAntiCheat === 'boolean'
-    ) {
-      ensureCloned();
-      current.requiresKernelAntiCheat = context.gameRequiresKernelAntiCheat;
-      repaired = true;
-    }
-    if (
-      (!current.kernelAntiCheatName || !String(current.kernelAntiCheatName).trim()) &&
-      typeof context.gameKernelAntiCheatName === 'string' &&
-      context.gameKernelAntiCheatName.trim()
-    ) {
-      ensureCloned();
-      current.kernelAntiCheatName = context.gameKernelAntiCheatName.trim();
-      repaired = true;
-    }
-  }
-
-  if (canonicalHandoff) {
-    if (
-      current.chainedLauncherHandoff !== canonicalHandoff ||
-      current.externalStorefrontHandoff !== canonicalHandoff
-    ) {
-      ensureCloned();
-      current.chainedLauncherHandoff = canonicalHandoff;
-      current.externalStorefrontHandoff = canonicalHandoff;
-      repaired = true;
-    }
-    if (pid === 'xbox') {
-      if (current.chainedHandoffTopology !== 'publisher_managed') {
-        ensureCloned();
-        current.chainedHandoffTopology = 'publisher_managed';
-        repaired = true;
-      }
-      const canonicalPubMeta =
-        /** @type {Record<string, { externalLauncher: string, externalLauncherUrl: string }>} */ (
-          CANONICAL_XBOX_CHAINED_PUBLISHER_META
-        )[canonicalHandoff];
-      if (canonicalPubMeta) {
-        if (
-          typeof current.externalLauncher !== 'string' ||
-          !current.externalLauncher.trim()
-        ) {
-          ensureCloned();
-          current.externalLauncher = canonicalPubMeta.externalLauncher;
-          repaired = true;
-        }
-        if (
-          typeof current.externalLauncherUrl !== 'string' ||
-          !/^https:\/\//i.test(current.externalLauncherUrl.trim())
-        ) {
-          ensureCloned();
-          current.externalLauncherUrl = canonicalPubMeta.externalLauncherUrl;
-          repaired = true;
-        }
-      }
-    }
-    if (
-      pid === 'epic' &&
-      (inferredEpicPartnerLink || canonicalHandoff === 'ea' || canonicalHandoff === 'ubisoft') &&
-      current.chainedHandoffTopology !== 'partner_launcher_link'
-    ) {
-      ensureCloned();
-      current.chainedHandoffTopology = 'partner_launcher_link';
-      repaired = true;
-    }
-  }
-
-  if (pid === 'xbox') {
-    if (
-      current.ownershipType !== 'owned' &&
-      typeof current.gamePassTier === 'string' &&
-      current.gamePassTier.trim() &&
-      !current.subscriptionTierId
-    ) {
-      const gpLower = current.gamePassTier.trim().toLowerCase();
-      let inferredTierId = '';
-      if (gpLower.includes('ultimate')) inferredTierId = 'ultimate';
-      else if (gpLower.includes('starter')) inferredTierId = 'starter';
-      else if (gpLower.includes('pc game pass')) inferredTierId = 'pc';
-      else if (gpLower.includes('premium') && gpLower.includes('game pass'))
-        inferredTierId = 'premium';
-      else if (gpLower.includes('essential')) inferredTierId = 'essential';
-      else if (gpLower.includes('ubisoft')) inferredTierId = 'ubisoft_classics';
-      else if (gpLower.includes('ea play')) inferredTierId = 'ea_play';
-      if (inferredTierId) {
-        ensureCloned();
-        current.subscriptionTierId = inferredTierId;
-        repaired = true;
-      }
-    }
-    if (Array.isArray(current.satisfyingPassIds)) {
-      const cleanedPassIds = Array.from(
-        new Set(
-          current.satisfyingPassIds
-            .map((p) => String(p || '').trim().toUpperCase())
-            .filter((p) => /^[A-Z0-9]{12}$/.test(p))
-        )
-      );
-      if (
-        cleanedPassIds.length !== current.satisfyingPassIds.length ||
-        cleanedPassIds.some((p, idx) => p !== current.satisfyingPassIds[idx])
-      ) {
-        ensureCloned();
-        current.satisfyingPassIds = cleanedPassIds;
-        repaired = true;
-      }
-    }
-    if (!current.isCrossPlatformLauncherRuntime) {
-      if (canonicalHandoff && WINDOWS_ONLY_CHAINED_HANDOFFS.has(canonicalHandoff)) {
-        if (
-          !current.platforms ||
-          typeof current.platforms !== 'object' ||
-          current.platforms.windows !== true ||
-          current.platforms.mac !== false
-        ) {
-          ensureCloned();
-          current.platforms = {
-            linux: Boolean(current.platforms?.linux),
-            ...current.platforms,
-            windows: true,
-            mac: false,
-          };
-          repaired = true;
-        }
-      } else if (
-        current.platforms &&
-        typeof current.platforms === 'object' &&
-        (current.platforms.windows === false || current.platforms.mac === true)
-      ) {
-        ensureCloned();
-        current.platforms = { windows: true, mac: false, linux: false };
-        repaired = true;
-      }
-    }
-    return { entry: current, repaired };
-  }
-
-  if (pid === 'ubisoft' || pid === 'ea' || pid === 'rockstar' || pid === 'riot') {
-    if (
-      !current.platforms ||
-      typeof current.platforms !== 'object' ||
-      current.platforms.windows !== true ||
-      current.platforms.mac !== false
-    ) {
-      ensureCloned();
-      current.platforms = {
-        linux: Boolean(current.platforms?.linux),
-        ...current.platforms,
-        windows: true,
-        mac: false,
-      };
-      repaired = true;
-    }
-    return { entry: current, repaired };
-  }
-
-  if (pid === 'epic') {
-    if (canonicalHandoff && WINDOWS_ONLY_CHAINED_HANDOFFS.has(canonicalHandoff)) {
-      if (
-        !current.platforms ||
-        typeof current.platforms !== 'object' ||
-        current.platforms.windows !== true ||
-        current.platforms.mac !== false
-      ) {
-        ensureCloned();
-        current.platforms = {
-          linux: Boolean(current.platforms?.linux),
-          ...current.platforms,
-          windows: true,
-          mac: false,
-        };
-        repaired = true;
-      }
-      return { entry: current, repaired };
-    }
-    if (
-      current.platforms &&
-      typeof current.platforms === 'object' &&
-      !current.platforms.windows &&
-      !current.platforms.mac &&
-      !current.platforms.linux
-    ) {
-      ensureCloned();
-      current.platforms = { windows: true, mac: false, linux: false };
-      repaired = true;
-    }
-    return { entry: current, repaired };
-  }
-
-  if (pid === 'gog') {
-    if (
-      current.platforms &&
-      typeof current.platforms === 'object' &&
-      !current.platforms.windows &&
-      !current.platforms.mac &&
-      !current.platforms.linux
-    ) {
-      ensureCloned();
-      current.platforms = { windows: true, mac: false, linux: false };
-      repaired = true;
-    }
-    return { entry: current, repaired };
-  }
-
-  if (pid === 'steam') {
-    if (
-      !hasEnrichedJson &&
-      current.platforms &&
-      typeof current.platforms === 'object' &&
-      current.platforms.mac === true &&
-      current.platforms.windows === true &&
-      !current.installed
-    ) {
-      ensureCloned();
-      delete current.platforms;
-      repaired = true;
-    }
-    return { entry: current, repaired };
-  }
-
-  return { entry: current, repaired };
-}
-
-/**
- * Pure self-healing sanitizer for per-storefront `platforms` entries stored in `vault_games`.
- * Repairs poisoned OS support flags (`windows: false` on non-Minecraft Xbox, all-false GOG/Epic,
- * Windows-only chained publisher clients marked Mac, and unenriched Steam `{ windows: true, mac: true }`
- * skeleton fallbacks), bi-directionally syncs `chainedLauncherHandoff` <-> `externalStorefrontHandoff`,
- * and self-heals Epic EA DRM-notice entries.
- *
- * @param {any[] | null | undefined} platforms
- * @param {boolean} [hasEnrichedJson=false]
- * @param {Record<string, any> | null} [context=null]
- * @returns {{ platforms: any[] | null | undefined, repaired: boolean }}
- */
-function sanitizeVaultPlatformEntriesOsFlags(platforms, hasEnrichedJson = false, context = null) {
-  if (!Array.isArray(platforms)) {
-    return { platforms, repaired: false };
-  }
-  let repaired = false;
-  const isSinglePlatform = platforms.length === 1;
-  const entryContext = {
-    hasEnrichedJson,
-    drmNotice: context?.drmNotice || null,
-    isSinglePlatform,
-    gameChainedLauncherHandoff: context?.gameChainedLauncherHandoff || null,
-    gameExternalStorefrontHandoff: context?.gameExternalStorefrontHandoff || null,
-  };
-  const next = [];
-  for (const p of platforms) {
-    const res = sanitizeVaultPlatformEntry(p, entryContext);
-    if (res.repaired) {
-      repaired = true;
-    }
-    if (res.entry === null) {
-      repaired = true;
-      continue;
-    }
-    next.push(res.entry);
-  }
-  return {
-    platforms: repaired ? next : platforms,
-    repaired,
-  };
-}
-
-/**
- * Validates whether a SQLite `game_media_assets` federated row (`source_url` + `federated_path`)
- * is origin-, ID-, and content-hash-compatible across macOS and Windows paths, and rejects
- * explicit user media overrides (`params?.ov`) so custom covers always use `media_blobs`.
- *
- * @param {unknown} sourceUrl
- * @param {unknown} federatedPath
- * @param {Record<string, any> | null} [params]
- * @returns {boolean}
- */
-function isFederatedAssetRowCompatible(sourceUrl, federatedPath, params = null) {
-  if (isExplicitOverrideParam(params?.ov)) {
-    return false;
-  }
-  const paramRole = params?.role != null ? String(params.role).trim().toLowerCase() : '';
-  const paramOrdinal = Math.max(0, Math.floor(Number(params?.ordinal ?? params?.ord ?? 0) || 0));
-  if (paramRole === 'achievement_icon' || (paramRole === 'icon' && paramOrdinal > 0)) {
-    return false;
-  }
-  const cleanFedPath = typeof federatedPath === 'string' ? federatedPath.trim() : '';
-  if (!cleanFedPath) {
-    return false;
-  }
-
-  const normPath = cleanFedPath.replace(/\\/g, '/');
-  const normPathLower = normPath.toLowerCase();
-  const paramGogId = params?.gogId != null ? String(params.gogId).trim() : params?.gid != null ? String(params.gid).trim() : '';
-  const paramSteamId = params?.steamAppId != null ? String(params.steamAppId).trim() : params?.sid != null ? String(params.sid).trim() : '';
-
-  const gogDirMatch = normPath.match(/\/gog\/(\d+)\//i);
-  if (paramGogId && gogDirMatch && gogDirMatch[1] !== paramGogId) {
-    return false;
-  }
-  const steamDirMatch = normPath.match(/\/librarycache\/(\d+)(?:\/|_)/i);
-  if (paramSteamId && steamDirMatch && steamDirMatch[1] !== paramSteamId) {
-    return false;
-  }
-
-  const cleanUrl = typeof sourceUrl === 'string' ? sourceUrl.trim() : '';
-  if (!cleanUrl) {
-    return true;
-  }
-
-  let parsed;
-  try {
-    parsed = new URL(cleanUrl);
-  } catch {
-    return false;
-  }
-
-  const host = parsed.hostname.toLowerCase();
-  const pathname = parsed.pathname || '';
-
-  // Third-party custom artwork hosts must never resolve to local storefront federated files
-  if (matchesCdnHost(host, ['igdb.com', 'steamgriddb.com'])) {
-    return false;
-  }
-
-  const isGogCache =
-    normPathLower.includes('gog.com/galaxy/webcache') ||
-    (normPathLower.includes('/webcache/') && normPathLower.includes('/gog/'));
-  if (isGogCache) {
-    if (!matchesCdnHost(host, ['gog-statics.com', 'gog.com'])) {
-      return false;
-    }
-    const urlHash64 = pathname.match(/([0-9a-f]{64})/i);
-    const fileHash64 = path.posix.basename(normPath).match(/([0-9a-f]{64})/i);
-    if (urlHash64 && fileHash64 && urlHash64[1].toLowerCase() !== fileHash64[1].toLowerCase()) {
-      return false;
-    }
-    return true;
-  }
-
-  const isSteamCache =
-    normPathLower.includes('appcache/librarycache') ||
-    (normPathLower.includes('/userdata/') && normPathLower.includes('/config/grid/')) ||
-    normPathLower.includes('/steam/games/');
-  if (isSteamCache) {
-    if (
-      !matchesCdnHost(host, [
-        'steamstatic.com',
-        'akamaihd.net',
-        'steamcdn-a.akamaihd.net',
-        'steampowered.com',
-      ])
-    ) {
-      return false;
-    }
-    const appUrlMatch = pathname.match(/\/(?:steam|images)\/apps\/(\d+)\//i);
-    if (appUrlMatch) {
-      if (steamDirMatch && steamDirMatch[1] !== appUrlMatch[1]) {
-        return false;
-      }
-      if (paramSteamId && paramSteamId !== appUrlMatch[1]) {
-        return false;
-      }
-    }
-    const sha40SegMatch = pathname.match(/\/([0-9a-f]{40})\//i);
-    if (sha40SegMatch && normPathLower.includes('appcache/librarycache')) {
-      if (!normPathLower.includes(sha40SegMatch[1].toLowerCase())) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  const isXboxCache =
-    normPathLower.includes('/xboxgames/') ||
-    normPathLower.includes('microsoft.gamingapp_') ||
-    normPathLower.includes('8wekyb3d8bbwe') ||
-    normPathLower.includes('/windowsapps/');
-  if (isXboxCache) {
-    return matchesCdnHost(host, ['s-microsoft.com', 'xboxlive.com', 'microsoft.com']);
-  }
-
-  const isEpicCache =
-    normPathLower.includes('/images-cache/') ||
-    normPathLower.includes('/heroic/') ||
-    normPathLower.includes('epicgameslauncher') ||
-    normPathLower.includes('/legendary/');
-  if (isEpicCache) {
-    return matchesCdnHost(host, ['epicgames.com', 'unrealengine.com']);
-  }
-
-  return true;
-}
-
-/**
- * Validates a candidate gameId string before SQLite queries or deletions.
- * @param {unknown} rawId
- * @returns {string}
- */
-function normalizeSafeVaultGameId(rawId) {
-  if (typeof rawId !== 'string') return '';
-  const trimmed = rawId.trim();
-  if (
-    !trimmed ||
-    trimmed.length > 256 ||
-    trimmed.includes('\0') ||
-    trimmed === '__proto__' ||
-    trimmed === 'constructor' ||
-    trimmed === 'prototype'
-  ) {
-    return '';
-  }
-  return trimmed;
-}
+const vaultSchema = require('./vault/vaultSchemaAndLifecycle.cjs');
+const vaultLattice = require('./vault/vaultMetadataLattice.cjs');
+const vaultSelfHeal = require('./vault/vaultStartupSelfHeal.cjs');
+const vaultGamesRepo = require('./vault/vaultGamesRepository.cjs');
+const vaultBlobStore = require('./vault/vaultBlobStore.cjs');
+const vaultMediaResolver = require('./vault/vaultMediaResolver.cjs');
+const vaultRemoteFetcher = require('./vault/vaultRemoteMediaFetcher.cjs');
+
+const {
+  electron,
+  OFFLINE_VAULT_TIER_CAPS,
+  VALID_TIERS,
+  MAX_P1_RECENT_DETAIL_GAMES,
+  DEFAULT_STARTUP_SWEEP_DELAY_MS,
+  PASS_THROUGH_MAX_BYTES,
+  MAX_INLINE_ANIMATED_GIF_CACHE_BYTES,
+  MAX_ASSET_FETCH_BYTES,
+  ROLE_MAX_WIDTHS,
+  VAULT_ZLIB_PREFIX,
+  compressVaultJson,
+  decompressVaultJsonString,
+  parseVaultJson,
+  collectVaultGameIdVariants,
+  VaultStatementCache,
+  resolveVaultPaths,
+  getSqliteDiskBytes,
+  getFreeDiskBytes,
+  openVaultDatabase,
+  runStartupZlibCompactionIfNeeded,
+} = vaultSchema;
+
+const {
+  QUALITY_RANK,
+  METADATA_QUALITY_RANK,
+  computeAdaptive404DelayMs,
+  isWafOrChallengeResponse,
+  isRejectedVideoUrl,
+  normalizeAssetIdentityUrl,
+  isAnimatedGifBuffer,
+  getCriticAuthorityRank,
+  isTrustedEnrichedMetacritic,
+  carryForwardVaultCriticAndReviewFields,
+  inferVaultMetadataQuality,
+  buildAssetUrlKey,
+  isExplicitOverrideParam,
+  normalizeVaultChainedHandoffId,
+  sanitizeVaultPlatformEntry,
+  sanitizeVaultPlatformEntriesOsFlags,
+  isFederatedAssetRowCompatible,
+} = vaultLattice;
 
 class OfflineVaultService {
   /**
@@ -1490,16 +74,34 @@ class OfflineVaultService {
           typeof options.federator.resolveLocalStoreAsset === 'function'))
         ? options.federator
         : new StorefrontLocalCacheFederator(options);
+
+    /** @type {any} */
     this.db = null;
+    /** @type {InstanceType<typeof VaultStatementCache> | null} */
+    this.stmtCache = null;
     this.vaultDir = '';
     this.blobsDir = '';
     this.tmpDir = '';
     this.dbPath = '';
 
+    /** @type {Set<string>} */
+    this.knownBlobHashes = new Set();
+    /** @type {Map<string, { ext: string, sizeBytes: number }>} */
+    this.blobMetaBySha = new Map();
+    this.totalBlobBytes = 0;
+
     /** @type {Map<string, number>} */
     this.pendingBlobAccessMap = new Map();
+    /** @type {any} */
     this.accessFlushTimer = null;
+    /** @type {any} */
     this.startupSweepTimer = null;
+    /** @type {any} */
+    this.p1FlushTimer = null;
+    this.p1RecentGamesDirty = false;
+    /** @type {Promise<any> | null} */
+    this.activeDiskSweepPromise = null;
+    this.txDepth = 0;
 
     /** @type {Map<string, number>} */
     this.p1RecentDetailGames = new Map();
@@ -1511,11 +113,32 @@ class OfflineVaultService {
 
     /** @type {Set<(snapshot: any) => void>} */
     this.healthListeners = new Set();
+    /** @type {any} */
     this.hydrationEngine = null;
 
+    /** @type {number | null} */
     this.cachedFreeDiskBytes = null;
     this.cachedFreeDiskAt = 0;
+    /** @type {number | null} */
+    this.cachedSqliteDiskBytes = null;
+    this.cachedSqliteDiskAt = 0;
     this.isShutdown = false;
+  }
+
+  /**
+   * Retrieves a lazy-compiled prepared statement from the active `VaultStatementCache`.
+   *
+   * @param {string} key
+   * @param {string} sql
+   */
+  stmt(key, sql) {
+    if (!this.stmtCache) {
+      this.ensureOpen();
+    }
+    if (!this.stmtCache) {
+      throw new Error('OfflineVaultService statement cache unavailable');
+    }
+    return this.stmtCache.get(key, sql);
   }
 
   now() {
@@ -1544,68 +167,42 @@ class OfflineVaultService {
     return this;
   }
 
+  /**
+   * @param {any} engine
+   */
   setHydrationEngine(engine) {
     this.hydrationEngine = engine || null;
   }
 
+  /** @param {any} db */
   loadP1RecentGamesFromDb(db) {
-    if (!db) return;
-    try {
-      const row = db.prepare("SELECT value FROM vault_settings WHERE key = 'p1_recent_games'").get();
-      if (!row || typeof row.value !== 'string') return;
-      const parsed = JSON.parse(row.value);
-      if (!Array.isArray(parsed)) return;
-      this.p1RecentDetailGames.clear();
-      for (const entry of parsed.slice(-MAX_P1_RECENT_DETAIL_GAMES)) {
-        if (typeof entry === 'string' && entry.trim()) {
-          this.p1RecentDetailGames.set(entry.trim(), this.now());
-        } else if (entry && typeof entry === 'object' && entry.gameId) {
-          this.p1RecentDetailGames.set(
-            String(entry.gameId).trim(),
-            Number(entry.ts || this.now())
-          );
-        }
-      }
-    } catch {}
+    vaultMediaResolver.loadP1RecentGamesFromDb(this, db);
   }
 
   persistP1RecentGamesToDb() {
-    if (!this.db) return;
-    try {
-      const serialized = JSON.stringify(
-        Array.from(this.p1RecentDetailGames.entries()).map(([gameId, ts]) => ({ gameId, ts }))
-      );
-      this.db
-        .prepare(
-          "INSERT INTO vault_settings (key, value, updated_at) VALUES ('p1_recent_games', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
-        )
-        .run(serialized, this.now());
-    } catch {}
+    vaultMediaResolver.persistP1RecentGamesToDb(this);
   }
 
+  flushP1RecentGamesToDb() {
+    vaultMediaResolver.flushP1RecentGamesToDb(this);
+  }
+
+  /** @param {string} gameId */
   recordP1DetailGame(gameId) {
-    const cleanId = String(gameId || '').trim();
-    if (!cleanId) return false;
-    this.ensureOpen();
-    if (this.p1RecentDetailGames.has(cleanId)) {
-      this.p1RecentDetailGames.delete(cleanId);
-    }
-    this.p1RecentDetailGames.set(cleanId, this.now());
-    while (this.p1RecentDetailGames.size > MAX_P1_RECENT_DETAIL_GAMES) {
-      const oldestKey = this.p1RecentDetailGames.keys().next().value;
-      if (!oldestKey) break;
-      this.p1RecentDetailGames.delete(oldestKey);
-    }
-    this.persistP1RecentGamesToDb();
-    return true;
+    return vaultMediaResolver.recordP1DetailGame(this, gameId);
   }
 
+  /** @param {string} gameId */
   isP1DetailGame(gameId) {
     const cleanId = String(gameId || '').trim();
     if (!cleanId) return false;
     return this.p1RecentDetailGames.has(cleanId);
   }
 
+  /**
+   * @param {string | Record<string, any>} gameIdOrPayload
+   * @param {Record<string, any>} [opts]
+   */
   promoteGame(gameIdOrPayload, opts = {}) {
     const rawObj =
       gameIdOrPayload && typeof gameIdOrPayload === 'object'
@@ -1639,120 +236,32 @@ class OfflineVaultService {
 
     this.startupSweepTimer = setTimeout(() => {
       this.startupSweepTimer = null;
-      if (!this.db) return;
+      if (!this.db || this.isShutdown) return;
       if (this.hydrationEngine?.isSuspendedInGame) return;
-      try {
-        this.sweepOrphanBlobs({ reclaimLegacyP2NonCover: true });
-        this.maybeEvictBlobs({ forceIfOverMax: true });
-      } catch (sweepErr) {
-        diagLog.debug('offlineVault.postInitSweep', sweepErr);
-      }
+      this.sweepOrphanBlobsAsync({ reclaimLegacyP2NonCover: true })
+        .then(() => {
+          if (this.db && !this.isShutdown) {
+            this.maybeEvictBlobs({ forceIfOverMax: true });
+          }
+        })
+        .catch((sweepErr) => {
+          diagLog.debug('offlineVault.postInitSweep', sweepErr);
+        });
     }, delayMs);
     if (this.startupSweepTimer && typeof this.startupSweepTimer.unref === 'function') {
       this.startupSweepTimer.unref();
     }
   }
 
+  /**
+   * @param {any} [db]
+   * @param {Record<string, any>} [opts]
+   */
   runStartupZlibCompactionIfNeeded(db = this.db, opts = {}) {
-    if (!db) return { compacted: false, compressedCount: 0 };
-    try {
-      const force = Boolean(opts && opts.force);
-      const thresholdBytes =
-        typeof opts?.thresholdBytes === 'number' && opts.thresholdBytes > 0
-          ? opts.thresholdBytes
-          : typeof this.options.sqliteCompactionThresholdBytes === 'number' &&
-              this.options.sqliteCompactionThresholdBytes > 0
-            ? this.options.sqliteCompactionThresholdBytes
-            : DEFAULT_SQLITE_COMPACTION_THRESHOLD_BYTES;
-
-      const preBytes = this.getSqliteDiskBytes();
-      const migRow = db
-        .prepare("SELECT value FROM vault_settings WHERE key = 'json_zlib_migrated_v1'")
-        .get();
-      const alreadyMigrated = migRow && migRow.value === '1';
-
-      if (!force && alreadyMigrated && preBytes <= thresholdBytes) {
-        return { compacted: false, compressedCount: 0 };
-      }
-
-      const uncompressedRows = db
-        .prepare(
-          `
-          SELECT game_id, platforms_json, summary_json, enriched_json, achievements_json, hltb_json, critic_json
-          FROM vault_games
-          WHERE (platforms_json IS NOT NULL AND LENGTH(platforms_json) >= 512 AND platforms_json NOT LIKE '__olz1:%')
-             OR (summary_json IS NOT NULL AND LENGTH(summary_json) >= 512 AND summary_json NOT LIKE '__olz1:%')
-             OR (enriched_json IS NOT NULL AND LENGTH(enriched_json) >= 512 AND enriched_json NOT LIKE '__olz1:%')
-             OR (achievements_json IS NOT NULL AND LENGTH(achievements_json) >= 512 AND achievements_json NOT LIKE '__olz1:%')
-             OR (hltb_json IS NOT NULL AND LENGTH(hltb_json) >= 512 AND hltb_json NOT LIKE '__olz1:%')
-             OR (critic_json IS NOT NULL AND LENGTH(critic_json) >= 512 AND critic_json NOT LIKE '__olz1:%')
-        `
-        )
-        .all();
-
-      let compressedCount = 0;
-      if (uncompressedRows.length > 0) {
-        const updStmt = db.prepare(
-          `
-          UPDATE vault_games
-          SET platforms_json = ?,
-              summary_json = ?,
-              enriched_json = ?,
-              achievements_json = ?,
-              hltb_json = ?,
-              critic_json = ?
-          WHERE game_id = ?
-        `
-        );
-        db.exec('BEGIN IMMEDIATE');
-        try {
-          for (const r of uncompressedRows) {
-            updStmt.run(
-              compressVaultJson(r.platforms_json),
-              compressVaultJson(r.summary_json),
-              compressVaultJson(r.enriched_json),
-              compressVaultJson(r.achievements_json),
-              compressVaultJson(r.hltb_json),
-              compressVaultJson(r.critic_json),
-              r.game_id
-            );
-            compressedCount++;
-          }
-          db.exec('COMMIT');
-        } catch (txErr) {
-          try {
-            db.exec('ROLLBACK');
-          } catch {}
-          throw txErr;
-        }
-      }
-
-      db.prepare(
-        "INSERT INTO vault_settings (key, value, updated_at) VALUES ('json_zlib_migrated_v1', '1', ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at"
-      ).run(this.now());
-
-      const vacRow = db
-        .prepare("SELECT value FROM vault_settings WHERE key = 'sqlite_vacuum_diet_v1'")
-        .get();
-      if (preBytes > thresholdBytes && (!vacRow || vacRow.value !== '1' || compressedCount > 0)) {
-        db.prepare(
-          "INSERT INTO vault_settings (key, value, updated_at) VALUES ('sqlite_vacuum_diet_v1', '1', ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at"
-        ).run(this.now());
-        try {
-          db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
-          db.exec('VACUUM;');
-          db.exec('PRAGMA journal_mode = WAL;');
-        } catch (vacErr) {
-          diagLog.debug('offlineVault.startupVacuum', vacErr);
-        }
-      }
-      return { compacted: compressedCount > 0, compressedCount };
-    } catch (compErr) {
-      diagLog.debug('offlineVault.startupZlibCompaction', compErr);
-      return { compacted: false, compressedCount: 0 };
-    }
+    return runStartupZlibCompactionIfNeeded(this, db, opts);
   }
 
+  /** @param {(snapshot: any) => void} listener */
   onHealthChanged(listener) {
     if (typeof listener !== 'function') return () => {};
     this.healthListeners.add(listener);
@@ -1761,6 +270,7 @@ class OfflineVaultService {
     };
   }
 
+  /** @param {any} snapshot */
   emitHealthChanged(snapshot) {
     for (const listener of this.healthListeners) {
       try {
@@ -1770,475 +280,42 @@ class OfflineVaultService {
   }
 
   resolveVaultPaths() {
-    const userDataDir = resolveFederatorUserDataDir(this.options);
-    const vaultDir = path.join(userDataDir, 'offline-vault');
-    return {
-      vaultDir,
-      blobsDir: path.join(vaultDir, 'blobs'),
-      tmpDir: path.join(vaultDir, 'tmp'),
-      dbPath: path.join(vaultDir, 'catalog_metadata.sqlite'),
-    };
+    return resolveVaultPaths(this.options);
   }
 
   ensureOpen() {
-    const paths = this.resolveVaultPaths();
-    if (this.db && this.dbPath === paths.dbPath) {
-      return this.db;
-    }
-    if (this.db && this.dbPath !== paths.dbPath) {
-      this.shutdown();
-    }
-
-    this.vaultDir = paths.vaultDir;
-    this.blobsDir = paths.blobsDir;
-    this.tmpDir = paths.tmpDir;
-    this.dbPath = paths.dbPath;
-
-    fs.mkdirSync(this.vaultDir, { recursive: true });
-    fs.mkdirSync(this.blobsDir, { recursive: true });
-    fs.mkdirSync(this.tmpDir, { recursive: true });
-
-    // Clean up any orphaned partial temp files from prior crash
-    try {
-      for (const f of fs.readdirSync(this.tmpDir)) {
-        if (f.endsWith('.tmp')) {
-          try {
-            fs.unlinkSync(path.join(this.tmpDir, f));
-          } catch {}
-        }
-      }
-    } catch {}
-
-    const initSql = `
-      PRAGMA auto_vacuum = INCREMENTAL;
-      PRAGMA journal_mode = WAL;
-      PRAGMA synchronous = NORMAL;
-      PRAGMA temp_store = MEMORY;
-      PRAGMA foreign_keys = ON;
-      PRAGMA busy_timeout = 3000;
-      PRAGMA cache_size = -8192;
-      PRAGMA wal_autocheckpoint = 1000;
-
-      CREATE TABLE IF NOT EXISTS vault_settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS vault_games (
-        game_id TEXT PRIMARY KEY,
-        canonical_title TEXT NOT NULL DEFAULT '',
-        steam_app_id INTEGER,
-        is_installed INTEGER NOT NULL DEFAULT 0,
-        is_favorited INTEGER NOT NULL DEFAULT 0,
-        archived_by_subscription_rotation INTEGER NOT NULL DEFAULT 0,
-        platforms_json TEXT,
-        summary_json TEXT,
-        enriched_json TEXT,
-        achievements_json TEXT,
-        hltb_json TEXT,
-        critic_json TEXT,
-        metadata_quality TEXT NOT NULL DEFAULT 'skeleton_fallback',
-        updated_at INTEGER NOT NULL DEFAULT 0,
-        enriched_at INTEGER NOT NULL DEFAULT 0,
-        media_hydrated_at INTEGER DEFAULT 0
-      );
-
-      CREATE TABLE IF NOT EXISTS media_blobs (
-        sha256 TEXT PRIMARY KEY,
-        ext TEXT NOT NULL,
-        mime_type TEXT NOT NULL,
-        size_bytes INTEGER NOT NULL,
-        created_at INTEGER NOT NULL,
-        last_accessed_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS game_media_assets (
-        url_key TEXT PRIMARY KEY,
-        game_id TEXT NOT NULL DEFAULT '',
-        asset_role TEXT NOT NULL DEFAULT 'cover',
-        ordinal INTEGER NOT NULL DEFAULT 0,
-        source_url TEXT NOT NULL DEFAULT '',
-        storage_kind TEXT NOT NULL DEFAULT 'pending',
-        blob_sha256 TEXT REFERENCES media_blobs(sha256) ON DELETE SET NULL,
-        federated_path TEXT,
-        failure_count INTEGER NOT NULL DEFAULT 0,
-        next_retry_at INTEGER NOT NULL DEFAULT 0,
-        last_status_code INTEGER,
-        last_verified_at INTEGER NOT NULL DEFAULT 0
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_game_media_assets_game_role
-        ON game_media_assets(game_id, asset_role, ordinal);
-      CREATE INDEX IF NOT EXISTS idx_game_media_assets_blob
-        ON game_media_assets(blob_sha256);
-      CREATE INDEX IF NOT EXISTS idx_game_media_assets_source_url
-        ON game_media_assets(source_url);
-
-      CREATE TABLE IF NOT EXISTS url_resolution_cache (
-        norm_url TEXT PRIMARY KEY,
-        game_id TEXT NOT NULL,
-        blob_sha256 TEXT REFERENCES media_blobs(sha256) ON DELETE SET NULL,
-        failure_count INTEGER NOT NULL DEFAULT 0,
-        next_retry_at INTEGER NOT NULL DEFAULT 0,
-        last_status_code INTEGER,
-        updated_at INTEGER NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_url_resolution_cache_game
-        ON url_resolution_cache(game_id);
-      CREATE INDEX IF NOT EXISTS idx_url_resolution_cache_blob
-        ON url_resolution_cache(blob_sha256);
-
-      CREATE TABLE IF NOT EXISTS storefront_endpoint_health (
-        host TEXT PRIMARY KEY,
-        state TEXT NOT NULL DEFAULT 'CLOSED',
-        consecutive_failures INTEGER NOT NULL DEFAULT 0,
-        opened_until INTEGER NOT NULL DEFAULT 0,
-        last_status_code INTEGER,
-        last_error TEXT,
-        updated_at INTEGER NOT NULL DEFAULT 0
-      );
-    `;
-
-    let db;
-    try {
-      db = new DatabaseSync(this.dbPath);
-      db.exec(initSql);
-    } catch (openErr) {
-      diagLog.warn('offlineVault.databaseCorrupt', openErr);
-      if (db) {
-        try {
-          db.close();
-        } catch {}
-        db = null;
-      }
-      try {
-        const corruptBackup = `${this.dbPath}.corrupt.${Date.now()}`;
-        if (fs.existsSync(this.dbPath)) {
-          fs.renameSync(this.dbPath, corruptBackup);
-        }
-        if (fs.existsSync(`${this.dbPath}-wal`)) {
-          try {
-            fs.unlinkSync(`${this.dbPath}-wal`);
-          } catch {}
-        }
-        if (fs.existsSync(`${this.dbPath}-shm`)) {
-          try {
-            fs.unlinkSync(`${this.dbPath}-shm`);
-          } catch {}
-        }
-        db = new DatabaseSync(this.dbPath);
-        db.exec(initSql);
-      } catch (recoverErr) {
-        diagLog.error('offlineVault.databaseRecoveryFailed', recoverErr);
-        throw recoverErr;
-      }
-    }
-
-    try {
-      const cols = db.prepare('PRAGMA table_info(vault_games)').all();
-      if (Array.isArray(cols)) {
-        if (!cols.some((c) => c && c.name === 'archived_by_subscription_rotation')) {
-          db.exec(
-            'ALTER TABLE vault_games ADD COLUMN archived_by_subscription_rotation INTEGER NOT NULL DEFAULT 0;'
-          );
-        }
-        if (!cols.some((c) => c && c.name === 'media_hydrated_at')) {
-          db.exec('ALTER TABLE vault_games ADD COLUMN media_hydrated_at INTEGER DEFAULT 0;');
-        }
-      }
-    } catch (migErr) {
-      diagLog.warn('offlineVault.migrateSubscriptionRotationCol', migErr);
-    }
-
-    db.prepare(
-      "INSERT OR IGNORE INTO vault_settings (key, value, updated_at) VALUES ('tier', 'balanced', ?)"
-    ).run(this.now());
-
-    this.db = db;
-    this.isShutdown = false;
-    this.loadP1RecentGamesFromDb(db);
-    this.runStartupSelfHeal(db);
-    this.runStartupZlibCompactionIfNeeded(db);
-    this.schedulePostInitOrphanSweep();
-    return db;
+    return openVaultDatabase(this);
   }
 
   /**
-   * Fast idempotent startup self-heal over `vault_games` & `game_media_assets`:
-   * 1. Downgrades poisoned `metadata_quality = 'authoritative'` rows on `steam-*` / `xbox-*` games
-   *    whose `enriched_json` lacks a positive numeric `appId` (or comes from Xbox) to `'storefront_native'`.
-   * 2. Deletes stale duplicate `xbox-<BigId>` rows when a cross-merged canonical row (e.g. `steam-<appId>`)
-   *    already owns that `xboxProductId`.
+   * @param {any} db
+   * @param {{ force?: boolean }} [options]
    */
-  runStartupSelfHeal(db) {
-    if (!db) return;
-    try {
-      const authCandidates = db
-        .prepare(
-          `
-          SELECT game_id, platforms_json, summary_json, enriched_json
-          FROM vault_games
-          WHERE metadata_quality = 'authoritative'
-        `
-        )
-        .all();
-
-      const downgradeStmt = db.prepare(
-        "UPDATE vault_games SET metadata_quality = 'storefront_native', enriched_json = ? WHERE game_id = ?"
-      );
-
-      for (const row of authCandidates) {
-        if (!row || !row.game_id) continue;
-        const enriched = parseVaultJson(row.enriched_json);
-        const gid = String(row.game_id);
-        const summary = parseVaultJson(row.summary_json);
-        const platforms = parseVaultJson(row.platforms_json);
-
-        const isXboxOrSteamRow =
-          gid.startsWith('steam-') ||
-          gid.startsWith('xbox-') ||
-          gid.startsWith('xbox_') ||
-          hasXboxPlatform({ id: gid, ...summary, platforms: platforms || summary?.platforms });
-        if (!isXboxOrSteamRow) continue;
-
-        const hasPosAppId = enriched && Number(enriched.appId) > 0;
-        const isExplicitXboxNative =
-          enriched &&
-          (enriched.enrichedSource === 'xbox' || enriched.metadataQuality === 'storefront_native');
-
-        if (!hasPosAppId || isExplicitXboxNative) {
-          let updatedJson = row.enriched_json;
-          if (enriched && typeof enriched === 'object') {
-            enriched.metadataQuality = 'storefront_native';
-            updatedJson = compressVaultJson(JSON.stringify(enriched));
-          }
-          downgradeStmt.run(updatedJson, gid);
-        }
-      }
-
-      // Clean up orphaned duplicate `xbox-<BigId>` rows superseded by cross-merged canonical games
-      const allGames = db
-        .prepare('SELECT game_id, summary_json, platforms_json FROM vault_games')
-        .all();
-      const deleteAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
-      const deleteGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
-
-      for (const row of allGames) {
-        if (!row || !row.game_id) continue;
-        const gid = String(row.game_id);
-        if (/^xbox[-_]/i.test(gid)) continue;
-
-        const summary = parseVaultJson(row.summary_json);
-        const platforms = parseVaultJson(row.platforms_json);
-
-        const bigIds = extractXboxBigIdsFromGame(summary, platforms);
-        for (const bigId of bigIds) {
-          const dupVariants = [
-            `xbox-${bigId.toLowerCase()}`,
-            `xbox-${bigId.toUpperCase()}`,
-            `xbox_${bigId.toLowerCase()}`,
-            `xbox_${bigId.toUpperCase()}`,
-          ];
-          for (const dupId of dupVariants) {
-            if (dupId !== gid) {
-              deleteAssetsStmt.run(dupId);
-              deleteGameStmt.run(dupId);
-            }
-          }
-        }
-      }
-
-      // Self-heal poisoned cross-storefront, third-party CDN, or mismatched-hash federated asset rows
-      const federatedRows = db
-        .prepare(
-          "SELECT url_key, game_id, asset_role, ordinal, source_url, federated_path FROM game_media_assets WHERE storage_kind = 'federated'"
-        )
-        .all();
-      if (Array.isArray(federatedRows) && federatedRows.length > 0) {
-        const resetFederatedStmt = db.prepare(
-          "UPDATE game_media_assets SET storage_kind = 'pending', federated_path = NULL WHERE url_key = ?"
-        );
-        const resetHydratedStmt = db.prepare(
-          'UPDATE vault_games SET media_hydrated_at = 0 WHERE game_id = ?'
-        );
-        for (const fedRow of federatedRows) {
-          if (!fedRow || !fedRow.url_key) continue;
-          if (
-            !isFederatedAssetRowCompatible(fedRow.source_url, fedRow.federated_path, {
-              role: fedRow.asset_role,
-              ordinal: fedRow.ordinal,
-            })
-          ) {
-            resetFederatedStmt.run(fedRow.url_key);
-            if (fedRow.game_id) {
-              resetHydratedStmt.run(String(fedRow.game_id));
-            }
-          }
-        }
-      }
-      // Self-heal poisoned platform OS flags across vault_games in a single fast transaction
-      const osCandidates = db
-        .prepare('SELECT game_id, platforms_json, summary_json, enriched_json FROM vault_games')
-        .all();
-      /** @type {Array<{ gameId: string, platformsJson: string | null, summaryJson: string | null }>} */
-      const osRepairs = [];
-      /** @type {string[]} */
-      const orphanPruneIds = [];
-      for (const row of osCandidates) {
-        if (!row || !row.game_id) continue;
-        const summary = parseVaultJson(row.summary_json);
-        const rawPlats = parseVaultJson(row.platforms_json) || summary?.platforms;
-        if (!Array.isArray(rawPlats)) continue;
-        const enrichedObj = row.enriched_json ? parseVaultJson(row.enriched_json) : null;
-        const hasEnrichedForOs = Boolean(
-          enrichedObj &&
-            !(enrichedObj.enrichedSource === 'xbox' && !(Number(enrichedObj.appId) > 0))
-        );
-        const sanitized = sanitizeVaultPlatformEntriesOsFlags(rawPlats, hasEnrichedForOs, {
-          drmNotice: enrichedObj?.drmNotice || summary?.drmNotice || null,
-          gameChainedLauncherHandoff:
-            summary?.chainedLauncherHandoff || summary?.chainedRequiresLauncherHandoff || null,
-          gameExternalStorefrontHandoff: summary?.externalStorefrontHandoff || null,
-          gameExternalLauncher: summary?.externalLauncher || enrichedObj?.externalLauncher || null,
-          gameExternalLauncherUrl:
-            summary?.externalLauncherUrl || enrichedObj?.externalLauncherUrl || null,
-          gameIsExternalLauncherStubPackage:
-            typeof summary?.isExternalLauncherStubPackage === 'boolean'
-              ? summary.isExternalLauncherStubPackage
-              : typeof enrichedObj?.isExternalLauncherStubPackage === 'boolean'
-                ? enrichedObj.isExternalLauncherStubPackage
-                : undefined,
-          gameXboxBottleCompatibilityReason:
-            summary?.xboxBottleCompatibilityReason ||
-            enrichedObj?.xboxBottleCompatibilityReason ||
-            null,
-          gameMaxDownloadSizeBytes:
-            summary?.maxDownloadSizeBytes ?? enrichedObj?.maxDownloadSizeBytes ?? null,
-          gamePcMaxInstallSizeBytes:
-            summary?.pcMaxInstallSizeBytes ?? enrichedObj?.pcMaxInstallSizeBytes ?? null,
-          gameRequiresKernelAntiCheat:
-            typeof summary?.requiresKernelAntiCheat === 'boolean'
-              ? summary.requiresKernelAntiCheat
-              : typeof enrichedObj?.requiresKernelAntiCheat === 'boolean'
-                ? enrichedObj.requiresKernelAntiCheat
-                : undefined,
-          gameKernelAntiCheatName:
-            summary?.kernelAntiCheatName ||
-            summary?.antiCheatName ||
-            enrichedObj?.kernelAntiCheatName ||
-            enrichedObj?.antiCheatName ||
-            null,
-        });
-        const finalPlats = sanitized.platforms || rawPlats;
-        if (rawPlats.length > 0 && Array.isArray(finalPlats) && finalPlats.length === 0) {
-          orphanPruneIds.push(String(row.game_id));
-          continue;
-        }
-        const allPlatsExplicitlyNonMac = Boolean(
-          Array.isArray(finalPlats) &&
-            finalPlats.length > 0 &&
-            finalPlats.every(
-              (ep) =>
-                ep &&
-                !ep.isCrossPlatformLauncherRuntime &&
-                ep.platforms &&
-                typeof ep.platforms === 'object' &&
-                ep.platforms.mac === false
-            )
-        );
-        const worksOnPoisoned = Boolean(
-          summary?.worksOn &&
-            typeof summary.worksOn === 'object' &&
-            ((!summary.worksOn.windows &&
-              !summary.worksOn.mac &&
-              !summary.worksOn.linux) ||
-              (summary.worksOn.mac === true && allPlatsExplicitlyNonMac))
-        );
-        if (sanitized.repaired || worksOnPoisoned) {
-          const updatedPlatsJson = sanitized.platforms
-            ? compressVaultJson(JSON.stringify(sanitized.platforms))
-            : null;
-          let updatedSummaryJson = row.summary_json;
-          if (summary && typeof summary === 'object') {
-            const nextSummary = { ...summary, platforms: sanitized.platforms };
-            if (worksOnPoisoned) {
-              nextSummary.worksOn = {
-                windows: true,
-                mac: false,
-                linux: Boolean(summary?.worksOn?.linux),
-              };
-            }
-            if (
-              Array.isArray(finalPlats) &&
-              finalPlats.length === 1 &&
-              finalPlats[0]?.chainedLauncherHandoff &&
-              (nextSummary.externalStorefrontHandoff || nextSummary.chainedLauncherHandoff)
-            ) {
-              nextSummary.chainedLauncherHandoff = finalPlats[0].chainedLauncherHandoff;
-              nextSummary.externalStorefrontHandoff = finalPlats[0].externalStorefrontHandoff;
-            }
-            updatedSummaryJson = compressVaultJson(JSON.stringify(nextSummary));
-          }
-          osRepairs.push({
-            gameId: String(row.game_id),
-            platformsJson: updatedPlatsJson,
-            summaryJson: updatedSummaryJson,
-          });
-        }
-      }
-      if ((osRepairs.length > 0 || orphanPruneIds.length > 0) && !this.options?.readOnly) {
-        const qOnly = db.prepare('PRAGMA query_only').get();
-        if (!Number(qOnly?.query_only)) {
-          db.exec('BEGIN IMMEDIATE');
-          try {
-            if (osRepairs.length > 0) {
-              const updateOsStmt = db.prepare(
-                'UPDATE vault_games SET platforms_json = ?, summary_json = ? WHERE game_id = ?'
-              );
-              for (const rep of osRepairs) {
-                updateOsStmt.run(rep.platformsJson, rep.summaryJson, rep.gameId);
-              }
-            }
-            if (orphanPruneIds.length > 0) {
-              const delAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
-              const delGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
-              for (const gid of orphanPruneIds) {
-                delAssetsStmt.run(gid);
-                delGameStmt.run(gid);
-              }
-            }
-            db.exec('COMMIT');
-          } catch (txErr) {
-            try {
-              db.exec('ROLLBACK');
-            } catch {}
-            throw txErr;
-          }
-        }
-      }
-    } catch (healErr) {
-      diagLog.debug('offlineVault.startupSelfHeal', healErr);
-    }
+  runStartupSelfHeal(db, options = {}) {
+    return vaultSelfHeal.runStartupSelfHeal(this, db, options);
   }
 
   getTier() {
-    const db = this.ensureOpen();
-    const row = db.prepare("SELECT value FROM vault_settings WHERE key = 'tier'").get();
+    this.ensureOpen();
+    const row = this.stmt(
+      'settings.getByKey',
+      'SELECT value FROM vault_settings WHERE key = ?'
+    ).get('tier');
     const val = row && typeof row.value === 'string' ? row.value : 'balanced';
     return VALID_TIERS.has(val) ? val : 'balanced';
   }
 
+  /** @param {string} tier */
   setTier(tier) {
     const cleanTier = String(tier || '').trim();
     if (!VALID_TIERS.has(cleanTier)) {
       return { success: false, error: `Invalid vault tier: ${cleanTier}` };
     }
-    const db = this.ensureOpen();
-    db.prepare(
-      "INSERT INTO vault_settings (key, value, updated_at) VALUES ('tier', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
-    ).run(cleanTier, this.now());
+    this.ensureOpen();
+    this.stmt(
+      'settings.upsert',
+      'INSERT INTO vault_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
+    ).run('tier', cleanTier, this.now());
 
     const maxBytes = OFFLINE_VAULT_TIER_CAPS[cleanTier];
     this.maybeEvictBlobs({ forceIfOverMax: true, maxBytes });
@@ -2248,159 +325,71 @@ class OfflineVaultService {
     };
   }
 
+  /**
+   * @param {string} sha256
+   * @param {string} ext
+   */
   getBlobFilePath(sha256, ext) {
-    this.ensureOpen();
-    const cleanSha = String(sha256 || '').toLowerCase().trim();
-    const cleanExt = String(ext || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
-    return path.join(this.blobsDir, cleanSha.slice(0, 2), `${cleanSha}.${cleanExt}`);
+    return vaultBlobStore.getBlobFilePath(this, sha256, ext);
   }
 
   scheduleBlobAccessFlush() {
-    if (this.accessFlushTimer) return;
-    this.accessFlushTimer = setTimeout(() => {
-      this.accessFlushTimer = null;
-      this.flushBlobAccessTimestamps();
-    }, 10000);
-    if (this.accessFlushTimer && typeof this.accessFlushTimer.unref === 'function') {
-      this.accessFlushTimer.unref();
-    }
+    vaultMediaResolver.scheduleBlobAccessFlush(this);
   }
 
+  /** @param {string} sha256 */
   touchBlobAccess(sha256) {
-    if (!sha256) return;
-    this.pendingBlobAccessMap.set(sha256, this.now());
-    if (this.pendingBlobAccessMap.size >= 100) {
-      this.flushBlobAccessTimestamps();
-    } else {
-      this.scheduleBlobAccessFlush();
-    }
+    vaultMediaResolver.touchBlobAccess(this, sha256);
   }
 
   flushBlobAccessTimestamps() {
-    if (this.accessFlushTimer) {
-      try {
-        clearTimeout(this.accessFlushTimer);
-      } catch {}
-      this.accessFlushTimer = null;
-    }
-    if (!this.db || this.pendingBlobAccessMap.size === 0) {
-      this.pendingBlobAccessMap.clear();
-      return;
-    }
-    const entries = Array.from(this.pendingBlobAccessMap.entries());
-    this.pendingBlobAccessMap.clear();
-    try {
-      const stmt = this.db.prepare(
-        'UPDATE media_blobs SET last_accessed_at = ? WHERE sha256 = ? AND last_accessed_at < ?'
-      );
-      this.db.exec('BEGIN IMMEDIATE');
-      try {
-        for (const [sha, ts] of entries) {
-          stmt.run(ts, sha, ts);
-        }
-        this.db.exec('COMMIT');
-      } catch (txErr) {
-        try {
-          this.db.exec('ROLLBACK');
-        } catch {}
-        throw txErr;
-      }
-    } catch (err) {
-      diagLog.debug('offlineVault.flushBlobAccess', err);
-    }
+    vaultMediaResolver.flushBlobAccessTimestamps(this);
   }
 
   getSqliteDiskBytes() {
-    if (!this.dbPath) return 0;
-    let total = 0;
-    for (const suffix of ['', '-wal', '-shm']) {
-      const p = `${this.dbPath}${suffix}`;
-      try {
-        if (fs.existsSync(p)) {
-          total += fs.statSync(p).size || 0;
-        }
-      } catch {}
-    }
-    return total;
+    return getSqliteDiskBytes(this, { forceRefresh: true });
   }
 
   getFreeDiskBytes() {
-    if (typeof this.options.freeDiskBytesFn === 'function') {
-      return Number(this.options.freeDiskBytesFn());
-    }
-    const now = this.now();
-    if (this.cachedFreeDiskBytes !== null && now - this.cachedFreeDiskAt < 30000) {
-      return this.cachedFreeDiskBytes;
-    }
-    let freeBytes = 100 * 1024 * 1024 * 1024;
-    try {
-      const target = this.vaultDir || resolveFederatorUserDataDir(this.options);
-      const launcherEngine = getLazyLauncherEngine();
-      let resolvedSync = false;
-      if (launcherEngine && typeof launcherEngine.getDiskSpace === 'function') {
-        const dsOrPromise = /** @type {any} */ (launcherEngine.getDiskSpace(target));
-        if (dsOrPromise && typeof dsOrPromise.then === 'function') {
-          dsOrPromise
-            .then((/** @type {any} */ ds) => {
-              if (ds && typeof ds.freeBytes === 'number') {
-                this.cachedFreeDiskBytes = ds.freeBytes;
-                this.cachedFreeDiskAt = this.now();
-              }
-            })
-            .catch(() => {});
-        } else if (dsOrPromise && typeof dsOrPromise.freeBytes === 'number') {
-          freeBytes = dsOrPromise.freeBytes;
-          resolvedSync = true;
-        }
-      }
-      if (!resolvedSync && typeof fs.statfsSync === 'function') {
-        let probe = target;
-        while (probe && !fs.existsSync(probe)) {
-          const parent = path.dirname(probe);
-          if (!parent || parent === probe) break;
-          probe = parent;
-        }
-        if (probe && fs.existsSync(probe)) {
-          const st = fs.statfsSync(probe);
-          freeBytes = Number(st.bavail || st.bfree || 0) * Number(st.bsize || 4096);
-        }
-      }
-    } catch {}
-    this.cachedFreeDiskBytes = freeBytes;
-    this.cachedFreeDiskAt = now;
-    return freeBytes;
+    return getFreeDiskBytes(this);
   }
 
   getStats() {
-    const db = this.ensureOpen();
+    this.ensureOpen();
     const tier = this.getTier();
     const maxBytes = OFFLINE_VAULT_TIER_CAPS[tier];
-    const sqliteBytes = this.getSqliteDiskBytes();
+    const sqliteBytes = getSqliteDiskBytes(this, { forceRefresh: true });
 
-    const blobRow = db
-      .prepare('SELECT COUNT(*) AS cnt, COALESCE(SUM(size_bytes), 0) AS bytes FROM media_blobs')
-      .get();
+    const blobRow = this.stmt(
+      'stats.blobs',
+      'SELECT COUNT(*) AS cnt, COALESCE(SUM(size_bytes), 0) AS bytes FROM media_blobs'
+    ).get();
     const blobCount = Number(blobRow?.cnt || 0);
     const blobBytes = Number(blobRow?.bytes || 0);
+    this.totalBlobBytes = blobBytes;
 
-    const fedRow = db
-      .prepare("SELECT COUNT(*) AS cnt FROM game_media_assets WHERE storage_kind = 'federated'")
-      .get();
+    const fedRow = this.stmt(
+      'stats.federated',
+      "SELECT COUNT(*) AS cnt FROM game_media_assets WHERE storage_kind = 'federated'"
+    ).get();
     const federatedAssetCount = Number(fedRow?.cnt || 0);
 
-    const gamesRow = db.prepare('SELECT COUNT(*) AS cnt FROM vault_games').get();
+    const gamesRow = this.stmt(
+      'stats.countVaultGames',
+      'SELECT COUNT(*) AS cnt FROM vault_games'
+    ).get();
     const totalGames = Number(gamesRow?.cnt || 0);
 
-    const enrichedRow = db
-      .prepare(
-        "SELECT COUNT(*) AS cnt FROM vault_games WHERE enriched_json IS NOT NULL AND enriched_json != '' AND metadata_quality != 'skeleton_fallback'"
-      )
-      .get();
+    const enrichedRow = this.stmt(
+      'stats.countEnrichedGames',
+      "SELECT COUNT(*) AS cnt FROM vault_games WHERE enriched_json IS NOT NULL AND enriched_json != '' AND metadata_quality != 'skeleton_fallback'"
+    ).get();
     const enrichedGames = Number(enrichedRow?.cnt || 0);
 
-    const pendingRow = db
-      .prepare("SELECT COUNT(*) AS cnt FROM game_media_assets WHERE storage_kind = 'pending'")
-      .get();
+    const pendingRow = this.stmt(
+      'stats.countPendingAssets',
+      "SELECT COUNT(*) AS cnt FROM game_media_assets WHERE storage_kind = 'pending'"
+    ).get();
     const dbPending = Number(pendingRow?.cnt || 0);
     const engineState = this.hydrationEngine?.getProgressSnapshot?.() || null;
 
@@ -2420,12 +409,13 @@ class OfflineVaultService {
     };
   }
 
+  /** @param {Record<string, any>} [options] */
   clear(options = {}) {
     const db = this.ensureOpen();
     this.flushBlobAccessTimestamps();
+    this.flushP1RecentGamesToDb();
     const preserveMetadata = Boolean(options && options.preserveMetadata);
 
-    // Remove all stored blob & temp files on disk
     try {
       if (this.blobsDir && fs.existsSync(this.blobsDir)) {
         fs.rmSync(this.blobsDir, { recursive: true, force: true });
@@ -2460,7 +450,9 @@ class OfflineVaultService {
         db.exec('DELETE FROM vault_games;');
         db.exec('DELETE FROM storefront_endpoint_health;');
         db.exec("DELETE FROM vault_settings WHERE key = 'p1_recent_games';");
+        db.exec("DELETE FROM vault_meta WHERE key = 'self_heal_version';");
         this.p1RecentDetailGames.clear();
+        this.p1RecentGamesDirty = false;
       }
       db.exec('COMMIT');
     } catch (txErr) {
@@ -2472,6 +464,11 @@ class OfflineVaultService {
         error: txErr instanceof Error ? txErr.message : String(txErr),
       };
     }
+
+    this.knownBlobHashes.clear();
+    this.blobMetaBySha.clear();
+    this.totalBlobBytes = 0;
+    this.cachedSqliteDiskBytes = null;
 
     try {
       db.exec('PRAGMA incremental_vacuum;');
@@ -2485,10 +482,14 @@ class OfflineVaultService {
     };
   }
 
-  // ==========================================================================
-  // Metadata Persistence (with Non-Destructive Quality Guard + Zlib Compression)
-  // ==========================================================================
-
+  /**
+   * @param {string} gameId
+   * @param {string} assetRole
+   * @param {number} ordinal
+   * @param {string} sourceUrl
+   * @param {number} nowTs
+   * @param {boolean} [allowCreatePending=true]
+   */
   registerGameMediaCandidate(
     gameId,
     assetRole,
@@ -2497,2648 +498,210 @@ class OfflineVaultService {
     nowTs,
     allowCreatePending = true
   ) {
-    if (!sourceUrl || typeof sourceUrl !== 'string') return;
-    const cleanUrl = sourceUrl.trim();
-    if (!/^https?:\/\//i.test(cleanUrl) || isRejectedVideoUrl(cleanUrl)) return;
-
-    const db = this.ensureOpen();
-    const urlKey = buildAssetUrlKey(gameId, assetRole, ordinal, cleanUrl);
-    const existing = db
-      .prepare('SELECT source_url, storage_kind, blob_sha256 FROM game_media_assets WHERE url_key = ?')
-      .get(urlKey);
-
-    if (!existing) {
-      if (!allowCreatePending) return;
-      db.prepare(
-        `
-        INSERT INTO game_media_assets (
-          url_key, game_id, asset_role, ordinal, source_url, storage_kind,
-          blob_sha256, federated_path, failure_count, next_retry_at, last_status_code, last_verified_at
-        ) VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, 0, 0, NULL, ?)
-      `
-      ).run(
-        urlKey,
-        String(gameId || ''),
-        String(assetRole || 'cover'),
-        Math.max(0, Math.floor(Number(ordinal) || 0)),
-        cleanUrl,
-        nowTs
-      );
-      return;
-    }
-
-    // Non-destructive sync candidate update:
-    // During routine upsertGames() syncs, NEVER wipe a healthy on-disk cover blob just because
-    // raw g.capsuleImage differs from the resolved cover URL rendered by GameCardCover
-    // (e.g., Epic ?h=480, Steam 1x vs 2x, GOG boxart vs IGDB). Explicit user overrides invalidate
-    // via saveUserOverride() / removeUserOverride(). Only update pending rows, rows whose disk
-    // blob is missing, or non-cover online updates.
-    if (
-      existing.source_url !== cleanUrl &&
-      normalizeAssetIdentityUrl(existing.source_url) !== normalizeAssetIdentityUrl(cleanUrl)
-    ) {
-      const normalizedRole = String(assetRole || 'cover').toLowerCase();
-      const isCoverRole = normalizedRole === 'cover' || normalizedRole === 'capsule';
-
-      if (existing.storage_kind === 'blob') {
-        let hasLiveBlobOnDisk = false;
-        if (existing.blob_sha256) {
-          const mb = db
-            .prepare('SELECT ext FROM media_blobs WHERE sha256 = ?')
-            .get(existing.blob_sha256);
-          if (mb) {
-            const blobPath = this.getBlobFilePath(existing.blob_sha256, mb.ext);
-            if (
-              isContainedWithinRoot(this.blobsDir, blobPath, this.options.platform) &&
-              fs.existsSync(blobPath)
-            ) {
-              hasLiveBlobOnDisk = true;
-            }
-          }
-        }
-        if (hasLiveBlobOnDisk && isCoverRole) {
-          return;
-        }
-        if (hasLiveBlobOnDisk && !this.isNetworkOnline()) {
-          return;
-        }
-      } else if (existing.storage_kind !== 'pending' && !this.isNetworkOnline()) {
-        return;
-      }
-
-      db.prepare(
-        `
-        UPDATE game_media_assets
-        SET source_url = ?,
-            storage_kind = 'pending',
-            blob_sha256 = NULL,
-            federated_path = NULL,
-            failure_count = 0,
-            next_retry_at = 0,
-            last_status_code = NULL,
-            last_verified_at = ?
-        WHERE url_key = ?
-      `
-      ).run(cleanUrl, nowTs, urlKey);
-    }
+    vaultGamesRepo.registerGameMediaCandidate(
+      this,
+      gameId,
+      assetRole,
+      ordinal,
+      sourceUrl,
+      nowTs,
+      allowCreatePending
+    );
   }
 
+  /** @param {any[]} games */
   upsertGames(games) {
-    if (!Array.isArray(games)) {
-      return { success: false, error: 'Expected array of games' };
-    }
-    const db = this.ensureOpen();
-    const nowTs = this.now();
-    let upserted = 0;
-    let skipped = 0;
-
-    const selectExistingStmt = db.prepare(
-      'SELECT canonical_title, steam_app_id, is_installed, is_favorited, archived_by_subscription_rotation, platforms_json, summary_json, enriched_json, metadata_quality, enriched_at FROM vault_games WHERE game_id = ?'
-    );
-    const deleteOrphanAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
-    const deleteOrphanUrlCacheStmt = db.prepare('DELETE FROM url_resolution_cache WHERE game_id = ?');
-    const deleteOrphanGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
-    const upsertStmt = db.prepare(`
-      INSERT INTO vault_games (
-        game_id, canonical_title, steam_app_id, is_installed, is_favorited,
-        archived_by_subscription_rotation,
-        platforms_json, summary_json, enriched_json, metadata_quality, updated_at, enriched_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(game_id) DO UPDATE SET
-        canonical_title = CASE WHEN excluded.canonical_title != '' THEN excluded.canonical_title ELSE vault_games.canonical_title END,
-        steam_app_id = excluded.steam_app_id,
-        is_installed = excluded.is_installed,
-        is_favorited = excluded.is_favorited,
-        archived_by_subscription_rotation = excluded.archived_by_subscription_rotation,
-        platforms_json = COALESCE(excluded.platforms_json, vault_games.platforms_json),
-        summary_json = COALESCE(excluded.summary_json, vault_games.summary_json),
-        enriched_json = excluded.enriched_json,
-        metadata_quality = excluded.metadata_quality,
-        updated_at = excluded.updated_at,
-        enriched_at = excluded.enriched_at
-    `);
-
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      for (const g of games) {
-        if (!g || typeof g !== 'object' || !g.id) continue;
-        const gameId = String(g.id).trim();
-        if (!gameId) continue;
-
-        const existing = selectExistingStmt.get(gameId);
-        const rawPlatforms = Array.isArray(g.platforms) ? g.platforms : null;
-        const incomingEnrichedPreview =
-          g.enrichedMetadata && typeof g.enrichedMetadata === 'object' ? g.enrichedMetadata : null;
-        const existingEnrichedStr =
-          existing && existing.enriched_json
-            ? decompressVaultJsonString(existing.enriched_json)
-            : null;
-        let existingEnrichedObj = null;
-        if (existingEnrichedStr) {
-          try {
-            existingEnrichedObj = JSON.parse(existingEnrichedStr);
-          } catch {
-            existingEnrichedObj = null;
-          }
-        }
-        const hasEnrichedForOsSanitize = Boolean(
-          (incomingEnrichedPreview &&
-            !(
-              incomingEnrichedPreview.enrichedSource === 'xbox' &&
-              !(Number(incomingEnrichedPreview.appId) > 0)
-            )) ||
-            (existingEnrichedObj &&
-              !(
-                existingEnrichedObj.enrichedSource === 'xbox' &&
-                !(Number(existingEnrichedObj.appId) > 0)
-              ))
-        );
-        const platforms = rawPlatforms
-          ? sanitizeVaultPlatformEntriesOsFlags(rawPlatforms, hasEnrichedForOsSanitize, {
-              drmNotice:
-                incomingEnrichedPreview?.drmNotice ||
-                existingEnrichedObj?.drmNotice ||
-                g.drmNotice ||
-                null,
-              gameChainedLauncherHandoff:
-                g.chainedLauncherHandoff || g.chainedRequiresLauncherHandoff || null,
-              gameExternalStorefrontHandoff: g.externalStorefrontHandoff || null,
-              gameExternalLauncher:
-                g.externalLauncher ||
-                incomingEnrichedPreview?.externalLauncher ||
-                existingEnrichedObj?.externalLauncher ||
-                null,
-              gameExternalLauncherUrl:
-                g.externalLauncherUrl ||
-                incomingEnrichedPreview?.externalLauncherUrl ||
-                existingEnrichedObj?.externalLauncherUrl ||
-                null,
-              gameIsExternalLauncherStubPackage:
-                typeof g.isExternalLauncherStubPackage === 'boolean'
-                  ? g.isExternalLauncherStubPackage
-                  : typeof incomingEnrichedPreview?.isExternalLauncherStubPackage === 'boolean'
-                    ? incomingEnrichedPreview.isExternalLauncherStubPackage
-                    : typeof existingEnrichedObj?.isExternalLauncherStubPackage === 'boolean'
-                      ? existingEnrichedObj.isExternalLauncherStubPackage
-                      : undefined,
-              gameXboxBottleCompatibilityReason:
-                g.xboxBottleCompatibilityReason ||
-                incomingEnrichedPreview?.xboxBottleCompatibilityReason ||
-                existingEnrichedObj?.xboxBottleCompatibilityReason ||
-                null,
-              gameMaxDownloadSizeBytes:
-                g.maxDownloadSizeBytes ??
-                incomingEnrichedPreview?.maxDownloadSizeBytes ??
-                existingEnrichedObj?.maxDownloadSizeBytes ??
-                null,
-              gamePcMaxInstallSizeBytes:
-                g.pcMaxInstallSizeBytes ??
-                incomingEnrichedPreview?.pcMaxInstallSizeBytes ??
-                existingEnrichedObj?.pcMaxInstallSizeBytes ??
-                null,
-              gameRequiresKernelAntiCheat:
-                typeof g.requiresKernelAntiCheat === 'boolean'
-                  ? g.requiresKernelAntiCheat
-                  : typeof incomingEnrichedPreview?.requiresKernelAntiCheat === 'boolean'
-                    ? incomingEnrichedPreview.requiresKernelAntiCheat
-                    : typeof existingEnrichedObj?.requiresKernelAntiCheat === 'boolean'
-                      ? existingEnrichedObj.requiresKernelAntiCheat
-                      : undefined,
-              gameKernelAntiCheatName:
-                g.kernelAntiCheatName ||
-                g.antiCheatName ||
-                incomingEnrichedPreview?.kernelAntiCheatName ||
-                existingEnrichedObj?.kernelAntiCheatName ||
-                null,
-            }).platforms || null
-          : null;
-
-        if (
-          Array.isArray(rawPlatforms) &&
-          rawPlatforms.length > 0 &&
-          Array.isArray(platforms) &&
-          platforms.length === 0
-        ) {
-          if (existing) {
-            try {
-              deleteOrphanAssetsStmt.run(gameId);
-              deleteOrphanUrlCacheStmt.run(gameId);
-              deleteOrphanGameStmt.run(gameId);
-            } catch {}
-          }
-          continue;
-        }
-
-        // Clean up stale duplicate `xbox-<BigId>` rows when upserting a cross-merged canonical game
-        if (!/^xbox[-_]/i.test(gameId)) {
-          const xboxBigIds = extractXboxBigIdsFromGame(g, platforms);
-          for (const bigId of xboxBigIds) {
-            const dupVariants = [
-              `xbox-${bigId.toLowerCase()}`,
-              `xbox-${bigId.toUpperCase()}`,
-              `xbox_${bigId.toLowerCase()}`,
-              `xbox_${bigId.toUpperCase()}`,
-            ];
-            for (const dupId of dupVariants) {
-              if (dupId !== gameId) {
-                deleteOrphanAssetsStmt.run(dupId);
-                deleteOrphanUrlCacheStmt.run(dupId);
-                deleteOrphanGameStmt.run(dupId);
-              }
-            }
-          }
-        }
-
-        const isInstalled =
-          g.isInstalled === true ||
-          Boolean(platforms && platforms.some((p) => p && p.installed === true))
-            ? 1
-            : 0;
-        if (!isInstalled && isStandaloneStorefrontLauncherUtility(g.title, platforms)) {
-          if (existing) {
-            try {
-              db.prepare('DELETE FROM vault_games WHERE game_id = ?').run(gameId);
-            } catch {}
-          }
-          continue;
-        }
-        const isFavorited =
-          typeof g.isFavorited === 'boolean'
-            ? g.isFavorited
-              ? 1
-              : 0
-            : existing
-              ? Number(existing.is_favorited || 0)
-              : 0;
-
-        const rawSteamAppIdStr = typeof g.steamAppId === 'string' ? g.steamAppId.trim() : '';
-        const steamAppId =
-          typeof g.steamAppId === 'number' && g.steamAppId > 0
-            ? g.steamAppId
-            : rawSteamAppIdStr && /^\d+$/.test(rawSteamAppIdStr) && parseInt(rawSteamAppIdStr, 10) > 0
-              ? parseInt(rawSteamAppIdStr, 10)
-              : g.steamAppId === null || platforms !== null
-                ? null
-                : existing && typeof existing.steam_app_id === 'number' && existing.steam_app_id > 0
-                  ? existing.steam_app_id
-                  : null;
-
-        const incomingIsSlimmed = Boolean(incomingEnrichedPreview?.__quotaSlimmed);
-        const existingIsSlimmed = Boolean(existingEnrichedObj?.__quotaSlimmed);
-        const existingSummaryStr =
-          existing && existing.summary_json !== null && existing.summary_json !== undefined
-            ? decompressVaultJsonString(existing.summary_json)
-            : null;
-        let existingSummaryObj = null;
-        if (existingSummaryStr) {
-          try {
-            existingSummaryObj = JSON.parse(existingSummaryStr);
-          } catch {
-            existingSummaryObj = null;
-          }
-        }
-
-        const summaryCopy = { ...g };
-        delete summaryCopy.enrichedMetadata;
-        if (platforms) {
-          summaryCopy.platforms = platforms;
-        }
-
-        // Protect summary_json against __quotaSlimmed / empty-field clobber
-        if (existingSummaryObj && typeof existingSummaryObj === 'object') {
-          if (
-            !(typeof summaryCopy.shortDescription === 'string' && summaryCopy.shortDescription.trim().length > 0) &&
-            typeof existingSummaryObj.shortDescription === 'string' &&
-            existingSummaryObj.shortDescription.trim().length > 0
-          ) {
-            summaryCopy.shortDescription = existingSummaryObj.shortDescription;
-          }
-          if (
-            !(typeof summaryCopy.detailedDescription === 'string' && summaryCopy.detailedDescription.trim().length > 0) &&
-            typeof existingSummaryObj.detailedDescription === 'string' &&
-            existingSummaryObj.detailedDescription.trim().length > 0
-          ) {
-            summaryCopy.detailedDescription = existingSummaryObj.detailedDescription;
-          }
-          if (
-            incomingIsSlimmed &&
-            !(typeof summaryCopy.aboutTheGame === 'string' && summaryCopy.aboutTheGame.trim().length > 0) &&
-            typeof existingSummaryObj.aboutTheGame === 'string' &&
-            existingSummaryObj.aboutTheGame.trim().length > 0
-          ) {
-            summaryCopy.aboutTheGame = existingSummaryObj.aboutTheGame;
-          }
-          if (
-            (incomingIsSlimmed || !hasVaultNonPlaceholderStrings(summaryCopy.developers, 'Unknown Developer')) &&
-            hasVaultNonPlaceholderStrings(existingSummaryObj.developers, 'Unknown Developer')
-          ) {
-            summaryCopy.developers = existingSummaryObj.developers;
-          }
-          if (
-            (incomingIsSlimmed || !hasVaultNonPlaceholderStrings(summaryCopy.publishers, 'Unknown Publisher')) &&
-            hasVaultNonPlaceholderStrings(existingSummaryObj.publishers, 'Unknown Publisher')
-          ) {
-            summaryCopy.publishers = existingSummaryObj.publishers;
-          }
-          if (
-            incomingIsSlimmed &&
-            (!Array.isArray(summaryCopy.tags) || summaryCopy.tags.length === 0) &&
-            Array.isArray(existingSummaryObj.tags) &&
-            existingSummaryObj.tags.length > 0
-          ) {
-            summaryCopy.tags = existingSummaryObj.tags;
-          }
-          if (
-            incomingIsSlimmed &&
-            Array.isArray(existingSummaryObj.genres) &&
-            existingSummaryObj.genres.length > (Array.isArray(summaryCopy.genres) ? summaryCopy.genres.length : 0)
-          ) {
-            summaryCopy.genres = existingSummaryObj.genres;
-          }
-          const incomingHasReviews = Boolean(
-            summaryCopy.reviewSummary &&
-              (summaryCopy.reviewSummary.totalReviews > 0 || summaryCopy.reviewSummary.positivePercent > 0)
-          );
-          const existingHasReviews = Boolean(
-            existingSummaryObj.reviewSummary &&
-              (existingSummaryObj.reviewSummary.totalReviews > 0 || existingSummaryObj.reviewSummary.positivePercent > 0)
-          );
-          if (!incomingHasReviews && existingHasReviews) {
-            summaryCopy.reviewSummary = existingSummaryObj.reviewSummary;
-          }
-        }
-
-        if (
-          Array.isArray(platforms) &&
-          platforms.some((ep) => ep && ep.isCrossPlatformLauncherRuntime === true)
-        ) {
-          const supportsLinux = platforms.some(
-            (ep) => ep && ep.platforms && ep.platforms.linux === true
-          );
-          if (
-            !summaryCopy.worksOn ||
-            typeof summaryCopy.worksOn !== 'object' ||
-            summaryCopy.worksOn.mac !== true ||
-            summaryCopy.worksOn.windows === false
-          ) {
-            summaryCopy.worksOn = {
-              ...(summaryCopy.worksOn || {}),
-              windows: true,
-              mac: true,
-              linux: Boolean(summaryCopy.worksOn?.linux || supportsLinux),
-            };
-          }
-        } else if (
-          summaryCopy.worksOn &&
-          typeof summaryCopy.worksOn === 'object' &&
-          !summaryCopy.worksOn.windows &&
-          !summaryCopy.worksOn.mac &&
-          !summaryCopy.worksOn.linux
-        ) {
-          summaryCopy.worksOn = { windows: true, mac: false, linux: false };
-        }
-        const rawSummaryJson = JSON.stringify(summaryCopy);
-        const rawPlatformsJson = platforms ? JSON.stringify(platforms) : null;
-
-        const incomingEnriched =
-          g.enrichedMetadata && typeof g.enrichedMetadata === 'object'
-            ? { ...g.enrichedMetadata }
-            : null;
-
-        let incomingQuality = inferVaultMetadataQuality(g, incomingEnriched);
-        if (!Object.prototype.hasOwnProperty.call(METADATA_QUALITY_RANK, incomingQuality)) {
-          incomingQuality = 'skeleton_fallback';
-        }
-
-        if (
-          incomingEnriched &&
-          existingEnrichedObj?.xboxDeliveryHints &&
-          !incomingEnriched.xboxDeliveryHints
-        ) {
-          incomingEnriched.xboxDeliveryHints = existingEnrichedObj.xboxDeliveryHints;
-        }
-        if (incomingEnriched && existingEnrichedObj) {
-          carryForwardVaultRequirements(incomingEnriched, existingEnrichedObj);
-          carryForwardVaultCriticAndReviewFields(incomingEnriched, existingEnrichedObj);
-        }
-
-        const rawIncomingEnrichedJson = incomingEnriched ? JSON.stringify(incomingEnriched) : null;
-
-        let keepExistingEnriched = false;
-        let finalQuality = incomingQuality;
-        let finalEnrichedAt = rawIncomingEnrichedJson ? nowTs : 0;
-
-        if (existing && existing.enriched_json) {
-          let existingQuality = String(existing.metadata_quality || 'skeleton_fallback');
-          // Universal C8 Lattice Invariant: demote existing __quotaSlimmed rows to Rank 0
-          // so rich records always heal them while slimmed projections NEVER overwrite rich rows.
-          if (existingIsSlimmed) {
-            existingQuality = 'skeleton_fallback';
-          } else if (
-            existingQuality === 'authoritative' &&
-            existingEnrichedObj &&
-            ((!(Number(existingEnrichedObj.appId) > 0) &&
-              (gameId.startsWith('steam-') || hasXboxPlatform(g))) ||
-              existingEnrichedObj.enrichedSource === 'xbox' ||
-              existingEnrichedObj.metadataQuality === 'storefront_native')
-          ) {
-            existingQuality = 'storefront_native';
-          }
-
-          const existingRank = METADATA_QUALITY_RANK[existingQuality] ?? 0;
-          const incomingRank = METADATA_QUALITY_RANK[incomingQuality] ?? 0;
-          if (incomingIsSlimmed && existingEnrichedObj && !existingIsSlimmed) {
-            keepExistingEnriched = true;
-            finalQuality = existingQuality;
-            finalEnrichedAt = Number(existing.enriched_at || nowTs);
-          } else if (!rawIncomingEnrichedJson || existingRank > incomingRank) {
-            keepExistingEnriched = true;
-            finalQuality = existingQuality;
-            finalEnrichedAt = Number(existing.enriched_at || nowTs);
-          } else if (existingIsSlimmed && !incomingIsSlimmed && incomingRank === 0) {
-            keepExistingEnriched = true;
-            finalQuality = existingQuality;
-            finalEnrichedAt = Number(existing.enriched_at || nowTs);
-          } else if (rawIncomingEnrichedJson === existingEnrichedStr) {
-            keepExistingEnriched = true;
-            finalEnrichedAt = Number(existing.enriched_at || nowTs);
-          }
-        }
-
-        const archivedByRotation =
-          g.archivedBySubscriptionRotation === true ? 1 : 0;
-
-        let isRowUnchanged = false;
-        if (existing) {
-          const existingPlatformsStr =
-            existing.platforms_json !== null && existing.platforms_json !== undefined
-              ? decompressVaultJsonString(existing.platforms_json)
-              : null;
-          const effectivePlatformsStr =
-            rawPlatformsJson !== null ? rawPlatformsJson : existingPlatformsStr;
-          const incomingTitle = String(g.title || '');
-          const effectiveTitle =
-            incomingTitle !== '' ? incomingTitle : String(existing.canonical_title || '');
-          const effectiveEnrichedStr = keepExistingEnriched
-            ? existingEnrichedStr
-            : rawIncomingEnrichedJson;
-
-          isRowUnchanged =
-            effectiveTitle === String(existing.canonical_title || '') &&
-            (steamAppId ?? null) === (existing.steam_app_id ?? null) &&
-            isInstalled === Number(existing.is_installed || 0) &&
-            isFavorited === Number(existing.is_favorited || 0) &&
-            archivedByRotation === Number(existing.archived_by_subscription_rotation || 0) &&
-            finalQuality === String(existing.metadata_quality || 'skeleton_fallback') &&
-            rawSummaryJson === existingSummaryStr &&
-            effectivePlatformsStr === existingPlatformsStr &&
-            effectiveEnrichedStr === existingEnrichedStr;
-        }
-
-        if (isRowUnchanged) {
-          skipped++;
-        } else {
-          const summaryJson = compressVaultJson(rawSummaryJson);
-          const platformsJson = rawPlatformsJson ? compressVaultJson(rawPlatformsJson) : null;
-          const finalEnrichedJson = keepExistingEnriched
-            ? compressVaultJson(existing.enriched_json)
-            : rawIncomingEnrichedJson
-              ? compressVaultJson(rawIncomingEnrichedJson)
-              : null;
-
-          upsertStmt.run(
-            gameId,
-            String(g.title || ''),
-            steamAppId,
-            isInstalled,
-            isFavorited,
-            archivedByRotation,
-            platformsJson,
-            summaryJson,
-            finalEnrichedJson,
-            finalQuality,
-            nowTs,
-            finalEnrichedAt
-          );
-          upserted++;
-        }
-
-        const activeEnriched = keepExistingEnriched ? existingEnrichedObj : incomingEnriched;
-        const coverCandidate = g.capsuleImage || activeEnriched?.capsuleImage;
-        const headerCandidate = g.headerImage || activeEnriched?.headerImage;
-        const iconCandidate = g.iconUrl || activeEnriched?.iconUrl;
-        const isHighPriorityDetailTier =
-          isInstalled === 1 ||
-          g.isPinned === true ||
-          this.isP1DetailGame(gameId) ||
-          (isFavorited === 1 && this.p1RecentDetailGames.size < MAX_P1_RECENT_DETAIL_GAMES);
-
-        if (typeof coverCandidate === 'string') {
-          this.registerGameMediaCandidate(gameId, 'cover', 0, coverCandidate, nowTs, true);
-        }
-        if (typeof headerCandidate === 'string') {
-          this.registerGameMediaCandidate(
-            gameId,
-            'header',
-            0,
-            headerCandidate,
-            nowTs,
-            isHighPriorityDetailTier
-          );
-        }
-        if (typeof iconCandidate === 'string') {
-          this.registerGameMediaCandidate(gameId, 'icon', 0, iconCandidate, nowTs, true);
-        }
-        if (activeEnriched && Array.isArray(activeEnriched.screenshots)) {
-          const maxShots = isInstalled === 1 || g.isPinned === true ? 6 : 4;
-          activeEnriched.screenshots.slice(0, maxShots).forEach((shot, idx) => {
-            const thumbUrl =
-              typeof shot === 'string' ? shot : shot?.pathThumbnail || shot?.pathFull || '';
-            if (thumbUrl) {
-              this.registerGameMediaCandidate(
-                gameId,
-                'screenshot_thumb',
-                idx,
-                thumbUrl,
-                nowTs,
-                isHighPriorityDetailTier
-              );
-            }
-          });
-        }
-      }
-      db.exec('COMMIT');
-    } catch (txErr) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {}
-      return {
-        success: false,
-        error: txErr instanceof Error ? txErr.message : String(txErr),
-      };
-    }
-
-    return { success: true, upserted, skipped };
+    return vaultGamesRepo.upsertGames(this, games);
   }
 
   /**
-   * Expands a candidate gameId into canonical/legacy separator variants (`:`, `-`, `_`).
    * @param {Set<string>} targetSet
    * @param {unknown} rawId
    */
   collectVaultGameIdVariants(targetSet, rawId) {
-    const clean = normalizeSafeVaultGameId(rawId);
-    if (!clean) return;
-    targetSet.add(clean);
-    const sepMatch = clean.match(/^(steam|gog|epic|xbox|ea|ubisoft|local)[:_-](.+)$/i);
-    if (sepMatch) {
-      const prefix = sepMatch[1].toLowerCase();
-      const rest = sepMatch[2].trim();
-      if (rest) {
-        targetSet.add(`${prefix}:${rest}`);
-        targetSet.add(`${prefix}-${rest}`);
-        targetSet.add(`${prefix}_${rest}`);
-        if (prefix === 'xbox' && /^[A-Z0-9]{12}$/i.test(rest)) {
-          const upper = rest.toUpperCase();
-          const lower = rest.toLowerCase();
-          targetSet.add(`xbox:${upper}`);
-          targetSet.add(`xbox:${lower}`);
-          targetSet.add(`xbox-${upper}`);
-          targetSet.add(`xbox-${lower}`);
-          targetSet.add(`xbox_${upper}`);
-          targetSet.add(`xbox_${lower}`);
-        }
-      }
-    }
+    collectVaultGameIdVariants(targetSet, rawId);
   }
 
-  /**
-   * Deletes orphaned or rekeyed game rows from `vault_games` and `game_media_assets`
-   * inside a single transaction while keeping content-addressed `media_blobs` intact.
-   *
-   * @param {string[] | { gameIds?: string[] } | string} gameIdsInput
-   */
+  /** @param {string[] | { gameIds?: string[] } | string} gameIdsInput */
   deleteGames(gameIdsInput) {
-    const rawList = Array.isArray(gameIdsInput)
-      ? gameIdsInput
-      : gameIdsInput && typeof gameIdsInput === 'object' && Array.isArray(gameIdsInput.gameIds)
-        ? gameIdsInput.gameIds
-        : typeof gameIdsInput === 'string'
-          ? [gameIdsInput]
-          : [];
-
-    /** @type {string[]} */
-    const safeIds = [];
-    const seen = new Set();
-    for (const rawId of rawList) {
-      const safe = normalizeSafeVaultGameId(rawId);
-      if (safe && !seen.has(safe)) {
-        seen.add(safe);
-        safeIds.push(safe);
-      }
-    }
-
-    if (safeIds.length === 0) {
-      return { success: true, deleted: 0 };
-    }
-
-    const db = this.ensureOpen();
-    const deleteAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
-    const deleteUrlCacheStmt = db.prepare('DELETE FROM url_resolution_cache WHERE game_id = ?');
-    const deleteGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
-    let deleted = 0;
-
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      for (const id of safeIds) {
-        deleteAssetsStmt.run(id);
-        deleteUrlCacheStmt.run(id);
-        const res = deleteGameStmt.run(id);
-        if (res && res.changes > 0) {
-          deleted += Number(res.changes);
-        }
-        this.p1RecentDetailGames.delete(id);
-      }
-      db.exec('COMMIT');
-    } catch (txErr) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {}
-      return {
-        success: false,
-        error: txErr instanceof Error ? txErr.message : String(txErr),
-      };
-    }
-
-    return { success: true, deleted };
+    return vaultGamesRepo.deleteGames(this, gameIdsInput);
   }
 
   /**
-   * Invalidates stale federated and superseded cover/header media rows when a user metadata
-   * or artwork override is saved, preserving content-addressed `media_blobs` and keeping
-   * matching `storage_kind = 'blob'` rows intact.
-   *
    * @param {string} gameId
    * @param {Record<string, any>} [record]
    * @param {string[]} [extraKeys]
    */
   saveUserOverride(gameId, record = {}, extraKeys = []) {
-    const primaryGameId = normalizeSafeVaultGameId(gameId);
-    if (!primaryGameId) {
-      return { success: false, invalidated: 0 };
-    }
-
-    /** @type {Set<string>} */
-    const candidateIds = new Set();
-    this.collectVaultGameIdVariants(candidateIds, primaryGameId);
-    if (record && typeof record === 'object') {
-      this.collectVaultGameIdVariants(candidateIds, record.gameId);
-      if (record.platformId && record.platformGameId) {
-        this.collectVaultGameIdVariants(
-          candidateIds,
-          `${String(record.platformId).trim()}:${String(record.platformGameId).trim()}`
-        );
-      }
-      const rawSid = record.steamAppId;
-      const numSid =
-        typeof rawSid === 'number' && rawSid > 0
-          ? rawSid
-          : typeof rawSid === 'string' && /^\d+$/.test(rawSid.trim())
-            ? parseInt(rawSid.trim(), 10)
-            : 0;
-      if (numSid > 0) {
-        this.collectVaultGameIdVariants(candidateIds, `steam-${numSid}`);
-      }
-      if (Array.isArray(record.purgeKeys)) {
-        for (const pk of record.purgeKeys) {
-          this.collectVaultGameIdVariants(candidateIds, pk);
-        }
-      }
-    }
-    if (Array.isArray(extraKeys)) {
-      for (const ek of extraKeys) {
-        this.collectVaultGameIdVariants(candidateIds, ek);
-      }
-    }
-
-    const nextCoverUrl =
-      typeof record?.coverUrl === 'string' && record.coverUrl.trim()
-        ? record.coverUrl.trim()
-        : typeof record?.capsuleImage === 'string' && record.capsuleImage.trim()
-          ? record.capsuleImage.trim()
-          : '';
-    const nextHeaderUrl =
-      typeof record?.heroUrl === 'string' && record.heroUrl.trim()
-        ? record.heroUrl.trim()
-        : typeof record?.headerUrl === 'string' && record.headerUrl.trim()
-          ? record.headerUrl.trim()
-          : typeof record?.headerImage === 'string' && record.headerImage.trim()
-            ? record.headerImage.trim()
-            : '';
-
-    const nextCoverNorm = nextCoverUrl ? normalizeAssetIdentityUrl(nextCoverUrl) : '';
-    const nextHeaderNorm = nextHeaderUrl ? normalizeAssetIdentityUrl(nextHeaderUrl) : '';
-
-    const hasReviewRoute = Boolean(
-      record &&
-        typeof record === 'object' &&
-        record.reviewRoute &&
-        typeof record.reviewRoute === 'object'
-    );
-    const reviewRouteMode = hasReviewRoute
-      ? String(record.reviewRoute.mode || '').trim().toLowerCase()
-      : '';
-    const hasExplicitReviewScoreProp = Boolean(
-      record &&
-        typeof record === 'object' &&
-        Object.prototype.hasOwnProperty.call(record, 'reviewScoreOverride') &&
-        record.reviewScoreOverride !== undefined
-    );
-    const explicitReviewScore =
-      hasExplicitReviewScoreProp &&
-      record.reviewScoreOverride &&
-      typeof record.reviewScoreOverride === 'object' &&
-      !Array.isArray(record.reviewScoreOverride) &&
-      typeof record.reviewScoreOverride.score === 'number' &&
-      Number.isFinite(record.reviewScoreOverride.score) &&
-      record.reviewScoreOverride.score > 0
-        ? record.reviewScoreOverride
-        : null;
-
-    // Reconcile vault_games.critic_json with explicit user review overrides:
-    // - 'unrated' or reviewScoreOverride === null -> clear critic_json = NULL
-    // - positive reviewScoreOverride -> overwrite critic_json directly (bypassing monotonic latch)
-    // - reviewRoute set without a resolved score yet (e.g. pending 'routed') -> clear stale critic_json = NULL
-    /** @type {'none' | 'clear' | 'write'} */
-    let criticUpdateMode = 'none';
-    /** @type {string | null} */
-    let nextCriticJson = null;
-    if (
-      reviewRouteMode === 'unrated' ||
-      (hasExplicitReviewScoreProp && record.reviewScoreOverride === null)
-    ) {
-      criticUpdateMode = 'clear';
-    } else if (explicitReviewScore) {
-      criticUpdateMode = 'write';
-      nextCriticJson = compressVaultJson(JSON.stringify(explicitReviewScore));
-    } else if (hasReviewRoute) {
-      criticUpdateMode = 'clear';
-    }
-
-    const db = this.ensureOpen();
-    const nowTs = this.now();
-    const selectRowsStmt = db.prepare(
-      'SELECT url_key, game_id, asset_role, source_url, storage_kind, blob_sha256 FROM game_media_assets WHERE game_id = ?'
-    );
-    const resetFederatedOnlyStmt = db.prepare(`
-      UPDATE game_media_assets
-      SET storage_kind = 'pending',
-          federated_path = NULL,
-          failure_count = 0,
-          next_retry_at = 0,
-          last_status_code = NULL
-      WHERE url_key = ?
-    `);
-    const resetFullRowStmt = db.prepare(`
-      UPDATE game_media_assets
-      SET storage_kind = 'pending',
-          blob_sha256 = NULL,
-          federated_path = NULL,
-          failure_count = 0,
-          next_retry_at = 0,
-          last_status_code = NULL
-      WHERE url_key = ?
-    `);
-    const resetHydratedStmt = db.prepare(
-      'UPDATE vault_games SET media_hydrated_at = 0 WHERE game_id = ?'
-    );
-    const clearCriticStmt =
-      criticUpdateMode === 'clear'
-        ? db.prepare('UPDATE vault_games SET critic_json = NULL, updated_at = ? WHERE game_id = ?')
-        : null;
-    const writeCriticStmt =
-      criticUpdateMode === 'write'
-        ? db.prepare('UPDATE vault_games SET critic_json = ?, updated_at = ? WHERE game_id = ?')
-        : null;
-    const clearUrlCache404Stmt = db.prepare(
-      'DELETE FROM url_resolution_cache WHERE game_id = ? AND blob_sha256 IS NULL'
-    );
-    const clearExactUrlCache404Stmt = db.prepare(
-      'DELETE FROM url_resolution_cache WHERE norm_url = ? AND blob_sha256 IS NULL'
-    );
-
-    let invalidated = 0;
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      if (nextCoverNorm) {
-        clearExactUrlCache404Stmt.run(nextCoverNorm);
-      }
-      if (nextHeaderNorm) {
-        clearExactUrlCache404Stmt.run(nextHeaderNorm);
-      }
-      for (const cid of candidateIds) {
-        clearUrlCache404Stmt.run(cid);
-        const rows = selectRowsStmt.all(cid);
-        let touchedGame = false;
-        for (const row of rows) {
-          if (!row || !row.url_key) continue;
-          const role = String(row.asset_role || '').toLowerCase();
-          const isCoverRole = role === 'cover' || role === 'capsule';
-          const isHeaderRole = role === 'header' || role === 'hero';
-
-          if (isCoverRole || isHeaderRole) {
-            const expectedNorm = isCoverRole ? nextCoverNorm : nextHeaderNorm;
-            const rowNorm = row.source_url ? normalizeAssetIdentityUrl(row.source_url) : '';
-            const keepMatchingBlob =
-              cid === primaryGameId &&
-              row.storage_kind === 'blob' &&
-              Boolean(row.blob_sha256) &&
-              Boolean(expectedNorm) &&
-              rowNorm === expectedNorm;
-            if (!keepMatchingBlob) {
-              resetFullRowStmt.run(row.url_key);
-              invalidated++;
-              touchedGame = true;
-            }
-          } else if (row.storage_kind === 'federated') {
-            resetFederatedOnlyStmt.run(row.url_key);
-            invalidated++;
-            touchedGame = true;
-          }
-        }
-        if (touchedGame) {
-          resetHydratedStmt.run(cid);
-        }
-        if (clearCriticStmt) {
-          clearCriticStmt.run(nowTs, cid);
-        } else if (writeCriticStmt) {
-          writeCriticStmt.run(nextCriticJson, nowTs, cid);
-        }
-      }
-      db.exec('COMMIT');
-    } catch (txErr) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {}
-      diagLog.debug('offlineVault.saveUserOverride', txErr);
-      return { success: false, invalidated: 0 };
-    }
-
-    return { success: true, invalidated };
+    return vaultGamesRepo.saveUserOverride(this, gameId, record, extraKeys);
   }
 
   /**
-   * Invalidates federated and cover/header media rows and clears persisted `vault_games.critic_json`
-   * across `gameId` and any removed alias/rekey IDs when a user override is reset/removed,
-   * keeping `media_blobs` intact on disk so deleted overrides never resurrect on cold boot.
-   *
    * @param {string} gameId
    * @param {string[]} [extraKeys]
    */
   removeUserOverride(gameId, extraKeys = []) {
-    /** @type {Set<string>} */
-    const candidateIds = new Set();
-    const collectWithNumericSteamVariant = (/** @type {unknown} */ rawKey) => {
-      this.collectVaultGameIdVariants(candidateIds, rawKey);
-      const trimmed =
-        typeof rawKey === 'string'
-          ? rawKey.trim()
-          : typeof rawKey === 'number' && Number.isInteger(rawKey) && rawKey > 0
-            ? String(rawKey)
-            : '';
-      if (/^\d+$/.test(trimmed)) {
-        this.collectVaultGameIdVariants(candidateIds, `steam-${trimmed}`);
-      }
-    };
-    collectWithNumericSteamVariant(gameId);
-    if (Array.isArray(extraKeys)) {
-      for (const ek of extraKeys) {
-        collectWithNumericSteamVariant(ek);
-      }
-    }
-    if (candidateIds.size === 0) {
-      return { success: false, invalidated: 0 };
-    }
-
-    const db = this.ensureOpen();
-    const nowTs = this.now();
-    const resetCoverHeaderStmt = db.prepare(`
-      UPDATE game_media_assets
-      SET storage_kind = 'pending',
-          blob_sha256 = NULL,
-          federated_path = NULL,
-          failure_count = 0,
-          next_retry_at = 0,
-          last_status_code = NULL
-      WHERE game_id = ?
-        AND asset_role IN ('cover', 'capsule', 'header', 'hero')
-    `);
-    const resetFederatedStmt = db.prepare(`
-      UPDATE game_media_assets
-      SET storage_kind = 'pending',
-          federated_path = NULL,
-          failure_count = 0,
-          next_retry_at = 0,
-          last_status_code = NULL
-      WHERE game_id = ?
-        AND storage_kind = 'federated'
-    `);
-    const resetHydratedAndCriticStmt = db.prepare(
-      'UPDATE vault_games SET media_hydrated_at = 0, critic_json = NULL, updated_at = ? WHERE game_id = ?'
-    );
-    const clearUrlCache404Stmt = db.prepare(
-      'DELETE FROM url_resolution_cache WHERE game_id = ? AND blob_sha256 IS NULL'
-    );
-
-    let invalidated = 0;
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      for (const cid of candidateIds) {
-        clearUrlCache404Stmt.run(cid);
-        const r1 = resetCoverHeaderStmt.run(cid);
-        const r2 = resetFederatedStmt.run(cid);
-        const changes = Number(r1?.changes || 0) + Number(r2?.changes || 0);
-        if (changes > 0) {
-          invalidated += changes;
-        }
-        resetHydratedAndCriticStmt.run(nowTs, cid);
-      }
-      db.exec('COMMIT');
-    } catch (txErr) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {}
-      diagLog.debug('offlineVault.removeUserOverride', txErr);
-      return { success: false, invalidated: 0 };
-    }
-
-    return { success: true, invalidated };
+    return vaultGamesRepo.removeUserOverride(this, gameId, extraKeys);
   }
 
-  /**
-   * Non-destructively marks Game Pass / subscription titles that rotated out of the active catalog
-   * so cached artwork blobs, achievements, HLTB, and enriched metadata remain preserved offline.
-   * @param {string[]} gameIds
-   */
+  /** @param {string[]} [gameIds] */
   archiveSubscriptionRotatedGames(gameIds = []) {
-    if (!Array.isArray(gameIds) || gameIds.length === 0) {
-      return { success: true, archived: 0 };
-    }
-    const db = this.ensureOpen();
-    const nowTs = this.now();
-    const stmt = db.prepare(
-      'UPDATE vault_games SET archived_by_subscription_rotation = 1, updated_at = ? WHERE game_id = ?'
-    );
-    let archived = 0;
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      for (const rawId of gameIds) {
-        const cleanId = String(rawId || '').trim();
-        if (!cleanId) continue;
-        const res = stmt.run(nowTs, cleanId);
-        if (res && res.changes > 0) archived += Number(res.changes);
-      }
-      db.exec('COMMIT');
-    } catch (txErr) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {}
-      return {
-        success: false,
-        error: txErr instanceof Error ? txErr.message : String(txErr),
-      };
-    }
-    return { success: true, archived };
+    return vaultGamesRepo.archiveSubscriptionRotatedGames(this, gameIds);
   }
 
-  /**
-   * @param {Record<string, any>} [payload]
-   */
+  /** @param {Record<string, any>} [payload] */
   saveGameDetail(payload = {}) {
-    if (!payload || typeof payload !== 'object' || !payload.gameId) {
-      return { success: false, error: 'Missing gameId' };
-    }
-    const gameId = String(payload.gameId).trim();
-    if (!gameId) {
-      return { success: false, error: 'Empty gameId' };
-    }
-
-    const db = this.ensureOpen();
-    const nowTs = this.now();
-    const existing = db
-      .prepare(
-        `
-        SELECT canonical_title, steam_app_id, is_installed, is_favorited,
-               archived_by_subscription_rotation,
-               enriched_json, achievements_json, hltb_json, critic_json,
-               metadata_quality, enriched_at
-        FROM vault_games
-        WHERE game_id = ?
-      `
-      )
-      .get(gameId);
-
-    const incomingEnrichedObj =
-      payload.enrichedMetadata && typeof payload.enrichedMetadata === 'object'
-        ? { ...payload.enrichedMetadata }
-        : null;
-
-    const existingEnrichedObj =
-      existing && existing.enriched_json ? parseVaultJson(existing.enriched_json) : null;
-    const incomingIsSlimmed = Boolean(incomingEnrichedObj?.__quotaSlimmed);
-    const existingIsSlimmed = Boolean(existingEnrichedObj?.__quotaSlimmed);
-
-    if (
-      incomingEnrichedObj &&
-      existingEnrichedObj?.xboxDeliveryHints &&
-      !incomingEnrichedObj.xboxDeliveryHints
-    ) {
-      incomingEnrichedObj.xboxDeliveryHints = existingEnrichedObj.xboxDeliveryHints;
-    }
-    if (incomingEnrichedObj && existingEnrichedObj) {
-      carryForwardVaultRequirements(incomingEnrichedObj, existingEnrichedObj);
-      carryForwardVaultCriticAndReviewFields(incomingEnrichedObj, existingEnrichedObj);
-    }
-
-    const incomingEnrichedJson = incomingEnrichedObj
-      ? compressVaultJson(JSON.stringify(incomingEnrichedObj))
-      : null;
-
-    let incomingQuality = incomingEnrichedObj
-      ? inferVaultMetadataQuality(
-          { id: gameId, metadataQuality: payload.metadataQuality },
-          incomingEnrichedObj
-        )
-      : String(payload.metadataQuality || existing?.metadata_quality || 'skeleton_fallback');
-    if (!Object.prototype.hasOwnProperty.call(METADATA_QUALITY_RANK, incomingQuality)) {
-      incomingQuality = 'skeleton_fallback';
-    }
-
-    let finalEnrichedJson = incomingEnrichedJson;
-    let finalQuality = incomingQuality;
-    let finalEnrichedAt =
-      typeof payload.enrichedAt === 'number' && payload.enrichedAt > 0 ? payload.enrichedAt : nowTs;
-
-    // Non-Destructive Metadata Upsert Rule (C8 Lattice Invariant):
-    // NEVER overwrite higher-ranked or non-slimmed enriched_json with lower-ranked, slimmed, or empty enriched_json!
-    if (existing && existing.enriched_json) {
-      let existingQuality = String(existing.metadata_quality || 'skeleton_fallback');
-      if (existingIsSlimmed) {
-        existingQuality = 'skeleton_fallback';
-      } else if (
-        existingQuality === 'authoritative' &&
-        existingEnrichedObj &&
-        ((!(Number(existingEnrichedObj.appId) > 0) &&
-          (gameId.startsWith('steam-') || /^xbox[-_]/i.test(gameId))) ||
-          existingEnrichedObj.enrichedSource === 'xbox' ||
-          existingEnrichedObj.metadataQuality === 'storefront_native')
-      ) {
-        existingQuality = 'storefront_native';
-      }
-
-      const existingRank = METADATA_QUALITY_RANK[existingQuality] ?? 0;
-      const incomingRank = METADATA_QUALITY_RANK[incomingQuality] ?? 0;
-      if (incomingIsSlimmed && existingEnrichedObj && !existingIsSlimmed) {
-        finalEnrichedJson = compressVaultJson(existing.enriched_json);
-        finalQuality = existingQuality;
-        finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);
-      } else if (!incomingEnrichedJson || existingRank > incomingRank) {
-        finalEnrichedJson = compressVaultJson(existing.enriched_json);
-        finalQuality = existingQuality;
-        finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);
-      } else if (existingIsSlimmed && !incomingIsSlimmed && incomingRank === 0) {
-        finalEnrichedJson = compressVaultJson(existing.enriched_json);
-        finalQuality = existingQuality;
-        finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);
-      }
-    }
-
-    const finalAchievementsJson =
-      payload.achievements !== undefined && payload.achievements !== null
-        ? compressVaultJson(JSON.stringify(payload.achievements))
-        : existing?.achievements_json
-          ? compressVaultJson(existing.achievements_json)
-          : null;
-    const finalHltbJson =
-      payload.hltb !== undefined && payload.hltb !== null
-        ? compressVaultJson(JSON.stringify(payload.hltb))
-        : existing?.hltb_json
-          ? compressVaultJson(existing.hltb_json)
-          : null;
-    let finalCriticJson = existing?.critic_json ? compressVaultJson(existing.critic_json) : null;
-    if (payload.clearCriticScore === true) {
-      finalCriticJson = null;
-    } else if (payload.criticScore === null && payload.forceCriticScore === true) {
-      finalCriticJson = null;
-    } else if (payload.criticScore !== undefined && payload.criticScore !== null) {
-      if (payload.forceCriticScore === true) {
-        finalCriticJson = compressVaultJson(JSON.stringify(payload.criticScore));
-      } else {
-        const existingCriticObj =
-          existing && existing.critic_json ? parseVaultJson(existing.critic_json) : null;
-        const existingCriticRank = getCriticAuthorityRank(existingCriticObj);
-        const incomingCriticRank = getCriticAuthorityRank(payload.criticScore);
-        if (existingCriticRank === 0 || incomingCriticRank >= existingCriticRank) {
-          finalCriticJson = compressVaultJson(JSON.stringify(payload.criticScore));
-        }
-      }
-    }
-
-    const canonicalTitle =
-      typeof payload.canonicalTitle === 'string' && payload.canonicalTitle.trim()
-        ? payload.canonicalTitle.trim()
-        : typeof incomingEnrichedObj?.name === 'string' && incomingEnrichedObj.name.trim()
-          ? incomingEnrichedObj.name.trim()
-          : existing?.canonical_title || '';
-
-    const steamAppId =
-      typeof payload.steamAppId === 'number' && payload.steamAppId > 0
-        ? payload.steamAppId
-        : existing?.steam_app_id ?? null;
-
-    const isInstalled =
-      typeof payload.isInstalled === 'boolean'
-        ? payload.isInstalled
-          ? 1
-          : 0
-        : existing?.is_installed ?? 0;
-    const isFavorited =
-      typeof payload.isFavorited === 'boolean'
-        ? payload.isFavorited
-          ? 1
-          : 0
-        : existing?.is_favorited ?? 0;
-    const archivedByRotation =
-      typeof payload.archivedBySubscriptionRotation === 'boolean'
-        ? payload.archivedBySubscriptionRotation
-          ? 1
-          : 0
-        : Number(existing?.archived_by_subscription_rotation || 0);
-
-    db.prepare(
-      `
-      INSERT INTO vault_games (
-        game_id, canonical_title, steam_app_id, is_installed, is_favorited,
-        archived_by_subscription_rotation,
-        enriched_json, achievements_json, hltb_json, critic_json,
-        metadata_quality, updated_at, enriched_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(game_id) DO UPDATE SET
-        canonical_title = CASE WHEN excluded.canonical_title != '' THEN excluded.canonical_title ELSE vault_games.canonical_title END,
-        steam_app_id = COALESCE(excluded.steam_app_id, vault_games.steam_app_id),
-        is_installed = excluded.is_installed,
-        is_favorited = excluded.is_favorited,
-        archived_by_subscription_rotation = excluded.archived_by_subscription_rotation,
-        enriched_json = excluded.enriched_json,
-        achievements_json = excluded.achievements_json,
-        hltb_json = excluded.hltb_json,
-        critic_json = excluded.critic_json,
-        metadata_quality = excluded.metadata_quality,
-        updated_at = excluded.updated_at,
-        enriched_at = excluded.enriched_at
-    `
-    ).run(
-      gameId,
-      canonicalTitle,
-      steamAppId,
-      isInstalled,
-      isFavorited,
-      archivedByRotation,
-      finalEnrichedJson,
-      finalAchievementsJson,
-      finalHltbJson,
-      finalCriticJson,
-      finalQuality,
-      nowTs,
-      finalEnrichedJson ? finalEnrichedAt : 0
-    );
-
-    // Register static image assets from enrichedMetadata (strictly ZERO video URLs!)
-    if (incomingEnrichedObj) {
-      const isHighPriorityDetailTier =
-        isInstalled === 1 ||
-        payload.promoteToP1 === true ||
-        this.isP1DetailGame(gameId) ||
-        (isFavorited === 1 && this.p1RecentDetailGames.size < MAX_P1_RECENT_DETAIL_GAMES);
-
-      if (typeof incomingEnrichedObj.capsuleImage === 'string') {
-        this.registerGameMediaCandidate(
-          gameId,
-          'cover',
-          0,
-          incomingEnrichedObj.capsuleImage,
-          nowTs,
-          true
-        );
-      }
-      if (typeof incomingEnrichedObj.headerImage === 'string') {
-        this.registerGameMediaCandidate(
-          gameId,
-          'header',
-          0,
-          incomingEnrichedObj.headerImage,
-          nowTs,
-          isHighPriorityDetailTier
-        );
-      }
-      if (Array.isArray(incomingEnrichedObj.screenshots)) {
-        const maxShots = isInstalled === 1 ? 6 : 4;
-        incomingEnrichedObj.screenshots.slice(0, maxShots).forEach((shot, idx) => {
-          const thumbUrl =
-            typeof shot === 'string' ? shot : shot?.pathThumbnail || shot?.pathFull || '';
-          if (thumbUrl) {
-            this.registerGameMediaCandidate(
-              gameId,
-              'screenshot_thumb',
-              idx,
-              thumbUrl,
-              nowTs,
-              isHighPriorityDetailTier
-            );
-          }
-        });
-      }
-    }
-
-    return { success: true };
+    return vaultGamesRepo.saveGameDetail(this, payload);
   }
 
   /**
-   * Durably stamps `media_hydrated_at` on `vault_games` once static image hydration completes
-   * (including 0-asset games whose media URLs were all video-excluded or already verified).
-   *
    * @param {string} gameId
    * @param {number} [hydratedAt]
    */
   markGameMediaHydrated(gameId, hydratedAt = this.now()) {
-    const cleanId = String(gameId || '').trim();
-    if (!cleanId || this.isShutdown) {
-      return { success: false, updated: 0 };
-    }
-    try {
-      const db = this.db || this.ensureOpen();
-      if (!db) {
-        return { success: false, updated: 0 };
-      }
-      const ts =
-        typeof hydratedAt === 'number' && Number.isFinite(hydratedAt) && hydratedAt >= 0
-          ? Math.floor(hydratedAt)
-          : this.now();
-      const res = db
-        .prepare('UPDATE vault_games SET media_hydrated_at = ? WHERE game_id = ?')
-        .run(ts, cleanId);
-      return {
-        success: true,
-        updated: Number(res?.changes || 0),
-        mediaHydratedAt: ts,
-      };
-    } catch (err) {
-      diagLog.debug('offlineVault.markGameMediaHydrated', err, { gameId: cleanId });
-      return { success: false, updated: 0 };
-    }
+    return vaultGamesRepo.markGameMediaHydrated(this, gameId, hydratedAt);
   }
 
+  /** @param {string} gameId */
   getGameDetail(gameId) {
-    const cleanId = String(gameId || '').trim();
-    if (!cleanId) return null;
-    const db = this.ensureOpen();
-    const row = db
-      .prepare(
-        `
-        SELECT game_id, archived_by_subscription_rotation, enriched_json, achievements_json, hltb_json, critic_json, metadata_quality, enriched_at, media_hydrated_at
-        FROM vault_games
-        WHERE game_id = ?
-      `
-      )
-      .get(cleanId);
-    if (!row) return null;
-
-    const enrichedMetadata = parseVaultJson(row.enriched_json);
-    const achievements = parseVaultJson(row.achievements_json);
-    const hltb = parseVaultJson(row.hltb_json);
-    const criticScore = parseVaultJson(row.critic_json);
-    const isArchivedRotation = Number(row.archived_by_subscription_rotation || 0) === 1;
-    const enrichedAtNum = Number(row.enriched_at) || 0;
-    const mediaHydratedAtNum = Number(row.media_hydrated_at) || 0;
-
-    if (
-      enrichedMetadata &&
-      typeof enrichedMetadata === 'object' &&
-      !enrichedMetadata.enrichedAt &&
-      enrichedAtNum > 0
-    ) {
-      enrichedMetadata.enrichedAt = enrichedAtNum;
-    }
-
-    let effectiveQuality = row.metadata_quality || 'skeleton_fallback';
-    if (
-      enrichedMetadata &&
-      typeof enrichedMetadata === 'object' &&
-      !(Number(enrichedMetadata.appId) > 0) &&
-      (String(row.game_id).startsWith('steam-') ||
-        /^xbox[-_]/i.test(String(row.game_id)) ||
-        enrichedMetadata.enrichedSource === 'xbox' ||
-        enrichedMetadata.metadataQuality === 'storefront_native')
-    ) {
-      if (
-        String(row.game_id).startsWith('steam-') ||
-        !enrichedMetadata.metadataQuality ||
-        enrichedMetadata.metadataQuality === 'authoritative'
-      ) {
-        enrichedMetadata.metadataQuality = 'storefront_native';
-      }
-      if (effectiveQuality === 'authoritative') {
-        effectiveQuality = 'storefront_native';
-      }
-    }
-
-    if (!enrichedMetadata && !achievements && !hltb && !criticScore) {
-      return {
-        gameId: row.game_id,
-        enrichedMetadata: null,
-        achievements: null,
-        hltb: null,
-        criticScore: null,
-        metadataQuality: effectiveQuality,
-        enrichedAt: enrichedAtNum,
-        mediaHydratedAt: mediaHydratedAtNum,
-        ...(isArchivedRotation ? { archivedBySubscriptionRotation: true } : {}),
-      };
-    }
-
-    return {
-      gameId: row.game_id,
-      enrichedMetadata,
-      achievements,
-      hltb,
-      criticScore,
-      metadataQuality: effectiveQuality,
-      enrichedAt: enrichedAtNum,
-      mediaHydratedAt: mediaHydratedAtNum,
-      ...(isArchivedRotation ? { archivedBySubscriptionRotation: true } : {}),
-    };
+    return vaultGamesRepo.getGameDetail(this, gameId);
   }
 
+  /** @param {string} gameId */
+  getGameMediaAssetCandidates(gameId) {
+    return vaultGamesRepo.getGameMediaAssetCandidates(this, gameId);
+  }
+
+  /**
+   * @param {string[]} gameIds
+   * @param {string[]} [candidateNormUrls]
+   */
+  getGamesMediaHydrationState(gameIds, candidateNormUrls = []) {
+    return vaultGamesRepo.getGamesMediaHydrationState(this, gameIds, candidateNormUrls);
+  }
+
+  /** @param {Record<string, any>} [options] */
   getAllHydratedGames(options = {}) {
     return this.getCatalogSnapshot(options);
   }
 
+  /** @param {Record<string, any>} [options] */
   getBootstrapCatalog(options = {}) {
     return this.getCatalogSnapshot(options);
   }
 
+  /** @param {Record<string, any>} [options] */
   getCatalogSnapshot(options = {}) {
-    const db = this.ensureOpen();
-    const includeArchived = Boolean(options && options.includeArchived);
-    const rows = db
-      .prepare(
-        `
-        SELECT game_id, canonical_title, steam_app_id, is_installed, is_favorited,
-               archived_by_subscription_rotation, platforms_json, summary_json,
-               enriched_json, achievements_json, hltb_json, critic_json,
-               metadata_quality, updated_at, enriched_at, media_hydrated_at
-        FROM vault_games
-        ORDER BY canonical_title ASC
-      `
-      )
-      .all();
-    const games = [];
-    /** @type {Record<string, any>} */
-    const details = {};
-    /** @type {Array<{ gameId: string, platformsJson: string | null, summaryJson: string | null }>} */
-    const pendingOsRepairs = [];
-    /** @type {string[]} */
-    const pendingOrphanPruneIds = [];
-    /** @type {string[]} */
-    const pendingLauncherUtilityPurgeIds = [];
-
-    for (const row of rows) {
-      const isArchivedRotation = Number(row.archived_by_subscription_rotation || 0) === 1;
-      const isRowInstalled = Number(row.is_installed || 0) === 1;
-
-      const summary = parseVaultJson(row.summary_json) || {};
-      const rawPlatforms = parseVaultJson(row.platforms_json) || summary.platforms || [];
-      const enrichedMetadata = parseVaultJson(row.enriched_json);
-      const hasEnrichedForOs = Boolean(
-        enrichedMetadata &&
-          !(enrichedMetadata.enrichedSource === 'xbox' && !(Number(enrichedMetadata.appId) > 0))
-      );
-      const sanitizedPlatRes = sanitizeVaultPlatformEntriesOsFlags(rawPlatforms, hasEnrichedForOs, {
-        drmNotice: enrichedMetadata?.drmNotice || summary.drmNotice || null,
-        gameChainedLauncherHandoff:
-          summary.chainedLauncherHandoff || summary.chainedRequiresLauncherHandoff || null,
-        gameExternalStorefrontHandoff: summary.externalStorefrontHandoff || null,
-        gameExternalLauncher:
-          summary.externalLauncher || enrichedMetadata?.externalLauncher || null,
-        gameExternalLauncherUrl:
-          summary.externalLauncherUrl || enrichedMetadata?.externalLauncherUrl || null,
-        gameIsExternalLauncherStubPackage:
-          typeof summary.isExternalLauncherStubPackage === 'boolean'
-            ? summary.isExternalLauncherStubPackage
-            : typeof enrichedMetadata?.isExternalLauncherStubPackage === 'boolean'
-              ? enrichedMetadata.isExternalLauncherStubPackage
-              : undefined,
-        gameXboxBottleCompatibilityReason:
-          summary.xboxBottleCompatibilityReason ||
-          enrichedMetadata?.xboxBottleCompatibilityReason ||
-          null,
-        gameMaxDownloadSizeBytes:
-          summary.maxDownloadSizeBytes ?? enrichedMetadata?.maxDownloadSizeBytes ?? null,
-        gamePcMaxInstallSizeBytes:
-          summary.pcMaxInstallSizeBytes ?? enrichedMetadata?.pcMaxInstallSizeBytes ?? null,
-        gameRequiresKernelAntiCheat:
-          typeof summary.requiresKernelAntiCheat === 'boolean'
-            ? summary.requiresKernelAntiCheat
-            : typeof enrichedMetadata?.requiresKernelAntiCheat === 'boolean'
-              ? enrichedMetadata.requiresKernelAntiCheat
-              : undefined,
-        gameKernelAntiCheatName:
-          summary.kernelAntiCheatName ||
-          summary.antiCheatName ||
-          enrichedMetadata?.kernelAntiCheatName ||
-          null,
-      });
-      const platforms = sanitizedPlatRes.platforms || [];
-      if (
-        Array.isArray(rawPlatforms) &&
-        rawPlatforms.length > 0 &&
-        Array.isArray(platforms) &&
-        platforms.length === 0
-      ) {
-        if (row.game_id) {
-          pendingOrphanPruneIds.push(String(row.game_id));
-        }
-        continue;
-      }
-      const rowTitle = String(summary?.title || row.canonical_title || '');
-      if (!isRowInstalled && isStandaloneStorefrontLauncherUtility(rowTitle, platforms)) {
-        if (!this.options?.readOnly && !options?.readOnly && row.game_id) {
-          pendingLauncherUtilityPurgeIds.push(String(row.game_id));
-        }
-        continue;
-      }
-      const anyPlatCrossPlatformMac = Boolean(
-        Array.isArray(platforms) &&
-          platforms.some(
-            (ep) =>
-              ep &&
-              (ep.isCrossPlatformLauncherRuntime === true ||
-                Boolean(ep.platforms && ep.platforms.mac === true))
-          )
-      );
-      const allPlatsExplicitlyNonMac = Boolean(
-        Array.isArray(platforms) &&
-          platforms.length > 0 &&
-          platforms.every(
-            (ep) =>
-              ep &&
-              !ep.isCrossPlatformLauncherRuntime &&
-              ep.platforms &&
-              typeof ep.platforms === 'object' &&
-              ep.platforms.mac === false
-          )
-      );
-      const worksOnMissingCrossPlatMac = Boolean(
-        anyPlatCrossPlatformMac &&
-          summary?.worksOn &&
-          typeof summary.worksOn === 'object' &&
-          summary.worksOn.mac === false
-      );
-      const worksOnPoisoned = Boolean(
-        summary?.worksOn &&
-          typeof summary.worksOn === 'object' &&
-          ((!summary.worksOn.windows &&
-            !summary.worksOn.mac &&
-            !summary.worksOn.linux) ||
-            (summary.worksOn.mac === true && allPlatsExplicitlyNonMac))
-      );
-      if (worksOnPoisoned) {
-        summary.worksOn = {
-          windows: true,
-          mac: false,
-          linux: Boolean(summary?.worksOn?.linux),
-        };
-      } else if (worksOnMissingCrossPlatMac) {
-        summary.worksOn = {
-          windows: summary.worksOn.windows !== false,
-          mac: true,
-          linux: Boolean(summary?.worksOn?.linux),
-        };
-      }
-      if (
-        Array.isArray(platforms) &&
-        platforms.length === 1 &&
-        platforms[0]?.chainedLauncherHandoff &&
-        (summary.externalStorefrontHandoff || summary.chainedLauncherHandoff)
-      ) {
-        summary.chainedLauncherHandoff = platforms[0].chainedLauncherHandoff;
-        summary.externalStorefrontHandoff = platforms[0].externalStorefrontHandoff;
-      }
-      if (
-        (sanitizedPlatRes.repaired || worksOnPoisoned || worksOnMissingCrossPlatMac) &&
-        row.game_id
-      ) {
-        const nextPlatsJson = compressVaultJson(JSON.stringify(platforms));
-        const nextSummary = { ...summary, platforms };
-        const nextSummaryJson = compressVaultJson(JSON.stringify(nextSummary));
-        pendingOsRepairs.push({
-          gameId: String(row.game_id),
-          platformsJson: nextPlatsJson,
-          summaryJson: nextSummaryJson,
-        });
-      }
-
-      if (isArchivedRotation && !isRowInstalled && !includeArchived) {
-        continue;
-      }
-
-      const achievements = parseVaultJson(row.achievements_json);
-      const hltb = parseVaultJson(row.hltb_json);
-      const criticScore = parseVaultJson(row.critic_json);
-      const enrichedAtNum = Number(row.enriched_at) || 0;
-      const mediaHydratedAtNum = Number(row.media_hydrated_at) || 0;
-
-      if (
-        enrichedMetadata &&
-        typeof enrichedMetadata === 'object' &&
-        !enrichedMetadata.enrichedAt &&
-        enrichedAtNum > 0
-      ) {
-        enrichedMetadata.enrichedAt = enrichedAtNum;
-      }
-
-      let effectiveQuality = row.metadata_quality || 'skeleton_fallback';
-      if (
-        enrichedMetadata &&
-        typeof enrichedMetadata === 'object' &&
-        !(Number(enrichedMetadata.appId) > 0) &&
-        (String(row.game_id).startsWith('steam-') ||
-          /^xbox[-_]/i.test(String(row.game_id)) ||
-          hasXboxPlatform({ id: row.game_id, ...summary, platforms }) ||
-          enrichedMetadata.enrichedSource === 'xbox' ||
-          enrichedMetadata.metadataQuality === 'storefront_native')
-      ) {
-        if (
-          String(row.game_id).startsWith('steam-') ||
-          !enrichedMetadata.metadataQuality ||
-          enrichedMetadata.metadataQuality === 'authoritative'
-        ) {
-          enrichedMetadata.metadataQuality = 'storefront_native';
-        }
-        if (effectiveQuality === 'authoritative') {
-          effectiveQuality = 'storefront_native';
-        }
-      }
-
-      if (summary && (summary.id || row.game_id)) {
-        const effectiveGameId = String(summary.id || row.game_id || '');
-        const hasSteamEntitlement =
-          Boolean(summary.steamAppId) ||
-          effectiveGameId.startsWith('steam-') ||
-          (Array.isArray(platforms) &&
-            platforms.some((p) => p && String(p.platformId || '').toLowerCase() === 'steam'));
-        const gameObj = {
-          ...summary,
-          id: effectiveGameId,
-          title: summary.title || row.canonical_title || row.game_id,
-          sortTitle:
-            summary.sortTitle ||
-            String(summary.title || row.canonical_title || row.game_id).replace(
-              /^(The|A|An)\s+/i,
-              ''
-            ),
-          ...(summary.steamAppId
-            ? { steamAppId: Number(summary.steamAppId) }
-            : hasSteamEntitlement && row.steam_app_id
-              ? { steamAppId: Number(row.steam_app_id) }
-              : {}),
-          ...(isArchivedRotation ? { archivedBySubscriptionRotation: true } : {}),
-          platforms,
-          ...(enrichedMetadata ? { enrichedMetadata } : {}),
-        };
-        games.push(gameObj);
-      }
-
-      if (enrichedMetadata || achievements || hltb || criticScore || mediaHydratedAtNum > 0) {
-        const gameIdKey = String(row.game_id || '');
-        details[gameIdKey] = {
-          gameId: gameIdKey,
-          enrichedMetadata,
-          achievements,
-          hltb,
-          criticScore,
-          metadataQuality: effectiveQuality,
-          enrichedAt: enrichedAtNum,
-          mediaHydratedAt: mediaHydratedAtNum,
-          ...(isArchivedRotation ? { archivedBySubscriptionRotation: true } : {}),
-        };
-      }
-    }
-
-    if (pendingOsRepairs.length > 0 && !this.options?.readOnly && !options?.readOnly) {
-      try {
-        const qOnly = db.prepare('PRAGMA query_only').get();
-        if (!Number(qOnly?.query_only)) {
-          db.exec('BEGIN IMMEDIATE');
-          try {
-            const repairStmt = db.prepare(
-              'UPDATE vault_games SET platforms_json = ?, summary_json = ? WHERE game_id = ?'
-            );
-            for (const rep of pendingOsRepairs) {
-              repairStmt.run(rep.platformsJson, rep.summaryJson, rep.gameId);
-            }
-            db.exec('COMMIT');
-          } catch (txErr) {
-            try {
-              db.exec('ROLLBACK');
-            } catch {}
-            throw txErr;
-          }
-        }
-      } catch (err) {
-        diagLog.debug('offlineVault.repairHydratedOsFlags', err);
-      }
-    }
-
-    if (pendingLauncherUtilityPurgeIds.length > 0 && !this.options?.readOnly && !options?.readOnly) {
-      try {
-        const qOnly = db.prepare('PRAGMA query_only').get();
-        if (!Number(qOnly?.query_only)) {
-          db.exec('BEGIN IMMEDIATE');
-          try {
-            const delAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
-            const delGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
-            for (const id of pendingLauncherUtilityPurgeIds) {
-              delAssetsStmt.run(id);
-              delGameStmt.run(id);
-            }
-            db.exec('COMMIT');
-          } catch (txErr) {
-            try {
-              db.exec('ROLLBACK');
-            } catch {}
-          }
-        }
-      } catch (err) {
-        diagLog.debug('offlineVault.purgeLauncherUtilities', err);
-      }
-    }
-
-    if (pendingOrphanPruneIds.length > 0 && !this.options?.readOnly && !options?.readOnly) {
-      const idsToPrune = pendingOrphanPruneIds.slice();
-      setImmediate(() => {
-        try {
-          if (!this.db) return;
-          const qOnly = this.db.prepare('PRAGMA query_only').get();
-          if (Number(qOnly?.query_only)) return;
-          this.deleteGames(idsToPrune);
-        } catch (err) {
-          diagLog.debug('offlineVault.pruneOrphanExpiredRows', err);
-        }
-      });
-    }
-
-    return {
-      success: true,
-      games,
-      details,
-    };
+    return vaultGamesRepo.getCatalogSnapshot(this, options);
   }
 
-  // ==========================================================================
-  // Per-Host Circuit Breaker + WAF Detection + Adaptive 404 Curve
-  // ==========================================================================
-
+  /** @param {string} host */
   getEndpointHealth(host) {
-    const cleanHost = String(host || '').toLowerCase().trim();
-    if (!cleanHost) return null;
-    const db = this.ensureOpen();
-    const row = db
-      .prepare('SELECT * FROM storefront_endpoint_health WHERE host = ?')
-      .get(cleanHost);
-    if (!row) {
-      return {
-        host: cleanHost,
-        state: 'CLOSED',
-        consecutiveFailures: 0,
-        openedUntil: 0,
-      };
-    }
-    const nowTs = this.now();
-    const openedUntilNum = Number(row.opened_until || 0);
-    let effectiveState = String(row.state || 'CLOSED');
-    if (effectiveState === 'OPEN' && openedUntilNum > 0 && nowTs >= openedUntilNum) {
-      effectiveState = 'HALF_OPEN';
-    }
-    return {
-      host: cleanHost,
-      state: effectiveState,
-      consecutiveFailures: Number(row.consecutive_failures || 0),
-      openedUntil: Number(row.opened_until || 0),
-      ...(row.last_status_code !== null && row.last_status_code !== undefined
-        ? { lastStatusCode: Number(row.last_status_code) }
-        : {}),
-      ...(row.last_error ? { lastError: String(row.last_error) } : {}),
-    };
+    return vaultRemoteFetcher.getEndpointHealth(this, host);
   }
 
+  /** @param {string} host */
   canRequestHost(host) {
-    const cleanHost = String(host || '').toLowerCase().trim();
-    if (!cleanHost) return { allowed: true, state: 'CLOSED', isCanary: false };
-
-    const snap = this.getEndpointHealth(cleanHost);
-    if (!snap || snap.state === 'CLOSED') {
-      return { allowed: true, state: 'CLOSED', isCanary: false };
-    }
-
-    const nowTs = this.now();
-    if (snap.state === 'OPEN' && snap.openedUntil > nowTs) {
-      return {
-        allowed: false,
-        state: 'OPEN',
-        isCanary: false,
-        retryAfterMs: snap.openedUntil - nowTs,
-      };
-    }
-
-    // HALF_OPEN: allow strictly 1 single-canary probe per host
-    if (this.halfOpenProbesInFlight.has(cleanHost)) {
-      return {
-        allowed: false,
-        state: 'HALF_OPEN',
-        isCanary: false,
-        retryAfterMs: 5000,
-      };
-    }
-
-    this.halfOpenProbesInFlight.add(cleanHost);
-    const db = this.ensureOpen();
-    db.prepare(
-      "UPDATE storefront_endpoint_health SET state = 'HALF_OPEN', updated_at = ? WHERE host = ?"
-    ).run(nowTs, cleanHost);
-
-    return {
-      allowed: true,
-      state: 'HALF_OPEN',
-      isCanary: true,
-    };
+    return vaultRemoteFetcher.canRequestHost(this, host);
   }
 
+  /** @param {string} host */
   releaseCanaryIfHeld(host) {
-    const cleanHost = String(host || '').toLowerCase().trim();
-    if (cleanHost) {
-      this.halfOpenProbesInFlight.delete(cleanHost);
-    }
-  }
-
-  recordHostSuccess(host, statusCode = 200) {
-    const cleanHost = String(host || '').toLowerCase().trim();
-    if (!cleanHost) return;
-    this.halfOpenProbesInFlight.delete(cleanHost);
-
-    const db = this.ensureOpen();
-    const prev = db
-      .prepare('SELECT state, consecutive_failures FROM storefront_endpoint_health WHERE host = ?')
-      .get(cleanHost);
-
-    if (!prev || (prev.state === 'CLOSED' && Number(prev.consecutive_failures || 0) === 0)) {
-      return;
-    }
-
-    const nowTs = this.now();
-    db.prepare(
-      `
-      INSERT INTO storefront_endpoint_health (
-        host, state, consecutive_failures, opened_until, last_status_code, last_error, updated_at
-      ) VALUES (?, 'CLOSED', 0, 0, ?, NULL, ?)
-      ON CONFLICT(host) DO UPDATE SET
-        state = 'CLOSED',
-        consecutive_failures = 0,
-        opened_until = 0,
-        last_status_code = excluded.last_status_code,
-        last_error = NULL,
-        updated_at = excluded.updated_at
-    `
-    ).run(cleanHost, statusCode, nowTs);
-
-    this.emitHealthChanged({
-      host: cleanHost,
-      state: 'CLOSED',
-      consecutiveFailures: 0,
-      openedUntil: 0,
-      lastStatusCode: statusCode,
-    });
-  }
-
-  recordHostWafBlock(host, statusCode = 403, retryAfterMs = 0, errorMsg = 'WAF or rate limit block') {
-    const cleanHost = String(host || '').toLowerCase().trim();
-    if (!cleanHost) return null;
-    this.halfOpenProbesInFlight.delete(cleanHost);
-
-    const db = this.ensureOpen();
-    const nowTs = this.now();
-    const prev = db
-      .prepare('SELECT consecutive_failures FROM storefront_endpoint_health WHERE host = ?')
-      .get(cleanHost);
-    const failures = Number(prev?.consecutive_failures || 0) + 1;
-
-    // Cooldown curve: Retry-After if provided, else 15m -> 30m -> 60m (+ small positive jitter)
-    const baseMs =
-      retryAfterMs > 0
-        ? retryAfterMs
-        : failures === 1
-          ? 15 * 60 * 1000
-          : failures === 2
-            ? 30 * 60 * 1000
-            : 60 * 60 * 1000;
-    const jitterMs = this.options.disableJitter ? 0 : Math.floor(Math.random() * 5000);
-    const openedUntil = nowTs + baseMs + jitterMs;
-
-    db.prepare(
-      `
-      INSERT INTO storefront_endpoint_health (
-        host, state, consecutive_failures, opened_until, last_status_code, last_error, updated_at
-      ) VALUES (?, 'OPEN', ?, ?, ?, ?, ?)
-      ON CONFLICT(host) DO UPDATE SET
-        state = 'OPEN',
-        consecutive_failures = excluded.consecutive_failures,
-        opened_until = excluded.opened_until,
-        last_status_code = excluded.last_status_code,
-        last_error = excluded.last_error,
-        updated_at = excluded.updated_at
-    `
-    ).run(cleanHost, failures, openedUntil, statusCode, String(errorMsg), nowTs);
-
-    const snapshot = {
-      host: cleanHost,
-      state: 'OPEN',
-      consecutiveFailures: failures,
-      openedUntil,
-      lastStatusCode: statusCode,
-      lastError: String(errorMsg),
-    };
-    this.emitHealthChanged(snapshot);
-    return snapshot;
-  }
-
-  recordHostFailure(host, statusCode = null, errorMsg = 'Transient upstream failure') {
-    const cleanHost = String(host || '').toLowerCase().trim();
-    if (!cleanHost) return null;
-    const wasCanary = this.halfOpenProbesInFlight.delete(cleanHost);
-
-    const db = this.ensureOpen();
-    const nowTs = this.now();
-    const prev = db
-      .prepare('SELECT state, consecutive_failures FROM storefront_endpoint_health WHERE host = ?')
-      .get(cleanHost);
-    const failures = Number(prev?.consecutive_failures || 0) + 1;
-
-    // Trip OPEN after >= 3 consecutive 5xx/timeout failures (or immediately if HALF_OPEN canary failed): 30s -> 2m -> 10m
-    const shouldTripOpen = failures >= 3 || wasCanary || prev?.state === 'HALF_OPEN';
-    const nextState = shouldTripOpen ? 'OPEN' : 'CLOSED';
-    let openedUntil = 0;
-    if (shouldTripOpen) {
-      const backoffMs =
-        failures <= 3 ? 30 * 1000 : failures === 4 ? 2 * 60 * 1000 : 10 * 60 * 1000;
-      openedUntil = nowTs + backoffMs;
-    }
-
-    db.prepare(
-      `
-      INSERT INTO storefront_endpoint_health (
-        host, state, consecutive_failures, opened_until, last_status_code, last_error, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(host) DO UPDATE SET
-        state = excluded.state,
-        consecutive_failures = excluded.consecutive_failures,
-        opened_until = excluded.opened_until,
-        last_status_code = excluded.last_status_code,
-        last_error = excluded.last_error,
-        updated_at = excluded.updated_at
-    `
-    ).run(cleanHost, nextState, failures, openedUntil, statusCode, String(errorMsg), nowTs);
-
-    const snapshot = {
-      host: cleanHost,
-      state: nextState,
-      consecutiveFailures: failures,
-      openedUntil,
-      ...(statusCode !== null && statusCode !== undefined ? { lastStatusCode: statusCode } : {}),
-      lastError: String(errorMsg),
-    };
-    if (shouldTripOpen) {
-      this.emitHealthChanged(snapshot);
-    }
-    return snapshot;
-  }
-
-  recordAssetAdaptive404(urlKey, gameId, assetRole, ordinal, sourceUrl) {
-    const db = this.ensureOpen();
-    const nowTs = this.now();
-    const cleanGameId = String(gameId || '').trim();
-    const cleanSourceUrl = String(sourceUrl || '').trim();
-    const normUrl = cleanSourceUrl ? normalizeAssetIdentityUrl(cleanSourceUrl) : '';
-
-    const existing = db
-      .prepare(
-        'SELECT failure_count, source_url, storage_kind, blob_sha256 FROM game_media_assets WHERE url_key = ?'
-      )
-      .get(urlKey);
-
-    const existingCache = normUrl
-      ? db
-          .prepare('SELECT failure_count, blob_sha256 FROM url_resolution_cache WHERE norm_url = ?')
-          .get(normUrl)
-      : null;
-
-    const existingNorm =
-      existing && existing.source_url ? normalizeAssetIdentityUrl(existing.source_url) : '';
-    const prevAssetFailures =
-      existing && existingNorm && normUrl && existingNorm === normUrl
-        ? Number(existing.failure_count || 0)
-        : existing && existing.source_url === cleanSourceUrl
-          ? Number(existing.failure_count || 0)
-          : 0;
-    const prevCacheFailures =
-      existingCache && !existingCache.blob_sha256 ? Number(existingCache.failure_count || 0) : 0;
-    const nextFailures = Math.max(prevAssetFailures, prevCacheFailures) + 1;
-    const delayMs = computeAdaptive404DelayMs(nextFailures);
-    const nextRetryAt = nowTs + delayMs;
-
-    const hasHealthyPinnedBlob = Boolean(
-      existing && existing.storage_kind === 'blob' && existing.blob_sha256
-    );
-
-    db.exec('SAVEPOINT record_adaptive_404');
-    try {
-      if (normUrl) {
-        db.prepare(
-          `
-          INSERT INTO url_resolution_cache (
-            norm_url, game_id, blob_sha256, failure_count, next_retry_at, last_status_code, updated_at
-          ) VALUES (?, ?, NULL, ?, ?, 404, ?)
-          ON CONFLICT(norm_url) DO UPDATE SET
-            game_id = CASE WHEN excluded.game_id != '' THEN excluded.game_id ELSE url_resolution_cache.game_id END,
-            blob_sha256 = NULL,
-            failure_count = excluded.failure_count,
-            next_retry_at = excluded.next_retry_at,
-            last_status_code = 404,
-            updated_at = excluded.updated_at
-        `
-        ).run(normUrl, cleanGameId, nextFailures, nextRetryAt, nowTs);
-      }
-
-      // Non-destructive guard: NEVER overwrite or unpin a healthy `storage_kind = 'blob'`
-      // row in `game_media_assets` when an alternate candidate URL returns HTTP 404!
-      if (!hasHealthyPinnedBlob) {
-        db.prepare(
-          `
-          INSERT INTO game_media_assets (
-            url_key, game_id, asset_role, ordinal, source_url, storage_kind,
-            blob_sha256, federated_path, failure_count, next_retry_at, last_status_code, last_verified_at
-          ) VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, 404, ?)
-          ON CONFLICT(url_key) DO UPDATE SET
-            source_url = excluded.source_url,
-            failure_count = excluded.failure_count,
-            next_retry_at = excluded.next_retry_at,
-            last_status_code = 404,
-            last_verified_at = excluded.last_verified_at
-        `
-        ).run(
-          urlKey,
-          cleanGameId,
-          String(assetRole || 'cover'),
-          Math.max(0, Math.floor(Number(ordinal) || 0)),
-          cleanSourceUrl,
-          nextFailures,
-          nextRetryAt,
-          nowTs
-        );
-      }
-      db.exec('RELEASE SAVEPOINT record_adaptive_404');
-    } catch (err) {
-      try {
-        db.exec('ROLLBACK TO SAVEPOINT record_adaptive_404');
-        db.exec('RELEASE SAVEPOINT record_adaptive_404');
-      } catch {}
-      throw err;
-    }
-
-    return {
-      failureCount: nextFailures,
-      nextRetryAt,
-      delayMs,
-    };
-  }
-
-  // ==========================================================================
-  // Zero-Addon Image Normalization + Content-Addressed Storage + LRU Eviction
-  // ==========================================================================
-
-  normalizeImageBuffer(rawBuffer, roleOrContentType = 'cover', maybeRole) {
-    let assetRole = 'cover';
-    if (typeof maybeRole === 'string' && maybeRole.trim()) {
-      assetRole = maybeRole.trim();
-    } else if (typeof roleOrContentType === 'string') {
-      const trimmed = roleOrContentType.trim();
-      if (trimmed && !trimmed.includes('/')) {
-        assetRole = trimmed;
-      }
-    }
-
-    if (!Buffer.isBuffer(rawBuffer) || rawBuffer.length < 33) {
-      return { valid: false };
-    }
-    const magic = detectImageMagicBytes(rawBuffer);
-    if (!magic.valid || !magic.ext || !magic.mimeType) {
-      return { valid: false };
-    }
-
-    const ext = magic.ext;
-    const mimeType = magic.mimeType;
-
-    // Animated GIFs MUST NEVER be flattened via nativeImage.toJPEG (which extracts only frame 0)!
-    if (ext === 'gif' && isAnimatedGifBuffer(rawBuffer)) {
-      return {
-        valid: true,
-        buffer: rawBuffer,
-        ext: 'gif',
-        mimeType: 'image/gif',
-        normalized: false,
-        animated: true,
-        ...(rawBuffer.length > MAX_INLINE_ANIMATED_GIF_CACHE_BYTES ? { skipDiskBlob: true } : {}),
-      };
-    }
-
-    const normalizedAssetRole = assetRole.toLowerCase();
-    const isAlphaSensitiveRole =
-      normalizedAssetRole === 'icon' ||
-      normalizedAssetRole === 'logo' ||
-      normalizedAssetRole === 'achievement_icon';
-    const effectivePassThroughBytes =
-      isAlphaSensitiveRole && ext === 'png'
-        ? TRANSPARENT_PNG_PASS_THROUGH_MAX_BYTES
-        : PASS_THROUGH_MAX_BYTES;
-
-    // Fast 0%-CPU pass-through for webp, avif, ico, <=45KB jpg/png (<=256KB for icon/logo/achievement_icon png), and <=128KB static gif
-    if (
-      ext === 'webp' ||
-      ext === 'avif' ||
-      ext === 'ico' ||
-      ((ext === 'jpg' || ext === 'png') && rawBuffer.length <= effectivePassThroughBytes) ||
-      (ext === 'gif' && rawBuffer.length <= GIF_PASS_THROUGH_MAX_BYTES)
-    ) {
-      return {
-        valid: true,
-        buffer: rawBuffer,
-        ext,
-        mimeType,
-        normalized: false,
-      };
-    }
-
-    // Oversized static PNG/JPEG (>45KB) or oversized static single-frame GIF (>128KB): resize via Electron nativeImage
-    const nativeImageImpl = this.options.nativeImage || electron.nativeImage;
-    if (nativeImageImpl && typeof nativeImageImpl.createFromBuffer === 'function') {
-      try {
-        let img = nativeImageImpl.createFromBuffer(rawBuffer);
-        if (img && typeof img.isEmpty === 'function' && !img.isEmpty()) {
-          const maxWidth = ROLE_MAX_WIDTHS[normalizedAssetRole] || 800;
-          const sz = typeof img.getSize === 'function' ? img.getSize() : null;
-          const needsResize = Boolean(
-            sz &&
-              typeof sz.width === 'number' &&
-              sz.width > maxWidth &&
-              typeof img.resize === 'function'
-          );
-          const unresizedCapBytes =
-            ext === 'gif'
-              ? GIF_PASS_THROUGH_MAX_BYTES
-              : isAlphaSensitiveRole && ext === 'png'
-                ? TRANSPARENT_PNG_PASS_THROUGH_MAX_BYTES
-                : UNRESIZED_STATIC_PASS_THROUGH_MAX_BYTES;
-          const exceedsUnresizedCap = rawBuffer.length > unresizedCapBytes;
-
-          if (!needsResize && !exceedsUnresizedCap) {
-            return {
-              valid: true,
-              buffer: rawBuffer,
-              ext,
-              mimeType,
-              normalized: false,
-            };
-          }
-
-          if (needsResize) {
-            const targetHeight =
-              typeof sz.height === 'number' && sz.height > 0
-                ? Math.max(1, Math.round((sz.height * maxWidth) / sz.width))
-                : undefined;
-            img = img.resize(
-              targetHeight ? { width: maxWidth, height: targetHeight } : { width: maxWidth }
-            );
-          }
-          if (isAlphaSensitiveRole && ext === 'png') {
-            if (typeof img.toPNG === 'function') {
-              const pngBuf = img.toPNG();
-              if (
-                Buffer.isBuffer(pngBuf) &&
-                pngBuf.length >= 33 &&
-                pngBuf.length < rawBuffer.length &&
-                detectImageMagicBytes(pngBuf).valid
-              ) {
-                return {
-                  valid: true,
-                  buffer: pngBuf,
-                  ext: 'png',
-                  mimeType: 'image/png',
-                  normalized: true,
-                };
-              }
-            }
-          } else if (typeof img.toJPEG === 'function') {
-            const jpegBuf = img.toJPEG(82);
-            if (
-              Buffer.isBuffer(jpegBuf) &&
-              jpegBuf.length >= 33 &&
-              (jpegBuf.length < rawBuffer.length || needsResize) &&
-              detectImageMagicBytes(jpegBuf).valid
-            ) {
-              return {
-                valid: true,
-                buffer: jpegBuf,
-                ext: 'jpg',
-                mimeType: 'image/jpeg',
-                normalized: true,
-              };
-            }
-          }
-        }
-      } catch (err) {
-        diagLog.debug('offlineVault.nativeImageNormalize', err, { assetRole });
-      }
-    }
-
-    // Fallback when running in pure Node without Electron nativeImage
-    return {
-      valid: true,
-      buffer: rawBuffer,
-      ext,
-      mimeType,
-      normalized: false,
-    };
-  }
-
-  async normalizeImageBufferAsync(rawBuffer, roleOrContentType = 'cover', maybeRole) {
-    if (Buffer.isBuffer(rawBuffer) && rawBuffer.length > PASS_THROUGH_MAX_BYTES) {
-      await yieldEventLoop();
-    }
-    const result = this.normalizeImageBuffer(rawBuffer, roleOrContentType, maybeRole);
-    if (result.normalized) {
-      await yieldEventLoop();
-    }
-    return result;
-  }
-
-  storeNormalizedBlob(rawBuffer, assetRole = 'cover', upstreamContentType = '') {
-    const norm = this.normalizeImageBuffer(rawBuffer, upstreamContentType || assetRole, assetRole);
-    if (!norm.valid || !norm.buffer) {
-      return { stored: false, reason: 'invalid_image' };
-    }
-
-    if ('skipDiskBlob' in norm && norm.skipDiskBlob) {
-      return {
-        stored: false,
-        skipDiskBlob: true,
-        reason: 'oversized_animated_gif_passthrough',
-        buffer: norm.buffer,
-        ext: norm.ext,
-        mimeType: norm.mimeType,
-      };
-    }
-
-    const freeBytes = this.getFreeDiskBytes();
-    if (freeBytes < MIN_FREE_DISK_BYTES_FOR_BLOBS) {
-      return {
-        stored: false,
-        reason: 'low_disk_space',
-        buffer: norm.buffer,
-        ext: norm.ext,
-        mimeType: norm.mimeType,
-      };
-    }
-
-    const db = this.ensureOpen();
-    const nowTs = this.now();
-    const finalBuf = norm.buffer;
-    const sha256 = crypto.createHash('sha256').update(finalBuf).digest('hex');
-    const targetPath = this.getBlobFilePath(sha256, norm.ext);
-
-    if (!fs.existsSync(targetPath)) {
-      const subDir = path.dirname(targetPath);
-      fs.mkdirSync(subDir, { recursive: true });
-      const tmpFile = path.join(
-        this.tmpDir,
-        `${sha256}.${process.pid}.${nowTs}.${Math.random().toString(36).slice(2, 7)}.tmp`
-      );
-      try {
-        fs.writeFileSync(tmpFile, finalBuf);
-        fs.renameSync(tmpFile, targetPath);
-      } catch (writeErr) {
-        try {
-          if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
-        } catch {}
-        fs.writeFileSync(targetPath, finalBuf);
-      }
-    }
-
-    db.prepare(
-      `
-      INSERT INTO media_blobs (sha256, ext, mime_type, size_bytes, created_at, last_accessed_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(sha256) DO UPDATE SET
-        last_accessed_at = excluded.last_accessed_at
-    `
-    ).run(sha256, norm.ext, norm.mimeType, finalBuf.length, nowTs, nowTs);
-
-    this.maybeEvictBlobs();
-
-    return {
-      stored: true,
-      sha256,
-      ext: norm.ext,
-      mimeType: norm.mimeType,
-      sizeBytes: finalBuf.length,
-      filePath: targetPath,
-      buffer: finalBuf,
-    };
-  }
-
-  async storeNormalizedBlobAsync(rawBuffer, assetRole = 'cover', upstreamContentType = '') {
-    const norm = await this.normalizeImageBufferAsync(
-      rawBuffer,
-      upstreamContentType || assetRole,
-      assetRole
-    );
-    if (!norm.valid || !norm.buffer) {
-      return { stored: false, reason: 'invalid_image' };
-    }
-
-    if ('skipDiskBlob' in norm && norm.skipDiskBlob) {
-      return {
-        stored: false,
-        skipDiskBlob: true,
-        reason: 'oversized_animated_gif_passthrough',
-        buffer: norm.buffer,
-        ext: norm.ext,
-        mimeType: norm.mimeType,
-      };
-    }
-
-    const freeBytes = this.getFreeDiskBytes();
-    if (freeBytes < MIN_FREE_DISK_BYTES_FOR_BLOBS) {
-      return {
-        stored: false,
-        reason: 'low_disk_space',
-        buffer: norm.buffer,
-        ext: norm.ext,
-        mimeType: norm.mimeType,
-      };
-    }
-
-    const db = this.ensureOpen();
-    const nowTs = this.now();
-    const finalBuf = norm.buffer;
-    const sha256 = crypto.createHash('sha256').update(finalBuf).digest('hex');
-    const targetPath = this.getBlobFilePath(sha256, norm.ext);
-
-    if (!fs.existsSync(targetPath)) {
-      const subDir = path.dirname(targetPath);
-      await fs.promises.mkdir(subDir, { recursive: true });
-      const tmpFile = path.join(
-        this.tmpDir,
-        `${sha256}.${process.pid}.${nowTs}.${Math.random().toString(36).slice(2, 7)}.tmp`
-      );
-      try {
-        await fs.promises.writeFile(tmpFile, finalBuf);
-        await fs.promises.rename(tmpFile, targetPath);
-      } catch {
-        try {
-          await fs.promises.unlink(tmpFile);
-        } catch {}
-        await fs.promises.writeFile(targetPath, finalBuf);
-      }
-    }
-
-    db.prepare(
-      `
-      INSERT INTO media_blobs (sha256, ext, mime_type, size_bytes, created_at, last_accessed_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(sha256) DO UPDATE SET
-        last_accessed_at = excluded.last_accessed_at
-    `
-    ).run(sha256, norm.ext, norm.mimeType, finalBuf.length, nowTs, nowTs);
-
-    this.maybeEvictBlobs();
-
-    return {
-      stored: true,
-      sha256,
-      ext: norm.ext,
-      mimeType: norm.mimeType,
-      sizeBytes: finalBuf.length,
-      filePath: targetPath,
-      buffer: finalBuf,
-    };
+    vaultRemoteFetcher.releaseCanaryIfHeld(this, host);
   }
 
   /**
-   * Unconditional Orphan & Legacy P2 Non-Cover Blob Garbage Collector (NO 4 GB threshold).
-   * 1. Demotes/unpins legacy non-(cover|capsule|icon) blobs cached for uninstalled P2 games
-   *    outside the active P1 40-game detail LRU window.
-   * 2. Deletes unreferenced `media_blobs` rows and their on-disk files.
-   * 3. Scans `offline-vault/blobs` and unlinks any untracked files missing from `media_blobs`.
-   * 4. Reclaims freelist pages via `PRAGMA incremental_vacuum`.
+   * @param {string} host
+   * @param {number} [statusCode]
    */
-  sweepOrphanBlobs(options = {}) {
-    const db = this.ensureOpen();
-    this.flushBlobAccessTimestamps();
-    const nowTs = this.now();
-    const thirtyDaysAgo = nowTs - 30 * 24 * 60 * 60 * 1000;
-    const reclaimLegacyP2NonCover = options.reclaimLegacyP2NonCover !== false;
-
-    let p2AssetsDemoted = 0;
-    let orphanBlobsRemoved = 0;
-    let untrackedFilesRemoved = 0;
-    let freedBytes = 0;
-
-    if (reclaimLegacyP2NonCover) {
-      const protectedP0OrP1Ids = new Set(this.p1RecentDetailGames.keys());
-      const gameRows = db
-        .prepare(
-          'SELECT game_id, is_installed, is_favorited, summary_json FROM vault_games'
-        )
-        .all();
-
-      let favAdded = 0;
-      for (const gr of gameRows) {
-        if (!gr || !gr.game_id) continue;
-        const gid = String(gr.game_id);
-        if (Number(gr.is_installed || 0) === 1) {
-          protectedP0OrP1Ids.add(gid);
-          continue;
-        }
-        const summary = parseVaultJson(gr.summary_json);
-        if (summary && typeof summary === 'object') {
-          if (summary.isPinned === true || summary.isInstalled === true) {
-            protectedP0OrP1Ids.add(gid);
-            continue;
-          }
-          const lpRaw = summary.lastPlayedAt || summary.lastPlayed || 0;
-          const lpMs = typeof lpRaw === 'number' ? lpRaw : Date.parse(String(lpRaw || ''));
-          if (Number.isFinite(lpMs) && lpMs >= thirtyDaysAgo) {
-            protectedP0OrP1Ids.add(gid);
-            continue;
-          }
-        }
-        if (
-          Number(gr.is_favorited || 0) === 1 &&
-          favAdded < MAX_P1_RECENT_DETAIL_GAMES
-        ) {
-          protectedP0OrP1Ids.add(gid);
-          favAdded++;
-        }
-      }
-
-      const nonCoverRows = db
-        .prepare(
-          `
-          SELECT url_key, game_id, source_url, failure_count, next_retry_at
-          FROM game_media_assets
-          WHERE asset_role NOT IN ('cover', 'capsule', 'icon')
-            AND storage_kind != 'federated'
-        `
-        )
-        .all();
-
-      const deleteAssetKeyStmt = db.prepare('DELETE FROM game_media_assets WHERE url_key = ?');
-      const unpinBackoffKeyStmt = db.prepare(
-        "UPDATE game_media_assets SET storage_kind = 'pending', blob_sha256 = NULL WHERE url_key = ?"
-      );
-      const deleteDemotedUrlCacheStmt = db.prepare(
-        'DELETE FROM url_resolution_cache WHERE norm_url = ? AND game_id = ?'
-      );
-
-      db.exec('BEGIN IMMEDIATE');
-      try {
-        for (const ar of nonCoverRows) {
-          const gid = String(ar.game_id || '').trim();
-          if (!gid || protectedP0OrP1Ids.has(gid)) continue;
-          if (ar.source_url) {
-            const demotedNorm = normalizeAssetIdentityUrl(ar.source_url);
-            if (demotedNorm) {
-              deleteDemotedUrlCacheStmt.run(demotedNorm, gid);
-            }
-          }
-          if (Number(ar.failure_count || 0) > 0 && Number(ar.next_retry_at || 0) > nowTs) {
-            unpinBackoffKeyStmt.run(ar.url_key);
-          } else {
-            deleteAssetKeyStmt.run(ar.url_key);
-          }
-          p2AssetsDemoted++;
-        }
-        db.exec('COMMIT');
-      } catch {
-        try {
-          db.exec('ROLLBACK');
-        } catch {}
-      }
-    }
-
-    // Prune `url_resolution_cache` BEFORE computing unreferenced `media_blobs`:
-    // 1. Delete stale 404 entries (`blob_sha256 IS NULL AND updated_at < now - 30d`).
-    // 2. Delete entries belonging to nonexistent `game_id`s.
-    // 3. For secondary (non-pinned) cached blobs (`blob_sha256 IS NOT NULL` not referenced by
-    //    `game_media_assets`), delete any older than 14 days and retain at most 1 newest
-    //    secondary cached blob per `game_id` so valid fallback covers survive without leaking disk.
-    const fourteenDaysAgo = nowTs - 14 * 24 * 60 * 60 * 1000;
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      db.prepare(
-        'DELETE FROM url_resolution_cache WHERE blob_sha256 IS NULL AND updated_at < ?'
-      ).run(thirtyDaysAgo);
-
-      const vaultGamesCountRow = db.prepare('SELECT COUNT(*) AS cnt FROM vault_games').get();
-      const hasVaultGames = Number(vaultGamesCountRow?.cnt || 0) > 0;
-      if (hasVaultGames) {
-        db.exec(`
-          DELETE FROM url_resolution_cache
-          WHERE game_id = ''
-             OR NOT EXISTS (
-               SELECT 1 FROM vault_games vg WHERE vg.game_id = url_resolution_cache.game_id
-             );
-        `);
-      } else {
-        db.exec(`
-          DELETE FROM url_resolution_cache
-          WHERE game_id = ''
-             OR NOT EXISTS (
-               SELECT 1 FROM game_media_assets gma WHERE gma.game_id = url_resolution_cache.game_id
-             );
-        `);
-      }
-
-      // Drop secondary cached blob rows older than 14 days
-      db.prepare(
-        `
-        DELETE FROM url_resolution_cache
-        WHERE blob_sha256 IS NOT NULL
-          AND updated_at < ?
-          AND NOT EXISTS (
-            SELECT 1 FROM game_media_assets gma WHERE gma.blob_sha256 = url_resolution_cache.blob_sha256
-          )
-      `
-      ).run(fourteenDaysAgo);
-
-      // Keep at most 1 newest secondary cached blob per `game_id`
-      const secondaryRows = db
-        .prepare(
-          `
-          SELECT urc.norm_url AS norm_url, urc.game_id AS game_id, urc.updated_at AS updated_at
-          FROM url_resolution_cache urc
-          WHERE urc.blob_sha256 IS NOT NULL
-            AND NOT EXISTS (
-              SELECT 1 FROM game_media_assets gma WHERE gma.blob_sha256 = urc.blob_sha256
-            )
-          ORDER BY urc.game_id ASC, urc.updated_at DESC, urc.norm_url ASC
-        `
-        )
-        .all();
-
-      const deleteUrlCacheByNormStmt = db.prepare(
-        'DELETE FROM url_resolution_cache WHERE norm_url = ?'
-      );
-      /** @type {Set<string>} */
-      const seenSecondaryGameIds = new Set();
-      for (const sRow of secondaryRows) {
-        if (!sRow || !sRow.norm_url) continue;
-        const gid = String(sRow.game_id || '');
-        if (seenSecondaryGameIds.has(gid)) {
-          deleteUrlCacheByNormStmt.run(sRow.norm_url);
-        } else {
-          seenSecondaryGameIds.add(gid);
-        }
-      }
-
-      db.exec('COMMIT');
-    } catch {
-      try {
-        db.exec('ROLLBACK');
-      } catch {}
-    }
-
-    // Remove unreferenced `media_blobs` rows (excluding BOTH `game_media_assets` AND surviving `url_resolution_cache`)
-    const unrefBlobs = db
-      .prepare(
-        `
-        SELECT mb.sha256 AS sha256, mb.ext AS ext, mb.size_bytes AS size_bytes
-        FROM media_blobs mb
-        LEFT JOIN game_media_assets gma ON gma.blob_sha256 = mb.sha256
-        LEFT JOIN url_resolution_cache urc ON urc.blob_sha256 = mb.sha256
-        WHERE gma.url_key IS NULL
-          AND urc.norm_url IS NULL
-      `
-      )
-      .all();
-
-    const deleteBlobStmt = db.prepare('DELETE FROM media_blobs WHERE sha256 = ?');
-    for (const ub of unrefBlobs) {
-      const fp = this.getBlobFilePath(ub.sha256, ub.ext);
-      let actualRemoved = 0;
-      try {
-        if (fs.existsSync(fp)) {
-          actualRemoved = fs.statSync(fp).size || Number(ub.size_bytes || 0);
-          fs.unlinkSync(fp);
-        } else {
-          actualRemoved = Number(ub.size_bytes || 0);
-        }
-      } catch {}
-      try {
-        deleteBlobStmt.run(ub.sha256);
-        orphanBlobsRemoved++;
-        freedBytes += actualRemoved;
-      } catch {}
-    }
-
-    // Walk `this.blobsDir` and remove any untracked files on disk not present in `media_blobs`
-    const validBlobFiles = new Set();
-    const allTrackedBlobs = db.prepare('SELECT sha256, ext FROM media_blobs').all();
-    for (const row of allTrackedBlobs) {
-      if (!row || !row.sha256) continue;
-      const cleanSha = String(row.sha256).toLowerCase().trim();
-      const cleanExt = String(row.ext || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
-      validBlobFiles.add(`${cleanSha}.${cleanExt}`);
-    }
-
-    if (this.blobsDir && fs.existsSync(this.blobsDir)) {
-      try {
-        for (const shardEnt of fs.readdirSync(this.blobsDir, { withFileTypes: true })) {
-          const shardPath = path.join(this.blobsDir, shardEnt.name);
-          if (shardEnt.isFile()) {
-            if (!validBlobFiles.has(shardEnt.name.toLowerCase())) {
-              try {
-                const sz = fs.statSync(shardPath).size || 0;
-                fs.unlinkSync(shardPath);
-                untrackedFilesRemoved++;
-                freedBytes += sz;
-              } catch {}
-            }
-            continue;
-          }
-          if (!shardEnt.isDirectory()) continue;
-          let remainingChildren = 0;
-          try {
-            const files = fs.readdirSync(shardPath, { withFileTypes: true });
-            for (const fEnt of files) {
-              const fPath = path.join(shardPath, fEnt.name);
-              if (fEnt.isFile() && !validBlobFiles.has(fEnt.name.toLowerCase())) {
-                try {
-                  const sz = fs.statSync(fPath).size || 0;
-                  fs.unlinkSync(fPath);
-                  untrackedFilesRemoved++;
-                  freedBytes += sz;
-                } catch {
-                  remainingChildren++;
-                }
-              } else {
-                remainingChildren++;
-              }
-            }
-            if (remainingChildren === 0) {
-              try {
-                fs.rmdirSync(shardPath);
-              } catch {}
-            }
-          } catch {}
-        }
-      } catch {}
-    }
-
-    try {
-      db.exec('PRAGMA incremental_vacuum;');
-      db.exec('PRAGMA wal_checkpoint(PASSIVE);');
-    } catch {}
-
-    return {
-      success: true,
-      p2AssetsDemoted,
-      orphanBlobsRemoved,
-      untrackedFilesRemoved,
-      freedBytes,
-      stats: this.getStats(),
-    };
+  recordHostSuccess(host, statusCode = 200) {
+    vaultRemoteFetcher.recordHostSuccess(this, host, statusCode);
   }
 
+  /**
+   * @param {string} host
+   * @param {number} [statusCode]
+   * @param {number} [retryAfterMs]
+   * @param {string} [errorMsg]
+   */
+  recordHostWafBlock(host, statusCode = 403, retryAfterMs = 0, errorMsg = 'WAF or rate limit block') {
+    return vaultRemoteFetcher.recordHostWafBlock(this, host, statusCode, retryAfterMs, errorMsg);
+  }
+
+  /**
+   * @param {string} host
+   * @param {number | null} [statusCode]
+   * @param {string} [errorMsg]
+   */
+  recordHostFailure(host, statusCode = null, errorMsg = 'Transient upstream failure') {
+    return vaultRemoteFetcher.recordHostFailure(this, host, statusCode, errorMsg);
+  }
+
+  /**
+   * @param {string} urlKey
+   * @param {string} gameId
+   * @param {string} assetRole
+   * @param {number} ordinal
+   * @param {string} sourceUrl
+   */
+  recordAssetAdaptive404(urlKey, gameId, assetRole, ordinal, sourceUrl) {
+    return vaultMediaResolver.recordAssetAdaptive404(
+      this,
+      urlKey,
+      gameId,
+      assetRole,
+      ordinal,
+      sourceUrl
+    );
+  }
+
+  /**
+   * @param {Buffer} rawBuffer
+   * @param {string} [roleOrContentType]
+   * @param {string} [maybeRole]
+   */
+  normalizeImageBuffer(rawBuffer, roleOrContentType = 'cover', maybeRole) {
+    return vaultBlobStore.normalizeImageBuffer(this, rawBuffer, roleOrContentType, maybeRole);
+  }
+
+  /**
+   * @param {Buffer} rawBuffer
+   * @param {string} [roleOrContentType]
+   * @param {string} [maybeRole]
+   */
+  normalizeImageBufferAsync(rawBuffer, roleOrContentType = 'cover', maybeRole) {
+    return vaultBlobStore.normalizeImageBufferAsync(this, rawBuffer, roleOrContentType, maybeRole);
+  }
+
+  /**
+   * @param {Buffer} rawBuffer
+   * @param {string} [assetRole]
+   * @param {string} [upstreamContentType]
+   */
+  storeNormalizedBlob(rawBuffer, assetRole = 'cover', upstreamContentType = '') {
+    return vaultBlobStore.storeNormalizedBlob(this, rawBuffer, assetRole, upstreamContentType);
+  }
+
+  /**
+   * @param {Buffer} rawBuffer
+   * @param {string} [assetRole]
+   * @param {string} [upstreamContentType]
+   */
+  storeNormalizedBlobAsync(rawBuffer, assetRole = 'cover', upstreamContentType = '') {
+    return vaultBlobStore.storeNormalizedBlobAsync(this, rawBuffer, assetRole, upstreamContentType);
+  }
+
+  /** @param {Record<string, any>} [options] */
+  sweepOrphanBlobs(options = {}) {
+    return vaultBlobStore.sweepOrphanBlobs(this, options);
+  }
+
+  /** @param {Record<string, any>} [options] */
+  sweepOrphanBlobsAsync(options = {}) {
+    return vaultBlobStore.sweepOrphanBlobsAsync(this, options);
+  }
+
+  /** @param {Record<string, any>} [options] */
   enforceQuota(options = {}) {
     const evictRes = this.maybeEvictBlobs({ forceIfOverMax: true, ...options });
     return {
@@ -5148,6 +711,7 @@ class OfflineVaultService {
     };
   }
 
+  /** @param {Record<string, any>} [options] */
   reclaimUnusedCache(options = {}) {
     const sweep = this.sweepOrphanBlobs(options);
     const quota = this.maybeEvictBlobs({ forceIfOverMax: true, ...options });
@@ -5165,6 +729,7 @@ class OfflineVaultService {
     };
   }
 
+  /** @param {Record<string, any>} [options] */
   compactVault(options = {}) {
     const db = this.ensureOpen();
     const preSqliteBytes = this.getSqliteDiskBytes();
@@ -5174,6 +739,7 @@ class OfflineVaultService {
       db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
       db.exec('VACUUM;');
       db.exec('PRAGMA journal_mode = WAL;');
+      this.cachedSqliteDiskBytes = null;
     } catch (vacErr) {
       diagLog.debug('offlineVault.compactVaultVacuum', vacErr);
     }
@@ -5199,1561 +765,90 @@ class OfflineVaultService {
     };
   }
 
-  /**
-   * Evicts unpinned LRU blobs when usage hits >= 95% of tier cap (or > maxBytes after tier change)
-   * down to 80% of tier cap. Installed games' cover/header/icon/logo/hero blobs (rank 100) are NEVER evicted,
-   * and P2/P1 non-cover detail blobs are always evicted before active library covers.
-   */
+  /** @param {{ maxBytes?: number, forceIfOverMax?: boolean }} [opts] */
   maybeEvictBlobs(opts = {}) {
-    const db = this.ensureOpen();
-    this.flushBlobAccessTimestamps();
-
-    const tier = this.getTier();
-    const maxBytes = typeof opts.maxBytes === 'number' ? opts.maxBytes : OFFLINE_VAULT_TIER_CAPS[tier];
-    const sqliteBytes = this.getSqliteDiskBytes();
-    const sumRow = db.prepare('SELECT COALESCE(SUM(size_bytes), 0) AS bytes FROM media_blobs').get();
-    let currentBlobBytes = Number(sumRow?.bytes || 0);
-    let currentTotalBytes = sqliteBytes + currentBlobBytes;
-
-    const triggerThreshold = opts.forceIfOverMax ? maxBytes : Math.floor(maxBytes * 0.95);
-    if (currentTotalBytes < triggerThreshold) {
-      return { evictedCount: 0, freedBytes: 0 };
-    }
-
-    const targetTotalBytes = Math.floor(maxBytes * 0.8);
-
-    // Retention priority rank:
-    // 100 = PINNED (installed game cover/capsule/header/hero/logo/icon)
-    //  65 = installed game screenshots / inline images
-    //  55 = active library cover / capsule
-    //  50 = active library icon
-    //  40 = uninstalled header / hero / logo
-    //  30 = screenshot_thumb / screenshot
-    //  25 = achievement_icon (deliberately unpinned even for installed games so 100+ trophies never starve covers)
-    //  20 = inline_img / inline_poster
-    //  10 = screenshot_full
-    //   0 = orphaned blob
-    const candidates = db
-      .prepare(
-        `
-        SELECT
-          mb.sha256 AS sha256,
-          mb.ext AS ext,
-          mb.size_bytes AS size_bytes,
-          mb.last_accessed_at AS last_accessed_at,
-          COALESCE(MAX(
-            CASE
-              WHEN vg.is_installed = 1 AND gma.asset_role IN ('cover', 'capsule', 'header', 'hero', 'logo', 'icon') THEN 100
-              WHEN vg.is_installed = 1 AND COALESCE(gma.asset_role, '') != 'achievement_icon' AND gma.url_key IS NOT NULL THEN 65
-              WHEN gma.asset_role IN ('cover', 'capsule') THEN 55
-              WHEN gma.asset_role = 'icon' THEN 50
-              WHEN gma.asset_role IN ('header', 'hero', 'logo') THEN 40
-              WHEN gma.asset_role IN ('screenshot_thumb', 'screenshot') THEN 30
-              WHEN gma.asset_role = 'achievement_icon' THEN 25
-              WHEN gma.asset_role IN ('inline_img', 'inline_poster') THEN 20
-              WHEN gma.asset_role = 'screenshot_full' THEN 10
-              WHEN gma.url_key IS NOT NULL THEN 15
-              ELSE 0
-            END
-          ), 0) AS retention_rank
-        FROM media_blobs mb
-        LEFT JOIN game_media_assets gma ON gma.blob_sha256 = mb.sha256
-        LEFT JOIN vault_games vg ON vg.game_id = gma.game_id
-        GROUP BY mb.sha256
-        HAVING retention_rank < 100
-        ORDER BY retention_rank ASC, mb.last_accessed_at ASC, mb.created_at ASC
-      `
-      )
-      .all();
-
-    let evictedCount = 0;
-    let freedBytes = 0;
-
-    const resetAssetStmt = db.prepare(
-      "UPDATE game_media_assets SET storage_kind = 'pending', blob_sha256 = NULL WHERE blob_sha256 = ?"
-    );
-    const deleteBlobStmt = db.prepare('DELETE FROM media_blobs WHERE sha256 = ?');
-
-    for (const cand of candidates) {
-      if (currentTotalBytes <= targetTotalBytes) break;
-      const blobFile = this.getBlobFilePath(cand.sha256, cand.ext);
-      try {
-        if (fs.existsSync(blobFile)) {
-          fs.unlinkSync(blobFile);
-        }
-      } catch {}
-
-      db.exec('BEGIN IMMEDIATE');
-      try {
-        resetAssetStmt.run(cand.sha256);
-        deleteBlobStmt.run(cand.sha256);
-        db.exec('COMMIT');
-        const sz = Number(cand.size_bytes || 0);
-        currentBlobBytes = Math.max(0, currentBlobBytes - sz);
-        currentTotalBytes = sqliteBytes + currentBlobBytes;
-        freedBytes += sz;
-        evictedCount++;
-      } catch {
-        try {
-          db.exec('ROLLBACK');
-        } catch {}
-      }
-    }
-
-    return { evictedCount, freedBytes };
+    return vaultBlobStore.maybeEvictBlobs(this, opts);
   }
-
-  // ==========================================================================
-  // `ol-media://` Resolution & Upstream Persist-on-Read
-  // ==========================================================================
 
   getFetchImpl() {
-    if (typeof this.options.fetchImpl === 'function') {
-      return this.options.fetchImpl;
-    }
-    if (electron.net && typeof electron.net.fetch === 'function') {
-      return electron.net.fetch.bind(electron.net);
-    }
-    return globalThis.fetch;
+    return vaultRemoteFetcher.getFetchImpl(this);
   }
 
+  /** @param {Record<string, any>} [params] */
   isAssetAlreadyHydratedOrBackedOff(params = {}) {
-    const db = this.ensureOpen();
-    const gameId = String(params.gameId || '').trim();
-    const role = String(params.role || 'cover').trim();
-    const ordinal = Math.max(0, Math.floor(Number(params.ordinal ?? params.ord ?? 0)));
-    const sourceUrl = String(params.url || '').trim();
-    const normSourceUrl = sourceUrl ? normalizeAssetIdentityUrl(sourceUrl) : '';
-    const urlKey = buildAssetUrlKey(gameId, role, ordinal, sourceUrl);
-    const nowTs = this.now();
-
-    if (normSourceUrl) {
-      const cacheRow = db
-        .prepare(
-          'SELECT blob_sha256, next_retry_at FROM url_resolution_cache WHERE norm_url = ?'
-        )
-        .get(normSourceUrl);
-      if (cacheRow) {
-        if (cacheRow.blob_sha256) {
-          const mb = db
-            .prepare('SELECT ext FROM media_blobs WHERE sha256 = ?')
-            .get(cacheRow.blob_sha256);
-          if (mb && fs.existsSync(this.getBlobFilePath(cacheRow.blob_sha256, mb.ext))) {
-            return true;
-          }
-        } else if (cacheRow.next_retry_at && Number(cacheRow.next_retry_at) > nowTs) {
-          return true;
-        }
-      }
-    }
-
-    const row = db.prepare('SELECT * FROM game_media_assets WHERE url_key = ?').get(urlKey);
-    if (!row) return false;
-
-    if (
-      sourceUrl &&
-      row.source_url &&
-      normalizeAssetIdentityUrl(row.source_url) !== normSourceUrl
-    ) {
-      return false;
-    }
-
-    if (row.storage_kind === 'blob' && row.blob_sha256) {
-      const mb = db
-        .prepare('SELECT ext FROM media_blobs WHERE sha256 = ?')
-        .get(row.blob_sha256);
-      if (mb && fs.existsSync(this.getBlobFilePath(row.blob_sha256, mb.ext))) {
-        return true;
-      }
-    }
-
-    if (row.storage_kind === 'federated' && row.federated_path) {
-      if (!isFederatedAssetRowCompatible(sourceUrl || row.source_url, row.federated_path, params)) {
-        return false;
-      }
-      try {
-        const lst = fs.lstatSync(String(row.federated_path));
-        if (!lst.isSymbolicLink() && lst.isFile() && lst.size >= 33) {
-          return true;
-        }
-      } catch {}
-    }
-
-    if (row.next_retry_at && Number(row.next_retry_at) > nowTs) {
-      return true;
-    }
-
-    return false;
+    return vaultMediaResolver.isAssetAlreadyHydratedOrBackedOff(this, params);
   }
 
+  /** @param {Record<string, any>} [params] */
   isAssetBackedOffFailure(params = {}) {
-    if (this.isShutdown) return false;
-    const db = this.db || this.ensureOpen();
-    if (!db) return false;
-    const gameId = String(params.gameId || '').trim();
-    const role = String(params.role || 'cover').trim();
-    const ordinal = Math.max(0, Math.floor(Number(params.ordinal ?? params.ord ?? 0)));
-    const sourceUrl = String(params.url || '').trim();
-    const normSourceUrl = sourceUrl ? normalizeAssetIdentityUrl(sourceUrl) : '';
-    const urlKey = buildAssetUrlKey(gameId, role, ordinal, sourceUrl);
-    const nowTs = this.now();
-
-    if (normSourceUrl) {
-      const cacheRow = db
-        .prepare(
-          'SELECT blob_sha256, failure_count, next_retry_at FROM url_resolution_cache WHERE norm_url = ?'
-        )
-        .get(normSourceUrl);
-      if (
-        cacheRow &&
-        !cacheRow.blob_sha256 &&
-        (Number(cacheRow.failure_count || 0) > 0 || Number(cacheRow.next_retry_at || 0) > nowTs)
-      ) {
-        return true;
-      }
-    }
-
-    const row = db
-      .prepare(
-        'SELECT storage_kind, failure_count, next_retry_at FROM game_media_assets WHERE url_key = ?'
-      )
-      .get(urlKey);
-    if (!row || row.storage_kind !== 'pending') return false;
-    return Number(row.failure_count || 0) > 0 || Number(row.next_retry_at || 0) > nowTs;
-  }
-
-  bindAssetBlobRow(urlKey, gameId, role, ordinal, rawUrl, sha256) {
-    const db = this.ensureOpen();
-    const nowTs = this.now();
-    const cleanGameId = String(gameId || '').trim();
-    const cleanRawUrl = typeof rawUrl === 'string' ? rawUrl.trim() : '';
-    const normUrl = cleanRawUrl ? normalizeAssetIdentityUrl(cleanRawUrl) : '';
-
-    db.exec('SAVEPOINT bind_asset_blob');
-    try {
-      // Preserve any previously-pinned live blob URL in `url_resolution_cache` before swapping
-      // (ensures pre-upgrade databases also retain fast secondary fallback hits!).
-      const prevRow = db
-        .prepare(
-          'SELECT game_id, source_url, storage_kind, blob_sha256 FROM game_media_assets WHERE url_key = ?'
-        )
-        .get(urlKey);
-      if (
-        prevRow &&
-        prevRow.storage_kind === 'blob' &&
-        prevRow.blob_sha256 &&
-        prevRow.source_url
-      ) {
-        const prevNorm = normalizeAssetIdentityUrl(prevRow.source_url);
-        if (prevNorm && prevNorm !== normUrl) {
-          db.prepare(
-            `
-            INSERT OR IGNORE INTO url_resolution_cache (
-              norm_url, game_id, blob_sha256, failure_count, next_retry_at, last_status_code, updated_at
-            ) VALUES (?, ?, ?, 0, 0, 200, ?)
-          `
-          ).run(
-            prevNorm,
-            String(prevRow.game_id || cleanGameId),
-            String(prevRow.blob_sha256),
-            nowTs
-          );
-        }
-      }
-
-      db.prepare(
-        `
-        INSERT INTO game_media_assets (
-          url_key, game_id, asset_role, ordinal, source_url, storage_kind,
-          blob_sha256, federated_path, failure_count, next_retry_at, last_status_code, last_verified_at
-        ) VALUES (?, ?, ?, ?, ?, 'blob', ?, NULL, 0, 0, 200, ?)
-        ON CONFLICT(url_key) DO UPDATE SET
-          source_url = excluded.source_url,
-          storage_kind = 'blob',
-          blob_sha256 = excluded.blob_sha256,
-          federated_path = NULL,
-          failure_count = 0,
-          next_retry_at = 0,
-          last_status_code = 200,
-          last_verified_at = excluded.last_verified_at
-      `
-      ).run(urlKey, cleanGameId, role, ordinal, cleanRawUrl, sha256, nowTs);
-
-      if (normUrl) {
-        db.prepare(
-          `
-          INSERT INTO url_resolution_cache (
-            norm_url, game_id, blob_sha256, failure_count, next_retry_at, last_status_code, updated_at
-          ) VALUES (?, ?, ?, 0, 0, 200, ?)
-          ON CONFLICT(norm_url) DO UPDATE SET
-            game_id = CASE WHEN excluded.game_id != '' THEN excluded.game_id ELSE url_resolution_cache.game_id END,
-            blob_sha256 = excluded.blob_sha256,
-            failure_count = 0,
-            next_retry_at = 0,
-            last_status_code = 200,
-            updated_at = excluded.updated_at
-        `
-        ).run(normUrl, cleanGameId, sha256, nowTs);
-      }
-
-      db.exec('RELEASE SAVEPOINT bind_asset_blob');
-    } catch (err) {
-      try {
-        db.exec('ROLLBACK TO SAVEPOINT bind_asset_blob');
-        db.exec('RELEASE SAVEPOINT bind_asset_blob');
-      } catch {}
-      throw err;
-    }
+    return vaultMediaResolver.isAssetBackedOffFailure(this, params);
   }
 
   /**
-   * Parse `paramsInput` (object, `ol-media://` URL string, or URL instance) into a uniform params object.
-   * @param {Record<string, any> | string | URL} paramsInput
-   * @returns {Record<string, any>}
+   * @param {string} urlKey
+   * @param {string} gameId
+   * @param {string} role
+   * @param {number} ordinal
+   * @param {string} rawUrl
+   * @param {string} sha256
    */
+  bindAssetBlobRow(urlKey, gameId, role, ordinal, rawUrl, sha256) {
+    vaultMediaResolver.bindAssetBlobRow(this, urlKey, gameId, role, ordinal, rawUrl, sha256);
+  }
+
+  /** @param {Record<string, any> | string | URL} [paramsInput] */
   parseMediaRequestParams(paramsInput = {}) {
-    if (typeof paramsInput === 'string' || paramsInput instanceof URL) {
-      try {
-        const parsedReq = new URL(String(paramsInput));
-        const sp = parsedReq.searchParams;
-        return {
-          gameId: sp.get('gameId') || '',
-          role: sp.get('role') || 'cover',
-          ordinal: Number(sp.get('ord') || sp.get('ordinal') || 0),
-          url: sp.get('url') || '',
-          steamAppId: sp.get('steamAppId') || '',
-          gogId: sp.get('gogId') || '',
-          epicAppName: sp.get('epicApp') || sp.get('epicAppName') || '',
-          xboxProductId: sp.get('xboxProductId') || sp.get('xid') || '',
-          pfn: sp.get('pfn') || sp.get('packageFamilyName') || '',
-          packageFamilyName: sp.get('pfn') || sp.get('packageFamilyName') || '',
-          xboxTitleId: sp.get('xboxTitleId') || sp.get('xtid') || '',
-          ov: sp.get('ov') || '',
-        };
-      } catch {
-        return {};
-      }
-    }
-    if (paramsInput && typeof paramsInput === 'object') {
-      return paramsInput;
-    }
-    return {};
+    return vaultMediaResolver.parseMediaRequestParams(paramsInput);
   }
 
   /**
-   * Async Tier 1A blob verification and response builder.
    * @param {string} sha256
    * @param {string} [cacheControl]
    */
-  async tryResolveBlobBySha(sha256, cacheControl = 'public, max-age=31536000, immutable') {
-    if (!sha256 || typeof sha256 !== 'string') return null;
-    const db = this.ensureOpen();
-    const mb = db
-      .prepare('SELECT sha256, ext, mime_type, size_bytes FROM media_blobs WHERE sha256 = ?')
-      .get(sha256);
-    if (!mb) return null;
-    const blobPath = this.getBlobFilePath(mb.sha256, mb.ext);
-    if (!isContainedWithinRoot(this.blobsDir, blobPath, this.options.platform)) {
-      return null;
-    }
-    let blobStat = null;
-    try {
-      blobStat = await fs.promises.stat(blobPath);
-    } catch {}
-    if (!blobStat || !blobStat.isFile() || blobStat.size <= 0) {
-      return null;
-    }
-    this.touchBlobAccess(mb.sha256);
-    return {
-      kind: 'file',
-      filePath: blobPath,
-      mimeType: mb.mime_type,
-      sizeBytes: Number(mb.size_bytes || blobStat.size || 0),
-      cacheControl,
-      source: 'vault_blob',
-    };
+  tryResolveBlobBySha(sha256, cacheControl) {
+    return vaultMediaResolver.tryResolveBlobBySha(this, sha256, cacheControl);
   }
 
   /**
-   * Async Tier 1B federated local file verification and response builder.
    * @param {Record<string, any>} assetRow
    * @param {string} rawUrl
    * @param {Record<string, any>} params
    * @param {boolean} isExplicitOverride
    * @param {{ selfHealMissing?: boolean }} [opts]
    */
-  async tryResolveFederatedRow(
-    assetRow,
-    rawUrl,
-    params,
-    isExplicitOverride,
-    opts = { selfHealMissing: false }
-  ) {
-    if (!assetRow || assetRow.storage_kind !== 'federated' || !assetRow.federated_path) {
-      return null;
-    }
-    const db = this.ensureOpen();
-    const federatedPath = String(assetRow.federated_path);
-    const effectiveRole = String(assetRow.asset_role || params?.role || '').trim().toLowerCase();
-    const effectiveOrdinal = Math.max(
-      0,
-      Math.floor(Number(assetRow.ordinal ?? params?.ordinal ?? params?.ord ?? 0) || 0)
+  tryResolveFederatedRow(assetRow, rawUrl, params, isExplicitOverride, opts) {
+    return vaultMediaResolver.tryResolveFederatedRow(
+      this,
+      assetRow,
+      rawUrl,
+      params,
+      isExplicitOverride,
+      opts
     );
-    const isDisallowedFederationRole =
-      effectiveRole === 'achievement_icon' || (effectiveRole === 'icon' && effectiveOrdinal > 0);
-    if (
-      isExplicitOverride ||
-      isDisallowedFederationRole ||
-      !isFederatedAssetRowCompatible(rawUrl || assetRow.source_url, federatedPath, {
-        ...(params && typeof params === 'object' ? params : {}),
-        role: effectiveRole || params?.role,
-        ordinal: effectiveOrdinal,
-      })
-    ) {
-      if (opts.selfHealMissing) {
-        db.prepare(
-          "UPDATE game_media_assets SET storage_kind = 'pending', federated_path = NULL WHERE url_key = ?"
-        ).run(assetRow.url_key);
-      }
-      return null;
-    }
-    try {
-      const lst = await fs.promises.lstat(federatedPath);
-      if (!lst.isSymbolicLink() && lst.isFile() && lst.size >= 33) {
-        const header = Buffer.allocUnsafe(16);
-        header.fill(0);
-        const fh = await fs.promises.open(federatedPath, 'r');
-        let bytesRead = 0;
-        try {
-          const readRes = await fh.read(header, 0, 16, 0);
-          bytesRead = Number(readRes?.bytesRead || 0);
-        } finally {
-          try {
-            await fh.close();
-          } catch {}
-        }
-        const magic = detectImageMagicBytes(header.subarray(0, bytesRead));
-        if (magic.valid && magic.mimeType) {
-          return {
-            kind: 'file',
-            filePath: federatedPath,
-            mimeType: magic.mimeType,
-            sizeBytes: lst.size,
-            cacheControl: 'public, max-age=86400',
-            source: 'federated_local',
-          };
-        }
-      }
-    } catch {}
-    if (opts.selfHealMissing) {
-      db.prepare(
-        "UPDATE game_media_assets SET storage_kind = 'pending', federated_path = NULL WHERE url_key = ?"
-      ).run(assetRow.url_key);
-    }
-    return null;
+  }
+
+  /** @param {Record<string, any> | string | URL} [paramsInput] */
+  resolveLocalCachedMedia(paramsInput = {}) {
+    return vaultMediaResolver.resolveLocalCachedMedia(this, paramsInput);
   }
 
   /**
-   * Zero-DNS Tier 1A/1B local disk cache lookup for `ol-media://` fast path.
-   * Returns a resolved local file hit ONLY when:
-   *   (a) `assetRow` matches `url_key` AND `normalizeAssetIdentityUrl(assetRow.source_url) === normalizeAssetIdentityUrl(params.url)`
-   *       (exact previously-validated URL) with a live blob/federated file on disk, OR
-   *   (b) `url_resolution_cache` has a live disk blob for `normalizeAssetIdentityUrl(params.url)`
-   *       (re-binding `game_media_assets` if needed), OR
-   *   (c) `params.localCacheOnly === true` or `!this.isNetworkOnline()` (explicit offline fallback to existing `assetRow` blob/federated file).
-   *
-   * Returns `null` whenever `params.url` is a new/different URL while online (forcing full DNS check
-   * + Tier 3 upgrade path!).
-   *
-   * @param {Record<string, any> | string | URL} paramsInput
-   */
-  async resolveLocalCachedMedia(paramsInput = {}) {
-    const params = this.parseMediaRequestParams(paramsInput);
-    const gameId = String(params.gameId || '').trim();
-    const role = String(params.role || 'cover').trim();
-    const ordinal = Math.max(0, Math.floor(Number(params.ordinal ?? params.ord ?? 0)));
-    const rawUrl = typeof params.url === 'string' ? params.url.trim() : '';
-    const isExplicitOverride = isExplicitOverrideParam(params.ov);
-    const localCacheOnly = params.localCacheOnly === true;
-
-    if (rawUrl && isRejectedVideoUrl(rawUrl)) {
-      return null;
-    }
-    if (!rawUrl && !gameId) {
-      return null;
-    }
-
-    const db = this.ensureOpen();
-    const normRawUrl = rawUrl ? normalizeAssetIdentityUrl(rawUrl) : '';
-    const urlKey = buildAssetUrlKey(gameId, role, ordinal, rawUrl);
-    const assetRow = db.prepare('SELECT * FROM game_media_assets WHERE url_key = ?').get(urlKey);
-    const assetSourceNorm =
-      assetRow && assetRow.source_url ? normalizeAssetIdentityUrl(assetRow.source_url) : '';
-    const isExactUrlMatch = Boolean(
-      assetRow && (!normRawUrl || (assetSourceNorm && assetSourceNorm === normRawUrl))
-    );
-
-    const recordDetailViewIfNeeded = () => {
-      if (
-        !params.backgroundHydration &&
-        gameId &&
-        ['header', 'hero', 'logo', 'screenshot', 'screenshot_thumb', 'screenshot_full'].includes(
-          role
-        )
-      ) {
-        this.recordP1DetailGame(gameId);
-        if (this.hydrationEngine && typeof this.hydrationEngine.recordP1DetailView === 'function') {
-          try {
-            this.hydrationEngine.recordP1DetailView(gameId);
-          } catch {}
-        }
-      }
-    };
-
-    // (a) Exact previously-validated URL hit on `game_media_assets`
-    if (isExactUrlMatch && assetRow) {
-      if (assetRow.storage_kind === 'blob' && assetRow.blob_sha256) {
-        const blobHit = await this.tryResolveBlobBySha(
-          String(assetRow.blob_sha256),
-          'public, max-age=31536000, immutable'
-        );
-        if (blobHit) {
-          recordDetailViewIfNeeded();
-          return blobHit;
-        }
-      } else if (assetRow.storage_kind === 'federated' && assetRow.federated_path) {
-        const fedHit = await this.tryResolveFederatedRow(
-          assetRow,
-          rawUrl,
-          params,
-          isExplicitOverride,
-          { selfHealMissing: false }
-        );
-        if (fedHit) {
-          recordDetailViewIfNeeded();
-          return fedHit;
-        }
-      }
-    }
-
-    // (b) Live disk blob in `url_resolution_cache` for exact normalized URL
-    if (normRawUrl) {
-      const cacheRow = db
-        .prepare('SELECT blob_sha256 FROM url_resolution_cache WHERE norm_url = ?')
-        .get(normRawUrl);
-      if (cacheRow && cacheRow.blob_sha256) {
-        const cachedHit = await this.tryResolveBlobBySha(
-          String(cacheRow.blob_sha256),
-          'public, max-age=31536000, immutable'
-        );
-        if (cachedHit) {
-          if (
-            !assetRow ||
-            assetRow.storage_kind !== 'blob' ||
-            assetRow.blob_sha256 !== cacheRow.blob_sha256 ||
-            assetSourceNorm !== normRawUrl
-          ) {
-            try {
-              this.bindAssetBlobRow(
-                urlKey,
-                gameId,
-                role,
-                ordinal,
-                rawUrl,
-                String(cacheRow.blob_sha256)
-              );
-            } catch {}
-          }
-          recordDetailViewIfNeeded();
-          return cachedHit;
-        }
-      }
-
-      // Upgrade compatibility: check exact `source_url` match across pre-upgrade `game_media_assets`
-      if (!assetRow) {
-        const bySourceRow = db
-          .prepare(
-            "SELECT blob_sha256 FROM game_media_assets WHERE source_url = ? AND storage_kind = 'blob' AND blob_sha256 IS NOT NULL LIMIT 1"
-          )
-          .get(rawUrl);
-        if (bySourceRow && bySourceRow.blob_sha256) {
-          const sourceHit = await this.tryResolveBlobBySha(
-            String(bySourceRow.blob_sha256),
-            'public, max-age=31536000, immutable'
-          );
-          if (sourceHit) {
-            recordDetailViewIfNeeded();
-            return sourceHit;
-          }
-        }
-      }
-    }
-
-    // (c) Explicit offline fallback to existing `assetRow` blob / federated file
-    if ((localCacheOnly || !this.isNetworkOnline()) && assetRow) {
-      if (assetRow.storage_kind === 'blob' && assetRow.blob_sha256) {
-        const offlineHit = await this.tryResolveBlobBySha(
-          String(assetRow.blob_sha256),
-          isExactUrlMatch ? 'public, max-age=31536000, immutable' : 'public, max-age=3600'
-        );
-        if (offlineHit) {
-          recordDetailViewIfNeeded();
-          return offlineHit;
-        }
-      } else if (assetRow.storage_kind === 'federated' && assetRow.federated_path) {
-        const fedHit = await this.tryResolveFederatedRow(
-          assetRow,
-          rawUrl,
-          params,
-          isExplicitOverride,
-          { selfHealMissing: false }
-        );
-        if (fedHit) {
-          recordDetailViewIfNeeded();
-          return fedHit;
-        }
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * Resolves a media asset request for `ol-media://` or `MediaHydrationEngine` across:
-   * 1. Content-addressed SQLite blob vault / `url_resolution_cache` / verified federated path
-   * 2. Zero-copy local first-party cache federation (Steam, GOG Galaxy, Heroic, Xbox)
-   * 3. Reference-counted `AbortSignal`-coalesced upstream fetch + async normalization + persist-on-read
-   *
-   * @param {Record<string, any> | string | URL} paramsInput
+   * @param {Record<string, any> | string | URL} [paramsInput]
    * @param {{ signal?: AbortSignal, backgroundHydration?: boolean, hydrationTier?: number, throwOnAbort?: boolean, localCacheOnly?: boolean }} [reqOpts]
    */
-  async resolveMediaRequest(paramsInput = {}, reqOpts = {}) {
-    const params = this.parseMediaRequestParams(paramsInput);
-
-    const gameId = String(params.gameId || '').trim();
-    const role = String(params.role || 'cover').trim();
-    const ordinal = Math.max(0, Math.floor(Number(params.ordinal ?? params.ord ?? 0)));
-    const rawUrl = typeof params.url === 'string' ? params.url.trim() : '';
-    const isExplicitOverride = isExplicitOverrideParam(params.ov);
-
-    // Strict zero-video mandate: NEVER download, cache, or serve video trailer blobs!
-    if (rawUrl && isRejectedVideoUrl(rawUrl)) {
-      return { kind: 'error', status: 415, reason: 'video_caching_prohibited' };
-    }
-
-    const db = this.ensureOpen();
-
-    // On-demand detail-page asset view (`ol-media://` without backgroundHydration) promotes game into P1 40-game LRU
-    if (
-      !reqOpts.backgroundHydration &&
-      gameId &&
-      ['header', 'hero', 'logo', 'screenshot', 'screenshot_thumb', 'screenshot_full'].includes(role)
-    ) {
-      this.recordP1DetailGame(gameId);
-      if (this.hydrationEngine && typeof this.hydrationEngine.recordP1DetailView === 'function') {
-        try {
-          this.hydrationEngine.recordP1DetailView(gameId);
-        } catch {}
-      }
-    }
-
-    const nowTs = this.now();
-    const normRawUrl = rawUrl ? normalizeAssetIdentityUrl(rawUrl) : '';
-    const urlKey = buildAssetUrlKey(gameId, role, ordinal, rawUrl);
-
-    let assetRow = db.prepare('SELECT * FROM game_media_assets WHERE url_key = ?').get(urlKey);
-    if (!assetRow && rawUrl) {
-      assetRow = db
-        .prepare(
-          "SELECT * FROM game_media_assets WHERE source_url = ? AND storage_kind IN ('blob', 'federated') LIMIT 1"
-        )
-        .get(rawUrl);
-    }
-
-    const assetSourceNorm =
-      assetRow && assetRow.source_url ? normalizeAssetIdentityUrl(assetRow.source_url) : '';
-    const isUrlMismatch = Boolean(
-      assetRow &&
-        assetRow.url_key === urlKey &&
-        normRawUrl &&
-        assetSourceNorm &&
-        assetSourceNorm !== normRawUrl
-    );
-    const onlineNow = this.isNetworkOnline();
-
-    // Look up `url_resolution_cache` for the requested normalized URL (fast secondary hits & 404 backoff)
-    const urlCacheRow = normRawUrl
-      ? db
-          .prepare(
-            'SELECT blob_sha256, failure_count, next_retry_at, last_status_code FROM url_resolution_cache WHERE norm_url = ?'
-          )
-          .get(normRawUrl)
-      : null;
-
-    // Track prior blob in case an upgraded URL fails due to offline/network loss
-    let offlineFallbackBlobSha = null;
-    let offlineFallbackPrevSourceUrl = '';
-    let skipTier1ForOnlineBlobUpgrade = false;
-
-    if (isUrlMismatch && assetRow) {
-      if (assetRow.storage_kind === 'blob' && assetRow.blob_sha256) {
-        offlineFallbackBlobSha = String(assetRow.blob_sha256);
-        offlineFallbackPrevSourceUrl = String(assetRow.source_url);
-
-        // 1. Check `url_resolution_cache` for `normRawUrl` first:
-        //    - Live disk blob -> serve in `< 1ms` and rebind `game_media_assets`
-        //    - Active 404 backoff -> fast-fail `404` in `< 0.1ms` WITHOUT unpinning healthy blob!
-        if (urlCacheRow && urlCacheRow.blob_sha256) {
-          const cachedHit = await this.tryResolveBlobBySha(
-            String(urlCacheRow.blob_sha256),
-            'public, max-age=31536000, immutable'
-          );
-          if (cachedHit) {
-            this.bindAssetBlobRow(
-              urlKey,
-              gameId,
-              role,
-              ordinal,
-              rawUrl,
-              String(urlCacheRow.blob_sha256)
-            );
-            return cachedHit;
-          }
-          db.prepare(
-            'UPDATE url_resolution_cache SET blob_sha256 = NULL WHERE norm_url = ?'
-          ).run(normRawUrl);
-        } else if (
-          onlineNow &&
-          reqOpts.localCacheOnly !== true &&
-          urlCacheRow &&
-          !urlCacheRow.blob_sha256 &&
-          Number(urlCacheRow.next_retry_at || 0) > nowTs
-        ) {
-          return {
-            kind: 'error',
-            status: 404,
-            reason: 'adaptive_404_cooldown',
-            nextRetryAt: Number(urlCacheRow.next_retry_at),
-          };
-        }
-
-        // 2. When online (and not `localCacheOnly`), proceed to Tier 2/3 WITHOUT wiping
-        //    `assetRow` to `pending` beforehand! Only `bindAssetBlobRow()` on HTTP 200 OK swaps it.
-        if (onlineNow && reqOpts.localCacheOnly !== true) {
-          skipTier1ForOnlineBlobUpgrade = true;
-        }
-      } else if (assetRow.storage_kind === 'pending') {
-        // Preserve instant 0s reset when `storage_kind === 'pending'` and `source_url` changes
-        db.prepare(
-          `
-          UPDATE game_media_assets
-          SET source_url = ?,
-              storage_kind = 'pending',
-              blob_sha256 = NULL,
-              federated_path = NULL,
-              failure_count = 0,
-              next_retry_at = 0,
-              last_status_code = NULL,
-              last_verified_at = ?
-          WHERE url_key = ?
-        `
-        ).run(rawUrl, nowTs, urlKey);
-        assetRow = db.prepare('SELECT * FROM game_media_assets WHERE url_key = ?').get(urlKey);
-      } else if (assetRow.storage_kind === 'federated' && onlineNow && reqOpts.localCacheOnly !== true) {
-        if (urlCacheRow && urlCacheRow.blob_sha256) {
-          const cachedHit = await this.tryResolveBlobBySha(
-            String(urlCacheRow.blob_sha256),
-            'public, max-age=31536000, immutable'
-          );
-          if (cachedHit) {
-            this.bindAssetBlobRow(
-              urlKey,
-              gameId,
-              role,
-              ordinal,
-              rawUrl,
-              String(urlCacheRow.blob_sha256)
-            );
-            return cachedHit;
-          }
-          db.prepare(
-            'UPDATE url_resolution_cache SET blob_sha256 = NULL WHERE norm_url = ?'
-          ).run(normRawUrl);
-        }
-        db.prepare(
-          `
-          UPDATE game_media_assets
-          SET source_url = ?,
-              storage_kind = 'pending',
-              blob_sha256 = NULL,
-              federated_path = NULL,
-              failure_count = 0,
-              next_retry_at = 0,
-              last_status_code = NULL,
-              last_verified_at = ?
-          WHERE url_key = ?
-        `
-        ).run(rawUrl, nowTs, urlKey);
-        assetRow = db.prepare('SELECT * FROM game_media_assets WHERE url_key = ?').get(urlKey);
-      }
-    }
-
-    // Tier 1A: Existing content-addressed blob hit (async stat — zero main-thread blocking)
-    if (!skipTier1ForOnlineBlobUpgrade && assetRow && assetRow.storage_kind === 'blob' && assetRow.blob_sha256) {
-      const blobHit = await this.tryResolveBlobBySha(
-        String(assetRow.blob_sha256),
-        isUrlMismatch ? 'public, max-age=3600' : 'public, max-age=31536000, immutable'
-      );
-      if (blobHit) {
-        return blobHit;
-      }
-      // Self-heal missing blob file
-      db.prepare(
-        "UPDATE game_media_assets SET storage_kind = 'pending', blob_sha256 = NULL WHERE url_key = ?"
-      ).run(assetRow.url_key);
-      if (normRawUrl && !isUrlMismatch) {
-        db.prepare(
-          'UPDATE url_resolution_cache SET blob_sha256 = NULL WHERE norm_url = ?'
-        ).run(normRawUrl);
-      }
-    }
-
-    // Tier 1A secondary hit: `url_resolution_cache` when `assetRow` is missing or `pending`
-    if (
-      !skipTier1ForOnlineBlobUpgrade &&
-      normRawUrl &&
-      urlCacheRow &&
-      urlCacheRow.blob_sha256 &&
-      (!assetRow || assetRow.storage_kind === 'pending')
-    ) {
-      const cachedHit = await this.tryResolveBlobBySha(
-        String(urlCacheRow.blob_sha256),
-        'public, max-age=31536000, immutable'
-      );
-      if (cachedHit) {
-        this.bindAssetBlobRow(
-          urlKey,
-          gameId,
-          role,
-          ordinal,
-          rawUrl,
-          String(urlCacheRow.blob_sha256)
-        );
-        return cachedHit;
-      }
-      db.prepare(
-        'UPDATE url_resolution_cache SET blob_sha256 = NULL WHERE norm_url = ?'
-      ).run(normRawUrl);
-    }
-
-    // Tier 1B: Existing verified federated local file hit (async lstat + 16-byte header probe)
-    if (!skipTier1ForOnlineBlobUpgrade && assetRow && assetRow.storage_kind === 'federated' && assetRow.federated_path) {
-      const fedHit = await this.tryResolveFederatedRow(
-        assetRow,
-        rawUrl,
-        params,
-        isExplicitOverride,
-        { selfHealMissing: true }
-      );
-      if (fedHit) {
-        return fedHit;
-      }
-    }
-
-    // Tier 2: Zero-Copy First-Party Local Cache Federation (Steam, GOG Galaxy, Heroic, Xbox)
-    // Skip Tier 2 completely when `ov` is set so explicit user media overrides always persist into `media_blobs`,
-    // and skip for `achievement_icon` or `(icon && ordinal > 0)` so game-level app icons never hijack individual achievement icons.
-    const normalizedRoleForFederation = role.toLowerCase();
-    const skipTier2Federation =
-      isExplicitOverride ||
-      normalizedRoleForFederation === 'achievement_icon' ||
-      (normalizedRoleForFederation === 'icon' && ordinal > 0);
-    if (!skipTier2Federation) {
-      let resolvedXboxProductId = params.xboxProductId || params.xid || '';
-      let resolvedPfn = params.packageFamilyName || params.pfn || params.xpfn || '';
-      let resolvedXboxTitleId = params.xboxTitleId || params.xtid || '';
-
-      if (!resolvedXboxProductId && /^xbox[-_:]([A-Z0-9]{12})$/i.test(gameId)) {
-        resolvedXboxProductId = gameId.replace(/^xbox[-_:]/i, '').toUpperCase();
-      }
-      if (gameId && (!resolvedXboxProductId || !resolvedPfn || !resolvedXboxTitleId)) {
-        try {
-          const gRow = db
-            .prepare('SELECT platforms_json, summary_json FROM vault_games WHERE game_id = ?')
-            .get(gameId);
-          if (gRow) {
-            const plats = parseVaultJson(gRow.platforms_json);
-            const xboxPlat = Array.isArray(plats)
-              ? plats.find((p) => p && String(p.platformId || '').toLowerCase() === 'xbox')
-              : null;
-            if (xboxPlat) {
-              if (!resolvedXboxProductId && xboxPlat.xboxProductId) {
-                resolvedXboxProductId = xboxPlat.xboxProductId;
-              }
-              if (!resolvedPfn && xboxPlat.packageFamilyName) {
-                resolvedPfn = xboxPlat.packageFamilyName;
-              }
-              if (!resolvedXboxTitleId && xboxPlat.xboxTitleId) {
-                resolvedXboxTitleId = xboxPlat.xboxTitleId;
-              }
-            }
-          }
-        } catch {}
-      }
-
-      const federationPayload = {
-        gameId,
-        role,
-        ordinal,
-        url: rawUrl,
-        ov: params.ov,
-        steamAppId: params.steamAppId ?? params.sid,
-        gogId: params.gogId ?? params.gid,
-        epicAppName: params.epicAppName || params.epicApp,
-        xboxProductId: resolvedXboxProductId,
-        packageFamilyName: resolvedPfn,
-        pfn: resolvedPfn,
-        xboxTitleId: resolvedXboxTitleId,
-        title: params.title,
-      };
-
-      const federatedHit =
-        typeof this.federator?.resolveFederatedAsset === 'function'
-          ? this.federator.resolveFederatedAsset(federationPayload)
-          : typeof this.federator?.resolveLocalStoreAsset === 'function'
-            ? this.federator.resolveLocalStoreAsset(federationPayload)
-            : null;
-
-      if (
-        federatedHit &&
-        federatedHit.path &&
-        federatedHit.mimeType &&
-        isFederatedAssetRowCompatible(rawUrl, federatedHit.path, federationPayload)
-      ) {
-        db.prepare(
-          `
-          INSERT INTO game_media_assets (
-            url_key, game_id, asset_role, ordinal, source_url, storage_kind,
-            blob_sha256, federated_path, failure_count, next_retry_at, last_status_code, last_verified_at
-          ) VALUES (?, ?, ?, ?, ?, 'federated', NULL, ?, 0, 0, 200, ?)
-          ON CONFLICT(url_key) DO UPDATE SET
-            source_url = excluded.source_url,
-            storage_kind = 'federated',
-            blob_sha256 = NULL,
-            federated_path = excluded.federated_path,
-            failure_count = 0,
-            next_retry_at = 0,
-            last_status_code = 200,
-            last_verified_at = excluded.last_verified_at
-        `
-        ).run(urlKey, gameId, role, ordinal, rawUrl, federatedHit.path, nowTs);
-
-        return {
-          kind: 'file',
-          filePath: federatedHit.path,
-          mimeType: federatedHit.mimeType,
-          sizeBytes: federatedHit.sizeBytes,
-          cacheControl: 'public, max-age=86400',
-          source: federatedHit.source || 'federated_local',
-        };
-      }
-    }
-
-    // Tier 3: Reference-Counted `AbortSignal`-Coalesced Upstream HTTPS Fetch + Persist-on-Read
-    if (!rawUrl) {
-      return { kind: 'error', status: 404, reason: 'no_upstream_url' };
-    }
-    if (!/^https:\/\//i.test(rawUrl)) {
-      return { kind: 'error', status: 403, reason: 'ssrf_blocked' };
-    }
-    if (reqOpts.localCacheOnly === true) {
-      if (offlineFallbackBlobSha) {
-        const fallbackMb = db
-          .prepare('SELECT sha256, ext, mime_type, size_bytes FROM media_blobs WHERE sha256 = ?')
-          .get(offlineFallbackBlobSha);
-        if (fallbackMb) {
-          const fallbackPath = this.getBlobFilePath(fallbackMb.sha256, fallbackMb.ext);
-          if (isContainedWithinRoot(this.blobsDir, fallbackPath, this.options.platform)) {
-            let fbStat = null;
-            try {
-              fbStat = await fs.promises.stat(fallbackPath);
-            } catch {}
-            if (fbStat && fbStat.isFile() && fbStat.size > 0) {
-              db.prepare(
-                "UPDATE game_media_assets SET source_url = ?, storage_kind = 'blob', blob_sha256 = ? WHERE url_key = ?"
-              ).run(offlineFallbackPrevSourceUrl || rawUrl, offlineFallbackBlobSha, urlKey);
-              this.touchBlobAccess(fallbackMb.sha256);
-              return {
-                kind: 'file',
-                filePath: fallbackPath,
-                mimeType: fallbackMb.mime_type,
-                sizeBytes: Number(fallbackMb.size_bytes || fbStat.size || 0),
-                cacheControl: 'public, max-age=3600',
-                source: 'vault_blob',
-              };
-            }
-          }
-        }
-      }
-      return { kind: 'error', status: 404, reason: 'offline_cache_miss' };
-    }
-
-    if (reqOpts.signal?.aborted) {
-      if (reqOpts.throwOnAbort === true) {
-        throw reqOpts.signal.reason || new Error('Aborted');
-      }
-      return { kind: 'error', status: 499, reason: 'aborted' };
-    }
-
-    // Check Adaptive 404 Backoff before touching network (slot-level & URL-level)
-    if (
-      assetRow &&
-      assetRow.url_key === urlKey &&
-      !skipTier1ForOnlineBlobUpgrade &&
-      Number(assetRow.next_retry_at || 0) > nowTs
-    ) {
-      return {
-        kind: 'error',
-        status: 404,
-        reason: 'adaptive_404_cooldown',
-        nextRetryAt: Number(assetRow.next_retry_at),
-      };
-    }
-    if (urlCacheRow && !urlCacheRow.blob_sha256 && Number(urlCacheRow.next_retry_at || 0) > nowTs) {
-      return {
-        kind: 'error',
-        status: 404,
-        reason: 'adaptive_404_cooldown',
-        nextRetryAt: Number(urlCacheRow.next_retry_at),
-      };
-    }
-
-    let parsedUrl;
-    try {
-      parsedUrl = new URL(rawUrl);
-    } catch {
-      return { kind: 'error', status: 400, reason: 'invalid_url' };
-    }
-    const host = parsedUrl.hostname.toLowerCase();
-    const fetchKey = `${role}::${rawUrl}`;
-
-    let inFlightEntry = this.inFlightMediaFetches.get(fetchKey);
-    if (!inFlightEntry) {
-      const gate = this.canRequestHost(host);
-      if (!gate.allowed) {
-        return {
-          kind: 'error',
-          status: 503,
-          reason: 'circuit_open',
-          retryAfterMs: gate.retryAfterMs,
-        };
-      }
-
-      const sharedAbortCtrl = new AbortController();
-      const entry = {
-        sharedAbortCtrl,
-        subscribers: new Set(),
-        hasForegroundSubscriber: !reqOpts.backgroundHydration,
-        abortedByAllSubscribers: false,
-        timedOut: false,
-        primaryUrlKey: urlKey,
-        promise: null,
-      };
-
-      const timeoutId = setTimeout(() => {
-        entry.timedOut = true;
-        sharedAbortCtrl.abort(new Error('Media fetch timeout'));
-      }, 10000);
-      if (typeof timeoutId.unref === 'function') timeoutId.unref();
-
-      const runSharedFetch = async () => {
-        const fetchFn = this.getFetchImpl();
-        if (typeof fetchFn !== 'function') {
-          this.releaseCanaryIfHeld(host);
-          return { response: { kind: 'error', status: 503, reason: 'fetch_unavailable' } };
-        }
-
-        try {
-          const { response: res } = await safePublicHttpsFetch(rawUrl, {
-            fetchImpl: fetchFn,
-            dnsLookup: this.options.dnsLookup,
-            allowDnsUnavailableForCustomFetch: this.hasCustomFetchImpl,
-            method: 'GET',
-            headers: {
-              Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-              'User-Agent':
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            },
-            signal: sharedAbortCtrl.signal,
-            timeoutMs: 10000,
-            maxRedirects: 3,
-            readBody: false,
-          });
-
-          const status = Number(res.status || 0);
-          const contentType = String(res.headers?.get?.('content-type') || '');
-
-          if (REJECTED_VIDEO_MIME_RE.test(contentType)) {
-            this.releaseCanaryIfHeld(host);
-            return { response: { kind: 'error', status: 415, reason: 'video_caching_prohibited' } };
-          }
-
-          if (status === 429 || status === 403 || res.headers?.get?.('cf-mitigated')) {
-            let sampleText = '';
-            try {
-              sampleText = (await res.text()).slice(0, 2048);
-            } catch {}
-            if (isWafOrChallengeResponse(status, sampleText, res.headers)) {
-              const retryMs = parseRetryAfterMs(res.headers);
-              this.recordHostWafBlock(host, status, retryMs, `HTTP ${status} WAF/rate-limit`);
-              return { response: { kind: 'error', status, reason: 'waf_blocked' } };
-            }
-          }
-
-          if (status === 404) {
-            let sampleText = '';
-            try {
-              if (/text\/html/i.test(contentType)) {
-                sampleText = (await res.text()).slice(0, 2048);
-              }
-            } catch {}
-            if (isWafOrChallengeResponse(404, sampleText, res.headers)) {
-              this.recordHostWafBlock(host, 404, 0, 'WAF disguised as 404');
-              return { response: { kind: 'error', status: 403, reason: 'waf_blocked' } };
-            }
-            this.recordHostSuccess(host, 404);
-            this.recordAssetAdaptive404(urlKey, gameId, role, ordinal, rawUrl);
-            return {
-              isDefinitive404: true,
-              response: { kind: 'error', status: 404, reason: 'not_found' },
-            };
-          }
-
-          if (status >= 500 || status === 0) {
-            this.recordHostFailure(host, status || 502, `HTTP ${status}`);
-            return { response: { kind: 'error', status: status || 502, reason: 'http_5xx' } };
-          }
-
-          if (!res.ok) {
-            this.releaseCanaryIfHeld(host);
-            return { response: { kind: 'error', status: status || 400, reason: 'http_error' } };
-          }
-
-          const isInlineOrGifCandidate =
-            role === 'inline_img' ||
-            /\.gif(?:$|[?#])/i.test(rawUrl) ||
-            /image\/gif/i.test(contentType);
-          const maxFetchBytes = isInlineOrGifCandidate
-            ? MAX_ASSET_FETCH_BYTES
-            : MAX_DOWNLOAD_IMAGE_BYTES;
-
-          const contentLength = Number(res.headers?.get?.('content-length') || 0);
-          if (contentLength > maxFetchBytes) {
-            this.releaseCanaryIfHeld(host);
-            return { response: { kind: 'error', status: 413, reason: 'image_too_large' } };
-          }
-
-          // Background hydration skips downloading oversized (>1.5 MB) inline GIF bodies altogether
-          if (
-            !entry.hasForegroundSubscriber &&
-            isInlineOrGifCandidate &&
-            (/image\/gif/i.test(contentType) || /\.gif(?:$|[?#])/i.test(rawUrl)) &&
-            contentLength > MAX_INLINE_ANIMATED_GIF_CACHE_BYTES
-          ) {
-            this.recordHostSuccess(host, 200);
-            try {
-              sharedAbortCtrl.abort(new Error('Skip oversized background GIF body'));
-            } catch {}
-            return {
-              response: {
-                kind: 'error',
-                status: 413,
-                reason: 'oversized_animated_gif_skipped',
-                skipDiskBlob: true,
-              },
-            };
-          }
-
-          let rawBuf;
-          try {
-            rawBuf = await readSafeResponseBuffer(res, maxFetchBytes);
-          } catch (streamErr) {
-            if (/** @type {any} */ (streamErr)?.code === 'ERR_RESPONSE_TOO_LARGE') {
-              this.releaseCanaryIfHeld(host);
-              return { response: { kind: 'error', status: 413, reason: 'image_too_large' } };
-            }
-            throw streamErr;
-          }
-          if (rawBuf.length > maxFetchBytes) {
-            this.releaseCanaryIfHeld(host);
-            return { response: { kind: 'error', status: 413, reason: 'image_too_large' } };
-          }
-
-          const magic = detectImageMagicBytes(rawBuf);
-          if (!magic.valid) {
-            if (isWafOrChallengeResponse(200, rawBuf, res.headers)) {
-              this.recordHostWafBlock(host, 403, 0, 'HTML challenge page on 200 OK');
-              return { response: { kind: 'error', status: 403, reason: 'waf_blocked' } };
-            }
-            this.releaseCanaryIfHeld(host);
-            return { response: { kind: 'error', status: 415, reason: 'invalid_image_magic' } };
-          }
-
-          if (
-            rawBuf.length > MAX_DOWNLOAD_IMAGE_BYTES &&
-            !(magic.ext === 'gif' && isAnimatedGifBuffer(rawBuf))
-          ) {
-            this.releaseCanaryIfHeld(host);
-            return { response: { kind: 'error', status: 413, reason: 'image_too_large' } };
-          }
-
-          // Valid upstream image received -> mark host CLOSED (recovers HALF_OPEN canary!)
-          this.recordHostSuccess(host, 200);
-
-          const stored = await this.storeNormalizedBlobAsync(rawBuf, role, contentType);
-          if (stored.stored && stored.sha256) {
-            this.bindAssetBlobRow(urlKey, gameId, role, ordinal, rawUrl, stored.sha256);
-            return {
-              storedSha256: stored.sha256,
-              response: {
-                kind: 'buffer',
-                buffer: stored.buffer,
-                filePath: stored.filePath,
-                mimeType: stored.mimeType,
-                sizeBytes: stored.sizeBytes,
-                cacheControl: 'public, max-age=31536000, immutable',
-                source: 'upstream_persisted',
-              },
-            };
-          }
-
-          if (stored.buffer && stored.mimeType) {
-            return {
-              response: {
-                kind: 'buffer',
-                buffer: stored.buffer,
-                mimeType: stored.mimeType,
-                sizeBytes: stored.buffer.length,
-                cacheControl: 'public, max-age=3600',
-                ...(stored.skipDiskBlob ? { skipDiskBlob: true } : {}),
-                source: stored.skipDiskBlob
-                  ? 'upstream_passthrough_oversized_gif'
-                  : 'upstream_passthrough_low_disk',
-              },
-            };
-          }
-
-          return { response: { kind: 'error', status: 415, reason: 'normalization_failed' } };
-        } catch (err) {
-          if (entry.abortedByAllSubscribers && !entry.timedOut) {
-            this.releaseCanaryIfHeld(host);
-            return { response: { kind: 'error', status: 499, reason: 'aborted' } };
-          }
-          if (/** @type {any} */ (err)?.isSsrfBlocked) {
-            this.releaseCanaryIfHeld(host);
-            return { response: { kind: 'error', status: 403, reason: 'ssrf_blocked' } };
-          }
-          const msg = err instanceof Error ? err.message : String(err);
-          this.recordHostFailure(host, null, msg);
-
-          // Offline safety: if an upgraded URL failed due to network loss and the prior cached blob
-          // still exists on disk, restore and serve the prior blob rather than showing a broken card!
-          if (offlineFallbackBlobSha) {
-            const fallbackMb = this.ensureOpen()
-              .prepare('SELECT sha256, ext, mime_type, size_bytes FROM media_blobs WHERE sha256 = ?')
-              .get(offlineFallbackBlobSha);
-            if (fallbackMb) {
-              const fallbackPath = this.getBlobFilePath(fallbackMb.sha256, fallbackMb.ext);
-              if (
-                isContainedWithinRoot(this.blobsDir, fallbackPath, this.options.platform) &&
-                fs.existsSync(fallbackPath)
-              ) {
-                this.ensureOpen()
-                  .prepare(
-                    `
-                    UPDATE game_media_assets
-                    SET source_url = ?, storage_kind = 'blob', blob_sha256 = ?
-                    WHERE url_key = ?
-                  `
-                  )
-                  .run(offlineFallbackPrevSourceUrl || rawUrl, offlineFallbackBlobSha, urlKey);
-                this.touchBlobAccess(fallbackMb.sha256);
-                return {
-                  response: {
-                    kind: 'file',
-                    filePath: fallbackPath,
-                    mimeType: fallbackMb.mime_type,
-                    sizeBytes: Number(fallbackMb.size_bytes || 0),
-                    cacheControl: 'public, max-age=3600',
-                    source: 'vault_blob',
-                  },
-                };
-              }
-            }
-          }
-
-          return { response: { kind: 'error', status: 504, reason: 'network_error' } };
-        } finally {
-          clearTimeout(timeoutId);
-          this.inFlightMediaFetches.delete(fetchKey);
-        }
-      };
-
-      entry.promise = runSharedFetch();
-      this.inFlightMediaFetches.set(fetchKey, entry);
-      inFlightEntry = entry;
-    } else if (!reqOpts.backgroundHydration) {
-      inFlightEntry.hasForegroundSubscriber = true;
-    }
-
-    const subId = Symbol('mediaSubscriber');
-    inFlightEntry.subscribers.add(subId);
-
-    return await new Promise((resolve, reject) => {
-      let settled = false;
-      const callerSignal = reqOpts.signal || null;
-
-      const onCallerAbort = () => {
-        if (settled) return;
-        settled = true;
-        inFlightEntry.subscribers.delete(subId);
-        if (inFlightEntry.subscribers.size === 0) {
-          inFlightEntry.abortedByAllSubscribers = true;
-          try {
-            inFlightEntry.sharedAbortCtrl.abort(
-              callerSignal?.reason || new Error('All media subscribers aborted')
-            );
-          } catch {}
-        }
-        if (reqOpts.throwOnAbort === true) {
-          reject(callerSignal?.reason || new Error('Aborted'));
-        } else {
-          resolve({ kind: 'error', status: 499, reason: 'aborted' });
-        }
-      };
-
-      if (callerSignal) {
-        if (callerSignal.aborted) {
-          onCallerAbort();
-          return;
-        }
-        callerSignal.addEventListener('abort', onCallerAbort, { once: true });
-      }
-
-      inFlightEntry.promise.then(
-        (sharedRes) => {
-          if (callerSignal) {
-            callerSignal.removeEventListener('abort', onCallerAbort);
-          }
-          inFlightEntry.subscribers.delete(subId);
-          if (settled) return;
-          settled = true;
-
-          if (sharedRes?.storedSha256 && urlKey !== inFlightEntry.primaryUrlKey) {
-            try {
-              this.bindAssetBlobRow(urlKey, gameId, role, ordinal, rawUrl, sharedRes.storedSha256);
-            } catch {}
-          } else if (sharedRes?.isDefinitive404 && urlKey !== inFlightEntry.primaryUrlKey) {
-            try {
-              this.recordAssetAdaptive404(urlKey, gameId, role, ordinal, rawUrl);
-            } catch {}
-          }
-
-          resolve(sharedRes?.response || { kind: 'error', status: 504, reason: 'network_error' });
-        },
-        (unexpectedErr) => {
-          if (callerSignal) {
-            callerSignal.removeEventListener('abort', onCallerAbort);
-          }
-          inFlightEntry.subscribers.delete(subId);
-          if (settled) return;
-          settled = true;
-          const msg = unexpectedErr instanceof Error ? unexpectedErr.message : String(unexpectedErr);
-          resolve({ kind: 'error', status: 504, reason: msg || 'network_error' });
-        }
-      );
-    });
+  resolveMediaRequest(paramsInput = {}, reqOpts = {}) {
+    return vaultRemoteFetcher.resolveMediaRequest(this, paramsInput, reqOpts);
   }
 
-  /**
-   * Checks upstream URL reachability & status for `offlineVault:check-url-status` IPC.
-   */
-  async checkUrlStatus(url) {
-    const cleanUrl = typeof url === 'string' ? url.trim() : '';
-    if (!cleanUrl || !/^https:\/\//i.test(cleanUrl)) {
-      return {
-        online: false,
-        status: null,
-        isDefinitive404: false,
-        isWafOrRateLimited: false,
-        ...(cleanUrl ? { blocked: true } : {}),
-      };
-    }
-
-    let host = '';
-    try {
-      host = new URL(cleanUrl).hostname.toLowerCase();
-    } catch {
-      return {
-        online: false,
-        status: null,
-        isDefinitive404: false,
-        isWafOrRateLimited: false,
-      };
-    }
-
-    const gate = this.canRequestHost(host);
-    if (!gate.allowed) {
-      const snap = this.getEndpointHealth(host);
-      const isWaf = snap?.lastStatusCode === 429 || snap?.lastStatusCode === 403;
-      return {
-        online: true,
-        status: snap?.lastStatusCode || 503,
-        isDefinitive404: false,
-        isWafOrRateLimited: isWaf,
-        retryAfterMs: gate.retryAfterMs,
-      };
-    }
-
-    const fetchFn = this.getFetchImpl();
-    if (typeof fetchFn !== 'function') {
-      this.releaseCanaryIfHeld(host);
-      return {
-        online: false,
-        status: null,
-        isDefinitive404: false,
-        isWafOrRateLimited: false,
-      };
-    }
-
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 6000);
-    if (typeof timer.unref === 'function') timer.unref();
-
-    try {
-      let { response: res } = await safePublicHttpsFetch(cleanUrl, {
-        fetchImpl: fetchFn,
-        dnsLookup: this.options.dnsLookup,
-        allowDnsUnavailableForCustomFetch: this.hasCustomFetchImpl,
-        method: 'HEAD',
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        },
-        signal: ctrl.signal,
-        timeoutMs: 6000,
-        maxRedirects: 3,
-        readBody: false,
-      });
-
-      if (res.status === 405 || res.status === 403) {
-        const fallbackGet = await safePublicHttpsFetch(cleanUrl, {
-          fetchImpl: fetchFn,
-          dnsLookup: this.options.dnsLookup,
-          allowDnsUnavailableForCustomFetch: this.hasCustomFetchImpl,
-          method: 'GET',
-          headers: {
-            Range: 'bytes=0-2047',
-            'User-Agent':
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          },
-          signal: ctrl.signal,
-          timeoutMs: 6000,
-          maxRedirects: 3,
-          readBody: false,
-        });
-        res = fallbackGet.response;
-      }
-
-      const status = Number(res.status || 0);
-      let bodySample = '';
-      if (status === 403 || status === 429 || status === 404) {
-        try {
-          bodySample = (await res.text()).slice(0, 2048);
-        } catch {}
-      }
-
-      if (isWafOrChallengeResponse(status, bodySample, res.headers)) {
-        const retryMs = parseRetryAfterMs(res.headers);
-        const snap = this.recordHostWafBlock(host, status, retryMs, `CheckURL WAF ${status}`);
-        return {
-          online: true,
-          status,
-          isDefinitive404: false,
-          isWafOrRateLimited: true,
-          retryAfterMs: snap ? Math.max(0, snap.openedUntil - this.now()) : retryMs,
-        };
-      }
-
-      if (status === 404) {
-        this.recordHostSuccess(host, 404);
-        return {
-          online: true,
-          status: 404,
-          isDefinitive404: true,
-          isWafOrRateLimited: false,
-        };
-      }
-
-      if (status >= 500) {
-        this.recordHostFailure(host, status, `CheckURL HTTP ${status}`);
-        return {
-          online: true,
-          status,
-          isDefinitive404: false,
-          isWafOrRateLimited: false,
-        };
-      }
-
-      this.recordHostSuccess(host, status || 200);
-      return {
-        online: true,
-        status: status || 200,
-        isDefinitive404: false,
-        isWafOrRateLimited: false,
-      };
-    } catch (err) {
-      if (/** @type {any} */ (err)?.isSsrfBlocked) {
-        this.releaseCanaryIfHeld(host);
-        return {
-          online: false,
-          status: null,
-          isDefinitive404: false,
-          isWafOrRateLimited: false,
-          blocked: true,
-        };
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      this.recordHostFailure(host, null, msg);
-      return {
-        online: false,
-        status: null,
-        isDefinitive404: false,
-        isWafOrRateLimited: false,
-      };
-    } finally {
-      clearTimeout(timer);
-    }
+  /** @param {string} url */
+  checkUrlStatus(url) {
+    return vaultRemoteFetcher.checkUrlStatus(this, url);
   }
 
+  /** @param {Record<string, any>} [payload] */
   resolveLocalMetadata(payload = {}) {
-    if (!this.federator || typeof this.federator.resolveLocalMetadata !== 'function') {
-      return null;
-    }
-    return this.federator.resolveLocalMetadata({
-      ...payload,
-      steamAppId: payload.steamAppId ?? payload.sid,
-      gogId: payload.gogId ?? payload.gid,
-      epicAppName: payload.epicAppName || payload.epicApp,
-      xboxProductId: payload.xboxProductId || payload.xid,
-      packageFamilyName: payload.packageFamilyName || payload.pfn || payload.xpfn,
-      xboxTitleId: payload.xboxTitleId || payload.xtid,
-    });
+    return vaultMediaResolver.resolveLocalMetadata(this, payload);
   }
-
-  // ==========================================================================
-  // Memory Trim & Clean NTFS-Safe Shutdown Lifecycle
-  // ==========================================================================
 
   trimMemory() {
     try {
@@ -6762,6 +857,7 @@ class OfflineVaultService {
     if (!this.db) return { success: true };
 
     this.flushBlobAccessTimestamps();
+    this.flushP1RecentGamesToDb();
     try {
       this.db.exec('PRAGMA wal_checkpoint(PASSIVE);');
       this.db.exec('PRAGMA shrink_memory;');
@@ -6769,6 +865,10 @@ class OfflineVaultService {
       diagLog.debug('offlineVault.trimMemory', err);
     }
     return { success: true };
+  }
+
+  close() {
+    this.shutdown();
   }
 
   shutdown() {
@@ -6784,10 +884,30 @@ class OfflineVaultService {
       } catch {}
       this.startupSweepTimer = null;
     }
+    if (this.p1FlushTimer) {
+      try {
+        clearTimeout(this.p1FlushTimer);
+      } catch {}
+      this.p1FlushTimer = null;
+    }
     this.halfOpenProbesInFlight.clear();
-    if (!this.db) return;
+    if (!this.db) {
+      if (this.stmtCache) {
+        this.stmtCache.clear();
+        this.stmtCache = null;
+      }
+      this.isShutdown = true;
+      return;
+    }
 
     this.flushBlobAccessTimestamps();
+    this.flushP1RecentGamesToDb();
+
+    if (this.stmtCache) {
+      this.stmtCache.clear();
+      this.stmtCache = null;
+    }
+
     try {
       this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
     } catch (err) {
@@ -6799,10 +919,17 @@ class OfflineVaultService {
       diagLog.debug('offlineVault.dbClose', err);
     }
     this.db = null;
+    this.knownBlobHashes.clear();
+    this.blobMetaBySha.clear();
+    this.totalBlobBytes = 0;
+    this.cachedSqliteDiskBytes = null;
     this.isShutdown = true;
   }
 }
 
+/**
+ * @param {Record<string, any>} [options]
+ */
 function createOfflineVaultService(options = {}) {
   return new OfflineVaultService(options);
 }
@@ -6810,6 +937,7 @@ function createOfflineVaultService(options = {}) {
 module.exports = {
   OfflineVaultService,
   createOfflineVaultService,
+  VaultStatementCache,
   OFFLINE_VAULT_TIER_CAPS,
   ROLE_MAX_WIDTHS,
   PASS_THROUGH_MAX_BYTES,
