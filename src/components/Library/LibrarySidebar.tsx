@@ -7,6 +7,7 @@ import { ActiveGameSession } from '../../contracts/launcher';
 import { VirtualListRows } from '../Common/VirtualContainers';
 import { recordScrollActivity } from './LibraryGridView';
 import { useSafeId } from '../../utils/useSafeId';
+import { isImeComposing } from '../../utils/keyboardUtils';
 import {
   Gamepad2,
   CheckCircle2,
@@ -107,6 +108,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
   const storesMenuRef = useRef<HTMLDivElement | null>(null);
   const sidebarScrollRef = useRef<HTMLDivElement | null>(null);
   const lastLauncherSigRef = useRef<string>('');
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   const focusStoreMenuItem = (target: 'first' | 'last') => {
     const run = () => {
@@ -261,6 +263,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
             className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-steam-subtext pointer-events-none"
           />
           <input
+            ref={searchInputRef}
             id={sidebarSearchInputId}
             type="text"
             aria-label="Search library by title"
@@ -268,9 +271,33 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
             spellCheck={false}
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape' && searchQuery && !isImeComposing(e)) {
+                e.preventDefault();
+                e.stopPropagation();
+                onSearchChange('');
+              }
+            }}
             placeholder="Search by title..."
-            className="w-full bg-[#10141b] border border-steam-border rounded pl-8 pr-3 py-1.5 text-xs text-white placeholder-steam-subtext focus:outline-none focus:border-steam-accent focus-visible:ring-2 focus-visible:ring-steam-accent/60 transition-colors"
+            className={`w-full bg-[#10141b] border border-steam-border rounded pl-8 ${
+              searchQuery ? 'pr-8' : 'pr-3'
+            } py-1.5 text-xs text-white placeholder-steam-subtext focus:outline-none focus:border-steam-accent focus-visible:ring-2 focus-visible:ring-steam-accent/60 transition-colors`}
           />
+          {searchQuery && (
+            <button
+              type="button"
+              data-testid="sidebar-search-clear-btn"
+              aria-label="Clear search"
+              title="Clear search (Escape)"
+              onClick={() => {
+                onSearchChange('');
+                searchInputRef.current?.focus?.({ preventScroll: true });
+              }}
+              className="absolute right-1 top-1/2 -translate-y-1/2 min-w-6 min-h-6 flex items-center justify-center rounded text-steam-subtext hover:text-white hover:bg-white/10 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-steam-accent/70"
+            >
+              <X aria-hidden="true" className="w-3.5 h-3.5" />
+            </button>
+          )}
         </search>
 
         {/* Filter Controls Row */}

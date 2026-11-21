@@ -87,6 +87,17 @@ export {
 export type { GridSortOption };
 
 const HOVER_DELAY_MS = 400;
+const HOVER_POPOUT_ESTIMATED_HEIGHT = 548;
+const HOVER_POPOUT_WIDTH = 320;
+const HOVER_POPOUT_VIEWPORT_PADDING = 12;
+
+function isDomNode(value: EventTarget | null | undefined): value is Node {
+  if (!value || typeof value !== 'object') return false;
+  if (typeof Node !== 'undefined') {
+    return value instanceof Node;
+  }
+  return typeof (value as { nodeType?: unknown }).nodeType === 'number';
+}
 
 interface LibraryGridViewProps {
   games: CanonicalGame[];
@@ -441,9 +452,23 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     hoverTimeoutRef.current = setTimeout(() => {
       const currentRect = cardEl.getBoundingClientRect();
       const isRight = currentRect.right + 340 > window.innerWidth;
+      const desiredY = Math.max(HOVER_POPOUT_VIEWPORT_PADDING, currentRect.top - 20);
+      const maxInitialY = Math.max(
+        HOVER_POPOUT_VIEWPORT_PADDING,
+        window.innerHeight - HOVER_POPOUT_ESTIMATED_HEIGHT - HOVER_POPOUT_VIEWPORT_PADDING
+      );
+      const rawLeft = isRight
+        ? Math.max(HOVER_POPOUT_VIEWPORT_PADDING, currentRect.left - 330)
+        : Math.min(
+            currentRect.right + 12,
+            Math.max(
+              HOVER_POPOUT_VIEWPORT_PADDING,
+              window.innerWidth - HOVER_POPOUT_WIDTH - HOVER_POPOUT_VIEWPORT_PADDING
+            )
+          );
       setPreviewPos({
-        x: isRight ? Math.max(12, currentRect.left - 330) : currentRect.right + 12,
-        y: Math.max(80, Math.min(currentRect.top - 20, window.innerHeight - 440)),
+        x: rawLeft,
+        y: Math.min(desiredY, maxInitialY),
         align: isRight ? 'right' : 'left',
       });
       setHoveredGame(game);
@@ -485,6 +510,10 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     window.addEventListener('wheel', handleScrollOrWheel, { passive: true });
     window.addEventListener('resize', handleDismiss, { passive: true });
     window.addEventListener('blur', handleDismiss);
+    const docEl = typeof document !== 'undefined' ? document.documentElement : null;
+    if (docEl && typeof docEl.addEventListener === 'function') {
+      docEl.addEventListener('mouseleave', handleDismiss);
+    }
 
     return () => {
       if (hoverTimeoutRef.current) {
@@ -495,6 +524,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       window.removeEventListener('wheel', handleScrollOrWheel);
       window.removeEventListener('resize', handleDismiss);
       window.removeEventListener('blur', handleDismiss);
+      if (docEl && typeof docEl.removeEventListener === 'function') {
+        docEl.removeEventListener('mouseleave', handleDismiss);
+      }
     };
   }, []);
 
@@ -602,8 +634,8 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       hoverTimeoutRef.current = null;
     }
 
-    const nextEl = e.relatedTarget as Node | null;
-    if (popoutRef.current && nextEl && popoutRef.current.contains(nextEl)) {
+    const nextEl = e.relatedTarget;
+    if (popoutRef.current && isDomNode(nextEl) && popoutRef.current.contains?.(nextEl)) {
       return;
     }
 
@@ -633,8 +665,8 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       hoverTimeoutRef.current = null;
     }
 
-    const nextEl = e.relatedTarget as Node | null;
-    if (activeCardRef.current && nextEl && activeCardRef.current.contains(nextEl)) {
+    const nextEl = e.relatedTarget;
+    if (activeCardRef.current && isDomNode(nextEl) && activeCardRef.current.contains?.(nextEl)) {
       return;
     }
 

@@ -89,16 +89,22 @@ export function renderSidebarStorefrontDropdown({
               return;
             }
             if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
-            if (typeof HTMLElement !== 'undefined' && 'focusGroup' in HTMLElement.prototype) {
+            if (
+              typeof HTMLElement !== 'undefined' &&
+              'focusGroup' in HTMLElement.prototype &&
+              typeof e.currentTarget?.hasAttribute === 'function' &&
+              e.currentTarget.hasAttribute('focusgroup')
+            ) {
               return;
             }
             const items = Array.from(
               e.currentTarget.querySelectorAll<HTMLButtonElement>(
-                'button[role^="menuitem"]:not(:disabled)'
+                'button[role^="menuitem"]:not(:disabled):not([aria-disabled="true"])'
               )
             );
             if (items.length === 0) return;
-            const currentIdx = items.indexOf(document.activeElement as HTMLButtonElement);
+            const activeEl = typeof document !== 'undefined' ? document.activeElement : null;
+            const currentIdx = items.indexOf(activeEl as HTMLButtonElement);
             const nextIdx =
               e.key === 'Home'
                 ? 0
@@ -111,7 +117,7 @@ export function renderSidebarStorefrontDropdown({
                     : (currentIdx + (e.key === 'ArrowUp' ? -1 : 1) + items.length) %
                       items.length;
             e.preventDefault();
-            items[nextIdx]?.focus({ preventScroll: true });
+            items[nextIdx]?.focus?.({ preventScroll: true });
           }}
           className="absolute left-0 top-full mt-1 w-48 bg-[#1b222d] border border-steam-border rounded shadow-2xl py-1 z-50"
         >

@@ -72,8 +72,11 @@ export function renderLibraryGridToolbar({
   return (
     <>
       {/* Header Bar */}
-      <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4 border-b border-steam-border/60 pb-4">
-        <div className="flex items-center gap-3 min-w-0">
+      <div
+        data-testid="library-grid-toolbar-header"
+        className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-steam-border/60 pb-4"
+      >
+        <div className="flex items-center gap-3 min-w-0 flex-1 basis-[280px]">
           <div className="p-2.5 rounded bg-steam-accent/15 border border-steam-accent/30 text-steam-accent shadow-sm flex items-center justify-center shrink-0">
             {groupIcon || <Gamepad2 aria-hidden="true" className="w-6 h-6" />}
           </div>
@@ -128,7 +131,10 @@ export function renderLibraryGridToolbar({
         </div>
 
         {/* Filter & Sort Controls */}
-        <div className="flex flex-wrap items-center gap-2.5 text-xs shrink-0 self-end lg:self-center">
+        <div
+          data-testid="library-grid-toolbar-controls"
+          className="flex flex-wrap items-center gap-2.5 text-xs shrink-0 max-w-full"
+        >
           <button
             type="button"
             data-testid="library-filter-toggle-btn"
@@ -151,7 +157,7 @@ export function renderLibraryGridToolbar({
           </button>
 
           <span className="text-steam-subtext font-medium whitespace-nowrap">Sort by:</span>
-          <div className="flex items-center rounded border border-steam-border bg-[#16202d] p-0.5 shrink-0">
+          <div className="flex flex-wrap items-center rounded border border-steam-border bg-[#16202d] p-0.5 shrink-0 max-w-full">
             <button
               type="button"
               onClick={() => onSortChange('alphabetical')}

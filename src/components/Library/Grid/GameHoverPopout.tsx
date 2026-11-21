@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useState } from 'react';
 import {
   AlertCircle,
   Clock,
@@ -30,6 +30,28 @@ import {
   getReleaseYear,
   isMicrosoftOrXboxAssetUrl,
 } from './gridCoverUtils';
+
+export function clampHoverPopoutVerticalPos(
+  desiredY: number,
+  measuredHeight: number,
+  viewportHeight: number,
+  padding = 12
+): number {
+  if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) {
+    return Math.max(padding, desiredY);
+  }
+  const safeHeight = Number.isFinite(measuredHeight) && measuredHeight > 0 ? measuredHeight : 0;
+  return Math.max(padding, Math.min(desiredY, viewportHeight - safeHeight - padding));
+}
+
+function isDisplayableUserReviewSummary(
+  summary: CanonicalGame['reviewSummary'] | undefined
+): summary is NonNullable<CanonicalGame['reviewSummary']> {
+  if (!summary) return false;
+  const desc = summary.reviewScoreDesc?.trim() ?? '';
+  if (!desc || /^no user reviews$/i.test(desc)) return false;
+  return (summary.totalReviews ?? 0) > 0;
+}
 
 export interface RenderGameHoverPopoutArgs {
   hoveredGame: CanonicalGame;
@@ -146,8 +168,17 @@ const GameHoverPopoutContent: React.FC<RenderGameHoverPopoutArgs> = ({
 
   void hoverCriticTick;
   const playtimeLabel = formatPlaytime(hoveredGame);
-  const effectiveReviewSummary =
-    hoveredGame.reviewSummary || hoveredGame.enrichedMetadata?.reviewSummary;
+  const effectiveReviewSummary = isDisplayableUserReviewSummary(hoveredGame.reviewSummary)
+    ? hoveredGame.reviewSummary
+    : isDisplayableUserReviewSummary(hoveredGame.enrichedMetadata?.reviewSummary)
+      ? hoveredGame.enrichedMetadata?.reviewSummary
+      : undefined;
+  const trimmedReviewScoreDesc = effectiveReviewSummary?.reviewScoreDesc?.trim() ?? '';
+  const shouldAppendPositivePercent = Boolean(
+    effectiveReviewSummary &&
+      typeof effectiveReviewSummary.positivePercent === 'number' &&
+      !trimmedReviewScoreDesc.includes('%')
+  );
   const oc = resolveGameReviewScore(hoveredGame, {
     skipBackgroundTrigger: true,
     userOverride: hoveredOverride,
@@ -228,13 +259,67 @@ const GameHoverPopoutContent: React.FC<RenderGameHoverPopoutArgs> = ({
     fixMatchOverride: hoveredOverride,
   });
 
+  const [measuredTopState, setMeasuredTopState] = useState<{
+    gameId: string;
+    baseY: number;
+    top: number;
+  } | null>(null);
+
+  const effectiveTop =
+    measuredTopState &&
+    measuredTopState.gameId === hoveredGame.id &&
+    measuredTopState.baseY === previewPos.y
+      ? measuredTopState.top
+      : previewPos.y;
+
+  useLayoutEffect(() => {
+    const el = popoutRef.current;
+    if (!el || typeof window === 'undefined' || !window.innerHeight) return undefined;
+
+    const syncVerticalBounds = () => {
+      const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+      const measuredHeight = rect && rect.height > 0 ? rect.height : el.offsetHeight || 0;
+      if (measuredHeight <= 0) return;
+      const nextTop = clampHoverPopoutVerticalPos(
+        previewPos.y,
+        measuredHeight,
+        window.innerHeight,
+        12
+      );
+      setMeasuredTopState((prev) =>
+        prev &&
+        prev.gameId === hoveredGame.id &&
+        prev.baseY === previewPos.y &&
+        prev.top === nextTop
+          ? prev
+          : { gameId: hoveredGame.id, baseY: previewPos.y, top: nextTop }
+      );
+    };
+
+    syncVerticalBounds();
+
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(syncVerticalBounds);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [
+    hoveredGame.id,
+    previewPos.y,
+    popoutRef,
+    Boolean(hltb),
+    Boolean(displayedSynopsis),
+    hoverHeaderFailed,
+    resolvedHoverTags.tags.length,
+  ]);
+
   return (
     <div
       ref={popoutRef}
+      data-testid="game-hover-popout"
       style={{
         position: 'fixed',
         left: `${previewPos.x}px`,
-        top: `${previewPos.y}px`,
+        top: `${effectiveTop}px`,
         zIndex: 60,
       }}
       onMouseEnter={onPopoutMouseEnter}
@@ -297,13 +382,13 @@ const GameHoverPopoutContent: React.FC<RenderGameHoverPopoutArgs> = ({
       <div className="p-3.5 space-y-3 text-xs">
         {/* Review Sentiment & Playtime Row */}
         <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
-          {effectiveReviewSummary?.reviewScoreDesc ? (
+          {effectiveReviewSummary && trimmedReviewScoreDesc ? (
             <div className="flex items-center gap-1.5">
               <ThumbsUp aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
               <span className="text-steam-accent font-semibold text-[11px]">
-                {effectiveReviewSummary.reviewScoreDesc}
+                {trimmedReviewScoreDesc}
               </span>
-              {typeof effectiveReviewSummary.positivePercent === 'number' && (
+              {shouldAppendPositivePercent && (
                 <span className="text-steam-subtext text-[10px]">
                   ({effectiveReviewSummary.positivePercent}%)
                 </span>

@@ -371,7 +371,12 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
       return;
     }
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
-    if (typeof HTMLElement !== 'undefined' && 'focusGroup' in HTMLElement.prototype) {
+    if (
+      typeof HTMLElement !== 'undefined' &&
+      'focusGroup' in HTMLElement.prototype &&
+      typeof event.currentTarget?.hasAttribute === 'function' &&
+      event.currentTarget.hasAttribute('focusgroup')
+    ) {
       return;
     }
     const items = Array.from(
