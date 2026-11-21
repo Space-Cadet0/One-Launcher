@@ -908,12 +908,19 @@ if (!gotTheLock) {
       '*://*.lutris.net/*',
       '*://*.opencritic.com/*',
       '*://*.metacritic.com/*',
+      '*://*.wikidata.org/*',
     ];
 
     const beforeSendFilters = [
       ...embedFilters,
       '*://*.steampowered.com/*',
       '*://*.lutris.net/*',
+      '*://*.metacritic.com/*',
+      '*://metacritic.com/*',
+      '*://*.opencritic.com/*',
+      '*://opencritic.com/*',
+      '*://*.wikidata.org/*',
+      '*://wikidata.org/*',
     ];
 
     const embedHostAllowlist = embedFilters.map((f) =>
@@ -955,6 +962,35 @@ if (!gotTheLock) {
 
     const STANDARD_CHROME_UA =
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    const WIKIMEDIA_METADATA_UA =
+      'One-Launcher/0.2.8 (https://github.com/Space-Cadet0/One-Launcher; desktop library metadata bridge)';
+
+    const setHeaderCaseInsensitive = (
+      /** @type {Record<string, any>} */ headers,
+      /** @type {string} */ name,
+      /** @type {string} */ value
+    ) => {
+      if (!headers || typeof headers !== 'object') return;
+      const lower = name.toLowerCase();
+      for (const key of Object.keys(headers)) {
+        if (key.toLowerCase() === lower && key !== name) {
+          delete headers[key];
+        }
+      }
+      headers[name] = value;
+    };
+
+    const deleteNullOriginHeader = (/** @type {Record<string, any>} */ headers) => {
+      if (!headers || typeof headers !== 'object') return;
+      for (const key of Object.keys(headers)) {
+        if (key.toLowerCase() === 'origin') {
+          const val = String(headers[key] ?? '').trim().toLowerCase();
+          if (val === 'null') {
+            delete headers[key];
+          }
+        }
+      }
+    };
 
     session.defaultSession.webRequest.onBeforeSendHeaders(
       { urls: beforeSendFilters },
@@ -1007,7 +1043,28 @@ if (!gotTheLock) {
         }
 
         if (isAllowedHttpsHost(url, ['lutris.net']) && isMainAppFrameInitiator(details)) {
-          details.requestHeaders['User-Agent'] = STANDARD_CHROME_UA;
+          setHeaderCaseInsensitive(details.requestHeaders, 'User-Agent', STANDARD_CHROME_UA);
+        }
+
+        if (isAllowedHttpsHost(url, ['wikidata.org']) && isMainAppFrameInitiator(details)) {
+          setHeaderCaseInsensitive(details.requestHeaders, 'User-Agent', WIKIMEDIA_METADATA_UA);
+          deleteNullOriginHeader(details.requestHeaders);
+        }
+
+        if (isAllowedHttpsHost(url, ['metacritic.com']) && isMainAppFrameInitiator(details)) {
+          setHeaderCaseInsensitive(details.requestHeaders, 'User-Agent', STANDARD_CHROME_UA);
+          setHeaderCaseInsensitive(
+            details.requestHeaders,
+            'Referer',
+            'https://www.metacritic.com/'
+          );
+          deleteNullOriginHeader(details.requestHeaders);
+        }
+
+        if (isAllowedHttpsHost(url, ['opencritic.com']) && isMainAppFrameInitiator(details)) {
+          setHeaderCaseInsensitive(details.requestHeaders, 'User-Agent', STANDARD_CHROME_UA);
+          setHeaderCaseInsensitive(details.requestHeaders, 'Referer', 'https://opencritic.com/');
+          deleteNullOriginHeader(details.requestHeaders);
         }
 
         callback({ requestHeaders: details.requestHeaders });

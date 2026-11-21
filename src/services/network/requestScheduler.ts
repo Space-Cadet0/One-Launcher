@@ -21,6 +21,7 @@ export const Priority = RequestPriority;
 export interface DomainConfig {
   requestsPerSecond: number; // Token fill rate
   burst: number;             // Maximum token bucket capacity
+  maxRetries?: number;       // Per-domain retry cap (defaults to scheduler maxRetries)
   cooldownOnRateLimitSec?: number; // Akamai or server cooldown on 429/403
 }
 
@@ -58,6 +59,7 @@ export interface TokenBucket {
   lastRefill: number;
   fillRate: number;
   capacity: number;
+  maxRetries: number;
   cooldownUntil: number;
   cooldownDurationMs: number;
   consecutiveServerErrors: number;
@@ -99,6 +101,36 @@ interface SchedulerHttpError {
     headers?: unknown;
     data?: unknown;
   };
+}
+
+interface ResponseLike {
+  status: number;
+  headers?: Headers | Record<string, unknown>;
+}
+
+function isResponseLike(value: unknown): value is ResponseLike {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    'status' in value &&
+    typeof (value as { status?: unknown }).status === 'number' &&
+    'headers' in value
+  );
+}
+
+function normalizeHeadersForInspection(
+  headers: Headers | Record<string, unknown> | undefined
+): Headers | Record<string, unknown> | undefined {
+  if (!headers || typeof headers !== 'object') return undefined;
+  if ('get' in headers && typeof (headers as Headers).get === 'function') {
+    return headers as Headers;
+  }
+  const normalized: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(headers as Record<string, unknown>)) {
+    normalized[k] = v;
+    normalized[k.toLowerCase()] = v;
+  }
+  return normalized;
 }
 
 function createAbortError(message: string): Error {
@@ -172,6 +204,18 @@ export const DOMAIN_CONFIGS: Record<string, DomainConfig> = {
     requestsPerSecond: 2.0,
     burst: 4,
   },
+  'query.wikidata.org': {
+    requestsPerSecond: 1.0,
+    burst: 2,
+    maxRetries: 2,
+    cooldownOnRateLimitSec: 120,
+  },
+  'www.wikidata.org': {
+    requestsPerSecond: 1.5,
+    burst: 3,
+    maxRetries: 2,
+    cooldownOnRateLimitSec: 90,
+  },
   default: {
     requestsPerSecond: 2.0,
     burst: 2,
@@ -180,6 +224,8 @@ export const DOMAIN_CONFIGS: Record<string, DomainConfig> = {
 
 const CANONICAL_HOST_ALIASES: Record<string, string> = {
   'opencritic.com': 'api.opencritic.com',
+  'www.opencritic.com': 'api.opencritic.com',
+  'wikidata.org': 'www.wikidata.org',
   'gog.com': 'catalog.gog.com',
   'embed.gog.com': 'catalog.gog.com',
   'api.gog.com': 'catalog.gog.com',
@@ -404,6 +450,7 @@ export class RequestScheduler {
         lastRefill: Date.now(),
         fillRate: cfg.requestsPerSecond,
         capacity: cfg.burst,
+        maxRetries: cfg.maxRetries ?? this.maxRetries,
         cooldownUntil: 0,
         cooldownDurationMs: cooldownSec * 1000,
         consecutiveServerErrors: 0,
@@ -438,7 +485,10 @@ export class RequestScheduler {
       if (clean.includes('/api/steam-community')) return 'steamcommunity.com';
       if (clean.includes('/api/metacritic-backend')) return 'backend.metacritic.com';
       if (clean.includes('/api/metacritic')) return 'metacritic.com';
+      if (clean.includes('/api/opencritic-web')) return 'api.opencritic.com';
       if (clean.includes('/api/opencritic')) return 'api.opencritic.com';
+      if (clean.includes('/api/wikidata-sparql')) return 'query.wikidata.org';
+      if (clean.includes('/api/wikidata-api')) return 'www.wikidata.org';
       if (clean.includes('/api/lutris')) return 'lutris.net';
       if (clean.includes('/api/gog')) return 'catalog.gog.com';
       if (clean.includes('/api/epic')) return 'launcher.store.epicgames.com';
@@ -475,6 +525,7 @@ export class RequestScheduler {
         lastRefill: Date.now(),
         fillRate: def.requestsPerSecond,
         capacity: def.burst,
+        maxRetries: def.maxRetries ?? this.maxRetries,
         cooldownUntil: 0,
         cooldownDurationMs: 0,
         consecutiveServerErrors: 0,
@@ -949,6 +1000,78 @@ export class RequestScheduler {
     }
     try {
       const result = await item.fn();
+      if (isResponseLike(result)) {
+        const status = result.status;
+        const headersMap = normalizeHeadersForInspection(result.headers);
+        const retryAfterMs =
+          status === 429 || status === 503 ? this.parseRetryAfterMs(headersMap) : 0;
+        const isRateLimitOrWaf =
+          status === 429 || isWafOrChallengeResponse(status, '', headersMap, true);
+        const isServerError = status >= 500;
+        const isOnline = onlineLifecycleManager.isOnline();
+
+        bucket.probeInFlight = false;
+
+        if (isRateLimitOrWaf) {
+          if (isOnline && (this.enforceDelays || domain === 'store.steampowered.com')) {
+            const cooldownMs = retryAfterMs > 0 ? retryAfterMs : bucket.cooldownDurationMs;
+            if (cooldownMs > 0) {
+              bucket.cooldownUntil = Date.now() + cooldownMs;
+              bucket.wasCoolingDown = true;
+              onlineLifecycleManager.recordEndpointHealth({
+                host: domain,
+                state: 'OPEN',
+                consecutiveFailures: Math.max(1, bucket.consecutiveServerErrors + 1),
+                openedUntil: bucket.cooldownUntil,
+                lastStatusCode: status,
+                lastError: `HTTP ${status}`,
+              });
+              console.warn(
+                `[RequestScheduler] Domain ${domain} returned HTTP ${status}. Entering cooldown for ${Math.round(cooldownMs / 1000)}s.`
+              );
+            }
+          }
+        } else if (isServerError) {
+          if (isOnline) {
+            bucket.consecutiveServerErrors += 1;
+            if (this.enforceDelays && bucket.consecutiveServerErrors >= 3) {
+              const step = Math.min(2, bucket.consecutiveServerErrors - 3);
+              const progressiveOutageMs = Math.min(120_000, 30_000 * Math.pow(2, step));
+              const outageCooldownMs = Math.max(retryAfterMs, progressiveOutageMs);
+              bucket.cooldownUntil = Date.now() + outageCooldownMs;
+              bucket.wasCoolingDown = true;
+              onlineLifecycleManager.recordEndpointHealth({
+                host: domain,
+                state: 'OPEN',
+                consecutiveFailures: bucket.consecutiveServerErrors,
+                openedUntil: bucket.cooldownUntil,
+                lastStatusCode: status,
+                lastError: `HTTP ${status}`,
+              });
+              console.warn(
+                `[RequestScheduler] Domain ${domain} hit ${bucket.consecutiveServerErrors} consecutive HTTP 5xx responses. Entering ${Math.round(outageCooldownMs / 1000)}s outage cooldown.`
+              );
+            }
+          }
+        } else {
+          const recovered = bucket.wasCoolingDown || bucket.consecutiveServerErrors >= 3;
+          bucket.consecutiveServerErrors = 0;
+          bucket.wasCoolingDown = false;
+          if (status < 400 && recovered) {
+            onlineLifecycleManager.recordEndpointHealth({
+              host: domain,
+              state: 'CLOSED',
+              consecutiveFailures: 0,
+              openedUntil: 0,
+            });
+          }
+        }
+
+        item.cleanupAbort?.();
+        item.resolve(result);
+        return;
+      }
+
       const recovered = bucket.wasCoolingDown || bucket.consecutiveServerErrors >= 3;
       bucket.consecutiveServerErrors = 0;
       bucket.wasCoolingDown = false;
@@ -1035,7 +1158,7 @@ export class RequestScheduler {
         }
       }
 
-      if ((isRateLimit || isServerError) && item.retries < this.maxRetries && bucket.cooldownUntil <= Date.now()) {
+      if ((isRateLimit || isServerError) && item.retries < bucket.maxRetries && bucket.cooldownUntil <= Date.now()) {
         item.retries++;
         const jitter = Math.random() * 100;
         const computedBackoff =

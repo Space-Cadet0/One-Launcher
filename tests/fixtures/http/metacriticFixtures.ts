@@ -4,8 +4,11 @@ interface MetacriticGameFixture {
   slug: string;
   name: string;
   year: number;
+  releaseDate?: string;
   criticScore?: number | null;
   criticCount?: number;
+  pcCriticScore?: number | null;
+  pcCriticCount?: number;
   userScore?: number | null;
   userCount?: number;
   description?: string;
@@ -20,7 +23,78 @@ const METACRITIC_GAMES: MetacriticGameFixture[] = [
   { slug: 'hitman-codename-47', name: 'Hitman: Codename 47', year: 2000, criticScore: 73, criticCount: 28 },
   { slug: 'postal-2', name: 'Postal 2', year: 2003, criticScore: 50, criticCount: 32 },
   { slug: 'fortnite', name: 'Fortnite', year: 2017, criticScore: 78, criticCount: 35 },
-  { slug: 'deus-ex-invisible-war', name: 'Deus Ex: Invisible War', year: 2003, criticScore: 80, criticCount: 41 },
+  {
+    slug: 'deus-ex-invisible-war',
+    name: 'Deus Ex: Invisible War',
+    year: 2003,
+    releaseDate: '2003-12-02',
+    criticScore: 84,
+    criticCount: 50,
+    pcCriticScore: 80,
+    pcCriticCount: 28,
+    userScore: 6.8,
+    userCount: 54,
+  },
+  {
+    slug: 'metro-2033-redux',
+    name: 'Metro: 2033 Redux',
+    year: 2014,
+    releaseDate: '2014-08-26',
+    criticScore: 90,
+    criticCount: 5,
+    userScore: 8.3,
+    userCount: 2649,
+  },
+  {
+    slug: 'battlefield-2042',
+    name: 'Battlefield 2042',
+    year: 2021,
+    releaseDate: '2021-11-19',
+    criticScore: 68,
+    criticCount: 64,
+    userScore: 2.3,
+    userCount: 5100,
+  },
+  {
+    slug: 'warhammer-40000-darktide',
+    name: 'Warhammer 40,000: Darktide',
+    year: 2022,
+    releaseDate: '2022-11-30',
+    criticScore: 75,
+    criticCount: 52,
+    userScore: 5.9,
+    userCount: 1450,
+  },
+  {
+    slug: 'god-of-war-ragnarok',
+    name: 'God of War Ragnarök',
+    year: 2022,
+    releaseDate: '2022-11-09',
+    criticScore: 94,
+    criticCount: 141,
+    userScore: 8.3,
+    userCount: 9200,
+  },
+  {
+    slug: 'dead-space',
+    name: 'Dead Space',
+    year: 2008,
+    releaseDate: '2008-10-14',
+    criticScore: 86,
+    criticCount: 28,
+    userScore: 8.7,
+    userCount: 2850,
+  },
+  {
+    slug: 'dead-space-2023',
+    name: 'Dead Space',
+    year: 2023,
+    releaseDate: '2023-01-27',
+    criticScore: 89,
+    criticCount: 73,
+    userScore: 8.6,
+    userCount: 3400,
+  },
   { slug: 'predator-hunting-grounds', name: 'Predator: Hunting Grounds', year: 2020, criticScore: 56, criticCount: 46 },
   { slug: 'star-wars-battlefront-ii-2005', name: 'Star Wars: Battlefront II (2005)', year: 2005, criticScore: 83, criticCount: 42 },
   { slug: 'styx-shards-of-darkness', name: 'Styx: Shards of Darkness', year: 2017, criticScore: 72, criticCount: 38 },
@@ -40,7 +114,16 @@ const METACRITIC_GAMES: MetacriticGameFixture[] = [
   { slug: 'kingdom-2015', name: 'Kingdom: Classic', year: 2015, criticScore: 74, criticCount: 14 },
   { slug: 'xcom-enemy-unknown', name: 'XCOM: Enemy Unknown', year: 2012, criticScore: 89, criticCount: 82 },
   { slug: 'metaphor-refantazio', name: 'Metaphor: ReFantazio', year: 2024, criticScore: 94, criticCount: 95 },
-  { slug: 'cyberpunk-2077', name: 'Cyberpunk 2077', year: 2020, criticScore: 86, criticCount: 100, userScore: 7.2, userCount: 32000 },
+  {
+    slug: 'cyberpunk-2077',
+    name: 'Cyberpunk 2077',
+    year: 2020,
+    releaseDate: '2020-12-10',
+    criticScore: 86,
+    criticCount: 100,
+    userScore: 7.2,
+    userCount: 32000,
+  },
   { slug: 'the-witcher-3-wild-hunt', name: 'The Witcher 3: Wild Hunt', year: 2015, criticScore: 93, criticCount: 79 },
   { slug: 'baldurs-gate-3', name: "Baldur's Gate 3", year: 2023, criticScore: 96, criticCount: 118 },
   { slug: 'baldurs-gate-ii-enhanced-edition', name: "Baldur's Gate II: Enhanced Edition", year: 2013, criticScore: 78, criticCount: 26 },
@@ -62,21 +145,36 @@ const METACRITIC_GAMES: MetacriticGameFixture[] = [
   { slug: 'subnautica', name: 'Subnautica', year: 2018, criticScore: null, userScore: 7.7, userCount: 418 },
 ];
 
+const FALLOUT_1997_FIXTURE: MetacriticGameFixture = {
+  slug: 'fallout',
+  name: 'Fallout',
+  year: 1997,
+  releaseDate: '1997-10-10',
+  criticScore: 89,
+  criticCount: 28,
+};
+
 const BY_SLUG = new Map<string, MetacriticGameFixture>(METACRITIC_GAMES.map((g) => [g.slug, g]));
 
+function getFixtureReleaseDate(g: MetacriticGameFixture): string {
+  return g.releaseDate || `${g.year}-05-15`;
+}
+
 function renderMetacriticHtml(g: MetacriticGameFixture): string {
+  const htmlCriticScore = g.pcCriticScore !== undefined ? g.pcCriticScore : g.criticScore;
+  const htmlCriticCount = g.pcCriticCount !== undefined ? g.pcCriticCount : g.criticCount;
   const ldJson: Record<string, unknown> = {
     '@context': 'https://schema.org',
     '@type': 'VideoGame',
     name: g.name,
-    datePublished: `${g.year}-05-15`,
+    datePublished: getFixtureReleaseDate(g),
     description: g.description || `${g.name} critical reception and player consensus.`,
   };
-  if (typeof g.criticScore === 'number' && g.criticScore > 0) {
+  if (typeof htmlCriticScore === 'number' && htmlCriticScore > 0) {
     ldJson.aggregateRating = {
       '@type': 'AggregateRating',
-      ratingValue: g.criticScore,
-      reviewCount: g.criticCount || 20,
+      ratingValue: htmlCriticScore,
+      reviewCount: htmlCriticCount || 20,
     };
   }
   const userSection =
@@ -86,16 +184,109 @@ function renderMetacriticHtml(g: MetacriticGameFixture): string {
   return `<!DOCTYPE html><html><head><title>${g.name} - Metacritic</title><script type="application/ld+json">${JSON.stringify(ldJson)}</script></head><body><h1>${g.name}</h1>${userSection}</body></html>`;
 }
 
+function renderMetacriticComposerJson(g: MetacriticGameFixture): Record<string, unknown> {
+  const releaseDate = getFixtureReleaseDate(g);
+  const overallScore =
+    typeof g.criticScore === 'number' && g.criticScore > 0 ? g.criticScore : null;
+  const overallCount = overallScore !== null ? g.criticCount || 20 : 0;
+  const pcScore =
+    g.pcCriticScore !== undefined
+      ? g.pcCriticScore
+      : overallScore;
+  const pcCount =
+    g.pcCriticCount !== undefined
+      ? g.pcCriticCount
+      : pcScore !== null
+        ? overallCount
+        : 0;
+  const userScore = typeof g.userScore === 'number' && g.userScore > 0 ? g.userScore : null;
+  const userCount = userScore !== null ? g.userCount || 25 : 0;
+
+  const criticScoreSummary = {
+    url: `/game/${g.slug}/critic-reviews/`,
+    max: 100,
+    score: overallScore,
+    reviewCount: overallCount,
+  };
+
+  const userScoreSummary = {
+    url: `/game/${g.slug}/user-reviews/`,
+    max: 10,
+    score: userScore,
+    reviewCount: userCount,
+  };
+
+  const platforms = [
+    {
+      id: 31,
+      name: 'PC',
+      slug: 'pc',
+      releaseDate,
+      criticScoreSummary: {
+        url: `/game/${g.slug}/critic-reviews/?platform=pc`,
+        max: 100,
+        score: pcScore,
+        reviewCount: pcCount,
+      },
+    },
+  ];
+
+  const productItem = {
+    type: 'game-title',
+    slug: g.slug,
+    title: g.name,
+    releaseDate,
+    description: g.description || `${g.name} critical reception and player consensus.`,
+    criticScoreSummary,
+    userScoreSummary,
+    platforms,
+  };
+
+  return {
+    data: {
+      item: productItem,
+    },
+    components: [
+      {
+        data: { item: productItem },
+        meta: { componentName: 'product', componentType: 'product' },
+      },
+      {
+        data: { item: criticScoreSummary },
+        meta: { componentName: 'critic-score-summary', componentType: 'critic-score-summary' },
+      },
+      {
+        data: { item: userScoreSummary },
+        meta: { componentName: 'user-score-summary', componentType: 'user-score-summary' },
+      },
+    ],
+  };
+}
+
 function normalizeQuery(q: string): string {
-  return decodeURIComponent(q)
+  let decoded = q;
+  try {
+    decoded = decodeURIComponent(q);
+  } catch {
+    decoded = q;
+  }
+  return decoded
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
     .replace(/\u0394/g, 'delta')
+    .replace(/(\d),(\d)/g, '$1$2')
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
 }
 
 const SEARCH_INDEX: Array<{ keywords: string[]; slugs: string[] }> = [
   { keywords: ['deus ex 2 invisible war', 'deus ex invisible war'], slugs: ['deus-ex-invisible-war'] },
+  { keywords: ['metro 2033 redux'], slugs: ['metro-2033-redux'] },
+  { keywords: ['battlefield 2042'], slugs: ['battlefield-2042'] },
+  { keywords: ['warhammer 40000 darktide', 'warhammer 40 000 darktide'], slugs: ['warhammer-40000-darktide'] },
+  { keywords: ['god of war ragnarok', 'god of war ragnar k'], slugs: ['god-of-war-ragnarok'] },
+  { keywords: ['dead space'], slugs: ['dead-space-2023', 'dead-space'] },
   { keywords: ['star wars battlefront ii', 'star wars battlefront 2'], slugs: ['star-wars-battlefront-ii-2005'] },
   { keywords: ['disco elysium'], slugs: ['disco-elysium-2019'] },
   { keywords: ['factorio'], slugs: ['factorio-2020'] },
@@ -131,12 +322,17 @@ export function handleMetacriticWeb(req: FixtureRequest): FixtureResponse | null
     return {
       status: 200,
       headers: { 'content-type': 'text/html; charset=utf-8' },
-      body: renderMetacriticHtml({ slug: 'fallout', name: 'Fallout', year: 1997, criticScore: 89, criticCount: 28 }),
+      body: renderMetacriticHtml(FALLOUT_1997_FIXTURE),
     };
   }
   const found = BY_SLUG.get(slug);
   if (!found) {
-    return { status: 404, statusText: 'Not Found', headers: { 'content-type': 'text/html' }, body: '<html><body>404 Not Found</body></html>' };
+    return {
+      status: 404,
+      statusText: 'Not Found',
+      headers: { 'content-type': 'text/html' },
+      body: '<html><body>404 Not Found</body></html>',
+    };
   }
   return {
     status: 200,
@@ -145,7 +341,32 @@ export function handleMetacriticWeb(req: FixtureRequest): FixtureResponse | null
   };
 }
 
+export function handleMetacriticComposer(req: FixtureRequest): FixtureResponse | null {
+  const m = req.url.pathname.match(
+    /^\/composer\/metacritic\/pages\/games\/([a-z0-9-]+)(?:\/(?:web|critic-reviews\/web|user-reviews\/web))?\/?$/i
+  );
+  if (!m) return null;
+  const slug = m[1].toLowerCase();
+  const found = slug === 'fallout' ? FALLOUT_1997_FIXTURE : BY_SLUG.get(slug);
+  if (!found) {
+    return {
+      status: 404,
+      statusText: 'Not Found',
+      headers: { 'content-type': 'application/json' },
+      body: { code: 404, message: 'Not Found' },
+    };
+  }
+  return {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+    body: renderMetacriticComposerJson(found),
+  };
+}
+
 export function handleMetacriticSearch(req: FixtureRequest): FixtureResponse | null {
+  const composerRes = handleMetacriticComposer(req);
+  if (composerRes) return composerRes;
+
   const m = req.url.pathname.match(/^\/finder\/metacritic\/search\/([^/]+)\/web\/?$/i);
   if (!m) return null;
   const norm = normalizeQuery(m[1]);
@@ -165,17 +386,32 @@ export function handleMetacriticSearch(req: FixtureRequest): FixtureResponse | n
       return {
         slug: g.slug,
         title: g.name,
-        releaseDate: `${g.year}-05-15`,
-        criticScoreSummary: { score: g.criticScore ?? null },
+        releaseDate: getFixtureReleaseDate(g),
+        criticScoreSummary: { score: g.criticScore ?? null, reviewCount: g.criticCount ?? 0 },
       };
     }
     if (slug === 'fallout') {
-      return { slug: 'fallout', title: 'Fallout', releaseDate: '1997-10-10', criticScoreSummary: { score: 89 } };
+      return {
+        slug: 'fallout',
+        title: 'Fallout',
+        releaseDate: '1997-10-10',
+        criticScoreSummary: { score: 89, reviewCount: 28 },
+      };
     }
     if (slug === 'kingdom-come-deliverance') {
-      return { slug: 'kingdom-come-deliverance', title: 'Kingdom Come: Deliverance', releaseDate: '2018-02-13', criticScoreSummary: { score: 76 } };
+      return {
+        slug: 'kingdom-come-deliverance',
+        title: 'Kingdom Come: Deliverance',
+        releaseDate: '2018-02-13',
+        criticScoreSummary: { score: 76, reviewCount: 40 },
+      };
     }
-    return { slug, title: slug.replace(/-/g, ' '), releaseDate: '2013-08-20', criticScoreSummary: { score: 62 } };
+    return {
+      slug,
+      title: slug.replace(/-/g, ' '),
+      releaseDate: '2013-08-20',
+      criticScoreSummary: { score: 62, reviewCount: 15 },
+    };
   });
 
   return {

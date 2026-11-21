@@ -1930,9 +1930,16 @@ function resolveFederatedAsset(params = {}, options = {}) {
 
 function formatUnixSecondsOrIsoDate(rawVal) {
   if (rawVal === null || rawVal === undefined || rawVal === '') return undefined;
-  if (typeof rawVal === 'number' || /^\d{9,13}$/.test(String(rawVal).trim())) {
+  const trimmed = String(rawVal).trim();
+  if (!trimmed) return undefined;
+  if (typeof rawVal === 'number' || /^-?\d+$/.test(trimmed)) {
     const num = Number(rawVal);
     if (!Number.isFinite(num) || num <= 0) return undefined;
+    if (num >= 1970 && num <= 2098) {
+      return String(Math.floor(num));
+    }
+    // Reject tiny positive placeholders (e.g. 1..157766399 before 1975-01-01)
+    if (num < 157766400) return undefined;
     const ms = num > 1e11 ? num : num * 1000;
     const d = new Date(ms);
     if (!Number.isNaN(d.getTime())) {
@@ -1943,10 +1950,9 @@ function formatUnixSecondsOrIsoDate(rawVal) {
     }
     return undefined;
   }
-  const str = String(rawVal).trim();
-  if (!str || str.startsWith('2099')) return undefined;
-  const isoMatch = str.match(/^(\d{4}-\d{2}-\d{2})/);
-  return isoMatch ? isoMatch[1] : str;
+  if (trimmed.startsWith('2099')) return undefined;
+  const isoMatch = trimmed.match(/^(\d{4}-\d{2}-\d{2})/);
+  return isoMatch ? isoMatch[1] : trimmed;
 }
 
 function stripVideoTagsAndHtmlToPlainText(html) {
@@ -2052,8 +2058,8 @@ function resolveLocalSteamMetadata(appId, options = {}) {
         }
         if (!releaseDate) {
           releaseDate =
-            formatUnixSecondsOrIsoDate(common.steam_release_date) ||
-            formatUnixSecondsOrIsoDate(common.original_release_date);
+            formatUnixSecondsOrIsoDate(common.original_release_date) ||
+            formatUnixSecondsOrIsoDate(common.steam_release_date);
         }
         if (common.associations && typeof common.associations === 'object') {
           for (const assoc of Object.values(common.associations)) {
@@ -2342,12 +2348,13 @@ function parseGogPiecesMapToMetadata(cleanGogId, piecesByType) {
 
   const rawCritics = metaObj?.criticsScore ?? origMetaObj?.criticsScore;
   const rawUserScore = reviewScoreObj?.score?.value ?? reviewScoreObj?.value;
-  const criticScoreVal =
-    typeof rawCritics === 'number' && rawCritics > 0
-      ? Math.round(rawCritics)
-      : typeof rawUserScore === 'number' && rawUserScore > 0
-        ? Math.round(rawUserScore <= 5 ? rawUserScore * 20 : rawUserScore)
-        : undefined;
+  const gogCriticScoreVal =
+    typeof rawCritics === 'number' && rawCritics > 0 ? Math.round(rawCritics) : undefined;
+  const gogUserReviewScoreVal =
+    typeof rawUserScore === 'number' && rawUserScore > 0
+      ? Math.round(rawUserScore <= 5 ? rawUserScore * 20 : rawUserScore)
+      : undefined;
+  const gogReviewScoreVal = gogCriticScoreVal ?? gogUserReviewScoreVal;
 
   if (
     !name &&
@@ -2384,7 +2391,8 @@ function parseGogPiecesMapToMetadata(cleanGogId, piecesByType) {
     movies: [],
     releaseDate,
     platforms,
-    ...(criticScoreVal ? { metacritic: { score: criticScoreVal }, reviewScore: criticScoreVal } : {}),
+    ...(gogCriticScoreVal ? { gogCriticScore: gogCriticScoreVal } : {}),
+    ...(gogReviewScoreVal ? { reviewScore: gogReviewScoreVal } : {}),
     metadataQuality: 'local_federated',
   };
 }

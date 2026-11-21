@@ -1,9 +1,14 @@
 import { handleEpicAndLutrisEndpoints } from './epicAndLutrisFixtures';
 import { handleGogEndpoints } from './gogFixtures';
-import { handleMetacriticSearch, handleMetacriticWeb } from './metacriticFixtures';
-import { handleOpenCriticApi } from './openCriticFixtures';
+import {
+  handleMetacriticComposer,
+  handleMetacriticSearch,
+  handleMetacriticWeb,
+} from './metacriticFixtures';
+import { handleOpenCriticApi, handleOpenCriticWeb } from './openCriticFixtures';
 import { handleSteamCommunityAndApi, handleSteamStore } from './steamFixtures';
 import { FixtureRequest, FixtureResponse, OfflineNetworkGuardError } from './types';
+import { handleWikidataEndpoints } from './wikidataFixtures';
 
 export function resolveOfflineFixture(req: FixtureRequest): FixtureResponse {
   const host = req.url.hostname.toLowerCase();
@@ -13,9 +18,17 @@ export function resolveOfflineFixture(req: FixtureRequest): FixtureResponse {
   if (host === 'www.metacritic.com' || host === 'metacritic.com') {
     matched = handleMetacriticWeb(req);
   } else if (host === 'backend.metacritic.com') {
-    matched = handleMetacriticSearch(req);
+    matched = handleMetacriticComposer(req) ?? handleMetacriticSearch(req);
   } else if (host === 'api.opencritic.com') {
     matched = handleOpenCriticApi(req);
+  } else if (host === 'opencritic.com' || host === 'www.opencritic.com') {
+    matched = handleOpenCriticWeb(req);
+  } else if (
+    host === 'query.wikidata.org' ||
+    host === 'www.wikidata.org' ||
+    host === 'wikidata.org'
+  ) {
+    matched = handleWikidataEndpoints(req);
   } else if (host === 'store.steampowered.com') {
     matched = handleSteamStore(req);
   } else if (host === 'steamcommunity.com' || host === 'api.steampowered.com') {

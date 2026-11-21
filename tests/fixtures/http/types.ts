@@ -28,9 +28,13 @@ export interface FixtureResponse {
 }
 
 const PROXY_PREFIX_MAP: Array<[string, string]> = [
+  ['/api/metacritic-backend', 'https://backend.metacritic.com'],
   ['/api/metacritic-search', 'https://backend.metacritic.com'],
   ['/api/metacritic', 'https://www.metacritic.com'],
+  ['/api/opencritic-web', 'https://opencritic.com'],
   ['/api/opencritic', 'https://api.opencritic.com'],
+  ['/api/wikidata-sparql', 'https://query.wikidata.org'],
+  ['/api/wikidata-api', 'https://www.wikidata.org'],
   ['/api/steam-store', 'https://store.steampowered.com'],
   ['/api/steam-community', 'https://steamcommunity.com'],
   ['/api/steam-api', 'https://api.steampowered.com'],
