@@ -31,6 +31,7 @@ static size_t g_live_users_count = 0;
 static size_t g_live_users_cap = 0;
 static struct user_change_reg *g_change_regs = NULL;
 static uint64_t g_next_change_token = 1;
+_Alignas(8) static volatile LONGLONG g_next_dev_reg_token = 10;
 
 static bool user_registry_contains_locked(XUserHandle u)
 {
@@ -109,12 +110,18 @@ uint64_t xgr_user_get_primary_xuid(void)
 
 HRESULT xgr_user_duplicate(XUserHandle user, XUserHandle *out_user)
 {
-    if (!user || !out_user) return E_INVALIDARG;
+    if (!out_user) return E_INVALIDARG;
+    *out_user = NULL;
+    if (!user) return E_INVALIDARG;
     AcquireSRWLockShared(&g_user_lock);
-    if (user_registry_contains_locked(user)) {
+    bool valid = user_registry_contains_locked(user);
+    if (valid) {
         InterlockedIncrement(&user->ref);
     }
     ReleaseSRWLockShared(&g_user_lock);
+    if (!valid) {
+        return E_HANDLE;
+    }
     *out_user = user;
     return S_OK;
 }
@@ -296,12 +303,14 @@ struct gamerpic_ctx {
     size_t png_len;
 };
 
-static const uint8_t k_fallback_png[67] = {
-    0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
-    0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,0x08,0x06,0x00,0x00,0x00,0x1F,0x15,0xC4,
-    0x89,0x00,0x00,0x00,0x0D,0x49,0x44,0x41,0x54,0x78,0x9C,0x63,0xF8,0xCF,0x50,0x0F,
-    0x00,0x03,0x86,0x01,0x80,0x5A,0x34,0x7D,0x6B,0x00,0x00,0x00,0x00,0x49,0x45,0x4E,
-    0x44,0xAE,0x42
+/* Verified valid minimal 1x1 RGBA PNG (68 bytes: signature + IHDR + zlib IDAT + IEND, all CRC-32s valid) */
+static const uint8_t k_fallback_png[68] = {
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+    0x0B, 0x49, 0x44, 0x41, 0x54, 0x78, 0xDA, 0x63, 0x60, 0x00, 0x02, 0x00,
+    0x00, 0x05, 0x00, 0x01, 0xE9, 0xFA, 0xDC, 0xD8, 0x00, 0x00, 0x00, 0x00,
+    0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82
 };
 
 static HRESULT CALLBACK gamerpic_provider(XAsyncOp op, const XAsyncProviderData *data)
@@ -430,6 +439,12 @@ static HRESULT CALLBACK token_sig_provider(XAsyncOp op, const XAsyncProviderData
 
             if (!token_utf8) token_utf8 = strdup("");
             if (!sig_utf8) sig_utf8 = strdup("");
+            if (!token_utf8 || !sig_utf8) {
+                free(token_utf8);
+                free(sig_utf8);
+                xgr_async_complete(data->async, E_OUTOFMEMORY, 0);
+                return S_OK;
+            }
 
             if (ctx->is_utf16) {
                 int tok_wchars = MultiByteToWideChar(CP_UTF8, 0, token_utf8, -1, NULL, 0);
@@ -565,9 +580,12 @@ static HRESULT CALLBACK noop_ok_provider(XAsyncOp op, const XAsyncProviderData *
  * IXUserImpl..IXUserImpl6 + IXUserGamertagImpl Dual-Vtable Object
  * ------------------------------------------------------------------------- */
 
+typedef struct IXUserImpl6Vtbl IXUserImpl6Vtbl;
+typedef struct IXUserGamertagImplVtbl IXUserGamertagImplVtbl;
+
 struct xgr_user_impl_obj {
-    const void *lpVtbl_user6;
-    const void *lpVtbl_gamertag;
+    const IXUserImpl6Vtbl *lpVtbl_user6;
+    const IXUserGamertagImplVtbl *lpVtbl_gamertag;
 };
 
 static struct xgr_user_impl_obj g_xuser_singleton;
@@ -576,6 +594,10 @@ static HRESULT WINAPI xu_QueryInterface(void *iface, REFIID riid, void **ppv)
 {
     (void)iface;
     if (!ppv) return E_POINTER;
+    if (!riid) {
+        *ppv = NULL;
+        return E_INVALIDARG;
+    }
     if (IsEqualGUID(riid, &IID_IUnknown) ||
         IsEqualGUID(riid, &IID_IXUserImpl) ||
         IsEqualGUID(riid, &IID_IXUserImpl2) ||
@@ -710,7 +732,13 @@ static HRESULT WINAPI xu_XUserGetState(void *iface, XUserHandle user, XUserState
     return xgr_return_hr(S_OK);
 }
 
-static HRESULT WINAPI xu_PADDING_1(void *iface) { (void)iface; return xgr_return_hr(E_NOTIMPL); }
+/* Slot 15: Legacy XUserGetGamertag (5-arg __stdcall: iface, user, size, buf, used) */
+static HRESULT WINAPI xu_XUserGetGamertagLegacy(void *iface, XUserHandle user, SIZE_T size, char *gamertag, SIZE_T *used)
+{
+    (void)iface; (void)user; (void)size; (void)gamertag;
+    if (used) *used = 0;
+    return xgr_return_hr(E_NOTIMPL);
+}
 
 static HRESULT WINAPI xu_XUserGetGamerPictureAsync(void *iface, XUserHandle user, XUserGamerPictureSize picSize, XAsyncBlock *async)
 {
@@ -783,18 +811,26 @@ static HRESULT WINAPI xu_XUserGetTokenAndSignatureAsync(
     struct token_sig_ctx *ctx = (struct token_sig_ctx *)calloc(1, sizeof(*ctx));
     if (!ctx) return xgr_return_hr(E_OUTOFMEMORY);
 
-    xgr_user_duplicate(user, &ctx->user);
+    if (FAILED(xgr_user_duplicate(user, &ctx->user))) {
+        ctx->user = NULL;
+    }
     ctx->options = options;
     ctx->is_utf16 = false;
     ctx->method = strdup(method);
     ctx->url = strdup(url);
     ctx->headers_json = serialize_headers_utf8_json(headerCount, headers);
+    if (!ctx->method || !ctx->url || !ctx->headers_json) {
+        token_sig_provider(XAsyncOp_Cleanup, &(XAsyncProviderData){ .context = ctx });
+        return xgr_return_hr(E_OUTOFMEMORY);
+    }
     if (bodySize > 0 && bodyBuffer) {
         ctx->body = (uint8_t *)malloc(bodySize);
-        if (ctx->body) {
-            memcpy(ctx->body, bodyBuffer, bodySize);
-            ctx->body_len = bodySize;
+        if (!ctx->body) {
+            token_sig_provider(XAsyncOp_Cleanup, &(XAsyncProviderData){ .context = ctx });
+            return xgr_return_hr(E_OUTOFMEMORY);
         }
+        memcpy(ctx->body, bodyBuffer, bodySize);
+        ctx->body_len = bodySize;
     }
 
     HRESULT hr = xgr_async_begin(async, ctx, NULL, "XUserGetTokenAndSignatureAsync", token_sig_provider);
@@ -837,7 +873,9 @@ static HRESULT WINAPI xu_XUserGetTokenAndSignatureUtf16Async(
     struct token_sig_ctx *ctx = (struct token_sig_ctx *)calloc(1, sizeof(*ctx));
     if (!ctx) return xgr_return_hr(E_OUTOFMEMORY);
 
-    xgr_user_duplicate(user, &ctx->user);
+    if (FAILED(xgr_user_duplicate(user, &ctx->user))) {
+        ctx->user = NULL;
+    }
     ctx->options = options;
     ctx->is_utf16 = true;
     ctx->method = wide_to_utf8_alloc(method);
@@ -846,28 +884,37 @@ static HRESULT WINAPI xu_XUserGetTokenAndSignatureUtf16Async(
     if (headerCount > 0 && headers) {
         XUserGetTokenAndSignatureHttpHeader *tmp_hdrs =
             (XUserGetTokenAndSignatureHttpHeader *)calloc(headerCount, sizeof(*tmp_hdrs));
-        if (tmp_hdrs) {
-            for (SIZE_T i = 0; i < headerCount; i++) {
-                tmp_hdrs[i].name = wide_to_utf8_alloc(headers[i].name);
-                tmp_hdrs[i].value = wide_to_utf8_alloc(headers[i].value);
-            }
-            ctx->headers_json = serialize_headers_utf8_json(headerCount, tmp_hdrs);
-            for (SIZE_T i = 0; i < headerCount; i++) {
-                free((void *)tmp_hdrs[i].name);
-                free((void *)tmp_hdrs[i].value);
-            }
-            free(tmp_hdrs);
+        if (!tmp_hdrs) {
+            token_sig_provider(XAsyncOp_Cleanup, &(XAsyncProviderData){ .context = ctx });
+            return xgr_return_hr(E_OUTOFMEMORY);
         }
+        for (SIZE_T i = 0; i < headerCount; i++) {
+            tmp_hdrs[i].name = wide_to_utf8_alloc(headers[i].name);
+            tmp_hdrs[i].value = wide_to_utf8_alloc(headers[i].value);
+        }
+        ctx->headers_json = serialize_headers_utf8_json(headerCount, tmp_hdrs);
+        for (SIZE_T i = 0; i < headerCount; i++) {
+            free((void *)tmp_hdrs[i].name);
+            free((void *)tmp_hdrs[i].value);
+        }
+        free(tmp_hdrs);
     } else {
         ctx->headers_json = strdup("{}");
     }
 
+    if (!ctx->method || !ctx->url || !ctx->headers_json) {
+        token_sig_provider(XAsyncOp_Cleanup, &(XAsyncProviderData){ .context = ctx });
+        return xgr_return_hr(E_OUTOFMEMORY);
+    }
+
     if (bodySize > 0 && bodyBuffer) {
         ctx->body = (uint8_t *)malloc(bodySize);
-        if (ctx->body) {
-            memcpy(ctx->body, bodyBuffer, bodySize);
-            ctx->body_len = bodySize;
+        if (!ctx->body) {
+            token_sig_provider(XAsyncOp_Cleanup, &(XAsyncProviderData){ .context = ctx });
+            return xgr_return_hr(E_OUTOFMEMORY);
         }
+        memcpy(ctx->body, bodyBuffer, bodySize);
+        ctx->body_len = bodySize;
     }
 
     HRESULT hr = xgr_async_begin(async, ctx, NULL, "XUserGetTokenAndSignatureUtf16Async", token_sig_provider);
@@ -1015,6 +1062,7 @@ static HRESULT WINAPI xu_SpopComplete(void *iface, void *op, uint32_t res) { (vo
 static BOOLEAN WINAPI xu_XUserIsSignOutPresent(void *iface) { (void)iface; return FALSE; }
 static HRESULT WINAPI xu_XUserSignOutAsync(void *iface, XUserHandle u, XAsyncBlock *ab) { (void)iface; (void)u; (void)ab; return E_NOTIMPL; }
 static HRESULT WINAPI xu_XUserSignOutResult(void *iface, XAsyncBlock *ab) { (void)iface; (void)ab; return E_NOTIMPL; }
+static HRESULT WINAPI xu_XUserImpl6_Ext50(void *iface, XUserHandle u, XAsyncBlock *ab) { (void)iface; (void)u; (void)ab; return xgr_return_hr(E_NOTIMPL); }
 
 /* IXUserGamertagImpl */
 static HRESULT WINAPI xgt_XUserGetGamertag(void *iface, XUserHandle user, XUserGamertagComponent comp, SIZE_T size, char *gamertag, SIZE_T *used)
@@ -1037,75 +1085,135 @@ static HRESULT WINAPI xgt_XUserGetGamertag(void *iface, XUserHandle user, XUserG
     return xgr_return_hr(S_OK);
 }
 
-static const void *const g_xuser6_vtbl[51] = {
-    (const void *)xu_QueryInterface,                        /* 0 */
-    (const void *)xu_AddRef,                                /* 1 */
-    (const void *)xu_Release,                               /* 2 */
-    (const void *)xu_XUserDuplicateHandle,                  /* 3 */
-    (const void *)xu_XUserCloseHandle,                      /* 4 */
-    (const void *)xu_XUserCompare,                          /* 5 */
-    (const void *)xu_XUserGetMaxUsers,                      /* 6 */
-    (const void *)xu_XUserAddAsync,                         /* 7 */
-    (const void *)xu_XUserAddResult,                        /* 8 */
-    (const void *)xu_XUserGetLocalId,                       /* 9 */
-    (const void *)xu_XUserFindUserByLocalId,                /* 10 */
-    (const void *)xu_XUserGetId,                            /* 11 */
-    (const void *)xu_XUserFindUserById,                     /* 12 */
-    (const void *)xu_XUserGetIsGuest,                       /* 13 */
-    (const void *)xu_XUserGetState,                         /* 14 */
-    (const void *)xu_PADDING_1,                             /* 15: __PADDING__ */
-    (const void *)xu_XUserGetGamerPictureAsync,             /* 16 */
-    (const void *)xu_XUserGetGamerPictureResultSize,        /* 17 */
-    (const void *)xu_XUserGetGamerPictureResult,            /* 18 */
-    (const void *)xu_XUserGetAgeGroup,                      /* 19 */
-    (const void *)xu_XUserCheckPrivilege,                   /* 20 */
-    (const void *)xu_XUserResolvePrivilegeWithUiAsync,      /* 21 */
-    (const void *)xu_XUserResolvePrivilegeWithUiResult,     /* 22 */
-    (const void *)xu_XUserGetTokenAndSignatureAsync,        /* 23 */
-    (const void *)xu_XUserGetTokenAndSignatureResultSize,   /* 24 */
-    (const void *)xu_XUserGetTokenAndSignatureResult,       /* 25 */
-    (const void *)xu_XUserGetTokenAndSignatureUtf16Async,   /* 26 */
-    (const void *)xu_XUserGetTokenAndSignatureUtf16ResultSize, /* 27 */
-    (const void *)xu_XUserGetTokenAndSignatureUtf16Result,  /* 28 */
-    (const void *)xu_XUserResolveIssueWithUiAsync,          /* 29 */
-    (const void *)xu_XUserResolveIssueWithUiResult,         /* 30 */
-    (const void *)xu_XUserResolveIssueWithUiUtf16Async,     /* 31 */
-    (const void *)xu_XUserResolveIssueWithUiUtf16Result,    /* 32 */
-    (const void *)xu_XUserRegisterForChangeEvent,           /* 33 */
-    (const void *)xu_XUserUnregisterForChangeEvent,         /* 34 */
-    (const void *)xu_XUserGetSignOutDeferral,               /* 35 */
-    (const void *)xu_XUserCloseSignOutDeferralHandle,       /* 36 */
-    /* IXUserImpl2 */
-    (const void *)xu_XUserAddByIdWithUiAsync,               /* 37 */
-    (const void *)xu_XUserAddByIdWithUiResult,              /* 38 */
-    /* IXUserImpl3 */
-    (const void *)xu_XUserGetMsaTokenSilentlyAsync,         /* 39 */
-    (const void *)xu_XUserGetMsaTokenSilentlyResult,        /* 40 */
-    (const void *)xu_XUserGetMsaTokenSilentlyResultSize,    /* 41 */
-    /* IXUserImpl4 */
-    (const void *)xu_XUserIsStoreUser,                      /* 42 */
-    /* IXUserImpl5 */
-    (const void *)xu_RemoteConnectSetHandlers,              /* 43 */
-    (const void *)xu_RemoteConnectCancel,                   /* 44 */
-    (const void *)xu_SpopSetHandlers,                       /* 45 */
-    (const void *)xu_SpopComplete,                          /* 46 */
-    /* IXUserImpl6 */
-    (const void *)xu_XUserIsSignOutPresent,                 /* 47 */
-    (const void *)xu_XUserSignOutAsync,                     /* 48 */
-    (const void *)xu_XUserSignOutResult,                    /* 49 */
-    (const void *)xgr_not_impl_stub                         /* 50 */
+struct IXUserImpl6Vtbl {
+    HRESULT (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);                                                 /* 0 */
+    ULONG   (WINAPI *AddRef)(void *iface);                                                                                  /* 1 */
+    ULONG   (WINAPI *Release)(void *iface);                                                                                 /* 2 */
+    HRESULT (WINAPI *XUserDuplicateHandle)(void *iface, XUserHandle h, XUserHandle *dup);                                   /* 3 */
+    void    (WINAPI *XUserCloseHandle)(void *iface, XUserHandle user);                                                      /* 4 */
+    INT32   (WINAPI *XUserCompare)(void *iface, XUserHandle u1, XUserHandle u2);                                            /* 5 */
+    HRESULT (WINAPI *XUserGetMaxUsers)(void *iface, UINT32 *maxUsers);                                                      /* 6 */
+    HRESULT (WINAPI *XUserAddAsync)(void *iface, XUserAddOptions options, XAsyncBlock *async);                              /* 7 */
+    HRESULT (WINAPI *XUserAddResult)(void *iface, XAsyncBlock *async, XUserHandle *newUser);                                /* 8 */
+    HRESULT (WINAPI *XUserGetLocalId)(void *iface, XUserHandle user, XUserLocalId *localId);                                /* 9 */
+    HRESULT (WINAPI *XUserFindUserByLocalId)(void *iface, XUserLocalId localId, XUserHandle *handle);                       /* 10 */
+    HRESULT (WINAPI *XUserGetId)(void *iface, XUserHandle user, UINT64 *userId);                                            /* 11 */
+    HRESULT (WINAPI *XUserFindUserById)(void *iface, UINT64 userId, XUserHandle *handle);                                   /* 12 */
+    HRESULT (WINAPI *XUserGetIsGuest)(void *iface, XUserHandle user, BOOLEAN *isGuest);                                     /* 13 */
+    HRESULT (WINAPI *XUserGetState)(void *iface, XUserHandle user, XUserState *state);                                      /* 14 */
+    HRESULT (WINAPI *XUserGetGamertagLegacy)(void *iface, XUserHandle user, SIZE_T size, char *gamertag, SIZE_T *used);    /* 15 */
+    HRESULT (WINAPI *XUserGetGamerPictureAsync)(void *iface, XUserHandle user, XUserGamerPictureSize picSize, XAsyncBlock *async); /* 16 */
+    HRESULT (WINAPI *XUserGetGamerPictureResultSize)(void *iface, XAsyncBlock *async, size_t *sz);                          /* 17 */
+    HRESULT (WINAPI *XUserGetGamerPictureResult)(void *iface, XAsyncBlock *async, size_t bufSize, void *buf, size_t *used); /* 18 */
+    HRESULT (WINAPI *XUserGetAgeGroup)(void *iface, XUserHandle user, XUserAgeGroup *ageGroup);                             /* 19 */
+    HRESULT (WINAPI *XUserCheckPrivilege)(void *iface, XUserHandle user, uint32_t opts, uint32_t priv, BOOLEAN *hasPriv, XUserPrivilegeDenyReason *reason); /* 20 */
+    HRESULT (WINAPI *XUserResolvePrivilegeWithUiAsync)(void *iface, XUserHandle user, uint32_t opts, uint32_t priv, XAsyncBlock *async); /* 21 */
+    HRESULT (WINAPI *XUserResolvePrivilegeWithUiResult)(void *iface, XAsyncBlock *async);                                   /* 22 */
+    HRESULT (WINAPI *XUserGetTokenAndSignatureAsync)(void *iface, XUserHandle user, uint32_t options, const char *method, const char *url, SIZE_T headerCount, const XUserGetTokenAndSignatureHttpHeader *headers, SIZE_T bodySize, const void *bodyBuffer, XAsyncBlock *async); /* 23 */
+    HRESULT (WINAPI *XUserGetTokenAndSignatureResultSize)(void *iface, XAsyncBlock *async, size_t *sz);                     /* 24 */
+    HRESULT (WINAPI *XUserGetTokenAndSignatureResult)(void *iface, XAsyncBlock *async, size_t bufSize, void *buf, XUserGetTokenAndSignatureData **ptrToBuffer, size_t *used); /* 25 */
+    HRESULT (WINAPI *XUserGetTokenAndSignatureUtf16Async)(void *iface, XUserHandle user, uint32_t options, const WCHAR *method, const WCHAR *url, SIZE_T headerCount, const XUserGetTokenAndSignatureUtf16HttpHeader *headers, SIZE_T bodySize, const void *bodyBuffer, XAsyncBlock *async); /* 26 */
+    HRESULT (WINAPI *XUserGetTokenAndSignatureUtf16ResultSize)(void *iface, XAsyncBlock *async, size_t *sz);                /* 27 */
+    HRESULT (WINAPI *XUserGetTokenAndSignatureUtf16Result)(void *iface, XAsyncBlock *async, size_t bufSize, void *buf, XUserGetTokenAndSignatureUtf16Data **ptrToBuffer, size_t *used); /* 28 */
+    HRESULT (WINAPI *XUserResolveIssueWithUiAsync)(void *iface, XUserHandle user, const char *url, XAsyncBlock *async);     /* 29 */
+    HRESULT (WINAPI *XUserResolveIssueWithUiResult)(void *iface, XAsyncBlock *async);                                       /* 30 */
+    HRESULT (WINAPI *XUserResolveIssueWithUiUtf16Async)(void *iface, XUserHandle user, const WCHAR *url, XAsyncBlock *async); /* 31 */
+    HRESULT (WINAPI *XUserResolveIssueWithUiUtf16Result)(void *iface, XAsyncBlock *async);                                  /* 32 */
+    HRESULT (WINAPI *XUserRegisterForChangeEvent)(void *iface, XTaskQueueHandle queue, void *ctx, XUserChangeEventCallback *cb, XTaskQueueRegistrationToken *token); /* 33 */
+    BOOLEAN (WINAPI *XUserUnregisterForChangeEvent)(void *iface, XTaskQueueRegistrationToken token, BOOLEAN wait);          /* 34 */
+    HRESULT (WINAPI *XUserGetSignOutDeferral)(void *iface, void **deferral);                                                /* 35 */
+    void    (WINAPI *XUserCloseSignOutDeferralHandle)(void *iface, void *deferral);                                         /* 36 */
+    HRESULT (WINAPI *XUserAddByIdWithUiAsync)(void *iface, UINT64 userId, XAsyncBlock *async);                              /* 37 */
+    HRESULT (WINAPI *XUserAddByIdWithUiResult)(void *iface, XAsyncBlock *async, XUserHandle *newUser);                      /* 38 */
+    HRESULT (WINAPI *XUserGetMsaTokenSilentlyAsync)(void *iface, XUserHandle user, uint32_t opts, const char *scope, XAsyncBlock *async); /* 39 */
+    HRESULT (WINAPI *XUserGetMsaTokenSilentlyResult)(void *iface, XAsyncBlock *async, SIZE_T sz, char *tok, SIZE_T *used);  /* 40 */
+    HRESULT (WINAPI *XUserGetMsaTokenSilentlyResultSize)(void *iface, XAsyncBlock *async, SIZE_T *sz);                      /* 41 */
+    BOOLEAN (WINAPI *XUserIsStoreUser)(void *iface, XUserHandle user);                                                      /* 42 */
+    HRESULT (WINAPI *RemoteConnectSetHandlers)(void *iface, XTaskQueueHandle q, void *h);                                   /* 43 */
+    HRESULT (WINAPI *RemoteConnectCancel)(void *iface, void *op);                                                           /* 44 */
+    HRESULT (WINAPI *SpopSetHandlers)(void *iface, XTaskQueueHandle q, void *h, void *c);                                   /* 45 */
+    HRESULT (WINAPI *SpopComplete)(void *iface, void *op, uint32_t res);                                                    /* 46 */
+    BOOLEAN (WINAPI *XUserIsSignOutPresent)(void *iface);                                                                   /* 47 */
+    HRESULT (WINAPI *XUserSignOutAsync)(void *iface, XUserHandle u, XAsyncBlock *ab);                                       /* 48 */
+    HRESULT (WINAPI *XUserSignOutResult)(void *iface, XAsyncBlock *ab);                                                     /* 49 */
+    HRESULT (WINAPI *XUserImpl6_Ext50)(void *iface, XUserHandle u, XAsyncBlock *ab);                                        /* 50 */
 };
 
-static const void *const g_xgamertag_vtbl[4] = {
-    (const void *)xu_QueryInterface,
-    (const void *)xu_AddRef,
-    (const void *)xu_Release,
-    (const void *)xgt_XUserGetGamertag
+_Static_assert(sizeof(IXUserImpl6Vtbl) == 51 * sizeof(void *), "IXUserImpl6Vtbl must have exactly 51 slots");
+
+struct IXUserGamertagImplVtbl {
+    HRESULT (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);                                                 /* 0 */
+    ULONG   (WINAPI *AddRef)(void *iface);                                                                                  /* 1 */
+    ULONG   (WINAPI *Release)(void *iface);                                                                                 /* 2 */
+    HRESULT (WINAPI *XUserGetGamertag)(void *iface, XUserHandle user, XUserGamertagComponent comp, SIZE_T size, char *gamertag, SIZE_T *used); /* 3 */
+};
+
+_Static_assert(sizeof(IXUserGamertagImplVtbl) == 4 * sizeof(void *), "IXUserGamertagImplVtbl must have exactly 4 slots");
+
+static const IXUserImpl6Vtbl g_xuser6_vtbl = {
+    xu_QueryInterface,
+    xu_AddRef,
+    xu_Release,
+    xu_XUserDuplicateHandle,
+    xu_XUserCloseHandle,
+    xu_XUserCompare,
+    xu_XUserGetMaxUsers,
+    xu_XUserAddAsync,
+    xu_XUserAddResult,
+    xu_XUserGetLocalId,
+    xu_XUserFindUserByLocalId,
+    xu_XUserGetId,
+    xu_XUserFindUserById,
+    xu_XUserGetIsGuest,
+    xu_XUserGetState,
+    xu_XUserGetGamertagLegacy,
+    xu_XUserGetGamerPictureAsync,
+    xu_XUserGetGamerPictureResultSize,
+    xu_XUserGetGamerPictureResult,
+    xu_XUserGetAgeGroup,
+    xu_XUserCheckPrivilege,
+    xu_XUserResolvePrivilegeWithUiAsync,
+    xu_XUserResolvePrivilegeWithUiResult,
+    xu_XUserGetTokenAndSignatureAsync,
+    xu_XUserGetTokenAndSignatureResultSize,
+    xu_XUserGetTokenAndSignatureResult,
+    xu_XUserGetTokenAndSignatureUtf16Async,
+    xu_XUserGetTokenAndSignatureUtf16ResultSize,
+    xu_XUserGetTokenAndSignatureUtf16Result,
+    xu_XUserResolveIssueWithUiAsync,
+    xu_XUserResolveIssueWithUiResult,
+    xu_XUserResolveIssueWithUiUtf16Async,
+    xu_XUserResolveIssueWithUiUtf16Result,
+    xu_XUserRegisterForChangeEvent,
+    xu_XUserUnregisterForChangeEvent,
+    xu_XUserGetSignOutDeferral,
+    xu_XUserCloseSignOutDeferralHandle,
+    xu_XUserAddByIdWithUiAsync,
+    xu_XUserAddByIdWithUiResult,
+    xu_XUserGetMsaTokenSilentlyAsync,
+    xu_XUserGetMsaTokenSilentlyResult,
+    xu_XUserGetMsaTokenSilentlyResultSize,
+    xu_XUserIsStoreUser,
+    xu_RemoteConnectSetHandlers,
+    xu_RemoteConnectCancel,
+    xu_SpopSetHandlers,
+    xu_SpopComplete,
+    xu_XUserIsSignOutPresent,
+    xu_XUserSignOutAsync,
+    xu_XUserSignOutResult,
+    xu_XUserImpl6_Ext50
+};
+
+static const IXUserGamertagImplVtbl g_xgamertag_vtbl = {
+    xu_QueryInterface,
+    xu_AddRef,
+    xu_Release,
+    xgt_XUserGetGamertag
 };
 
 static struct xgr_user_impl_obj g_xuser_singleton = {
-    g_xuser6_vtbl,
-    g_xgamertag_vtbl
+    &g_xuser6_vtbl,
+    &g_xgamertag_vtbl
 };
 
 HRESULT xgr_query_user(REFIID iid, void **ppv)
@@ -1120,6 +1228,10 @@ HRESULT xgr_query_user(REFIID iid, void **ppv)
 static HRESULT WINAPI xud_QueryInterface(void *iface, REFIID riid, void **ppv)
 {
     if (!ppv) return E_POINTER;
+    if (!riid) {
+        *ppv = NULL;
+        return E_INVALIDARG;
+    }
     if (IsEqualGUID(riid, &IID_IUnknown) ||
         IsEqualGUID(riid, &IID_IXUserDeviceImpl) ||
         IsEqualGUID(riid, &IID_IXUserDeviceImpl2)) {
@@ -1148,7 +1260,8 @@ static HRESULT WINAPI xud_FindForDevice(void *iface, const void *devId, XUserHan
 static HRESULT WINAPI xud_RegDevAssoc(void *iface, XTaskQueueHandle q, void *c, void *cb, XTaskQueueRegistrationToken *tok)
 {
     (void)iface; (void)q; (void)c; (void)cb;
-    if (tok) tok->token = 1;
+    if (!tok) return E_INVALIDARG;
+    tok->token = (uint64_t)InterlockedIncrement64(&g_next_dev_reg_token);
     return S_OK;
 }
 static BOOLEAN WINAPI xud_UnregDevAssoc(void *iface, XTaskQueueRegistrationToken tok, BOOLEAN w)
@@ -1166,7 +1279,8 @@ static HRESULT WINAPI xud_GetDefaultAudio(void *iface, XUserLocalId u, uint32_t 
 static HRESULT WINAPI xud_RegAudio(void *iface, XTaskQueueHandle q, void *c, void *cb, XTaskQueueRegistrationToken *tok)
 {
     (void)iface; (void)q; (void)c; (void)cb;
-    if (tok) tok->token = 2;
+    if (!tok) return E_INVALIDARG;
+    tok->token = (uint64_t)InterlockedIncrement64(&g_next_dev_reg_token);
     return S_OK;
 }
 static BOOLEAN WINAPI xud_UnregAudio(void *iface, XTaskQueueRegistrationToken tok, BOOLEAN w)
@@ -1186,21 +1300,37 @@ static HRESULT WINAPI xud_FindCtrlResult(void *iface, XAsyncBlock *ab, void *dev
     return xgr_async_get_result(ab, NULL, 0, NULL, NULL);
 }
 
-static const void *const g_xuser_device_vtbl[11] = {
-    (const void *)xud_QueryInterface,
-    (const void *)xu_AddRef,
-    (const void *)xu_Release,
-    (const void *)xud_FindForDevice,
-    (const void *)xud_RegDevAssoc,
-    (const void *)xud_UnregDevAssoc,
-    (const void *)xud_GetDefaultAudio,
-    (const void *)xud_RegAudio,
-    (const void *)xud_UnregAudio,
-    (const void *)xud_FindCtrlAsync,
-    (const void *)xud_FindCtrlResult
+typedef struct IXUserDeviceImpl2Vtbl {
+    HRESULT (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);                                                 /* 0 */
+    ULONG   (WINAPI *AddRef)(void *iface);                                                                                  /* 1 */
+    ULONG   (WINAPI *Release)(void *iface);                                                                                 /* 2 */
+    HRESULT (WINAPI *FindForDevice)(void *iface, const void *devId, XUserHandle *handle);                                   /* 3 */
+    HRESULT (WINAPI *RegDevAssoc)(void *iface, XTaskQueueHandle q, void *c, void *cb, XTaskQueueRegistrationToken *tok);    /* 4 */
+    BOOLEAN (WINAPI *UnregDevAssoc)(void *iface, XTaskQueueRegistrationToken tok, BOOLEAN w);                               /* 5 */
+    HRESULT (WINAPI *GetDefaultAudio)(void *iface, XUserLocalId u, uint32_t kind, SIZE_T cnt, WCHAR *out, SIZE_T *used);    /* 6 */
+    HRESULT (WINAPI *RegAudio)(void *iface, XTaskQueueHandle q, void *c, void *cb, XTaskQueueRegistrationToken *tok);       /* 7 */
+    BOOLEAN (WINAPI *UnregAudio)(void *iface, XTaskQueueRegistrationToken tok, BOOLEAN w);                                  /* 8 */
+    HRESULT (WINAPI *FindCtrlAsync)(void *iface, XUserHandle u, XAsyncBlock *ab);                                           /* 9 */
+    HRESULT (WINAPI *FindCtrlResult)(void *iface, XAsyncBlock *ab, void *devId);                                            /* 10 */
+} IXUserDeviceImpl2Vtbl;
+
+_Static_assert(sizeof(IXUserDeviceImpl2Vtbl) == 11 * sizeof(void *), "IXUserDeviceImpl2Vtbl must have exactly 11 slots");
+
+static const IXUserDeviceImpl2Vtbl g_xuser_device_vtbl = {
+    xud_QueryInterface,
+    xu_AddRef,
+    xu_Release,
+    xud_FindForDevice,
+    xud_RegDevAssoc,
+    xud_UnregDevAssoc,
+    xud_GetDefaultAudio,
+    xud_RegAudio,
+    xud_UnregAudio,
+    xud_FindCtrlAsync,
+    xud_FindCtrlResult
 };
 
-static struct { const void *lpVtbl; } g_xuser_device_singleton = { g_xuser_device_vtbl };
+static struct { const IXUserDeviceImpl2Vtbl *lpVtbl; } g_xuser_device_singleton = { &g_xuser_device_vtbl };
 
 HRESULT xgr_query_user_device(REFIID iid, void **ppv)
 {

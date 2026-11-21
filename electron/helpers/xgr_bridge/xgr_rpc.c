@@ -12,6 +12,10 @@
 
 #include "xgr_internal.h"
 #include <ctype.h>
+#include <errno.h>
+#ifndef _WIN32
+#include <sys/select.h>
+#endif
 
 static volatile LONG g_rpc_seq = 1;
 static INIT_ONCE g_rpc_once = INIT_ONCE_STATIC_INIT;
@@ -69,8 +73,12 @@ bool xgr_sb_reserve(XgrStrBuf *sb, size_t extra)
 
 bool xgr_sb_append_len(XgrStrBuf *sb, const char *str, size_t n)
 {
+    if (n > 0 && !str) {
+        if (sb) sb->failed = true;
+        return false;
+    }
     if (!xgr_sb_reserve(sb, n)) return false;
-    if (n > 0 && str) {
+    if (n > 0) {
         memcpy(sb->buf + sb->len, str, n);
     }
     sb->len += n;
@@ -150,7 +158,8 @@ bool xgr_sb_append_fmt(XgrStrBuf *sb, const char *fmt, ...)
         sb->failed = true;
         return false;
     }
-    sb->len += (size_t)n2;
+    size_t written = (n2 > n) ? (size_t)n : (size_t)n2;
+    sb->len += written;
     sb->buf[sb->len] = '\0';
     return true;
 }
@@ -218,19 +227,23 @@ char *xgr_json_escape_alloc(const char *raw)
  * Wide Environment Reader (`GetEnvironmentVariableW` -> UTF-8)
  * ------------------------------------------------------------------------- */
 
+static int hex_nibble(char c);
+
 bool xgr_get_env_utf8(const WCHAR *name, char *out_buf, size_t out_cap)
 {
     if (!out_buf || out_cap == 0) return false;
     out_buf[0] = '\0';
-    if (!name || !*name) return false;
+    /* Reject out_cap < 2: passing cbMultiByte == 0 to WideCharToMultiByte queries length without writing! */
+    if (out_cap < 2 || !name || !*name) return false;
 
+    int mb_cap = (out_cap - 1 > (size_t)INT_MAX) ? INT_MAX : (int)(out_cap - 1);
     WCHAR stack_w[512];
     DWORD wlen = GetEnvironmentVariableW(name, stack_w, (DWORD)(sizeof(stack_w) / sizeof(stack_w[0])));
     if (wlen == 0) return false;
 
     if (wlen < (DWORD)(sizeof(stack_w) / sizeof(stack_w[0]))) {
-        int u8 = WideCharToMultiByte(CP_UTF8, 0, stack_w, (int)wlen, out_buf, (int)(out_cap - 1), NULL, NULL);
-        if (u8 <= 0) {
+        int u8 = WideCharToMultiByte(CP_UTF8, 0, stack_w, (int)wlen, out_buf, mb_cap, NULL, NULL);
+        if (u8 <= 0 || (size_t)u8 >= out_cap) {
             out_buf[0] = '\0';
             return false;
         }
@@ -246,9 +259,9 @@ bool xgr_get_env_utf8(const WCHAR *name, char *out_buf, size_t out_cap)
         free(heap_w);
         return false;
     }
-    int u8 = WideCharToMultiByte(CP_UTF8, 0, heap_w, (int)got, out_buf, (int)(out_cap - 1), NULL, NULL);
+    int u8 = WideCharToMultiByte(CP_UTF8, 0, heap_w, (int)got, out_buf, mb_cap, NULL, NULL);
     free(heap_w);
-    if (u8 <= 0) {
+    if (u8 <= 0 || (size_t)u8 >= out_cap) {
         out_buf[0] = '\0';
         return false;
     }
@@ -265,6 +278,12 @@ static bool read_bridge_env(uint16_t *out_port, char out_key[65])
     if (strlen(key_buf) != 64) {
         SecureZeroMemory(key_buf, sizeof(key_buf));
         return false;
+    }
+    for (size_t i = 0; i < 64; i++) {
+        if (hex_nibble(key_buf[i]) < 0) {
+            SecureZeroMemory(key_buf, sizeof(key_buf));
+            return false;
+        }
     }
     char *end = NULL;
     unsigned long p = strtoul(port_str, &end, 10);
@@ -315,6 +334,10 @@ static bool parse_hex4_strict(const char *s, uint32_t *out_val)
 static bool append_utf8_codepoint(XgrStrBuf *sb, uint32_t cp)
 {
     char u8[4];
+    if (cp == 0) {
+        /* Never inject embedded NUL into C strings */
+        return xgr_sb_append_len(sb, "\xEF\xBF\xBD", 3);
+    }
     if (cp <= 0x7Fu) {
         u8[0] = (char)cp;
         return xgr_sb_append_len(sb, u8, 1);
@@ -510,6 +533,11 @@ char *xgr_json_alloc_string(const char *json, const char *key)
             return NULL;
         }
     }
+    if (*v != '"') {
+        /* Unterminated JSON string */
+        xgr_sb_free(&sb);
+        return NULL;
+    }
     return xgr_sb_detach(&sb);
 }
 
@@ -529,14 +557,22 @@ bool xgr_json_get_string(const char *json, const char *key, char *out_buf, size_
     return xgr_json_extract_string(json, key, out_buf, out_size);
 }
 
+static bool json_is_num_delim(char c, bool quoted)
+{
+    if (quoted) return c == '"';
+    return c == '\0' || c == ',' || c == '}' || c == ']' || isspace((unsigned char)c);
+}
+
 bool xgr_json_get_int64(const char *json, const char *key, int64_t *out_val)
 {
     const char *v = json_locate_key_value(json, key);
     if (!v || !out_val) return false;
-    if (*v == '"') v++;
+    bool quoted = (*v == '"');
+    if (quoted) v++;
+    errno = 0;
     char *end = NULL;
     long long parsed = _strtoi64(v, &end, 10);
-    if (end == v) return false;
+    if (end == v || errno == ERANGE || !json_is_num_delim(*end, quoted)) return false;
     *out_val = (int64_t)parsed;
     return true;
 }
@@ -545,10 +581,13 @@ bool xgr_json_get_uint64(const char *json, const char *key, uint64_t *out_val)
 {
     const char *v = json_locate_key_value(json, key);
     if (!v || !out_val) return false;
-    if (*v == '"') v++;
+    bool quoted = (*v == '"');
+    if (quoted) v++;
+    if (*v == '-') return false;
+    errno = 0;
     char *end = NULL;
     unsigned long long parsed = _strtoui64(v, &end, 10);
-    if (end == v) return false;
+    if (end == v || errno == ERANGE || !json_is_num_delim(*end, quoted)) return false;
     *out_val = (uint64_t)parsed;
     return true;
 }
@@ -557,21 +596,9 @@ bool xgr_json_get_bool(const char *json, const char *key, bool *out_val)
 {
     const char *v = json_locate_key_value(json, key);
     if (!v || !out_val) return false;
-    if (strncmp(v, "true", 4) == 0) { *out_val = true; return true; }
-    if (strncmp(v, "false", 5) == 0) { *out_val = false; return true; }
+    if (strncmp(v, "true", 4) == 0 && json_is_num_delim(v[4], false)) { *out_val = true; return true; }
+    if (strncmp(v, "false", 5) == 0 && json_is_num_delim(v[5], false)) { *out_val = false; return true; }
     return false;
-}
-
-static bool is_unescaped_quote_at(const char *base, const char *p)
-{
-    if (*p != '"') return false;
-    size_t backslashes = 0;
-    const char *q = p;
-    while (q > base && q[-1] == '\\') {
-        backslashes++;
-        q--;
-    }
-    return (backslashes & 1u) == 0;
 }
 
 static char *extract_json_subobject_alloc(const char *json, const char *key)
@@ -580,22 +607,32 @@ static char *extract_json_subobject_alloc(const char *json, const char *key)
     if (!v || *v != '{') return NULL;
     int depth = 0;
     bool in_str = false;
+    bool escaped = false;
     for (const char *p = v; *p; p++) {
-        if (is_unescaped_quote_at(v, p)) {
-            in_str = !in_str;
-        } else if (!in_str) {
-            if (*p == '{') {
-                depth++;
-            } else if (*p == '}') {
-                depth--;
-                if (depth == 0) {
-                    size_t len = (size_t)(p - v + 1);
-                    char *sub = (char *)malloc(len + 1);
-                    if (!sub) return NULL;
-                    memcpy(sub, v, len);
-                    sub[len] = '\0';
-                    return sub;
-                }
+        if (in_str) {
+            if (escaped) {
+                escaped = false;
+            } else if (*p == '\\') {
+                escaped = true;
+            } else if (*p == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        if (*p == '"') {
+            in_str = true;
+            escaped = false;
+        } else if (*p == '{') {
+            depth++;
+        } else if (*p == '}') {
+            depth--;
+            if (depth == 0) {
+                size_t len = (size_t)(p - v + 1);
+                char *sub = (char *)malloc(len + 1);
+                if (!sub) return NULL;
+                memcpy(sub, v, len);
+                sub[len] = '\0';
+                return sub;
             }
         }
     }
@@ -610,6 +647,7 @@ static const char k_b64_enc[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 
 char *xgr_base64_encode_alloc(const uint8_t *data, size_t len)
 {
+    if (len > 0 && !data) return NULL;
     if (len > (SIZE_MAX - 8) / 4 * 3) return NULL;
     size_t out_len = ((len + 2) / 3) * 4;
     char *out = (char *)malloc(out_len + 1);
@@ -723,18 +761,14 @@ void xgr_rpc_shutdown(void)
     LeaveCriticalSection(&g_rpc_cs);
 }
 
-static bool connect_rpc_sock_locked(uint16_t port, const char key[65])
+/* Establish a loopback TCP socket with a bounded 2500 ms connect timeout OUTSIDE g_rpc_cs */
+static SOCKET dial_rpc_sock_bounded(uint16_t port)
 {
-    close_rpc_sock_locked();
-
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return false;
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
 
-    BOOL nodelay = TRUE;
-    DWORD timeout_ms = 15000;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+    int nodelay = 1;
+    (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -742,16 +776,76 @@ static bool connect_rpc_sock_locked(uint16_t port, const char key[65])
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(0x7f000001u);
 
-    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        closesocket(s);
-        return false;
+    bool connected = false;
+#ifdef _WIN32
+    u_long nb = 1;
+    bool switched_nb = (ioctlsocket(s, FIONBIO, &nb) == 0);
+    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        connected = true;
+    } else if (switched_nb) {
+        int werr = WSAGetLastError();
+        if (werr == WSAEWOULDBLOCK || werr == WSAEINPROGRESS) {
+            fd_set wfds, efds;
+            FD_ZERO(&wfds);
+            FD_ZERO(&efds);
+            FD_SET(s, &wfds);
+            FD_SET(s, &efds);
+            struct timeval tv;
+            tv.tv_sec = 2;
+            tv.tv_usec = 500000;
+            int sel = select(0, NULL, &wfds, &efds, &tv);
+            if (sel > 0 && FD_ISSET(s, &wfds) && !FD_ISSET(s, &efds)) {
+                int so_err = 0;
+                int so_len = (int)sizeof(so_err);
+                if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&so_err, &so_len) == 0 && so_err == 0) {
+                    connected = true;
+                }
+            }
+        }
     }
+    if (switched_nb) {
+        nb = 0;
+        (void)ioctlsocket(s, FIONBIO, &nb);
+    }
+    DWORD timeout_ms = 15000;
+    (void)setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+    (void)setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+#else
+    int flags = fcntl(s, F_GETFL, 0);
+    bool switched_nb = (flags >= 0 && fcntl(s, F_SETFL, flags | O_NONBLOCK) == 0);
+    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        connected = true;
+    } else if (switched_nb && errno == EINPROGRESS) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(s, &wfds);
+        struct timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 500000;
+        int sel = select(s + 1, NULL, &wfds, NULL, &tv);
+        if (sel > 0 && FD_ISSET(s, &wfds)) {
+            int so_err = 0;
+            socklen_t so_len = (socklen_t)sizeof(so_err);
+            if (getsockopt(s, SOL_SOCKET, SO_ERROR, &so_err, &so_len) == 0 && so_err == 0) {
+                connected = true;
+            }
+        }
+    }
+    if (switched_nb) {
+        (void)fcntl(s, F_SETFL, flags);
+    }
+    struct timeval io_tv;
+    io_tv.tv_sec = 15;
+    io_tv.tv_usec = 0;
+    (void)setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &io_tv, sizeof(io_tv));
+    (void)setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &io_tv, sizeof(io_tv));
+#endif
 
-    g_rpc_sock = s;
-    g_rpc_sock_port = port;
-    memcpy(g_rpc_sock_key, key, 65);
-    g_rpc_sock_authed = false;
-    return true;
+    if (!connected) {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    return s;
 }
 
 static HRESULT exchange_rpc_frame_locked(
@@ -795,14 +889,23 @@ static HRESULT exchange_rpc_frame_locked(
 static HRESULT ensure_socket_preauthed_for_large_frame_locked(const char key[65])
 {
     if (g_rpc_sock_authed) return S_OK;
-    char auth_body[160];
-    int n = snprintf(auth_body, sizeof(auth_body), "{\"id\":0,\"key\":\"%s\",\"method\":\"auth\",\"params\":{}}", key);
-    if (n <= 0 || (size_t)n >= sizeof(auth_body)) return E_INVALIDARG;
+    XgrStrBuf auth_sb;
+    xgr_sb_init(&auth_sb);
+    xgr_sb_append_cstr(&auth_sb, "{\"id\":0,\"key\":");
+    xgr_sb_append_json_str(&auth_sb, key);
+    xgr_sb_append_cstr(&auth_sb, ",\"method\":\"auth\",\"params\":{}}");
+    size_t auth_len = auth_sb.len;
+    char *auth_body = xgr_sb_detach(&auth_sb);
+    if (!auth_body || auth_len == 0) {
+        free(auth_body);
+        return E_OUTOFMEMORY;
+    }
 
     char *auth_resp = NULL;
     uint32_t auth_resp_len = 0;
-    HRESULT hr = exchange_rpc_frame_locked(auth_body, (size_t)n, &auth_resp, &auth_resp_len);
-    SecureZeroMemory(auth_body, sizeof(auth_body));
+    HRESULT hr = exchange_rpc_frame_locked(auth_body, auth_len, &auth_resp, &auth_resp_len);
+    SecureZeroMemory(auth_body, auth_len);
+    free(auth_body);
     if (FAILED(hr)) return hr;
 
     bool ok = false;
@@ -833,8 +936,7 @@ HRESULT xgr_rpc_call(const char *method, const char *params_json_obj, char **out
         return HRESULT_FROM_WIN32(ERROR_ENVVAR_NOT_FOUND);
     }
 
-    InitOnceExecuteOnce(&g_rpc_once, init_rpc_once, NULL, NULL);
-    if (!g_wsa_ok) {
+    if (!InitOnceExecuteOnce(&g_rpc_once, init_rpc_once, NULL, NULL) || !g_wsa_ok) {
         SecureZeroMemory(key, sizeof(key));
         return E_FAIL;
     }
@@ -877,9 +979,28 @@ HRESULT xgr_rpc_call(const char *method, const char *params_json_obj, char **out
     bool reused_existing = (g_rpc_sock != INVALID_SOCKET);
     for (int attempt = 0; attempt < 2; attempt++) {
         if (g_rpc_sock == INVALID_SOCKET) {
-            if (!connect_rpc_sock_locked(port, key)) {
-                hr = HRESULT_FROM_WIN32(ERROR_CONNECTION_REFUSED);
-                break;
+            /* Dial outside g_rpc_cs with bounded 2.5s timeout so other threads never stall on dead port */
+            LeaveCriticalSection(&g_rpc_cs);
+            SOCKET dialed = dial_rpc_sock_bounded(port);
+            EnterCriticalSection(&g_rpc_cs);
+            if (dialed == INVALID_SOCKET) {
+                if (g_rpc_sock == INVALID_SOCKET ||
+                    g_rpc_sock_port != port ||
+                    strcmp(g_rpc_sock_key, key) != 0) {
+                    hr = HRESULT_FROM_WIN32(ERROR_CONNECTION_REFUSED);
+                    break;
+                }
+            } else if (g_rpc_sock != INVALID_SOCKET &&
+                       g_rpc_sock_port == port &&
+                       strcmp(g_rpc_sock_key, key) == 0) {
+                /* Another thread already established a matching socket while we dialed */
+                closesocket(dialed);
+            } else {
+                close_rpc_sock_locked();
+                g_rpc_sock = dialed;
+                g_rpc_sock_port = port;
+                memcpy(g_rpc_sock_key, key, 65);
+                g_rpc_sock_authed = false;
             }
         }
 
@@ -911,17 +1032,24 @@ HRESULT xgr_rpc_call(const char *method, const char *params_json_obj, char **out
     }
 
     if (SUCCEEDED(hr) && resp_buf) {
-        bool ok = false;
-        if (!xgr_json_get_bool(resp_buf, "ok", &ok) || !ok) {
-            int64_t remote_hr = (int64_t)E_FAIL;
-            xgr_json_get_int64(resp_buf, "hr", &remote_hr);
-            hr = (HRESULT)(uint32_t)remote_hr;
-            if (SUCCEEDED(hr)) hr = E_FAIL;
+        int64_t resp_id = 0;
+        if (xgr_json_get_int64(resp_buf, "id", &resp_id) && resp_id != (int64_t)req_id) {
+            /* Response id desync on persistent stream: close socket and fail closed */
+            close_rpc_sock_locked();
+            hr = E_UNEXPECTED;
         } else {
-            g_rpc_sock_authed = true;
-            if (out_result_json) {
-                *out_result_json = extract_json_subobject_alloc(resp_buf, "result");
-                if (!*out_result_json) *out_result_json = strdup("{}");
+            bool ok = false;
+            if (!xgr_json_get_bool(resp_buf, "ok", &ok) || !ok) {
+                int64_t remote_hr = (int64_t)E_FAIL;
+                xgr_json_get_int64(resp_buf, "hr", &remote_hr);
+                hr = (HRESULT)(uint32_t)remote_hr;
+                if (SUCCEEDED(hr)) hr = E_FAIL;
+            } else {
+                g_rpc_sock_authed = true;
+                if (out_result_json) {
+                    *out_result_json = extract_json_subobject_alloc(resp_buf, "result");
+                    if (!*out_result_json) *out_result_json = strdup("{}");
+                }
             }
         }
     }

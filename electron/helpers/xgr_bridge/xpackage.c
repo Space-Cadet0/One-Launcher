@@ -17,7 +17,7 @@ struct XPackageInstallationMonitorObject {
     XPackageInstallationProgress progress;
 };
 
-static uint64_t g_next_pkg_token = 500;
+_Alignas(8) static volatile LONGLONG g_next_pkg_token = 500;
 
 HRESULT xgr_package_mount_internal(const char *pkg_id, XPackageMountHandle *out)
 {
@@ -526,6 +526,7 @@ static HRESULT WINAPI xp_XPackageGetKind(void *iface, const char *pkgId, uint32_
 {
     (void)iface;
     if (!pkgId || !kind) return E_INVALIDARG;
+    xgr_ensure_session_metadata_loaded();
     struct xgr_runtime_config_snapshot cfg;
     xgr_copy_runtime_config_snapshot(&cfg);
     if (cfg.packageIdentifier[0] && _stricmp(pkgId, cfg.packageIdentifier) == 0) {
@@ -536,55 +537,99 @@ static HRESULT WINAPI xp_XPackageGetKind(void *iface, const char *pkgId, uint32_
     return S_OK;
 }
 
-static const void *const g_xpackage4_vtbl[42] = {
-    (const void *)xp_QueryInterface,                                    /* 0 */
-    (const void *)xp_AddRef,                                            /* 1 */
-    (const void *)xp_Release,                                           /* 2 */
-    (const void *)xp_XPackageGetCurrentProcessPackageIdentifier,        /* 3 */
-    (const void *)xp_XPackageIsPackagedProcess,                         /* 4 */
-    (const void *)xp_XPackageCreateInstallationMonitor,                 /* 5 */
-    (const void *)xp_XPackageCloseInstallationMonitorHandle,            /* 6 */
-    (const void *)xp_XPackageGetInstallationProgress,                   /* 7 */
-    (const void *)xp_XPackageUpdateInstallationMonitor,                 /* 8 */
-    (const void *)xp_XPackageRegisterInstallationProgressChanged,       /* 9 */
-    (const void *)xp_XPackageUnregisterInstallationProgressChanged,     /* 10 */
-    (const void *)xp_XPackageGetUserLocale,                             /* 11 */
-    (const void *)xp_XPackageFindChunkAvailability,                     /* 12 */
-    (const void *)xp_XPackageEnumerateChunkAvailability,                /* 13 */
-    (const void *)xp_XPackageChangeChunkInstallOrder,                   /* 14 */
-    (const void *)xp_XPackageInstallChunks,                             /* 15 */
-    (const void *)xp_XPackageInstallChunksAsync,                        /* 16 */
-    (const void *)xp_XPackageInstallChunksResult,                       /* 17 */
-    (const void *)xp_XPackageEstimateDownloadSize,                      /* 18 */
-    (const void *)xp_XPackageUninstallChunks,                           /* 19 */
-    (const void *)xp_XPackageEnumeratePackages,                         /* 20: Legacy */
-    (const void *)xp_XPackageRegisterPackageInstalled,                  /* 21: Legacy */
-    (const void *)xp_XPackageUnregisterPackageInstalled,                /* 22 */
-    (const void *)xp_XPackageMountLegacy,                               /* 23: Legacy */
-    (const void *)xp_XPackageGetMountPathSize,                          /* 24 */
-    (const void *)xp_XPackageGetMountPath,                              /* 25 */
-    (const void *)xp_XPackageCloseMountHandle,                          /* 26 */
-    (const void *)xp_XPackageGetIdentifierLegacy,                       /* 27: Legacy */
-    (const void *)xp_XPackageEnumeratePackages,                         /* 28 */
-    (const void *)xp_XPackageRegisterPackageInstalled,                  /* 29 */
-    (const void *)xp_XPackageGetWriteStats,                             /* 30 */
-    (const void *)xp_XPackageEnumerateFeatures,                         /* 31: Legacy */
-    (const void *)xp_XPackageUninstallUWPInstance,                      /* 32 */
-    (const void *)xp_XPackageEnumerateFeatures,                         /* 33 */
-    (const void *)xp_XPackageUninstallPackage,                          /* 34 */
-    /* IXPackageImpl2 */
-    (const void *)xp_XPackageEnumeratePackages,                         /* 35 */
-    (const void *)xp_XPackageRegisterPackageInstalled,                  /* 36 */
-    (const void *)xp_XPackageMountWithUiAsync,                          /* 37 */
-    (const void *)xp_XPackageMountWithUiResult,                         /* 38 */
-    /* IXPackageImpl3 */
-    (const void *)xp_XPackageEnumeratePackages,                         /* 39 */
-    (const void *)xp_XPackageRegisterPackageInstalled,                  /* 40 */
-    /* IXPackageImpl4 */
-    (const void *)xp_XPackageGetKind                                    /* 41 */
+typedef struct IXPackageImpl4Vtbl {
+    HRESULT (WINAPI *QueryInterface)(void *iface, REFIID riid, void **ppv);                                                 /* 0 */
+    ULONG   (WINAPI *AddRef)(void *iface);                                                                                  /* 1 */
+    ULONG   (WINAPI *Release)(void *iface);                                                                                 /* 2 */
+    HRESULT (WINAPI *XPackageGetCurrentProcessPackageIdentifier)(void *iface, SIZE_T bufferSize, char *buffer);             /* 3 */
+    BOOLEAN (WINAPI *XPackageIsPackagedProcess)(void *iface);                                                               /* 4 */
+    HRESULT (WINAPI *XPackageCreateInstallationMonitor)(void *iface, const char *pkgId, uint32_t selCnt, void *sels, uint32_t minMs, XTaskQueueHandle q, XPackageInstallationMonitorHandle *out); /* 5 */
+    void    (WINAPI *XPackageCloseInstallationMonitorHandle)(void *iface, XPackageInstallationMonitorHandle mon);           /* 6 */
+    void    (WINAPI *XPackageGetInstallationProgress)(void *iface, XPackageInstallationMonitorHandle mon, XPackageInstallationProgress *prog); /* 7 */
+    BOOLEAN (WINAPI *XPackageUpdateInstallationMonitor)(void *iface, XPackageInstallationMonitorHandle mon);                /* 8 */
+    HRESULT (WINAPI *XPackageRegisterInstallationProgressChanged)(void *iface, XPackageInstallationMonitorHandle mon, void *ctx, void *cb, XTaskQueueRegistrationToken *tok); /* 9 */
+    BOOLEAN (WINAPI *XPackageUnregisterInstallationProgressChanged)(void *iface, XPackageInstallationMonitorHandle mon, XTaskQueueRegistrationToken tok, BOOLEAN wait); /* 10 */
+    HRESULT (WINAPI *XPackageGetUserLocale)(void *iface, SIZE_T localeSize, char *locale);                                  /* 11 */
+    HRESULT (WINAPI *XPackageFindChunkAvailability)(void *iface, const char *pkgId, uint32_t selCnt, void *sels, uint32_t *avail); /* 12 */
+    HRESULT (WINAPI *XPackageEnumerateChunkAvailability)(void *iface, const char *pkgId, uint32_t type, void *ctx, void *cb); /* 13 */
+    HRESULT (WINAPI *XPackageChangeChunkInstallOrder)(void *iface, const char *pkgId, uint32_t selCnt, void *sels);         /* 14 */
+    HRESULT (WINAPI *XPackageInstallChunks)(void *iface, const char *pkgId, uint32_t selCnt, void *sels, uint32_t minMs, BOOLEAN sup, XTaskQueueHandle q, XPackageInstallationMonitorHandle *out); /* 15 */
+    HRESULT (WINAPI *XPackageInstallChunksAsync)(void *iface, const char *pkgId, uint32_t selCnt, void *sels, uint32_t minMs, BOOLEAN sup, XAsyncBlock *async); /* 16 */
+    HRESULT (WINAPI *XPackageInstallChunksResult)(void *iface, XAsyncBlock *async, XPackageInstallationMonitorHandle *out); /* 17 */
+    HRESULT (WINAPI *XPackageEstimateDownloadSize)(void *iface, const char *pkgId, uint32_t selCnt, void *sels, uint64_t *dlSize, BOOLEAN *shouldPresent); /* 18 */
+    HRESULT (WINAPI *XPackageUninstallChunks)(void *iface, const char *pkgId, uint32_t selCnt, void *sels);                 /* 19 */
+    HRESULT (WINAPI *XPackageEnumeratePackagesLegacy)(void *iface, uint32_t kind, uint32_t scope, void *ctx, XPackageEnumerationCallback *cb); /* 20 */
+    HRESULT (WINAPI *XPackageRegisterPackageInstalledLegacy)(void *iface, XTaskQueueHandle q, void *ctx, void *cb, XTaskQueueRegistrationToken *tok); /* 21 */
+    BOOLEAN (WINAPI *XPackageUnregisterPackageInstalled)(void *iface, XTaskQueueRegistrationToken tok, BOOLEAN wait);       /* 22 */
+    HRESULT (WINAPI *XPackageMountLegacy)(void *iface, const char *pkgId, XPackageMountHandle *mount);                      /* 23 */
+    HRESULT (WINAPI *XPackageGetMountPathSize)(void *iface, XPackageMountHandle mount, SIZE_T *pathSize);                   /* 24 */
+    HRESULT (WINAPI *XPackageGetMountPath)(void *iface, XPackageMountHandle mount, SIZE_T pathSize, char *path);            /* 25 */
+    void    (WINAPI *XPackageCloseMountHandle)(void *iface, XPackageMountHandle mount);                                     /* 26 */
+    HRESULT (WINAPI *XPackageGetIdentifierLegacy)(void *iface, const char *storeId, SIZE_T size, char *identifier);         /* 27 */
+    HRESULT (WINAPI *XPackageEnumeratePackages)(void *iface, uint32_t kind, uint32_t scope, void *ctx, XPackageEnumerationCallback *cb); /* 28 */
+    HRESULT (WINAPI *XPackageRegisterPackageInstalled)(void *iface, XTaskQueueHandle q, void *ctx, void *cb, XTaskQueueRegistrationToken *tok); /* 29 */
+    HRESULT (WINAPI *XPackageGetWriteStats)(void *iface, XPackageWriteStats *stats);                                        /* 30 */
+    HRESULT (WINAPI *XPackageEnumerateFeaturesLegacy)(void *iface, const char *pkgId, void *ctx, void *cb);                 /* 31 */
+    HRESULT (WINAPI *XPackageUninstallUWPInstance)(void *iface, const char *pkgName);                                       /* 32 */
+    HRESULT (WINAPI *XPackageEnumerateFeatures)(void *iface, const char *pkgId, void *ctx, void *cb);                       /* 33 */
+    BOOLEAN (WINAPI *XPackageUninstallPackage)(void *iface, const char *pkgId);                                             /* 34 */
+    HRESULT (WINAPI *XPackageEnumeratePackages2)(void *iface, uint32_t kind, uint32_t scope, void *ctx, XPackageEnumerationCallback *cb); /* 35 */
+    HRESULT (WINAPI *XPackageRegisterPackageInstalled2)(void *iface, XTaskQueueHandle q, void *ctx, void *cb, XTaskQueueRegistrationToken *tok); /* 36 */
+    HRESULT (WINAPI *XPackageMountWithUiAsync)(void *iface, const char *pkgId, XAsyncBlock *async);                         /* 37 */
+    HRESULT (WINAPI *XPackageMountWithUiResult)(void *iface, XAsyncBlock *async, XPackageMountHandle *mount);               /* 38 */
+    HRESULT (WINAPI *XPackageEnumeratePackages3)(void *iface, uint32_t kind, uint32_t scope, void *ctx, XPackageEnumerationCallback *cb); /* 39 */
+    HRESULT (WINAPI *XPackageRegisterPackageInstalled3)(void *iface, XTaskQueueHandle q, void *ctx, void *cb, XTaskQueueRegistrationToken *tok); /* 40 */
+    HRESULT (WINAPI *XPackageGetKind)(void *iface, const char *pkgId, uint32_t *kind);                                      /* 41 */
+} IXPackageImpl4Vtbl;
+
+_Static_assert(sizeof(IXPackageImpl4Vtbl) == 42 * sizeof(void *), "IXPackageImpl4Vtbl must have exactly 42 slots");
+
+static const IXPackageImpl4Vtbl g_xpackage4_vtbl = {
+    xp_QueryInterface,
+    xp_AddRef,
+    xp_Release,
+    xp_XPackageGetCurrentProcessPackageIdentifier,
+    xp_XPackageIsPackagedProcess,
+    xp_XPackageCreateInstallationMonitor,
+    xp_XPackageCloseInstallationMonitorHandle,
+    xp_XPackageGetInstallationProgress,
+    xp_XPackageUpdateInstallationMonitor,
+    xp_XPackageRegisterInstallationProgressChanged,
+    xp_XPackageUnregisterInstallationProgressChanged,
+    xp_XPackageGetUserLocale,
+    xp_XPackageFindChunkAvailability,
+    xp_XPackageEnumerateChunkAvailability,
+    xp_XPackageChangeChunkInstallOrder,
+    xp_XPackageInstallChunks,
+    xp_XPackageInstallChunksAsync,
+    xp_XPackageInstallChunksResult,
+    xp_XPackageEstimateDownloadSize,
+    xp_XPackageUninstallChunks,
+    xp_XPackageEnumeratePackages,
+    xp_XPackageRegisterPackageInstalled,
+    xp_XPackageUnregisterPackageInstalled,
+    xp_XPackageMountLegacy,
+    xp_XPackageGetMountPathSize,
+    xp_XPackageGetMountPath,
+    xp_XPackageCloseMountHandle,
+    xp_XPackageGetIdentifierLegacy,
+    xp_XPackageEnumeratePackages,
+    xp_XPackageRegisterPackageInstalled,
+    xp_XPackageGetWriteStats,
+    xp_XPackageEnumerateFeatures,
+    xp_XPackageUninstallUWPInstance,
+    xp_XPackageEnumerateFeatures,
+    xp_XPackageUninstallPackage,
+    xp_XPackageEnumeratePackages,
+    xp_XPackageRegisterPackageInstalled,
+    xp_XPackageMountWithUiAsync,
+    xp_XPackageMountWithUiResult,
+    xp_XPackageEnumeratePackages,
+    xp_XPackageRegisterPackageInstalled,
+    xp_XPackageGetKind
 };
 
-static struct { const void *lpVtbl; } g_xpackage_singleton = { g_xpackage4_vtbl };
+static struct { const IXPackageImpl4Vtbl *lpVtbl; } g_xpackage_singleton = { &g_xpackage4_vtbl };
 
 HRESULT xgr_query_package(REFIID iid, void **ppv)
 {

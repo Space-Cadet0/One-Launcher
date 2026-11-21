@@ -6,6 +6,11 @@
 #include "xgr_internal.h"
 #include <ctype.h>
 
+/* External SRWLOCK protecting g_xgr_cfg so memset(&g_xgr_cfg, 0, ...) never wipes a live lock */
+static SRWLOCK g_xgr_cfg_lock = SRWLOCK_INIT;
+/* Single-flight guard for session.init RPC (always acquired OUTSIDE g_xgr_cfg_lock) */
+static SRWLOCK g_session_meta_rpc_lock = SRWLOCK_INIT;
+
 static const uint32_t k_sha256[64] = {
     0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
     0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
@@ -160,6 +165,22 @@ static char *xml_strip_comments_alloc(const char *xml)
     return out;
 }
 
+static const char *xml_find_tag_end(const char *p)
+{
+    if (!p) return NULL;
+    char quote = 0;
+    while (*p) {
+        if (quote) {
+            if (*p == quote) quote = 0;
+        } else {
+            if (*p == '"' || *p == '\'') quote = *p;
+            else if (*p == '>') return p;
+        }
+        p++;
+    }
+    return NULL;
+}
+
 static char *xml_strip_tag_blocks_ci_alloc(const char *xml, const char *tag_name)
 {
     if (!xml || !tag_name || !*tag_name) return NULL;
@@ -179,15 +200,25 @@ static char *xml_strip_tag_blocks_ci_alloc(const char *xml, const char *tag_name
         if (_strnicmp(p, open_pat, open_len) == 0) {
             char next_ch = p[open_len];
             if (next_ch == '>' || next_ch == '/' || isspace((unsigned char)next_ch)) {
-                const char *gt = strchr(p + open_len, '>');
+                const char *gt = xml_find_tag_end(p + open_len);
                 if (!gt) break;
-                if (gt > p && gt[-1] == '/') {
+                const char *slash_check = gt - 1;
+                while (slash_check > p && isspace((unsigned char)*slash_check)) slash_check--;
+                if (slash_check >= p + open_len && *slash_check == '/') {
                     p = gt + 1;
                     continue;
                 }
-                const char *close_tag = ci_find(gt + 1, close_pat);
-                if (!close_tag) break;
-                const char *close_gt = strchr(close_tag + close_len, '>');
+                const char *close_scan = gt + 1;
+                const char *close_gt = NULL;
+                while ((close_scan = ci_find(close_scan, close_pat)) != NULL) {
+                    const char *after = close_scan + close_len;
+                    while (*after && isspace((unsigned char)*after)) after++;
+                    if (*after == '>') {
+                        close_gt = after;
+                        break;
+                    }
+                    close_scan += close_len;
+                }
                 if (!close_gt) break;
                 p = close_gt + 1;
                 continue;
@@ -299,26 +330,40 @@ static void xml_copy_decoded_slice(const char *start, const char *end, char *out
 
 static bool xml_extract_tag_value(const char *xml, const char *tag_name, char *out, size_t out_size)
 {
+    if (!xml || !tag_name || !out || out_size == 0) return false;
     char open_pat[64], close_pat[64];
     snprintf(open_pat, sizeof(open_pat), "<%s", tag_name);
-    snprintf(close_pat, sizeof(close_pat), "</%s>", tag_name);
+    snprintf(close_pat, sizeof(close_pat), "</%s", tag_name);
 
     const char *p = xml;
     size_t open_len = strlen(open_pat);
+    size_t close_len = strlen(close_pat);
     while ((p = ci_find(p, open_pat)) != NULL) {
         char next_ch = p[open_len];
         if (next_ch != '>' && next_ch != '/' && next_ch != ' ' && next_ch != '\t' && next_ch != '\r' && next_ch != '\n') {
             p += open_len;
             continue;
         }
-        const char *gt = strchr(p, '>');
+        const char *gt = xml_find_tag_end(p + open_len);
         if (!gt) return false;
-        if (gt > p && gt[-1] == '/') {
+        const char *slash_check = gt - 1;
+        while (slash_check > p && isspace((unsigned char)*slash_check)) slash_check--;
+        if (slash_check >= p + open_len && *slash_check == '/') {
             p = gt + 1;
             continue;
         }
         gt++;
-        const char *end = ci_find(gt, close_pat);
+        const char *end = NULL;
+        const char *scan = gt;
+        while ((scan = ci_find(scan, close_pat)) != NULL) {
+            const char *after = scan + close_len;
+            while (*after && isspace((unsigned char)*after)) after++;
+            if (*after == '>') {
+                end = scan;
+                break;
+            }
+            scan += close_len;
+        }
         if (!end) return false;
         while (gt < end && isspace((unsigned char)*gt)) gt++;
         while (end > gt && isspace((unsigned char)end[-1])) end--;
@@ -330,22 +375,41 @@ static bool xml_extract_tag_value(const char *xml, const char *tag_name, char *o
 
 static bool xml_extract_attr_from_element(const char *elem_start, const char *elem_end, const char *attr_name, char *out, size_t out_size)
 {
+    if (!elem_start || !elem_end || elem_end <= elem_start || !attr_name || !out || out_size == 0) return false;
     size_t alen = strlen(attr_name);
-    for (const char *p = elem_start; p + alen + 2 < elem_end; p++) {
-        if (_strnicmp(p, attr_name, alen) == 0 &&
-            (p == elem_start || isspace((unsigned char)p[-1]))) {
-            const char *q = p + alen;
-            while (q < elem_end && isspace((unsigned char)*q)) q++;
-            if (q >= elem_end || *q != '=') continue;
-            q++;
-            while (q < elem_end && isspace((unsigned char)*q)) q++;
-            if (q >= elem_end || (*q != '"' && *q != '\'')) continue;
-            char quote = *q++;
-            const char *val_end = (const char *)memchr(q, quote, (size_t)(elem_end - q));
-            if (!val_end) return false;
-            xml_copy_decoded_slice(q, val_end, out, out_size);
+    const char *p = elem_start;
+    while (p < elem_end) {
+        while (p < elem_end && (isspace((unsigned char)*p) || *p == '/')) p++;
+        if (p >= elem_end) break;
+
+        const char *name_start = p;
+        while (p < elem_end && !isspace((unsigned char)*p) && *p != '=' && *p != '/' && *p != '>') p++;
+        size_t name_len = (size_t)(p - name_start);
+
+        while (p < elem_end && isspace((unsigned char)*p)) p++;
+        if (p >= elem_end || *p != '=') {
+            if (p < elem_end && (*p == '"' || *p == '\'')) {
+                char q = *p++;
+                const char *qe = (const char *)memchr(p, q, (size_t)(elem_end - p));
+                p = qe ? qe + 1 : elem_end;
+            } else if (p < elem_end && p == name_start) {
+                p++;
+            }
+            continue;
+        }
+        p++; /* skip '=' */
+        while (p < elem_end && isspace((unsigned char)*p)) p++;
+        if (p >= elem_end || (*p != '"' && *p != '\'')) continue;
+        char quote = *p++;
+        const char *val_start = p;
+        const char *val_end = (const char *)memchr(val_start, quote, (size_t)(elem_end - val_start));
+        if (!val_end) return false;
+
+        if (name_len == alen && _strnicmp(name_start, attr_name, alen) == 0) {
+            xml_copy_decoded_slice(val_start, val_end, out, out_size);
             return true;
         }
+        p = val_end + 1;
     }
     return false;
 }
@@ -362,7 +426,7 @@ static bool xml_extract_tag_attr(const char *xml, const char *tag_name, const ch
             p += open_len;
             continue;
         }
-        const char *gt = strchr(p, '>');
+        const char *gt = xml_find_tag_end(p + open_len);
         if (!gt) return false;
         if (xml_extract_attr_from_element(p + open_len, gt, attr_name, out, out_size))
             return true;
@@ -422,22 +486,61 @@ static char *read_utf8_file_alloc(const wchar_t *path)
         CloseHandle(hf);
         return NULL;
     }
-    char *buf = (char *)calloc((size_t)sz.QuadPart + 1, 1);
+    size_t want = (size_t)sz.QuadPart;
+    char *buf = (char *)calloc(want + 2, 1);
     if (!buf) {
         CloseHandle(hf);
         return NULL;
     }
-    DWORD rd = 0;
-    if (!ReadFile(hf, buf, (DWORD)sz.QuadPart, &rd, NULL)) {
-        free(buf);
-        CloseHandle(hf);
-        return NULL;
+    size_t total = 0;
+    while (total < want) {
+        DWORD rd = 0;
+        if (!ReadFile(hf, buf + total, (DWORD)(want - total), &rd, NULL)) {
+            free(buf);
+            CloseHandle(hf);
+            return NULL;
+        }
+        if (rd == 0) break;
+        total += (size_t)rd;
     }
-    buf[rd] = '\0';
+    buf[total] = '\0';
     CloseHandle(hf);
+
+    /* Convert UTF-16LE BOM (0xFF 0xFE) to UTF-8 */
+    if (total >= 2 && (uint8_t)buf[0] == 0xFFu && (uint8_t)buf[1] == 0xFEu) {
+        size_t wchar_cnt = (total - 2) / 2;
+        wchar_t *wtmp = (wchar_t *)calloc(wchar_cnt + 1, sizeof(wchar_t));
+        if (!wtmp) {
+            free(buf);
+            return NULL;
+        }
+        const uint8_t *src = (const uint8_t *)(buf + 2);
+        for (size_t i = 0; i < wchar_cnt; i++) {
+            wtmp[i] = (wchar_t)((uint16_t)src[i * 2] | ((uint16_t)src[i * 2 + 1] << 8));
+        }
+        wtmp[wchar_cnt] = L'\0';
+        free(buf);
+        int u8_need = WideCharToMultiByte(CP_UTF8, 0, wtmp, (int)wchar_cnt, NULL, 0, NULL, NULL);
+        if (u8_need < 0) {
+            free(wtmp);
+            return NULL;
+        }
+        char *u8_buf = (char *)calloc((size_t)u8_need + 1, 1);
+        if (!u8_buf) {
+            free(wtmp);
+            return NULL;
+        }
+        if (u8_need > 0) {
+            WideCharToMultiByte(CP_UTF8, 0, wtmp, (int)wchar_cnt, u8_buf, u8_need, NULL, NULL);
+        }
+        u8_buf[u8_need] = '\0';
+        free(wtmp);
+        return u8_buf;
+    }
+
     /* Strip UTF-8 BOM if present */
-    if (rd >= 3 && (uint8_t)buf[0] == 0xEF && (uint8_t)buf[1] == 0xBB && (uint8_t)buf[2] == 0xBF) {
-        memmove(buf, buf + 3, rd - 2);
+    if (total >= 3 && (uint8_t)buf[0] == 0xEFu && (uint8_t)buf[1] == 0xBBu && (uint8_t)buf[2] == 0xBFu) {
+        memmove(buf, buf + 3, total - 2);
     }
     return buf;
 }
@@ -566,8 +669,8 @@ static void apply_game_config_xml(const char *raw_xml)
         if (ext) {
             const char *lt = ext;
             while (lt > xml && *lt != '<') lt--;
-            const char *gt = strchr(ext, '>');
-            if (gt && xml_extract_attr_from_element(lt, gt, "Value", tmp, sizeof(tmp)) && tmp[0]) {
+            const char *gt = xml_find_tag_end(lt + 1);
+            if (gt && xml_extract_attr_from_element(lt + 1, gt, "Value", tmp, sizeof(tmp)) && tmp[0]) {
                 for (size_t i = 0; tmp[i]; i++) tmp[i] = (char)tolower((unsigned char)tmp[i]);
                 snprintf(g_xgr_cfg.scid, sizeof(g_xgr_cfg.scid), "%s", tmp);
             }
@@ -624,9 +727,9 @@ static bool read_first_nonempty_env(const WCHAR *primary_name, const WCHAR *seco
 
 void xgr_load_runtime_config(const struct xgr_initialize_options *options)
 {
-    AcquireSRWLockExclusive(&g_xgr_cfg.lock);
+    AcquireSRWLockExclusive(&g_xgr_cfg_lock);
     if (g_xgr_cfg.initialized && !(options && options->gameConfig)) {
-        ReleaseSRWLockExclusive(&g_xgr_cfg.lock);
+        ReleaseSRWLockExclusive(&g_xgr_cfg_lock);
         return;
     }
 
@@ -824,7 +927,7 @@ void xgr_load_runtime_config(const struct xgr_initialize_options *options)
     }
 
     g_xgr_cfg.initialized = true;
-    ReleaseSRWLockExclusive(&g_xgr_cfg.lock);
+    ReleaseSRWLockExclusive(&g_xgr_cfg_lock);
 
     if (startup_invite_uri[0]) {
         xgr_set_pending_invite_uri(startup_invite_uri);
@@ -833,24 +936,22 @@ void xgr_load_runtime_config(const struct xgr_initialize_options *options)
 
 void xgr_runtime_config_reset(void)
 {
-    AcquireSRWLockExclusive(&g_xgr_cfg.lock);
-    SRWLOCK saved_lock = g_xgr_cfg.lock;
+    AcquireSRWLockExclusive(&g_xgr_cfg_lock);
     memset(&g_xgr_cfg, 0, sizeof(g_xgr_cfg));
-    g_xgr_cfg.lock = saved_lock;
-    ReleaseSRWLockExclusive(&g_xgr_cfg.lock);
+    ReleaseSRWLockExclusive(&g_xgr_cfg_lock);
 }
 
 void xgr_copy_runtime_config_snapshot(struct xgr_runtime_config_snapshot *out_snap)
 {
     if (!out_snap) return;
-    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    AcquireSRWLockShared(&g_xgr_cfg_lock);
     bool init = g_xgr_cfg.initialized;
-    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    ReleaseSRWLockShared(&g_xgr_cfg_lock);
     if (!init) {
         xgr_load_runtime_config(NULL);
     }
 
-    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    AcquireSRWLockShared(&g_xgr_cfg_lock);
     out_snap->initialized = g_xgr_cfg.initialized;
     out_snap->packaged = g_xgr_cfg.packaged;
     out_snap->fullTrust = g_xgr_cfg.fullTrust;
@@ -869,40 +970,82 @@ void xgr_copy_runtime_config_snapshot(struct xgr_runtime_config_snapshot *out_sn
     memcpy(out_snap->locale, g_xgr_cfg.locale, sizeof(out_snap->locale));
     memcpy(out_snap->saveRootUtf8, g_xgr_cfg.saveRootUtf8, sizeof(out_snap->saveRootUtf8));
     out_snap->version = g_xgr_cfg.version;
-    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    ReleaseSRWLockShared(&g_xgr_cfg_lock);
 }
 
 void xgr_copy_game_root_utf8(char *out_buf, size_t out_size)
 {
     if (!out_buf || out_size == 0) return;
-    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    AcquireSRWLockShared(&g_xgr_cfg_lock);
     bool init = g_xgr_cfg.initialized;
-    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    ReleaseSRWLockShared(&g_xgr_cfg_lock);
     if (!init) {
         xgr_load_runtime_config(NULL);
     }
 
-    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    AcquireSRWLockShared(&g_xgr_cfg_lock);
     snprintf(out_buf, out_size, "%s", g_xgr_cfg.gameRootUtf8);
-    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    ReleaseSRWLockShared(&g_xgr_cfg_lock);
 }
 
 static const char *cfg_find_json_array(const char *json, const char *key)
 {
     if (!json || !key) return NULL;
-    char pat[128];
-    int plen = snprintf(pat, sizeof(pat), "\"%s\"", key);
-    if (plen <= 0 || (size_t)plen >= sizeof(pat)) return NULL;
+    size_t key_len = strlen(key);
     const char *p = json;
-    while ((p = strstr(p, pat)) != NULL) {
-        const char *after = p + plen;
-        while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') after++;
-        if (*after == ':') {
-            after++;
-            while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') after++;
-            return (*after == '[') ? after : NULL;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '{') return NULL;
+
+    int depth = 0;
+    bool expect_key = false;
+    while (*p) {
+        char ch = *p;
+        if (ch == '"') {
+            const char *str_start = ++p;
+            while (*p && *p != '"') {
+                if (*p == '\\') {
+                    p++;
+                    if (!*p) return NULL;
+                }
+                p++;
+            }
+            if (!*p) return NULL;
+            const char *str_end = p;
+            p++;
+            if (depth == 1 && expect_key) {
+                bool match = ((size_t)(str_end - str_start) == key_len) &&
+                             (key_len == 0 || memcmp(str_start, key, key_len) == 0);
+                const char *after = p;
+                while (*after && isspace((unsigned char)*after)) after++;
+                if (*after == ':') {
+                    after++;
+                    while (*after && isspace((unsigned char)*after)) after++;
+                    expect_key = false;
+                    if (match) {
+                        return (*after == '[') ? after : NULL;
+                    }
+                    p = after;
+                    continue;
+                }
+            }
+            continue;
         }
-        p += plen;
+        if (ch == '{') {
+            depth++;
+            if (depth == 1) expect_key = true;
+        } else if (ch == '}') {
+            depth--;
+            if (depth <= 0) break;
+        } else if (ch == '[') {
+            depth++;
+        } else if (ch == ']') {
+            depth--;
+            if (depth <= 0) break;
+        } else if (depth == 1) {
+            if (ch == ',') expect_key = true;
+            else if (ch == ':') expect_key = false;
+        }
+        p++;
     }
     return NULL;
 }
@@ -1020,7 +1163,7 @@ void xgr_apply_session_init_json(const char *res_json)
         }
     }
 
-    AcquireSRWLockExclusive(&g_xgr_cfg.lock);
+    AcquireSRWLockExclusive(&g_xgr_cfg_lock);
     g_xgr_cfg.sessionMetadataLoaded = true;
     if (has_offline) {
         g_xgr_cfg.offline = offline_val;
@@ -1058,7 +1201,7 @@ void xgr_apply_session_init_json(const char *res_json)
         g_xgr_cfg.dlcCount = parsed_dlc_count;
         memcpy(g_xgr_cfg.dlcPackages, parsed_dlcs, sizeof(parsed_dlcs));
     }
-    ReleaseSRWLockExclusive(&g_xgr_cfg.lock);
+    ReleaseSRWLockExclusive(&g_xgr_cfg_lock);
 
     if (has_invite) {
         xgr_set_pending_invite_uri(inv_buf);
@@ -1067,18 +1210,29 @@ void xgr_apply_session_init_json(const char *res_json)
 
 void xgr_ensure_session_metadata_loaded(void)
 {
-    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    AcquireSRWLockShared(&g_xgr_cfg_lock);
     bool init = g_xgr_cfg.initialized;
     bool loaded = g_xgr_cfg.sessionMetadataLoaded;
-    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    ReleaseSRWLockShared(&g_xgr_cfg_lock);
 
     if (!init) {
         xgr_load_runtime_config(NULL);
-        AcquireSRWLockShared(&g_xgr_cfg.lock);
+        AcquireSRWLockShared(&g_xgr_cfg_lock);
         loaded = g_xgr_cfg.sessionMetadataLoaded;
-        ReleaseSRWLockShared(&g_xgr_cfg.lock);
+        ReleaseSRWLockShared(&g_xgr_cfg_lock);
     }
     if (loaded || !xgr_rpc_is_configured()) {
+        return;
+    }
+
+    /* Single-flight guard prevents concurrent threads from stampeding session.init RPC */
+    AcquireSRWLockExclusive(&g_session_meta_rpc_lock);
+
+    AcquireSRWLockShared(&g_xgr_cfg_lock);
+    loaded = g_xgr_cfg.sessionMetadataLoaded;
+    ReleaseSRWLockShared(&g_xgr_cfg_lock);
+    if (loaded || !xgr_rpc_is_configured()) {
+        ReleaseSRWLockExclusive(&g_session_meta_rpc_lock);
         return;
     }
 
@@ -1098,32 +1252,36 @@ void xgr_ensure_session_metadata_loaded(void)
     xgr_sb_append_char(&sb, '}');
 
     char *params = xgr_sb_detach(&sb);
-    if (!params) return;
+    if (!params) {
+        ReleaseSRWLockExclusive(&g_session_meta_rpc_lock);
+        return;
+    }
 
     char *res = NULL;
     if (SUCCEEDED(xgr_rpc_call("session.init", params, &res)) && res) {
         xgr_apply_session_init_json(res);
     } else {
-        AcquireSRWLockExclusive(&g_xgr_cfg.lock);
+        AcquireSRWLockExclusive(&g_xgr_cfg_lock);
         g_xgr_cfg.sessionMetadataLoaded = true;
         g_xgr_cfg.offline = true;
-        ReleaseSRWLockExclusive(&g_xgr_cfg.lock);
+        ReleaseSRWLockExclusive(&g_xgr_cfg_lock);
     }
     free(res);
     free(params);
+    ReleaseSRWLockExclusive(&g_session_meta_rpc_lock);
 }
 
 bool xgr_is_offline_mode(void)
 {
-    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    AcquireSRWLockShared(&g_xgr_cfg_lock);
     bool init = g_xgr_cfg.initialized;
     bool off = g_xgr_cfg.offline;
-    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    ReleaseSRWLockShared(&g_xgr_cfg_lock);
     if (!init) {
         xgr_load_runtime_config(NULL);
-        AcquireSRWLockShared(&g_xgr_cfg.lock);
+        AcquireSRWLockShared(&g_xgr_cfg_lock);
         off = g_xgr_cfg.offline;
-        ReleaseSRWLockShared(&g_xgr_cfg.lock);
+        ReleaseSRWLockShared(&g_xgr_cfg_lock);
     }
     if (!xgr_rpc_is_configured()) return true;
     return off;
@@ -1131,22 +1289,22 @@ bool xgr_is_offline_mode(void)
 
 void xgr_set_offline_mode(bool offline)
 {
-    AcquireSRWLockExclusive(&g_xgr_cfg.lock);
+    AcquireSRWLockExclusive(&g_xgr_cfg_lock);
     g_xgr_cfg.offline = offline;
-    ReleaseSRWLockExclusive(&g_xgr_cfg.lock);
+    ReleaseSRWLockExclusive(&g_xgr_cfg_lock);
 }
 
 uint32_t xgr_copy_dlc_packages(struct xgr_dlc_package_entry *out_entries, uint32_t max_entries)
 {
     xgr_ensure_session_metadata_loaded();
-    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    AcquireSRWLockShared(&g_xgr_cfg_lock);
     uint32_t count = g_xgr_cfg.dlcCount;
     if (out_entries && max_entries > 0 && count > 0) {
         uint32_t n = count < max_entries ? count : max_entries;
         memcpy(out_entries, g_xgr_cfg.dlcPackages, n * sizeof(*out_entries));
         count = n;
     }
-    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    ReleaseSRWLockShared(&g_xgr_cfg_lock);
     return count;
 }
 
@@ -1182,7 +1340,7 @@ bool xgr_find_dlc_mount_path(const char *pkg_id, char *out_mount_path, size_t ou
     xgr_ensure_session_metadata_loaded();
 
     bool found = false;
-    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    AcquireSRWLockShared(&g_xgr_cfg_lock);
     for (uint32_t i = 0; i < g_xgr_cfg.dlcCount && i < XGR_MAX_DLC_PACKAGES; i++) {
         const struct xgr_dlc_package_entry *ent = &g_xgr_cfg.dlcPackages[i];
         if (ent->mount_path_win[0] && dlc_id_matches(pkg_id, ent)) {
@@ -1191,7 +1349,7 @@ bool xgr_find_dlc_mount_path(const char *pkg_id, char *out_mount_path, size_t ou
             break;
         }
     }
-    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    ReleaseSRWLockShared(&g_xgr_cfg_lock);
 
     if (found) {
         size_t len = strlen(out_mount_path);

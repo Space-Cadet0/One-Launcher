@@ -84,7 +84,13 @@ typedef LONG (NTAPI *PFN_LdrUnregisterDllNotification)(PVOID Cookie);
 static HMODULE g_bridge_hmod = NULL;
 static PVOID g_ldr_cookie = NULL;
 static PFN_LdrUnregisterDllNotification g_ldr_unregister = NULL;
+/* Lock hierarchy:
+ *   g_xcurl_shim_lock: serializes install/uninstall state (NEVER held across LdrRegister/Unregister
+ *                      or CreateToolhelp32Snapshot, and NEVER acquired from ldr_dll_notification_cb).
+ *   g_iat_patch_lock:  leaf lock serializing VirtualProtect + atomic IAT swap only
+ *                      (NEVER calls GetModuleHandleExW / loader-lock APIs while held). */
 static SRWLOCK g_xcurl_shim_lock = SRWLOCK_INIT;
+static SRWLOCK g_iat_patch_lock = SRWLOCK_INIT;
 static volatile LONG g_xcurl_hook_state = 0; /* 0 = uninitialized, 1 = installing, 2 = active/completed */
 static volatile LONG g_iat_hooks_installed = 0;
 static volatile LONG g_is_wine = 0;
@@ -267,42 +273,77 @@ static inline void ensure_bridge_module_pinned(void)
     InitOnceExecuteOnce(&g_pin_bridge_once, pin_bridge_module_once_cb, NULL, NULL);
 }
 
-static void replace_iat_slot(IMAGE_THUNK_DATA *thunk, void *new_fn, void **orig_slot)
+static bool rva_in_image(uint32_t rva, size_t size, uint32_t image_size)
 {
-    if (orig_slot && *orig_slot == NULL && (void *)(uintptr_t)thunk->u1.Function != new_fn) {
-        *orig_slot = (void *)(uintptr_t)thunk->u1.Function;
-    }
-    if ((void *)(uintptr_t)thunk->u1.Function == new_fn) {
-        return;
-    }
-    ensure_bridge_module_pinned();
-    DWORD old_prot = 0;
-    if (VirtualProtect(&thunk->u1.Function, sizeof(uintptr_t), PAGE_READWRITE, &old_prot)) {
-        thunk->u1.Function = (ULONG_PTR)(uintptr_t)new_fn;
-        VirtualProtect(&thunk->u1.Function, sizeof(uintptr_t), old_prot, &old_prot);
-        InterlockedExchange(&g_iat_hooks_installed, 1);
-    }
+    if (image_size == 0 || rva >= image_size) return false;
+    return size <= (size_t)(image_size - rva);
 }
 
-static void patch_module_iat(HMODULE hMod)
+static bool cstr_in_image(const uint8_t *base, uint32_t rva, uint32_t image_size, size_t max_len)
+{
+    if (!base || rva >= image_size) return false;
+    size_t avail = (size_t)(image_size - rva);
+    if (avail > max_len) avail = max_len;
+    const char *s = (const char *)(base + rva);
+    return memchr(s, '\0', avail) != NULL;
+}
+
+static void replace_iat_slot(IMAGE_THUNK_DATA *thunk, void *new_fn, PVOID volatile *orig_slot)
+{
+    AcquireSRWLockExclusive(&g_iat_patch_lock);
+    void *cur_fn = (void *)(uintptr_t)thunk->u1.Function;
+    if (orig_slot && cur_fn != new_fn) {
+        (void)InterlockedCompareExchangePointer(orig_slot, cur_fn, NULL);
+    }
+    if (cur_fn != new_fn) {
+        DWORD old_prot = 0;
+        if (VirtualProtect(&thunk->u1.Function, sizeof(uintptr_t), PAGE_READWRITE, &old_prot)) {
+            (void)InterlockedExchangePointer((PVOID volatile *)&thunk->u1.Function, new_fn);
+            DWORD restore_prot = 0;
+            VirtualProtect(&thunk->u1.Function, sizeof(uintptr_t), old_prot, &restore_prot);
+            InterlockedExchange(&g_iat_hooks_installed, 1);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_iat_patch_lock);
+}
+
+static void patch_module_iat(HMODULE hMod, bool allow_pin_bridge)
 {
     HMODULE selfMod = (HMODULE)InterlockedCompareExchangePointer((PVOID *)&g_bridge_hmod, NULL, NULL);
     if (!hMod || hMod == selfMod) return;
 
+    if (allow_pin_bridge) {
+        /* Pin our bridge module BEFORE acquiring g_iat_patch_lock (GetModuleHandleExW takes loader lock). */
+        ensure_bridge_module_pinned();
+    }
+
     uint8_t *base = (uint8_t *)hMod;
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    if (dos->e_lfanew < (LONG)sizeof(IMAGE_DOS_HEADER) || (uint32_t)dos->e_lfanew > 0x10000000u) return;
 
-    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    uint32_t nt_rva = (uint32_t)dos->e_lfanew;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + nt_rva);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return;
     if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) return;
 
+    uint32_t image_size = nt->OptionalHeader.SizeOfImage;
+    if (image_size < nt_rva + (uint32_t)sizeof(IMAGE_NT_HEADERS)) return;
+    if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IMPORT) return;
+
     IMAGE_DATA_DIRECTORY imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!imp_dir.VirtualAddress || !imp_dir.Size) return;
+    if (!imp_dir.VirtualAddress || imp_dir.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR)) return;
+    if (!rva_in_image(imp_dir.VirtualAddress, imp_dir.Size, image_size)) return;
 
     bool wine = (InterlockedCompareExchange(&g_is_wine, 0, 0) != 0);
-    IMAGE_IMPORT_DESCRIPTOR *desc = (IMAGE_IMPORT_DESCRIPTOR *)(base + imp_dir.VirtualAddress);
-    for (; desc->Name != 0; desc++) {
+    uint32_t imp_end = imp_dir.VirtualAddress + imp_dir.Size;
+    for (uint32_t desc_rva = imp_dir.VirtualAddress;
+         desc_rva + (uint32_t)sizeof(IMAGE_IMPORT_DESCRIPTOR) <= imp_end;
+         desc_rva += (uint32_t)sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+        IMAGE_IMPORT_DESCRIPTOR *desc = (IMAGE_IMPORT_DESCRIPTOR *)(base + desc_rva);
+        if (desc->Name == 0) break;
+        if (!cstr_in_image(base, desc->Name, image_size, 260)) continue;
+
         const char *dll_name = (const char *)(base + desc->Name);
         bool is_winhttp = wine && (_stricmp(dll_name, "winhttp.dll") == 0);
         bool is_appnotify = wine && (
@@ -313,45 +354,59 @@ static void patch_module_iat(HMODULE hMod)
         if (!is_winhttp && !is_appnotify && !is_playfab_gamesave) continue;
         if (!desc->OriginalFirstThunk || !desc->FirstThunk) continue;
 
-        IMAGE_THUNK_DATA *orig_thunk = (IMAGE_THUNK_DATA *)(base + desc->OriginalFirstThunk);
-        IMAGE_THUNK_DATA *iat_thunk = (IMAGE_THUNK_DATA *)(base + desc->FirstThunk);
+        uint32_t orig_rva = desc->OriginalFirstThunk;
+        uint32_t iat_rva = desc->FirstThunk;
+        while (rva_in_image(orig_rva, sizeof(IMAGE_THUNK_DATA), image_size) &&
+               rva_in_image(iat_rva, sizeof(IMAGE_THUNK_DATA), image_size)) {
+            IMAGE_THUNK_DATA *orig_thunk = (IMAGE_THUNK_DATA *)(base + orig_rva);
+            IMAGE_THUNK_DATA *iat_thunk = (IMAGE_THUNK_DATA *)(base + iat_rva);
+            if (orig_thunk->u1.AddressOfData == 0) break;
 
-        for (; orig_thunk->u1.AddressOfData != 0; orig_thunk++, iat_thunk++) {
-            if (IMAGE_SNAP_BY_ORDINAL(orig_thunk->u1.Ordinal)) continue;
-            IMAGE_IMPORT_BY_NAME *imp_name = (IMAGE_IMPORT_BY_NAME *)(base + orig_thunk->u1.AddressOfData);
-            const char *fn = (const char *)imp_name->Name;
+            if (!IMAGE_SNAP_BY_ORDINAL(orig_thunk->u1.Ordinal)) {
+                ULONG_PTR name_rva_ptr = orig_thunk->u1.AddressOfData;
+                if (name_rva_ptr > 0 && name_rva_ptr < (ULONG_PTR)image_size) {
+                    uint32_t name_rva = (uint32_t)name_rva_ptr;
+                    if (rva_in_image(name_rva, sizeof(WORD) + 1, image_size) &&
+                        cstr_in_image(base, name_rva + (uint32_t)sizeof(WORD), image_size, 256)) {
+                        IMAGE_IMPORT_BY_NAME *imp_name = (IMAGE_IMPORT_BY_NAME *)(base + name_rva);
+                        const char *fn = (const char *)imp_name->Name;
 
-            if (is_winhttp) {
-                if (strcmp(fn, "WinHttpSetOption") == 0)
-                    replace_iat_slot(iat_thunk, (void *)shim_WinHttpSetOption, (void **)&g_real_WinHttpSetOption);
-                else if (strcmp(fn, "WinHttpSendRequest") == 0)
-                    replace_iat_slot(iat_thunk, (void *)shim_WinHttpSendRequest, (void **)&g_real_WinHttpSendRequest);
-                else if (strcmp(fn, "WinHttpReceiveResponse") == 0)
-                    replace_iat_slot(iat_thunk, (void *)shim_WinHttpReceiveResponse, (void **)&g_real_WinHttpReceiveResponse);
-                else if (strcmp(fn, "WinHttpQueryDataAvailable") == 0)
-                    replace_iat_slot(iat_thunk, (void *)shim_WinHttpQueryDataAvailable, (void **)&g_real_WinHttpQueryDataAvailable);
-                else if (strcmp(fn, "WinHttpReadData") == 0)
-                    replace_iat_slot(iat_thunk, (void *)shim_WinHttpReadData, (void **)&g_real_WinHttpReadData);
-                else if (strcmp(fn, "WinHttpWriteData") == 0)
-                    replace_iat_slot(iat_thunk, (void *)shim_WinHttpWriteData, (void **)&g_real_WinHttpWriteData);
-                else if (strcmp(fn, "WinHttpCloseHandle") == 0)
-                    replace_iat_slot(iat_thunk, (void *)shim_WinHttpCloseHandle, (void **)&g_real_WinHttpCloseHandle);
-            } else if (is_appnotify) {
-                if (strcmp(fn, "RegisterAppStateChangeNotification") == 0)
-                    replace_iat_slot(iat_thunk, (void *)shim_RegisterAppStateChangeNotification, NULL);
-                else if (strcmp(fn, "UnregisterAppStateChangeNotification") == 0)
-                    replace_iat_slot(iat_thunk, (void *)shim_UnregisterAppStateChangeNotification, NULL);
-                else if (strcmp(fn, "RegisterAppConstrainedChangeNotification") == 0)
-                    replace_iat_slot(iat_thunk, (void *)shim_RegisterAppConstrainedChangeNotification, NULL);
-                else if (strcmp(fn, "UnregisterAppConstrainedChangeNotification") == 0)
-                    replace_iat_slot(iat_thunk, (void *)shim_UnregisterAppConstrainedChangeNotification, NULL);
-            } else if (is_playfab_gamesave) {
-                void *orig_proc = (void *)(uintptr_t)iat_thunk->u1.Function;
-                void *replacement = xgr_playfab_resolve_iat_replacement(fn, orig_proc);
-                if (replacement) {
-                    replace_iat_slot(iat_thunk, replacement, NULL);
+                        if (is_winhttp) {
+                            if (strcmp(fn, "WinHttpSetOption") == 0)
+                                replace_iat_slot(iat_thunk, (void *)shim_WinHttpSetOption, (PVOID volatile *)&g_real_WinHttpSetOption);
+                            else if (strcmp(fn, "WinHttpSendRequest") == 0)
+                                replace_iat_slot(iat_thunk, (void *)shim_WinHttpSendRequest, (PVOID volatile *)&g_real_WinHttpSendRequest);
+                            else if (strcmp(fn, "WinHttpReceiveResponse") == 0)
+                                replace_iat_slot(iat_thunk, (void *)shim_WinHttpReceiveResponse, (PVOID volatile *)&g_real_WinHttpReceiveResponse);
+                            else if (strcmp(fn, "WinHttpQueryDataAvailable") == 0)
+                                replace_iat_slot(iat_thunk, (void *)shim_WinHttpQueryDataAvailable, (PVOID volatile *)&g_real_WinHttpQueryDataAvailable);
+                            else if (strcmp(fn, "WinHttpReadData") == 0)
+                                replace_iat_slot(iat_thunk, (void *)shim_WinHttpReadData, (PVOID volatile *)&g_real_WinHttpReadData);
+                            else if (strcmp(fn, "WinHttpWriteData") == 0)
+                                replace_iat_slot(iat_thunk, (void *)shim_WinHttpWriteData, (PVOID volatile *)&g_real_WinHttpWriteData);
+                            else if (strcmp(fn, "WinHttpCloseHandle") == 0)
+                                replace_iat_slot(iat_thunk, (void *)shim_WinHttpCloseHandle, (PVOID volatile *)&g_real_WinHttpCloseHandle);
+                        } else if (is_appnotify) {
+                            if (strcmp(fn, "RegisterAppStateChangeNotification") == 0)
+                                replace_iat_slot(iat_thunk, (void *)shim_RegisterAppStateChangeNotification, NULL);
+                            else if (strcmp(fn, "UnregisterAppStateChangeNotification") == 0)
+                                replace_iat_slot(iat_thunk, (void *)shim_UnregisterAppStateChangeNotification, NULL);
+                            else if (strcmp(fn, "RegisterAppConstrainedChangeNotification") == 0)
+                                replace_iat_slot(iat_thunk, (void *)shim_RegisterAppConstrainedChangeNotification, NULL);
+                            else if (strcmp(fn, "UnregisterAppConstrainedChangeNotification") == 0)
+                                replace_iat_slot(iat_thunk, (void *)shim_UnregisterAppConstrainedChangeNotification, NULL);
+                        } else if (is_playfab_gamesave) {
+                            void *orig_proc = (void *)(uintptr_t)iat_thunk->u1.Function;
+                            void *replacement = xgr_playfab_resolve_iat_replacement(fn, orig_proc);
+                            if (replacement) {
+                                replace_iat_slot(iat_thunk, replacement, NULL);
+                            }
+                        }
+                    }
                 }
             }
+            orig_rva += (uint32_t)sizeof(IMAGE_THUNK_DATA);
+            iat_rva += (uint32_t)sizeof(IMAGE_THUNK_DATA);
         }
     }
 }
@@ -390,7 +445,8 @@ static bool is_excluded_system_or_bridge_module(const wchar_t *full_path, size_t
         }
         lower[n] = L'\0';
         if (wcsstr(lower, L"\\windows\\system32\\") != NULL ||
-            wcsstr(lower, L"\\windows\\syswow64\\") != NULL) {
+            wcsstr(lower, L"\\windows\\syswow64\\") != NULL ||
+            wcsstr(lower, L"\\windows\\winsxs\\") != NULL) {
             return true;
         }
     }
@@ -398,7 +454,17 @@ static bool is_excluded_system_or_bridge_module(const wchar_t *full_path, size_t
     return false;
 }
 
-static void patch_loaded_non_system_modules_locked(void)
+static void pin_and_patch_module(HMODULE candidate)
+{
+    if (!candidate) return;
+    HMODULE pinned = NULL;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)(uintptr_t)candidate, &pinned) && pinned) {
+        patch_module_iat(pinned, true);
+        FreeLibrary(pinned);
+    }
+}
+
+static void patch_loaded_non_system_modules(void)
 {
     HMODULE selfMod = (HMODULE)InterlockedCompareExchangePointer((PVOID *)&g_bridge_hmod, NULL, NULL);
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -412,7 +478,7 @@ static void patch_loaded_non_system_modules_locked(void)
                 if (!is_excluded_system_or_bridge_module(
                         me.szExePath, wcslen(me.szExePath),
                         me.szModule, wcslen(me.szModule))) {
-                    patch_module_iat(me.hModule);
+                    pin_and_patch_module(me.hModule);
                 }
             } while (Module32NextW(snap, &me));
         }
@@ -422,11 +488,11 @@ static void patch_loaded_non_system_modules_locked(void)
 
     /* Fallback if toolhelp snapshot is unavailable */
     HMODULE hMain = GetModuleHandleW(NULL);
-    if (hMain && hMain != selfMod) patch_module_iat(hMain);
+    if (hMain && hMain != selfMod) pin_and_patch_module(hMain);
     HMODULE hXcurl = GetModuleHandleW(L"XCurl.dll");
-    if (hXcurl) patch_module_iat(hXcurl);
+    if (hXcurl) pin_and_patch_module(hXcurl);
     HMODULE hHttp = GetModuleHandleW(L"libHttpClient.GDK.dll");
-    if (hHttp) patch_module_iat(hHttp);
+    if (hHttp) pin_and_patch_module(hHttp);
 }
 
 static VOID CALLBACK ldr_dll_notification_cb(
@@ -436,7 +502,8 @@ static VOID CALLBACK ldr_dll_notification_cb(
 )
 {
     (void)ctx;
-    /* LDR_DLL_NOTIFICATION_REASON_LOADED == 1 */
+    /* LDR_DLL_NOTIFICATION_REASON_LOADED == 1 (runs under OS Loader Lock: NEVER take g_xcurl_shim_lock
+     * or call GetModuleHandleExW here; bridge module was already pinned before registering callback). */
     if (reason == 1 && data && data->Loaded.DllBase) {
         HMODULE hMod = (HMODULE)data->Loaded.DllBase;
         HMODULE selfMod = (HMODULE)InterlockedCompareExchangePointer((PVOID *)&g_bridge_hmod, NULL, NULL);
@@ -448,7 +515,7 @@ static VOID CALLBACK ldr_dll_notification_cb(
         size_t base_chars = data->Loaded.BaseDllName ? (data->Loaded.BaseDllName->Length / sizeof(wchar_t)) : 0;
 
         if (!is_excluded_system_or_bridge_module(full_buf, full_chars, base_buf, base_chars)) {
-            patch_module_iat(hMod);
+            patch_module_iat(hMod, false);
         }
     }
 }
@@ -456,34 +523,56 @@ static VOID CALLBACK ldr_dll_notification_cb(
 void xgr_install_xcurl_shim(void)
 {
     AcquireSRWLockExclusive(&g_xcurl_shim_lock);
-    if (InterlockedCompareExchange(&g_xcurl_hook_state, 0, 0) == 2) {
+    if (InterlockedCompareExchange(&g_xcurl_hook_state, 0, 0) != 0) {
         ReleaseSRWLockExclusive(&g_xcurl_shim_lock);
         return;
     }
     InterlockedExchange(&g_xcurl_hook_state, 1);
+    ReleaseSRWLockExclusive(&g_xcurl_shim_lock);
 
     /* WinHTTP & AppNotify IAT hooks are Wine-gated via g_is_wine inside patch_module_iat;
      * PlayFabGameSave.dll in-proc IAT hooks run on both Wine and GamingServices-less win32. */
     InterlockedExchange(&g_is_wine, is_running_under_wine() ? 1 : 0);
 
-    patch_loaded_non_system_modules_locked();
+    /* Pin bridge module and walk loaded modules OUTSIDE g_xcurl_shim_lock so loader lock
+     * ordering can never invert with ldr_dll_notification_cb. */
+    ensure_bridge_module_pinned();
+    patch_loaded_non_system_modules();
 
-    /* Register dynamic load notification for late LoadLibrary calls */
+    /* Register dynamic load notification for late LoadLibrary calls (outside g_xcurl_shim_lock) */
+    PVOID new_cookie = NULL;
+    PFN_LdrUnregisterDllNotification unreg_fn = NULL;
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (hNtdll && !g_ldr_cookie) {
+    if (hNtdll) {
         PFN_LdrRegisterDllNotification pReg =
             (PFN_LdrRegisterDllNotification)(void *)GetProcAddress(hNtdll, "LdrRegisterDllNotification");
-        g_ldr_unregister =
+        unreg_fn =
             (PFN_LdrUnregisterDllNotification)(void *)GetProcAddress(hNtdll, "LdrUnregisterDllNotification");
         if (pReg) {
-            ensure_bridge_module_pinned();
-            pReg(0, ldr_dll_notification_cb, NULL, &g_ldr_cookie);
+            pReg(0, ldr_dll_notification_cb, NULL, &new_cookie);
         }
     }
 
-    /* Always transition to 2 even if g_ldr_cookie == NULL so QueryApiImpl never re-walks on every call */
-    InterlockedExchange(&g_xcurl_hook_state, 2);
+    PVOID duplicate_cookie = NULL;
+    AcquireSRWLockExclusive(&g_xcurl_shim_lock);
+    if (InterlockedCompareExchange(&g_xcurl_hook_state, 0, 0) == 1) {
+        if (!g_ldr_cookie && new_cookie) {
+            g_ldr_cookie = new_cookie;
+            g_ldr_unregister = unreg_fn;
+        } else if (new_cookie) {
+            duplicate_cookie = new_cookie;
+        }
+        /* Always transition to 2 even if g_ldr_cookie == NULL so QueryApiImpl never re-walks on every call */
+        InterlockedExchange(&g_xcurl_hook_state, 2);
+    } else if (new_cookie) {
+        /* Uninstalled while installing */
+        duplicate_cookie = new_cookie;
+    }
     ReleaseSRWLockExclusive(&g_xcurl_shim_lock);
+
+    if (duplicate_cookie && unreg_fn) {
+        unreg_fn(duplicate_cookie);
+    }
 }
 
 void xgr_ensure_xcurl_shim(void)
