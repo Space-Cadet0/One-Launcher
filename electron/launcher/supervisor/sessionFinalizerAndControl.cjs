@@ -15,6 +15,7 @@ const {
   isBottleWinExeRunning,
   reapOrphanedGogOverlayProcesses,
   waitForGogPostExitFlush,
+  waitForEpicLauncherCloudSyncCompletion,
 } = require('../storefrontReadinessBarrier.cjs');
 const {
   syncXboxCloudSaves,
@@ -220,7 +221,11 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
           entry.session?.launchMethod !== 'storefront_uri' &&
           !entry.isChainedPublisherLauncher) ||
         Boolean(entry.xboxLoopbackServer) ||
-        (entry.bottleSteamRoot && (entry.steamAppId || entry.platformGameId)))
+        (entry.bottleSteamRoot && (entry.steamAppId || entry.platformGameId)) ||
+        (stoppedSession.platformId === 'steam' &&
+          !entry.bottleSteamRoot &&
+          !entry.isFastDirectBypass &&
+          Boolean(entry.steamAppId || entry.platformGameId)))
   );
 
   if (!willRunPostExitCloudSync && activeSessions.size === 0) {
@@ -542,17 +547,60 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
                 }
               }
             }
+            const fallbackEntryScid =
+              entry.scid || entry.xboxScid || entry.payload?.xboxScid || '';
             const scidsToSync =
-              dedupedRuntimeScids.length > 0 ? dedupedRuntimeScids : [entry.scid];
+              dedupedRuntimeScids.length > 0 ? dedupedRuntimeScids : [fallbackEntryScid];
             /** @type {any} */
             let lastRes = { synced: false, reason: 'skipped' };
             for (const activeScid of scidsToSync) {
               const effectiveFallbackScid =
                 entry.fallbackScid ||
-                (entry.scid &&
+                (fallbackEntryScid &&
                 activeScid &&
-                String(entry.scid).toLowerCase() !== String(activeScid).toLowerCase()
-                  ? entry.scid
+                String(fallbackEntryScid).toLowerCase() !== String(activeScid).toLowerCase()
+                  ? fallbackEntryScid
+                  : undefined);
+              const consumedLock = (() => {
+                if (
+                  !entry.xboxLoopbackServer ||
+                  typeof entry.xboxLoopbackServer.consumeHeldLock !== 'function'
+                ) {
+                  return null;
+                }
+                if (activeScid) {
+                  const directHit = entry.xboxLoopbackServer.consumeHeldLock(activeScid);
+                  if (directHit) return directHit;
+                }
+                if (scidsToSync.length === 1) {
+                  const fallbackCandidates = Array.from(
+                    new Set(
+                      [
+                        entry.scid,
+                        entry.xboxScid,
+                        entry.payload?.xboxScid,
+                        effectiveFallbackScid,
+                        typeof entry.xboxLoopbackServer.getState === 'function'
+                          ? entry.xboxLoopbackServer.getState()?.scid
+                          : '',
+                      ]
+                        .map((v) => String(v || '').trim())
+                        .filter(Boolean)
+                    )
+                  );
+                  for (const cand of fallbackCandidates) {
+                    const hit = entry.xboxLoopbackServer.consumeHeldLock(cand);
+                    if (hit) return hit;
+                  }
+                }
+                return null;
+              })();
+              const resolvedSyncFallbackScid =
+                effectiveFallbackScid ||
+                (consumedLock?.resolvedScid &&
+                activeScid &&
+                String(consumedLock.resolvedScid).toLowerCase() !== String(activeScid).toLowerCase()
+                  ? consumedLock.resolvedScid
                   : undefined);
               const res = await syncXboxCloudSaves(
                 {
@@ -562,8 +610,8 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
                   title: stoppedSession.title,
                   installPath: entry.installPath,
                   packageFamilyName: entry.packageFamilyName,
-                  scid: activeScid,
-                  fallbackScid: effectiveFallbackScid,
+                  scid: activeScid || consumedLock?.resolvedScid || undefined,
+                  fallbackScid: resolvedSyncFallbackScid,
                   msaAppId: entry.msaAppId,
                   xboxTitleId: entry.xboxTitleId,
                   xboxProductId: entry.xboxProductId,
@@ -578,6 +626,9 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
                   isAppxRegistered: Boolean(entry.isAppxRegistered),
                   useGamingServicesRuntime: Boolean(entry.isAppxRegistered),
                   userDataDir: getUserDataDir(mergedOptions.userDataDir),
+                  alreadyLocked: Boolean(consumedLock?.lockHeld),
+                  keepLockHeld: false,
+                  priorHadWrites: Boolean(consumedLock?.hadWrites),
                 }
               );
               if (shouldQueueFailedPostExitUpload(res)) {
@@ -643,6 +694,11 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
             ...mergedOptions,
             mode: 'post_exit',
             ignoreStaleLogAge: true,
+            isBottleSteam: true,
+            steamRootStrict: true,
+            ...(typeof entry.steamCloudLogSessionStartOffset === 'number'
+              ? { sessionStartOffset: entry.steamCloudLogSessionStartOffset }
+              : {}),
           }
         );
         emitCloudSyncTelemetry('post_exit', cloudRes);
@@ -660,6 +716,10 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
               : typeof mergedOptions.execFileFn === 'function'
                 ? mergedOptions.execFileFn
                 : execFile;
+          const steamShutdownTimeoutMs = Math.max(
+            1000,
+            Number(mergedOptions.bottleSteamShutdownTimeoutMs ?? 8000)
+          );
           await new Promise((resolve) => {
             try {
               const shutdownEnv = {
@@ -670,6 +730,9 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
                 wineBinary: entry.wineBinary,
                 bottlePath: entry.winePrefix,
                 env: shutdownEnv,
+                ...(entry.chosenCompatLayerType
+                  ? { layerType: entry.chosenCompatLayerType }
+                  : {}),
               });
               deleteBottleDaemonEnvContract(entry.winePrefix);
               execFileImpl(
@@ -677,7 +740,7 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
                 [entry.bottleSteamExe, '-shutdown'],
                 {
                   env: alignedSteamShutdown.env,
-                  timeout: 5000,
+                  timeout: steamShutdownTimeoutMs,
                 },
                 () => resolve(undefined)
               );
@@ -686,6 +749,33 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
               resolve(undefined);
             }
           });
+          const shouldAwaitBottleSteamExit =
+            !isTestEnvironment(mergedOptions) || mergedOptions.awaitBottleSteamExitInTest === true;
+          const bottleSteamExitWaitMs = shouldAwaitBottleSteamExit
+            ? Math.max(0, Number(mergedOptions.bottleSteamExitWaitMs ?? 12000))
+            : 0;
+          if (bottleSteamExitWaitMs > 0 && entry.winePrefix) {
+            const pollIntervalMs = Math.max(
+              15,
+              Number(mergedOptions.bottleSteamExitPollIntervalMs ?? 300)
+            );
+            const exitDeadline = Date.now() + bottleSteamExitWaitMs;
+            while (Date.now() < exitDeadline) {
+              if (isPrefixBusyWithOtherSession()) break;
+              const stillRunning = await isBottleWinExeRunning(
+                'steam.exe',
+                entry.winePrefix,
+                mergedOptions
+              ).catch(() => false);
+              if (!stillRunning) break;
+              const remaining = exitDeadline - Date.now();
+              if (remaining <= 0) break;
+              await new Promise((resolve) => {
+                const t = setTimeout(resolve, Math.min(pollIntervalMs, remaining));
+                if (typeof t.unref === 'function') t.unref();
+              });
+            }
+          }
         }
         return { completed: true, cloudRes, closedBottleSteam };
       })().catch(() => ({ completed: false }))
@@ -709,8 +799,12 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
           await waitForGogPostExitFlush({
             platform: 'win32',
             bottlePath: entry.winePrefix,
+            isStorefrontUri: entry.session?.launchMethod === 'storefront_uri',
             ...(typeof entry.gogCommLogPreExitOffset === 'number'
               ? { preExitOffset: entry.gogCommLogPreExitOffset }
+              : {}),
+            ...(typeof entry.gogClientLogPreExitOffset === 'number'
+              ? { preExitClientOffset: entry.gogClientLogPreExitOffset }
               : {}),
             options: mergedOptions,
           });
@@ -730,6 +824,9 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
                 wineBinary: entry.wineBinary,
                 bottlePath: entry.winePrefix,
                 env: shutdownEnv,
+                ...(entry.chosenCompatLayerType
+                  ? { layerType: entry.chosenCompatLayerType }
+                  : {}),
               });
               execFileImpl(
                 alignedGogShutdown.binaryPath,
@@ -765,6 +862,17 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
           if (isPrefixBusyWithOtherSession()) {
             return { completed: false, closedBottleEpic: false };
           }
+          await waitForEpicLauncherCloudSyncCompletion({
+            platform: 'win32',
+            bottlePath: entry.winePrefix,
+            ...(typeof entry.epicLogPreExitOffset === 'number'
+              ? { preExitOffset: entry.epicLogPreExitOffset }
+              : {}),
+            options: mergedOptions,
+          }).catch(() => null);
+          if (isPrefixBusyWithOtherSession()) {
+            return { completed: false, closedBottleEpic: false };
+          }
           const execFileImpl =
             typeof mergedOptions.execFileImpl === 'function'
               ? mergedOptions.execFileImpl
@@ -782,6 +890,9 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
                   wineBinary: entry.wineBinary,
                   bottlePath: entry.winePrefix,
                   env: shutdownEnv,
+                  ...(entry.chosenCompatLayerType
+                    ? { layerType: entry.chosenCompatLayerType }
+                    : {}),
                 });
                 execFileImpl(
                   alignedEpicShutdown.binaryPath,
@@ -853,6 +964,11 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
           ...mergedOptions,
           mode: 'post_exit',
           ignoreStaleLogAge: true,
+          ...(typeof entry.steamCloudLogSessionStartOffset === 'number'
+            ? { sessionStartOffset: entry.steamCloudLogSessionStartOffset }
+            : {}),
+          isFastDirectBypass: Boolean(entry.isFastDirectBypass),
+          wokeSteamByLauncher: Boolean(entry.wokeSteamByLauncher),
         })
           .then((/** @type {any} */ res) => {
             emitCloudSyncTelemetry('post_exit', res);
@@ -863,7 +979,7 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
     }
   }
 
-  // 2. Chain Wine prefix shutdown strictly AFTER post-exit cloud sync & bottle storefront shutdown finish
+  // 2. Trigger ephemeral storefront & chained publisher client shutdown strictly BEFORE wineserver -k
   const entryPublisherHandoff = resolveAnyChainedHandoffId(entry.chainedLauncherHandoff);
   const hasActiveBottleStorefrontClient = Boolean(
     entry.launchedViaBottleSteam ||
@@ -885,85 +1001,40 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
             entry.wasBottlePublisherRunning &&
             !entry.wokePublisherClientByLauncher))));
 
+  const hasEphemeralShutdown = Boolean(
+    entry.wokeGogGalaxyByLauncher ||
+      entry.wokeSteamByLauncher ||
+      entry.wokeEpicByLauncher ||
+      entry.wokeXboxAppByLauncher ||
+      entry.wokePublisherClientByLauncher ||
+      entry.ephemeralClientWoken
+  );
+
   /** @type {Promise<any>} */
-  let bottlePublisherPostExitPromise = Promise.resolve({
-    completed: false,
-    closedBottlePublisher: false,
-  });
-  if (
-    entryPublisherHandoff === 'ea' &&
-    entry.wokePublisherClientByLauncher &&
-    lifecyclePolicy === 'minimal_and_close_if_started' &&
-    entry.wineBinary &&
-    entry.winePrefix &&
-    (shouldPreserveBottleStorefrontClient ||
-      effectivePerfPolicy.autoShutdownWinePrefixOnExit === false)
-  ) {
-    bottlePublisherPostExitPromise = trackPostSessionPromise(
-      Promise.allSettled([epicCloudSaveSyncPromise, bottleSteamPostExitPromise])
-        .then(async () => {
-          if (isPrefixBusyWithOtherSession()) {
-            return { completed: false, closedBottlePublisher: false };
-          }
-          const execFileImpl =
-            typeof mergedOptions.execFileImpl === 'function'
-              ? mergedOptions.execFileImpl
-              : typeof mergedOptions.execFileFn === 'function'
-                ? mergedOptions.execFileFn
-                : execFile;
-          const runBottleCmd = (/** @type {string[]} */ cmdArgs) =>
-            new Promise((resolve) => {
-              try {
-                const shutdownEnv = {
-                  ...(entry.launchEnv || process.env),
-                  ...(entry.winePrefix ? { WINEPREFIX: entry.winePrefix } : {}),
-                };
-                const alignedPubShutdown = prepareAlignedAuxBottleWineCommand({
-                  wineBinary: entry.wineBinary,
-                  bottlePath: entry.winePrefix,
-                  env: shutdownEnv,
-                  suppressGuiDialogs: true,
-                });
-                execFileImpl(
-                  alignedPubShutdown.binaryPath,
-                  cmdArgs,
-                  { env: alignedPubShutdown.env, timeout: 6000 },
-                  () => resolve(undefined)
-                );
-              } catch {
-                resolve(undefined);
-              }
-            });
-          await runBottleCmd([
-            'reg',
-            'delete',
-            'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run',
-            '/v',
-            'EADM',
-            '/f',
-          ]);
-          await runBottleCmd([
-            'taskkill',
-            '/F',
-            '/IM',
-            'EADesktop.exe',
-            '/IM',
-            'EALauncher.exe',
-            '/IM',
-            'EACefSubProcess.exe',
-            '/IM',
-            'EALocalHostSvc.exe',
-            '/IM',
-            'Link2EA.exe',
-            '/IM',
-            'EABackgroundService.exe',
-          ]);
-          return { completed: true, closedBottlePublisher: true };
-        })
-        .catch(() => ({ completed: false, closedBottlePublisher: false }))
+  let ephemeralClientShutdownPromise = Promise.resolve({ closed: false });
+  if (hasEphemeralShutdown) {
+    ephemeralClientShutdownPromise = trackPostSessionPromise(
+      Promise.allSettled([
+        gogCloudSaveSyncPromise,
+        epicCloudSaveSyncPromise,
+        xboxCloudSaveSyncPromise,
+        bottleSteamPostExitPromise,
+        bottleGogPostExitPromise,
+        bottleEpicPostExitPromise,
+      ]).then(() =>
+        shutdownEphemeralStorefrontClient(entry, mergedOptions)
+          .then((res) => {
+            if (res && 'cloudSyncWait' in res && res.cloudSyncWait) {
+              emitCloudSyncTelemetry('post_exit', res.cloudSyncWait);
+            }
+            return res;
+          })
+          .catch(() => ({ closed: false }))
+      )
     );
   }
 
+  // 3. Chain Wine prefix shutdown strictly AFTER post-exit cloud sync & ephemeral storefront/publisher shutdown finish
   /** @type {Promise<any>} */
   let winePrefixShutdownPromise = Promise.resolve(false);
   if (
@@ -987,25 +1058,21 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
         bottleSteamPostExitPromise,
         bottleGogPostExitPromise,
         bottleEpicPostExitPromise,
-        bottlePublisherPostExitPromise,
+        ephemeralClientShutdownPromise,
       ])
         .then(async () => {
-          if (
-            entry.isChainedPublisherLauncher &&
-            !isTestEnvironment(mergedOptions) &&
-            !entry.stopping
-          ) {
-            await new Promise((r) => {
-              const t = setTimeout(r, 3000);
-              if (typeof t.unref === 'function') t.unref();
-            });
-          }
           if (isPrefixBusyWithOtherSession()) return false;
           deleteBottleDaemonEnvContract(entry.winePrefix);
           return shutdownWinePrefix(
             entry.wineserverBinary || entry.wineBinary,
             entry.winePrefix,
-            3000
+            3000,
+            {
+              bottleName: path.basename(path.resolve(entry.winePrefix)),
+              ...(entry.chosenCompatLayerType
+                ? { layerType: entry.chosenCompatLayerType }
+                : {}),
+            }
           ).then((res) => {
             if (typeof mergedOptions.onWinePrefixShutdown === 'function') {
               try {
@@ -1026,7 +1093,7 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
     bottleSteamPostExitPromise,
     bottleGogPostExitPromise,
     bottleEpicPostExitPromise,
-    bottlePublisherPostExitPromise,
+    ephemeralClientShutdownPromise,
     winePrefixShutdownPromise,
   ]).finally(() => {
     if (entryPublisherHandoff === 'ea' && entry.winePrefix) {
@@ -1038,7 +1105,7 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
     resolveBottleBarrier();
   });
 
-  // 3. Sync playtime to storefront (skip GOG when launched via storefront_uri to avoid Galaxy double-count)
+  // 4. Sync playtime to storefront (skip GOG when launched via storefront_uri to avoid Galaxy double-count)
   /** @type {Promise<any>} */
   let storefrontSyncPromise = Promise.resolve(null);
   const skipGogStorefrontPlaytimeSync =
@@ -1093,33 +1160,7 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
     );
   }
 
-  // 4. Trigger ephemeral storefront client shutdown after playtime & cloud sync finish
-  /** @type {Promise<any>} */
-  let ephemeralClientShutdownPromise = Promise.resolve({ closed: false });
-  if (
-    entry.wokeGogGalaxyByLauncher ||
-    entry.wokeSteamByLauncher ||
-    entry.wokeEpicByLauncher ||
-    entry.wokeXboxAppByLauncher ||
-    entry.wokePublisherClientByLauncher ||
-    entry.ephemeralClientWoken
-  ) {
-    ephemeralClientShutdownPromise = trackPostSessionPromise(
-      Promise.allSettled([
-        gogCloudSaveSyncPromise,
-        epicCloudSaveSyncPromise,
-        xboxCloudSaveSyncPromise,
-      ]).then(() =>
-        shutdownEphemeralStorefrontClient(entry, mergedOptions)
-          .then((res) => {
-            if (res && 'cloudSyncWait' in res && res.cloudSyncWait) {
-              emitCloudSyncTelemetry('post_exit', res.cloudSyncWait);
-            }
-            return res;
-          })
-          .catch(() => ({ closed: false }))
-      )
-    );
+  if (hasEphemeralShutdown) {
     storefrontSyncPromise = trackPostSessionPromise(
       storefrontSyncPromise.finally(() => ephemeralClientShutdownPromise)
     );
@@ -1132,7 +1173,6 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
     bottleSteamPostExitPromise,
     bottleGogPostExitPromise,
     bottleEpicPostExitPromise,
-    bottlePublisherPostExitPromise,
     hostSteamCloudSyncPromise,
     winePrefixShutdownPromise,
     ephemeralClientShutdownPromise,
@@ -1602,7 +1642,12 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
       if (!hasOtherActiveSessionInPrefix) {
         targetEntry.wineShutdownHandledByStopGame = true;
         deleteBottleDaemonEnvContract(sessionWinePrefix);
-        await shutdownWinePrefix(resolvedWineserverForStop, sessionWinePrefix, 2500);
+        await shutdownWinePrefix(resolvedWineserverForStop, sessionWinePrefix, 2500, {
+          bottleName: path.basename(path.resolve(sessionWinePrefix)),
+          ...(targetEntry.chosenCompatLayerType
+            ? { layerType: targetEntry.chosenCompatLayerType }
+            : {}),
+        });
       }
     }
 
