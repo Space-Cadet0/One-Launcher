@@ -7,10 +7,14 @@ import {
   isGenericPlaceholderSynopsis,
 } from '../steam/fallbackMetadataProvider';
 import { getOpenCriticData, criticScoreService } from '../critic/criticScoreService';
+import { getReviewSourceAuthorityRank } from '../critic/criticUtils';
+import { buildVerifiedSteamMetacriticAnchor } from '../critic/reviewScoreResolver';
+import { wikidataBridge, normalizeWikidataGogSlug, type WikidataBatchStoreItem } from '../critic/wikidataBridge';
 import { requestScheduler, RequestPriority } from './requestScheduler';
 import {
   getUserOverrideForGame,
   inferMetadataRouteFromOverride,
+  inferReviewRouteFromOverride,
   updateRoutedMetadataSnapshot,
 } from '../storage/userOverrideStorage';
 import {
@@ -1148,7 +1152,12 @@ export class SyncJobManager {
    */
   public async startCriticScoreSync(
     games: CanonicalGame[],
-    options?: { forceRefresh?: boolean; isBackgroundWarmup?: boolean; isBackground?: boolean }
+    options?: {
+      forceRefresh?: boolean;
+      deepReverify?: boolean;
+      isBackgroundWarmup?: boolean;
+      isBackground?: boolean;
+    }
   ): Promise<void> {
     const isBackground = Boolean(options?.isBackgroundWarmup || options?.isBackground);
 
@@ -1175,9 +1184,35 @@ export class SyncJobManager {
     return this.executeCriticScoreSync(games, options, false);
   }
 
+  private extractGameGogSlugForWikidata(game: CanonicalGame): string | undefined {
+    const gogPlat = game.platforms?.find((p) => p?.platformId?.toLowerCase() === 'gog');
+    if (gogPlat) {
+      const fromPlat =
+        normalizeWikidataGogSlug(gogPlat.platformGameId) ||
+        normalizeWikidataGogSlug(gogPlat.storefrontAppId);
+      if (fromPlat) return fromPlat;
+    }
+    if (game.enrichedMetadata?.website && /gog\.com\//i.test(game.enrichedMetadata.website)) {
+      const fromSite = normalizeWikidataGogSlug(game.enrichedMetadata.website);
+      if (fromSite) return fromSite;
+    }
+    if (game.id?.startsWith('gog-')) {
+      const fromId = normalizeWikidataGogSlug(game.id.slice(4));
+      if (fromId) return fromId;
+    }
+    return undefined;
+  }
+
   private async executeCriticScoreSync(
     games: CanonicalGame[],
-    options: { forceRefresh?: boolean; isBackgroundWarmup?: boolean; isBackground?: boolean } | undefined,
+    options:
+      | {
+          forceRefresh?: boolean;
+          deepReverify?: boolean;
+          isBackgroundWarmup?: boolean;
+          isBackground?: boolean;
+        }
+      | undefined,
     isBackground: boolean
   ): Promise<void> {
     if (isBackground) {
@@ -1194,13 +1229,36 @@ export class SyncJobManager {
     }
 
     if (options?.forceRefresh) {
-      criticScoreService.clearCache();
+      if (options?.deepReverify) {
+        criticScoreService.clearCache();
+      } else {
+        criticScoreService.prepareForIncrementalRefresh();
+      }
     }
     criticScoreService.purgeStaleNullScores();
 
-    // Pass skipBackgroundTrigger = true so filtering does NOT fire 393 simultaneous background requests!
-    const targetGames = options?.forceRefresh
-      ? games
+    const shouldSkipFreshVerifiedMcOnForceRefresh = Boolean(
+      options?.forceRefresh && !options?.deepReverify && games.length > 25
+    );
+
+    // Pass skipBackgroundTrigger = true so filtering does NOT fire simultaneous background requests!
+    const filteredGames = options?.forceRefresh
+      ? shouldSkipFreshVerifiedMcOnForceRefresh
+        ? games.filter((g) => {
+            const targetSteamId = steamMatcher.getEffectiveSteamAppId(g);
+            const ov = getUserOverrideForGame(g);
+            const route = ov ? inferReviewRouteFromOverride(ov) : undefined;
+            if (route?.mode === 'unrated' || route?.mode === 'static') {
+              return false;
+            }
+            return !criticScoreService.hasFreshVerifiedPressCriticScore(g.title, {
+              steamAppId: targetSteamId,
+              gameId: g.id,
+              platforms: g.platforms,
+              metacriticOnly: true,
+            });
+          })
+        : games
       : games.filter((g) => {
           const targetSteamId = steamMatcher.getEffectiveSteamAppId(g);
           const ov = getUserOverrideForGame(g) as
@@ -1229,9 +1287,10 @@ export class SyncJobManager {
             g.title,
             g.reviewSummary?.positivePercent ?? g.enrichedMetadata?.reviewSummary?.positivePercent,
             g.releaseDate,
-            undefined,
+            buildVerifiedSteamMetacriticAnchor(g),
             false,
-            true
+            true,
+            { gameId: g.id, platforms: g.platforms }
           );
           if (isBackground && criticScoreService.hasValidCachedResolution(targetSteamId, g.title)) {
             return false;
@@ -1260,6 +1319,43 @@ export class SyncJobManager {
           return true;
         });
 
+    // Stage 2 Priority Ordering:
+    // 0: null / uncached -> 1: upgradeable non-critic fallbacks (GOG/XBX/EGS/STM/MCU) -> 2: stale OC -> 3: stale MC
+    const targetGames = filteredGames
+      .map((g, origIdx) => {
+        const targetSteamId = steamMatcher.getEffectiveSteamAppId(g);
+        const existingScore = getOpenCriticData(
+          targetSteamId || undefined,
+          g.title,
+          undefined,
+          g.releaseDate,
+          undefined,
+          false,
+          true,
+          { gameId: g.id, platforms: g.platforms }
+        );
+        let bucket = 0;
+        let subRank = 0;
+        if (existingScore && existingScore.score > 0) {
+          if (existingScore.source === 'metacritic') {
+            bucket = 3;
+            subRank = 4;
+          } else if (existingScore.source === 'opencritic') {
+            bucket = 2;
+            subRank = 3;
+          } else if (existingScore.source === 'custom') {
+            bucket = 3;
+            subRank = 5;
+          } else {
+            bucket = 1;
+            subRank = getReviewSourceAuthorityRank(existingScore);
+          }
+        }
+        return { game: g, bucket, subRank, origIdx };
+      })
+      .sort((a, b) => a.bucket - b.bucket || a.subRank - b.subRank || a.origIdx - b.origIdx)
+      .map((entry) => entry.game);
+
     if (targetGames.length === 0) {
       if (!isBackground) {
         this.state = {
@@ -1278,7 +1374,6 @@ export class SyncJobManager {
     }
 
     const myToken = ++this.criticLoopToken;
-    this.mediaSyncLoopToken++;
     this.isCancelled = false;
 
     const jobId = isBackground
@@ -1313,6 +1408,42 @@ export class SyncJobManager {
     };
     this.syncHeadlineAndPriorityFields();
     this.notify();
+
+    // Stage 1: Polite Batch Wikidata SPARQL Pre-Pass for upgrade-eligible games with Steam AppIDs or GOG slugs.
+    // Guarded in try/catch so isolated unit tests without network/router mocks never throw.
+    if (onlineLifecycleManager.isOnline() && !this.isCancelled && this.criticLoopToken === myToken) {
+      const wikidataBatchItems: WikidataBatchStoreItem[] = [];
+      for (const game of targetGames) {
+        const steamAppId = steamMatcher.getEffectiveSteamAppId(game);
+        const gogSlug = this.extractGameGogSlugForWikidata(game);
+        if (!steamAppId && !gogSlug) continue;
+        if (
+          criticScoreService.hasFreshVerifiedPressCriticScore(game.title, {
+            steamAppId,
+            gameId: game.id,
+            platforms: game.platforms,
+            metacriticOnly: true,
+          })
+        ) {
+          continue;
+        }
+        wikidataBatchItems.push({
+          key: game.id || `${steamAppId ?? ''}:${gogSlug ?? ''}:${game.title}`,
+          steamAppId: steamAppId ?? null,
+          gogSlug: gogSlug ?? null,
+          title: game.title,
+        });
+      }
+      if (wikidataBatchItems.length > 0) {
+        try {
+          await wikidataBridge.batchResolveByStoreIds(wikidataBatchItems, {
+            priority: isBackground ? RequestPriority.P2_BACKGROUND : RequestPriority.P1_VIEWPORT,
+          });
+        } catch {
+          // Non-fatal: individual game resolution still cascades through Metacritic / OpenCritic / Steam
+        }
+      }
+    }
 
     const chunkSize = isBackground ? 2 : 3;
     let completedCount = 0;
@@ -1375,11 +1506,12 @@ export class SyncJobManager {
                   if (matchedId) targetSteamId = matchedId;
                 } catch {}
               }
+              const storefrontAnchor = buildVerifiedSteamMetacriticAnchor(game) ?? undefined;
               const resolvedScore = await criticScoreService.resolveDynamicScore(
                 game.title,
                 targetSteamId,
                 game.releaseDate,
-                undefined,
+                storefrontAnchor ?? undefined,
                 {
                   bypassAttempted: Boolean(options?.forceRefresh),
                   platforms: game.platforms,

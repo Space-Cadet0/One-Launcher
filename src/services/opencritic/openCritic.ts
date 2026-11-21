@@ -11,6 +11,21 @@ export type {
   OpenCriticData,
 } from '../../contracts/critic';
 
+export type {
+  ReviewSourceDisplayMeta,
+  ReviewSourceShortTag,
+} from '../critic/criticUtils';
+
+export {
+  getReviewSourceDisplayMeta,
+  getReviewSourceAuthorityRank,
+} from '../critic/criticUtils';
+
+export type {
+  CriticScoreContext,
+  CriticEntitlementPlatform,
+} from '../critic/criticScoreService';
+
 export {
   calculateTier,
   getTierColor,

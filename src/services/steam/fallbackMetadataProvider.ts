@@ -12,7 +12,6 @@ import {
   LanguageTableSchema,
   XboxDeliveryHints,
 } from '../../contracts/steam';
-import { getOpenCriticData } from '../opencritic/openCritic';
 import {
   getUserOverrideForGame,
   inferMetadataRouteFromOverride,
@@ -2254,20 +2253,11 @@ export class FallbackMetadataProvider {
       });
     }
 
-    // Pull Critic review data if verified (never fabricate 90%/10% positive/negative counts)
-    const ocData = getOpenCriticData(undefined, game.title);
+    // Preserve only authentic storefront user review summaries (never fabricate Steam
+    // reviewSummary descriptions or counts from press critic scores).
     const reviewSummary: SteamReviewSummary =
       storeMetadata?.reviewSummary && storeMetadata.reviewSummary.totalReviews > 0
         ? storeMetadata.reviewSummary
-        : ocData
-        ? {
-            reviewScore: Math.round(ocData.score / 10),
-            reviewScoreDesc: `${ocData.tier} (${ocData.score}%)`,
-            totalPositive: 0,
-            totalNegative: 0,
-            totalReviews: ocData.numReviews || 0,
-            positivePercent: ocData.score,
-          }
         : {
             reviewScore: 0,
             reviewScoreDesc: 'No user reviews',

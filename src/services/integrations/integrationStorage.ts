@@ -10,7 +10,7 @@ import {
   XboxSubscriptionTierId,
 } from '../../contracts/game';
 import type { InstalledGameRecord } from '../../contracts/launcher';
-import type { CriticScoreData } from '../../contracts/critic';
+import type { CriticScoreData, CriticSource } from '../../contracts/critic';
 import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
 import { steamIntegration } from './steamIntegration';
 import { gogIntegration, normalizeGogAvatarUrl } from './gogIntegration';
@@ -50,6 +50,10 @@ import {
 } from '../storage/userOverrideStorage';
 import { hydrateUserTagOverridesFromVault } from '../storage/userTagStorage';
 import { criticScoreService } from '../critic/criticScoreService';
+import { calculateTier } from '../critic/criticUtils';
+import { isAnchorSlugCompatible } from '../critic/metacriticResolver';
+import { recoverSteamAnchorFromVault } from '../critic/storefrontReviewHarvester';
+import { steamMatcher } from '../steam/steamMatcher';
 import { seedHltbFromVaultIfMissing } from '../hltb/howLongToBeat';
 import { clearExpiredStagedCache } from '../storage/stagedCacheService';
 import { vaultDelete, vaultGet, vaultSet } from '../storage/indexedDbVault';
@@ -1455,6 +1459,204 @@ function writeCatalogToLocalStorage(
   });
 }
 
+const VALID_VAULT_CRITIC_SOURCES: ReadonlySet<CriticSource> = new Set([
+  'opencritic',
+  'metacritic',
+  'metacritic_user',
+  'steam',
+  'gog',
+  'epic',
+  'xbox',
+  'custom',
+]);
+
+const VALID_VAULT_CRITIC_TIERS: ReadonlySet<CriticScoreData['tier']> = new Set([
+  'Mighty',
+  'Strong',
+  'Fair',
+  'Weak',
+]);
+
+const LAZY_STEAM_ANCHOR_RECOVERY_CHUNK_SIZE = 16;
+let lazySteamAnchorRecoveryToken = 0;
+let lazySteamAnchorRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function hasValidSteamMetacriticOnGame(game: CanonicalGame): boolean {
+  const meta = game.enrichedMetadata;
+  if (!meta?.metacritic || typeof meta.metacritic !== 'object') return false;
+  if (
+    meta.metadataQuality === 'local_federated' ||
+    String(meta.enrichedSource || '') === 'local_federated'
+  ) {
+    return false;
+  }
+  const score = meta.metacritic.score;
+  const url = typeof meta.metacritic.url === 'string' ? meta.metacritic.url.trim() : '';
+  const hasMcUrl = /^https?:\/\/(?:www\.)?metacritic\.com\/game\//i.test(url);
+  if (hasMcUrl) return true;
+  return (
+    meta.enrichedSource === 'steam' &&
+    typeof score === 'number' &&
+    Number.isFinite(score) &&
+    score > 0
+  );
+}
+
+/**
+ * Lazy chunked background pass recovering verified Steam `metacritic` anchors from IndexedDB
+ * (`enriched_metadata:<appId>`) for Steam-linked games missing `enrichedMetadata.metacritic`,
+ * seeding `criticScoreService` + writing back to SQLite via `offlineVault.saveGameDetail`, and
+ * firing one batched `antigravity_critic_updated` (`{ hydratedFromVault: true }`) if any anchors upgraded scores.
+ */
+function scheduleLazySteamAnchorVaultRecovery(games: CanonicalGame[]): void {
+  if (typeof window === 'undefined' || !Array.isArray(games) || games.length === 0) return;
+
+  const candidates: Array<{ game: CanonicalGame; steamAppId: number }> = [];
+  for (const g of games) {
+    if (!g?.id || !g.title) continue;
+    if (hasValidSteamMetacriticOnGame(g)) continue;
+    const effectiveSteamAppId = steamMatcher.getEffectiveSteamAppId(g);
+    if (typeof effectiveSteamAppId === 'number' && effectiveSteamAppId > 0) {
+      candidates.push({ game: g, steamAppId: effectiveSteamAppId });
+    }
+  }
+
+  if (candidates.length === 0) return;
+
+  const myToken = ++lazySteamAnchorRecoveryToken;
+  if (lazySteamAnchorRecoveryTimer !== null) {
+    clearTimeout(lazySteamAnchorRecoveryTimer);
+    lazySteamAnchorRecoveryTimer = null;
+  }
+
+  let cursor = 0;
+  let upgradedCount = 0;
+
+  const scheduleNext = (fn: () => void) => {
+    const handle = setTimeout(fn, 0);
+    if (handle && typeof (handle as { unref?: () => void }).unref === 'function') {
+      (handle as { unref: () => void }).unref();
+    }
+    lazySteamAnchorRecoveryTimer = handle;
+  };
+
+  const runChunk = async () => {
+    lazySteamAnchorRecoveryTimer = null;
+    if (myToken !== lazySteamAnchorRecoveryToken) return;
+
+    const end = Math.min(candidates.length, cursor + LAZY_STEAM_ANCHOR_RECOVERY_CHUNK_SIZE);
+    const slice = candidates.slice(cursor, end);
+    cursor = end;
+
+    for (const { game, steamAppId } of slice) {
+      if (myToken !== lazySteamAnchorRecoveryToken) return;
+      try {
+        const anchor = await recoverSteamAnchorFromVault(steamAppId);
+        if (
+          !anchor ||
+          typeof anchor.metacriticScore !== 'number' ||
+          !Number.isFinite(anchor.metacriticScore) ||
+          anchor.metacriticScore <= 0
+        ) {
+          continue;
+        }
+        if (anchor.metacriticSlug && !isAnchorSlugCompatible(game.title, anchor.metacriticSlug)) {
+          continue;
+        }
+
+        const roundedScore = Math.round(anchor.metacriticScore);
+        const mcSlug = anchor.metacriticSlug || '';
+        const canonicalMcUrl =
+          anchor.metacriticUrl ||
+          (mcSlug
+            ? `https://www.metacritic.com/game/${mcSlug}/critic-reviews/`
+            : `https://store.steampowered.com/app/${steamAppId}`);
+
+        const recoveredCritic: CriticScoreData = {
+          id: mcSlug ? `mc-${mcSlug}` : `steam-mc-${steamAppId}`,
+          source: 'metacritic',
+          score: roundedScore,
+          tier: calculateTier(roundedScore),
+          numReviews: 20,
+          url: canonicalMcUrl,
+          summary: 'Verified by official STEAM store review anchor.',
+          isVerified: true,
+          isSynthetic: false,
+        };
+
+        const upgraded = criticScoreService.seedFromVaultIfMissing(
+          steamAppId,
+          game.title,
+          recoveredCritic,
+          game.releaseDate,
+          game.genres,
+          { gameId: game.id, platforms: game.platforms }
+        );
+
+        if (
+          game.enrichedMetadata &&
+          !game.enrichedMetadata.__quotaSlimmed &&
+          game.enrichedMetadata.metadataQuality !== 'local_federated'
+        ) {
+          game.enrichedMetadata = {
+            ...game.enrichedMetadata,
+            metacritic: {
+              score: roundedScore,
+              url: canonicalMcUrl,
+            },
+          };
+        }
+
+        if (window.electronAPI?.offlineVault?.saveGameDetail) {
+          try {
+            void window.electronAPI.offlineVault
+              .saveGameDetail({
+                gameId: game.id,
+                steamAppId,
+                canonicalTitle: game.title,
+                criticScore: { ...recoveredCritic } as unknown as Record<string, unknown>,
+              })
+              ?.catch?.(() => {});
+          } catch {}
+        }
+
+        if (upgraded) {
+          upgradedCount += 1;
+        }
+      } catch {
+        // Ignore individual vault lookup failures
+      }
+    }
+
+    if (myToken !== lazySteamAnchorRecoveryToken) return;
+
+    if (cursor < candidates.length) {
+      scheduleNext(() => {
+        void runChunk();
+      });
+      return;
+    }
+
+    if (
+      upgradedCount > 0 &&
+      typeof window !== 'undefined' &&
+      typeof window.dispatchEvent === 'function'
+    ) {
+      try {
+        window.dispatchEvent(
+          new CustomEvent('antigravity_critic_updated', {
+            detail: { hydratedFromVault: true },
+          })
+        );
+      } catch {}
+    }
+  };
+
+  scheduleNext(() => {
+    void runChunk();
+  });
+}
+
 /**
  * Asynchronously hydrates the full rich catalog from IndexedDB on startup,
  * seamlessly upgrading any quota-slimmed localStorage snapshot or migrating
@@ -1466,6 +1668,7 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
   await hydrateUserTagOverridesFromVault().catch(() => false);
   let vaultCatalog = await vaultGet<CanonicalGame[]>(IDB_KEY_MAIN_CATALOG);
   let vaultSnapIds: Set<string> | null = null;
+  let hydratedAnyCriticFromVault = false;
 
   if (window.electronAPI?.offlineVault?.getCatalogSnapshot) {
     try {
@@ -1490,47 +1693,75 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
             typeof Reflect.get(rawCritic, 'score') === 'number'
           ) {
             const cScore = Number(Reflect.get(rawCritic, 'score'));
-            const cSourceRaw = Reflect.get(rawCritic, 'source');
-            const cTierRaw = Reflect.get(rawCritic, 'tier');
-            const cNumRaw = Reflect.get(rawCritic, 'numReviews');
-            const cPercentRaw = Reflect.get(rawCritic, 'percentRecommended');
-            const cUrlRaw = Reflect.get(rawCritic, 'url');
-            const cSummaryRaw = Reflect.get(rawCritic, 'summary');
-            const cVerifiedRaw = Reflect.get(rawCritic, 'isVerified');
-            const cSyntheticRaw = Reflect.get(rawCritic, 'isSynthetic');
-            const fallbackTier: CriticScoreData['tier'] =
-              cScore >= 84 ? 'Mighty' : cScore >= 75 ? 'Strong' : cScore >= 66 ? 'Fair' : 'Weak';
-            const validTiers: ReadonlySet<CriticScoreData['tier']> = new Set([
-              'Mighty',
-              'Strong',
-              'Fair',
-              'Weak',
-            ]);
-            const vaultCriticData: CriticScoreData = {
-              score: cScore,
-              source:
-                typeof cSourceRaw === 'string'
-                  ? (cSourceRaw as CriticScoreData['source'])
-                  : 'metacritic',
-              tier:
+            if (Number.isFinite(cScore) && cScore > 0) {
+              const cIdRaw = Reflect.get(rawCritic, 'id');
+              const cSourceRaw = Reflect.get(rawCritic, 'source');
+              const cTierRaw = Reflect.get(rawCritic, 'tier');
+              const cUserScoreRaw = Reflect.get(rawCritic, 'userScoreRaw');
+              const cStarRatingRaw = Reflect.get(rawCritic, 'starRatingRaw');
+              const cNumRaw = Reflect.get(rawCritic, 'numReviews');
+              const cPercentRaw = Reflect.get(rawCritic, 'percentRecommended');
+              const cPercentileRaw = Reflect.get(rawCritic, 'percentile');
+              const cUrlRaw = Reflect.get(rawCritic, 'url');
+              const cSummaryRaw = Reflect.get(rawCritic, 'summary');
+              const cVerifiedRaw = Reflect.get(rawCritic, 'isVerified');
+              const cSyntheticRaw = Reflect.get(rawCritic, 'isSynthetic');
+
+              const resolvedSource: CriticSource =
+                typeof cSourceRaw === 'string' &&
+                VALID_VAULT_CRITIC_SOURCES.has(cSourceRaw as CriticSource)
+                  ? (cSourceRaw as CriticSource)
+                  : 'metacritic';
+              const resolvedPercent =
+                typeof cPercentRaw === 'number' && Number.isFinite(cPercentRaw)
+                  ? cPercentRaw
+                  : undefined;
+              const resolvedTier: CriticScoreData['tier'] =
                 typeof cTierRaw === 'string' &&
-                validTiers.has(cTierRaw as CriticScoreData['tier'])
+                VALID_VAULT_CRITIC_TIERS.has(cTierRaw as CriticScoreData['tier'])
                   ? (cTierRaw as CriticScoreData['tier'])
-                  : fallbackTier,
-              ...(typeof cNumRaw === 'number' ? { numReviews: cNumRaw } : {}),
-              ...(typeof cPercentRaw === 'number' ? { percentRecommended: cPercentRaw } : {}),
-              url: typeof cUrlRaw === 'string' ? cUrlRaw : '',
-              ...(typeof cSummaryRaw === 'string' ? { summary: cSummaryRaw } : {}),
-              isVerified: typeof cVerifiedRaw === 'boolean' ? cVerifiedRaw : true,
-              ...(typeof cSyntheticRaw === 'boolean' ? { isSynthetic: cSyntheticRaw } : {}),
-            };
-            criticScoreService.seedFromVaultIfMissing(
-              g.steamAppId,
-              g.title,
-              vaultCriticData,
-              g.releaseDate,
-              g.genres
-            );
+                  : calculateTier(cScore, resolvedPercent);
+              const resolvedVerified =
+                typeof cVerifiedRaw === 'boolean'
+                  ? cVerifiedRaw
+                  : resolvedSource === 'metacritic' || resolvedSource === 'opencritic';
+
+              const vaultCriticData: CriticScoreData = {
+                ...(typeof cIdRaw === 'string' || typeof cIdRaw === 'number' ? { id: cIdRaw } : {}),
+                score: cScore,
+                source: resolvedSource,
+                tier: resolvedTier,
+                ...(typeof cUserScoreRaw === 'number' && Number.isFinite(cUserScoreRaw)
+                  ? { userScoreRaw: cUserScoreRaw }
+                  : {}),
+                ...(typeof cStarRatingRaw === 'number' && Number.isFinite(cStarRatingRaw)
+                  ? { starRatingRaw: cStarRatingRaw }
+                  : {}),
+                ...(typeof cNumRaw === 'number' && Number.isFinite(cNumRaw)
+                  ? { numReviews: cNumRaw }
+                  : {}),
+                ...(resolvedPercent !== undefined ? { percentRecommended: resolvedPercent } : {}),
+                ...(typeof cPercentileRaw === 'number' && Number.isFinite(cPercentileRaw)
+                  ? { percentile: cPercentileRaw }
+                  : {}),
+                url: typeof cUrlRaw === 'string' ? cUrlRaw : '',
+                ...(typeof cSummaryRaw === 'string' ? { summary: cSummaryRaw } : {}),
+                isVerified: resolvedVerified,
+                ...(typeof cSyntheticRaw === 'boolean' ? { isSynthetic: cSyntheticRaw } : {}),
+              };
+              const effectiveSteamAppId = steamMatcher.getEffectiveSteamAppId(g) ?? g.steamAppId;
+              const seeded = criticScoreService.seedFromVaultIfMissing(
+                effectiveSteamAppId,
+                g.title,
+                vaultCriticData,
+                g.releaseDate,
+                g.genres,
+                { gameId: g.id, platforms: g.platforms }
+              );
+              if (seeded) {
+                hydratedAnyCriticFromVault = true;
+              }
+            }
           }
           if (detailEntry?.hltb && typeof detailEntry.hltb === 'object') {
             seedHltbFromVaultIfMissing(g.title, g.steamAppId ?? undefined, detailEntry.hltb);
@@ -1646,6 +1877,20 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
           void vaultSet(IDB_KEY_MAIN_CATALOG, mergedCache);
         }
       }
+      if (
+        hydratedAnyCriticFromVault &&
+        typeof window !== 'undefined' &&
+        typeof window.dispatchEvent === 'function'
+      ) {
+        try {
+          window.dispatchEvent(
+            new CustomEvent('antigravity_critic_updated', {
+              detail: { hydratedFromVault: true },
+            })
+          );
+        } catch {}
+      }
+      scheduleLazySteamAnchorVaultRecovery(mergedCache);
       return mergedCache;
     }
   } else if (inMemoryCatalogCache && inMemoryCatalogCache.length > 0) {
