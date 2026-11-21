@@ -12,6 +12,7 @@ const {
   isHostGogGalaxyRunning,
   reapOrphanedGogOverlayProcesses,
   waitForGogPostExitFlush,
+  waitForEpicLauncherCloudSyncCompletion,
 } = require('../storefrontReadinessBarrier.cjs');
 const {
   syncXboxCloudSaves,
@@ -43,6 +44,7 @@ const { resolveXboxClientBinaryPath } = require('../windowsXboxAppxAndMsixvcOrch
 const {
   discoverSteamLocations,
   detectCompatibilityLayers,
+  prepareAlignedAuxBottleWineCommand,
 } = require('../macNativeInstallerAndCodesign.cjs');
 const {
   renewEpicTokensSingleFlight,
@@ -228,6 +230,432 @@ function detectInstalledStorefrontClients(/** @type {any} */ options = {}) {
 }
 
 /**
+ * Abortable, unref'd sleep helper so pending shutdown/settle barriers never pin app exit.
+ *
+ * @param {number} ms
+ * @param {AbortSignal | null | undefined} [signal]
+ * @returns {Promise<void>}
+ */
+function sleepAbortable(ms, signal) {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (signal && typeof signal.removeEventListener === 'function') {
+        signal.removeEventListener('abort', finish);
+      }
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    if (typeof timer.unref === 'function') timer.unref();
+    if (signal && typeof signal.addEventListener === 'function') {
+      signal.addEventListener('abort', finish, { once: true });
+    }
+  });
+}
+
+/**
+ * Pure line-by-line detector for native macOS `Steam.app` (`steam_osx`).
+ * Explicitly excludes Windows `steam.exe` running inside Wine/CrossOver bottles.
+ *
+ * @param {any} stdoutStr
+ * @param {{ ignoreShutdownHelper?: boolean }} [opts]
+ * @returns {boolean}
+ */
+function doesProcessListHaveHostMacSteam(stdoutStr, opts = {}) {
+  const out = String(stdoutStr || '');
+  const macSteamRegex = /(?:Steam\.app\/Contents\/MacOS\/steam_osx|(?:^|[\\/])steam_osx(?:\s|$))/i;
+  for (const rawLine of out.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    const cmd = trimmed.replace(/^\d+\s+/, '').trim();
+    if (!cmd || /^(?:\/bin\/|\/usr\/bin\/)?ps(?:\s|$)/i.test(cmd)) continue;
+    if (/\.exe(?:\s|["']|$)/i.test(cmd)) continue;
+    if (opts.ignoreShutdownHelper && /\s-shutdown(?:\s|$)/i.test(cmd)) continue;
+    if (macSteamRegex.test(cmd)) return true;
+  }
+  return false;
+}
+
+/**
+ * Probe whether native macOS `steam_osx` is currently running.
+ *
+ * @param {Function} execFileImpl
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<boolean>}
+ */
+async function isHostMacSteamRunning(execFileImpl, options = {}) {
+  if (typeof options.getProcessListOutput === 'function') {
+    try {
+      const out = await options.getProcessListOutput();
+      return doesProcessListHaveHostMacSteam(out, { ignoreShutdownHelper: true });
+    } catch {
+      return false;
+    }
+  }
+  if (typeof options.mockProcessListOutput === 'string') {
+    return doesProcessListHaveHostMacSteam(options.mockProcessListOutput, {
+      ignoreShutdownHelper: true,
+    });
+  }
+  return await new Promise((resolve) => {
+    try {
+      execFileImpl(
+        'ps',
+        ['-ax', '-o', 'command='],
+        { timeout: 1500 },
+        (/** @type {any} */ err, /** @type {any} */ stdout) => {
+          resolve(!err && doesProcessListHaveHostMacSteam(stdout, { ignoreShutdownHelper: true }));
+        }
+      );
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+/**
+ * Anchored per-publisher bottle daemon process regexes (zero collateral kills; NEVER bare `launcher.exe`).
+ * @type {Record<string, RegExp>}
+ */
+const BOTTLE_PUBLISHER_DAEMON_REGEX_BY_HANDOFF = Object.freeze({
+  ea: /(?:^|[\\/\s"'])(?:eadesktop|eabackgroundservice|ealauncher|link2ea|eacefsubprocess|ealocalhostsvc)\.exe(?:\s|["']|$)/i,
+  ubisoft:
+    /(?:^|[\\/\s"'])(?:upc|ubisoftconnect|ubisoftgamelauncher|ubisoftgamelauncher64|uplaywebcore|uplayservice)\.exe(?:\s|["']|$)/i,
+  bnet: /(?:^|[\\/\s"'])(?:battle\.net|battle\.net\s+launcher|agent|blizzardbrowser)\.exe(?:\s|["']|$)/i,
+  rockstar:
+    /(?:rockstar\s*games[\\/]launcher[\\/]launcher\.exe|(?:^|[\\/\s"'])(?:rockstarlauncher|launcherpatcher|socialclubhelper|rockstarservice)\.exe(?:\s|["']|$))/i,
+});
+
+/**
+ * Native macOS `.app` bundle metadata for chained publishers (`bnet`, `ea`, `riot`).
+ * @type {Record<string, { appName: string, pkillNames: string[] }>}
+ */
+const MAC_NATIVE_PUBLISHER_APPS = Object.freeze({
+  bnet: { appName: 'Battle.net', pkillNames: ['Battle.net'] },
+  ea: { appName: 'EA app', pkillNames: ['EADesktop', 'EA app'] },
+  riot: {
+    appName: 'Riot Client',
+    pkillNames: ['RiotClientUx', 'RiotClientServices', 'Riot Client'],
+  },
+});
+
+/**
+ * Check whether a `ps eww` command line belongs to the exact target bottle prefix
+ * (supporting unquoted `WINEPREFIX=/.../Bottles/OneLauncher C:\...` and `WINEPREFIX=... KEY=VAL`
+ * without cross-matching sibling bottles like `OneLauncher-arm64` or `OneLauncher Copy`).
+ *
+ * @param {string} rawCmd
+ * @param {string[]} candidateBottleNorms
+ * @returns {boolean}
+ */
+function lineMatchesExactBottlePrefix(rawCmd, candidateBottleNorms) {
+  const lowerCmd = String(rawCmd || '')
+    .replace(/\\/g, '/')
+    .toLowerCase();
+  if (!lowerCmd || candidateBottleNorms.length === 0) return false;
+
+  const hasWinePrefixEnv = /\bwineprefix=/i.test(lowerCmd);
+  for (const pfx of candidateBottleNorms) {
+    if (!pfx) continue;
+    const escapedPfx = pfx.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (hasWinePrefixEnv) {
+      const exactEnvRe = new RegExp(
+        `\\bwineprefix=(?:["']${escapedPfx}\\/?["']|${escapedPfx}\\/?(?=\\s+[a-z]:\\/|\\s+[a-z_][a-z0-9_]*=|\\s+["'/]|["'](?:\\s|$)|$))`,
+        'i'
+      );
+      if (exactEnvRe.test(lowerCmd)) return true;
+    } else {
+      const boundedPathRe = new RegExp(`(?:^|[\\s"'=])${escapedPfx}(?:\\/|["']|$)`, 'i');
+      if (boundedPathRe.test(lowerCmd)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Discover candidate log files for a chained publisher client across CrossOver bottle,
+ * native Windows, and native macOS paths (async so polling never blocks the main thread).
+ *
+ * @param {string} handoffId
+ * @param {Record<string, any>} [sessionEntry]
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<string[]>}
+ */
+async function discoverPublisherLogFilesAsync(handoffId, sessionEntry = {}, options = {}) {
+  /** @type {string[]} */
+  const candidates = [];
+  if (typeof options.publisherLogPath === 'string' && options.publisherLogPath.trim()) {
+    candidates.push(options.publisherLogPath.trim());
+  }
+  if (Array.isArray(options.publisherLogPaths)) {
+    for (const p of options.publisherLogPaths) {
+      if (typeof p === 'string' && p.trim()) candidates.push(p.trim());
+    }
+  }
+  if (candidates.length > 0) {
+    return Array.from(new Set(candidates));
+  }
+
+  const normHandoff = String(handoffId || '').toLowerCase();
+  const bottlePath = String(
+    sessionEntry.winePrefix || sessionEntry.bottlePath || options.bottlePath || ''
+  ).trim();
+  const targetPlatform = options.platform || process.platform;
+  const home = String(options.homedir || os.homedir());
+
+  if (bottlePath) {
+    const driveC = path.join(bottlePath, 'drive_c');
+    /** @type {string[]} */
+    let bottleUsers = ['crossover'];
+    try {
+      const dirents = await fs.promises.readdir(path.join(driveC, 'users'), {
+        withFileTypes: true,
+      });
+      const discovered = dirents
+        .filter((d) => d.isDirectory() && !d.name.startsWith('.') && d.name.toLowerCase() !== 'public')
+        .map((d) => d.name);
+      if (discovered.length > 0) {
+        bottleUsers = discovered;
+      }
+    } catch {}
+
+    if (normHandoff === 'ea') {
+      for (const u of bottleUsers) {
+        candidates.push(
+          path.join(driveC, 'users', u, 'AppData', 'Local', 'Electronic Arts', 'EA Desktop', 'Logs', 'EADesktop.log'),
+          path.join(
+            driveC,
+            'users',
+            u,
+            'AppData',
+            'Local',
+            'Electronic Arts',
+            'EA Desktop',
+            'Logs',
+            'EABackgroundService.log'
+          )
+        );
+      }
+      candidates.push(
+        path.join(driveC, 'ProgramData', 'EA Desktop', 'Logs', 'EABackgroundService.log'),
+        path.join(driveC, 'ProgramData', 'EA Desktop', 'Logs', 'EADesktop.log')
+      );
+    } else if (normHandoff === 'ubisoft') {
+      candidates.push(
+        path.join(driveC, 'Program Files (x86)', 'Ubisoft', 'Ubisoft Game Launcher', 'logs', 'launcher_log.txt'),
+        path.join(driveC, 'Program Files', 'Ubisoft', 'Ubisoft Game Launcher', 'logs', 'launcher_log.txt')
+      );
+    } else if (normHandoff === 'rockstar') {
+      for (const u of bottleUsers) {
+        candidates.push(
+          path.join(driveC, 'users', u, 'Documents', 'Rockstar Games', 'Launcher', 'launcher.log'),
+          path.join(driveC, 'users', u, 'My Documents', 'Rockstar Games', 'Launcher', 'launcher.log')
+        );
+      }
+    } else if (normHandoff === 'bnet') {
+      for (const u of bottleUsers) {
+        candidates.push(
+          path.join(driveC, 'users', u, 'AppData', 'Local', 'Battle.net', 'Logs', 'Battle.net.log')
+        );
+      }
+      candidates.push(path.join(driveC, 'ProgramData', 'Battle.net', 'Agent', 'Logs', 'Agent.log'));
+    }
+    return Array.from(new Set(candidates));
+  }
+
+  if (targetPlatform === 'win32') {
+    const localAppData = String(
+      options.localAppDataDir || process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local')
+    );
+    const programData = String(
+      options.programDataDir || process.env.PROGRAMDATA || 'C:\\ProgramData'
+    );
+    const progFiles86 = String(
+      options.programFilesX86Dir || process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
+    );
+    const progFiles = String(
+      options.programFilesDir || process.env.ProgramFiles || 'C:\\Program Files'
+    );
+    const joinWin = localAppData.startsWith('/') ? path.join : path.win32.join;
+    if (normHandoff === 'ea') {
+      candidates.push(
+        joinWin(localAppData, 'Electronic Arts', 'EA Desktop', 'Logs', 'EADesktop.log'),
+        joinWin(localAppData, 'Electronic Arts', 'EA Desktop', 'Logs', 'EABackgroundService.log'),
+        joinWin(programData, 'EA Desktop', 'Logs', 'EABackgroundService.log')
+      );
+    } else if (normHandoff === 'ubisoft') {
+      candidates.push(
+        joinWin(progFiles86, 'Ubisoft', 'Ubisoft Game Launcher', 'logs', 'launcher_log.txt'),
+        joinWin(progFiles, 'Ubisoft', 'Ubisoft Game Launcher', 'logs', 'launcher_log.txt'),
+        joinWin(localAppData, 'Ubisoft Game Launcher', 'logs', 'launcher_log.txt')
+      );
+    } else if (normHandoff === 'rockstar') {
+      candidates.push(joinWin(home, 'Documents', 'Rockstar Games', 'Launcher', 'launcher.log'));
+    } else if (normHandoff === 'bnet') {
+      candidates.push(
+        joinWin(localAppData, 'Battle.net', 'Logs', 'Battle.net.log'),
+        joinWin(programData, 'Battle.net', 'Agent', 'Logs', 'Agent.log')
+      );
+    } else if (normHandoff === 'riot') {
+      candidates.push(
+        joinWin(
+          localAppData,
+          'Riot Games',
+          'Riot Client',
+          'Logs',
+          'Riot Client Logs',
+          'RiotClientServices.log'
+        )
+      );
+    }
+    return Array.from(new Set(candidates));
+  }
+
+  // Native macOS `.app` publisher logs
+  if (normHandoff === 'ea') {
+    candidates.push(
+      path.join(home, 'Library', 'Application Support', 'Electronic Arts', 'EA app', 'Logs', 'EADesktop.log'),
+      path.join(home, 'Library', 'Logs', 'Electronic Arts', 'EA app', 'EADesktop.log')
+    );
+  } else if (normHandoff === 'bnet') {
+    candidates.push(
+      path.join(home, 'Library', 'Application Support', 'Battle.net', 'Logs', 'Battle.net.log'),
+      '/Users/Shared/Battle.net/Agent/Logs/Agent.log'
+    );
+  } else if (normHandoff === 'riot') {
+    candidates.push(
+      path.join(home, 'Library', 'Logs', 'Riot Games', 'Riot Client Logs', 'RiotClientServices.log')
+    );
+  }
+  return Array.from(new Set(candidates));
+}
+
+/**
+ * Publisher cloud-upload settle barrier executed before closing woken chained publisher clients
+ * (`ea`, `ubisoft`, `bnet`, `rockstar`, `riot`). Waits a minimum grace window (`8000 ms` in
+ * production, `0 ms` in tests unless configured) and extends up to `25000 ms` max while known
+ * publisher log files show active writes within the last `3000 ms`.
+ *
+ * @param {string} handoffId
+ * @param {Record<string, any>} [sessionEntry]
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ settled: boolean, waitedMs: number, extended: boolean, aborted?: boolean, reason: string }>}
+ */
+async function waitForPublisherCloudUploadSettle(handoffId, sessionEntry = {}, options = {}) {
+  const isTest = isTestEnvironment(options);
+  const hasExplicitConfig =
+    options.publisherCloudSyncGraceMs !== undefined ||
+    options.publisherCloudSyncMaxWaitMs !== undefined ||
+    options.enablePublisherCloudSyncSettleInTest === true;
+
+  const minGraceMs = Math.max(
+    0,
+    Number(
+      options.publisherCloudSyncGraceMs ??
+        (isTest && options.enablePublisherCloudSyncSettleInTest !== true ? 0 : 8000)
+    )
+  );
+  const maxWaitMs = Math.max(
+    minGraceMs,
+    Number(
+      options.publisherCloudSyncMaxWaitMs ?? (isTest && !hasExplicitConfig ? 0 : 25000)
+    )
+  );
+  if (maxWaitMs === 0) {
+    return { settled: true, waitedMs: 0, extended: false, reason: 'skipped_in_test' };
+  }
+
+  const signal = options.signal || null;
+  if (signal?.aborted) {
+    return { settled: false, aborted: true, waitedMs: 0, extended: false, reason: 'aborted' };
+  }
+
+  const activeWriteWindowMs = Math.max(
+    50,
+    Number(options.publisherActiveWriteWindowMs ?? 3000)
+  );
+  const pollIntervalMs = Math.max(
+    15,
+    Number(options.publisherCloudSyncPollIntervalMs ?? 500)
+  );
+  const startedAt = Date.now();
+
+  if (minGraceMs > 0) {
+    await sleepAbortable(minGraceMs, signal);
+    if (signal?.aborted) {
+      return {
+        settled: false,
+        aborted: true,
+        waitedMs: Date.now() - startedAt,
+        extended: false,
+        reason: 'aborted',
+      };
+    }
+  }
+
+  const logCandidates = await discoverPublisherLogFilesAsync(handoffId, sessionEntry, options);
+  const getMostRecentWriteAgeMs = async () => {
+    let newestMtime = 0;
+    for (const logPath of logCandidates) {
+      try {
+        const st = await fs.promises.stat(logPath);
+        if (st.isFile() && st.mtimeMs > newestMtime) {
+          newestMtime = st.mtimeMs;
+        }
+      } catch {}
+    }
+    if (newestMtime <= 0) return Number.POSITIVE_INFINITY;
+    return Math.max(0, Date.now() - newestMtime);
+  };
+
+  let extended = false;
+  while (Date.now() - startedAt < maxWaitMs) {
+    if (signal?.aborted) {
+      return {
+        settled: false,
+        aborted: true,
+        waitedMs: Date.now() - startedAt,
+        extended,
+        reason: 'aborted',
+      };
+    }
+    const newestWriteAgeMs = await getMostRecentWriteAgeMs();
+    if (newestWriteAgeMs > activeWriteWindowMs) {
+      return {
+        settled: true,
+        waitedMs: Date.now() - startedAt,
+        extended,
+        reason: extended ? 'log_writes_settled' : 'grace_elapsed',
+      };
+    }
+    extended = true;
+    const remaining = maxWaitMs - (Date.now() - startedAt);
+    if (remaining <= 0) break;
+    await sleepAbortable(Math.min(pollIntervalMs, remaining), signal);
+  }
+
+  if (signal?.aborted) {
+    return {
+      settled: false,
+      aborted: true,
+      waitedMs: Date.now() - startedAt,
+      extended,
+      reason: 'aborted',
+    };
+  }
+  return {
+    settled: true,
+    waitedMs: Date.now() - startedAt,
+    extended,
+    reason: extended ? 'max_wait_reached' : 'grace_elapsed',
+  };
+}
+
+/**
  * Resolve Steam client binary path and minimal launch command when Steam is not already running.
  */
 async function resolveSteamClientLaunchCommand(
@@ -269,9 +697,7 @@ async function resolveSteamClientLaunchCommand(
     if (targetPlatform === 'win32') {
       return /steam\.exe/i.test(out);
     }
-    return /(?:Steam\.app\/Contents\/MacOS\/steam_osx|(?:^|[\\/])steam_osx(?:\s|$)|(?:^|[\\/])steam\.exe(?:\s|$))/i.test(
-      out
-    );
+    return doesProcessListHaveHostMacSteam(out);
   };
 
   if (typeof options.mockProcessListOutput === 'string') {
@@ -415,9 +841,40 @@ async function shutdownEphemeralStorefrontClient(
   };
 
   try {
+    const sessionChainedHandoff = resolveAnyChainedHandoffId(
+      sessionEntry.chainedLauncherHandoff ||
+        sessionEntry.chainedRequiresLauncherHandoff ||
+        sessionEntry.chainedHandedOffTo ||
+        sessionEntry.steamChainedPublisherHandoff ||
+        sessionEntry.platformId
+    );
+    const wasPublisherWokenByLauncher = Boolean(
+      sessionEntry.wokePublisherClientByLauncher === true ||
+        sessionEntry.ephemeralClientWoken === true ||
+        sessionEntry.wokeBottleSteamPublisherByLauncher === true ||
+        (sessionEntry.wasRunningAtLaunch === false && Boolean(sessionChainedHandoff))
+    );
+    const sessionBottlePath = String(
+      sessionEntry.winePrefix || sessionEntry.bottlePath || ''
+    ).trim();
+    const isPrimaryStorefrontWoken = Boolean(
+      (platformId === 'gog' && sessionEntry.wokeGogGalaxyByLauncher === true) ||
+        (platformId === 'steam' && sessionEntry.wokeSteamByLauncher === true) ||
+        (platformId === 'epic' && sessionEntry.wokeEpicByLauncher === true) ||
+        (platformId === 'xbox' &&
+          sessionEntry.wokeXboxAppByLauncher === true &&
+          targetPlatform === 'win32')
+    );
+    const isStandalonePublisherShutdown = Boolean(
+      !isPrimaryStorefrontWoken &&
+        wasPublisherWokenByLauncher &&
+        ['ea', 'ubisoft', 'bnet', 'rockstar', 'riot'].includes(sessionChainedHandoff)
+    );
+
     const defaultGraceMs =
       isTestEnvironment(options) ||
       options.skipCloudSyncGraceDelay === true ||
+      isStandalonePublisherShutdown ||
       typeof options.spawnFn === 'function' ||
       typeof options.execFileFn === 'function' ||
       typeof options.execFileImpl === 'function'
@@ -429,19 +886,7 @@ async function shutdownEphemeralStorefrontClient(
         : defaultGraceMs;
 
     if (graceMs > 0) {
-      await new Promise((resolve) => {
-        let settled = false;
-        const finish = () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(t);
-          abortCtrl.signal.removeEventListener('abort', finish);
-          resolve(undefined);
-        };
-        const t = setTimeout(finish, graceMs);
-        if (typeof t.unref === 'function') t.unref();
-        abortCtrl.signal.addEventListener('abort', finish, { once: true });
-      });
+      await sleepAbortable(graceMs, abortCtrl.signal);
       const busyAfterGrace = getBusyOrAbortedReason();
       if (busyAfterGrace) {
         return { closed: false, shutDown: false, reason: busyAfterGrace };
@@ -455,6 +900,533 @@ async function shutdownEphemeralStorefrontClient(
         : typeof options.execFileFn === 'function'
           ? options.execFileFn
           : execFile;
+
+    const runExecFileNoThrow = (
+      /** @type {string} */ cmd,
+      /** @type {string[]} */ args,
+      /** @type {Record<string, any>} */ execOpts
+    ) =>
+      new Promise((resolve) => {
+        try {
+          execFileImpl(cmd, args, execOpts, (/** @type {any} */ err) => resolve(!err));
+        } catch {
+          resolve(false);
+        }
+      });
+
+    /**
+     * Unified cloud-settle + graceful-to-force shutdown for woken chained publishers
+     * (`ea`, `ubisoft`, `bnet`, `rockstar`, `riot`) across CrossOver bottles, native macOS `.app`,
+     * and native Windows (`win32`).
+     */
+    const shutdownWokenPublisherClient = async () => {
+      if (
+        !wasPublisherWokenByLauncher ||
+        !['ea', 'ubisoft', 'bnet', 'rockstar', 'riot'].includes(sessionChainedHandoff)
+      ) {
+        return { closed: false, shutDown: false, reason: 'not_woken_by_launcher' };
+      }
+
+      const hasActivePublisherDownload = () =>
+        Array.from(downloadQueueMap.values()).some(
+          (t) =>
+            t &&
+            (String(t.platformId || '').toLowerCase() === sessionChainedHandoff ||
+              resolveAnyChainedHandoffId(t.chainedLauncherHandoff) === sessionChainedHandoff) &&
+            (['downloading', 'queued', 'extracting', 'verifying'].includes(t.status) ||
+              pausedByInGameTaskIds.has(t.taskId))
+        );
+
+      const hasOtherActivePublisherSession = (/** @type {string} */ matchBottlePrefix = '') =>
+        Array.from(activeSessions.values()).some((other) => {
+          if (!other || other === sessionEntry || other.finalized) return false;
+          if (matchBottlePrefix) {
+            const otherPrefix = String(other.winePrefix || other.bottlePath || '').trim();
+            return Boolean(otherPrefix && path.resolve(otherPrefix) === matchBottlePrefix);
+          }
+          const otherPrefix = String(other.winePrefix || other.bottlePath || '').trim();
+          if (targetPlatform === 'darwin' && otherPrefix) return false;
+          return (
+            resolveAnyChainedHandoffId(
+              other.chainedLauncherHandoff || other.platformId || other.session?.platformId
+            ) === sessionChainedHandoff
+          );
+        });
+
+      // 1. CrossOver / Wine bottle publisher on macOS (`ea`, `ubisoft`, `bnet`, `rockstar`)
+      if (
+        targetPlatform === 'darwin' &&
+        sessionBottlePath &&
+        ['ea', 'ubisoft', 'bnet', 'rockstar'].includes(sessionChainedHandoff)
+      ) {
+        const resolvedBottlePrefix = path.resolve(sessionBottlePath);
+        const checkBottlePubBusy = () => {
+          const baseBusy = getBusyOrAbortedReason();
+          if (baseBusy) return baseBusy;
+          if (
+            (pendingBottleLaunches.get(resolvedBottlePrefix) || 0) > 0 ||
+            hasOtherActivePublisherSession(resolvedBottlePrefix)
+          ) {
+            return 'other_session_active';
+          }
+          if (hasActivePublisherDownload()) return 'active_download_in_progress';
+          return null;
+        };
+
+        const busyBeforeSettle = checkBottlePubBusy();
+        if (busyBeforeSettle) {
+          return { closed: false, shutDown: false, reason: busyBeforeSettle };
+        }
+
+        const settleRes = await waitForPublisherCloudUploadSettle(
+          sessionChainedHandoff,
+          sessionEntry,
+          { ...options, signal: abortCtrl.signal }
+        );
+        const busyAfterSettle = checkBottlePubBusy();
+        if (busyAfterSettle || settleRes.aborted) {
+          return {
+            closed: false,
+            shutDown: false,
+            reason: busyAfterSettle || 'other_session_active',
+          };
+        }
+
+        // Remove EA autostart entry cleanly *after* cloud-upload settle grace
+        if (sessionChainedHandoff === 'ea' && sessionEntry.wineBinary) {
+          try {
+            const regEnv = {
+              ...(sessionEntry.launchEnv || process.env),
+              WINEPREFIX: resolvedBottlePrefix,
+            };
+            const alignedReg = prepareAlignedAuxBottleWineCommand({
+              wineBinary: sessionEntry.wineBinary,
+              bottlePath: resolvedBottlePrefix,
+              env: regEnv,
+              suppressGuiDialogs: true,
+              ...(sessionEntry.chosenCompatLayerType
+                ? { layerType: sessionEntry.chosenCompatLayerType }
+                : {}),
+            });
+            await runExecFileNoThrow(
+              alignedReg.binaryPath,
+              [
+                'reg',
+                'delete',
+                'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run',
+                '/v',
+                'EADM',
+                '/f',
+              ],
+              { env: alignedReg.env, timeout: 6000 }
+            );
+          } catch {}
+        }
+
+        const targetPubRegex = BOTTLE_PUBLISHER_DAEMON_REGEX_BY_HANDOFF[sessionChainedHandoff];
+        const bottleNormLower = resolvedBottlePrefix.replace(/\\/g, '/').toLowerCase();
+        let realBottleNormLower = bottleNormLower;
+        try {
+          if (fs.existsSync(resolvedBottlePrefix)) {
+            realBottleNormLower = fs
+              .realpathSync(resolvedBottlePrefix)
+              .replace(/\\/g, '/')
+              .toLowerCase();
+          }
+        } catch {}
+        const candidateBottleNorms = Array.from(
+          new Set([bottleNormLower, realBottleNormLower].filter(Boolean))
+        );
+
+        const killPidImpl =
+          typeof options.killPidFn === 'function'
+            ? options.killPidFn
+            : (/** @type {number} */ pid, /** @type {string} */ sig) => process.kill(pid, sig);
+
+        const readPsOutputAsync = async () => {
+          if (typeof options.mockProcessListOutput === 'string') {
+            return options.mockProcessListOutput;
+          }
+          if (typeof options.getProcessListOutput === 'function') {
+            return String((await options.getProcessListOutput()) || '');
+          }
+          return await new Promise((resolve) => {
+            try {
+              execFileImpl(
+                'ps',
+                ['eww', '-axo', 'pid=,command='],
+                { timeout: 2500 },
+                (/** @type {any} */ err, /** @type {any} */ stdout) =>
+                  resolve(err ? '' : String(stdout || ''))
+              );
+            } catch {
+              resolve('');
+            }
+          });
+        };
+
+        const findMatchingBottlePublisherPids = (/** @type {string} */ psText) => {
+          /** @type {number[]} */
+          const matched = [];
+          if (!targetPubRegex) return matched;
+          for (const rawLine of String(psText || '').split(/\r?\n/)) {
+            const m = rawLine.trim().match(/^(\d+)\s+(.+)$/);
+            if (!m) continue;
+            const cPid = Number.parseInt(m[1], 10);
+            if (!(cPid > 1) || cPid === process.pid) continue;
+            const rawCmd = m[2];
+            if (!lineMatchesExactBottlePrefix(rawCmd, candidateBottleNorms)) continue;
+            if (targetPubRegex.test(rawCmd)) {
+              matched.push(cPid);
+            }
+          }
+          return matched;
+        };
+
+        try {
+          const initialPs = await readPsOutputAsync();
+          const pidsToTerminate = findMatchingBottlePublisherPids(initialPs);
+          for (const pid of pidsToTerminate) {
+            try {
+              killPidImpl(pid, 'SIGTERM');
+            } catch {}
+          }
+          const waitMs = Math.max(
+            0,
+            Number(
+              options.bottlePublisherGracefulKillWaitMs ?? (isTestEnvironment(options) ? 0 : 3000)
+            )
+          );
+          if (waitMs > 0 && pidsToTerminate.length > 0) {
+            await sleepAbortable(waitMs, abortCtrl.signal);
+            if (!checkBottlePubBusy()) {
+              const followUpPs = await readPsOutputAsync();
+              for (const stillPid of findMatchingBottlePublisherPids(followUpPs)) {
+                try {
+                  killPidImpl(stillPid, 'SIGKILL');
+                } catch {}
+              }
+            }
+          }
+          return {
+            closed: true,
+            shutDown: true,
+            platformId: platformId || sessionChainedHandoff,
+            chainedLauncherHandoff: sessionChainedHandoff,
+            winePrefix: resolvedBottlePrefix,
+            terminatedPids: pidsToTerminate,
+            method: 'bottle_publisher_sigterm',
+            ...(settleRes.reason !== 'skipped_in_test' ? { cloudSettleWait: settleRes } : {}),
+          };
+        } catch {
+          return {
+            closed: false,
+            shutDown: false,
+            platformId: platformId || sessionChainedHandoff,
+            reason: 'shutdown_command_failed',
+          };
+        }
+      }
+
+      // 2. Native macOS `.app` publisher (`bnet`, `ea`, `riot`)
+      if (
+        targetPlatform === 'darwin' &&
+        !sessionBottlePath &&
+        ['bnet', 'ea', 'riot'].includes(sessionChainedHandoff)
+      ) {
+        const macPubApp = MAC_NATIVE_PUBLISHER_APPS[sessionChainedHandoff];
+        const checkMacPubBusy = () => {
+          const baseBusy = getBusyOrAbortedReason();
+          if (baseBusy) return baseBusy;
+          if (hasOtherActivePublisherSession('')) return 'other_session_active';
+          if (hasActivePublisherDownload()) return 'active_download_in_progress';
+          return null;
+        };
+        const busyBeforeMacSettle = checkMacPubBusy();
+        if (busyBeforeMacSettle) {
+          return { closed: false, shutDown: false, reason: busyBeforeMacSettle };
+        }
+
+        const settleRes = await waitForPublisherCloudUploadSettle(
+          sessionChainedHandoff,
+          sessionEntry,
+          { ...options, signal: abortCtrl.signal }
+        );
+        const busyAfterMacSettle = checkMacPubBusy();
+        if (busyAfterMacSettle || settleRes.aborted) {
+          return {
+            closed: false,
+            shutDown: false,
+            reason: busyAfterMacSettle || 'other_session_active',
+          };
+        }
+
+        const canInvokeHostQuit =
+          !isTestEnvironment(options) ||
+          typeof options.execFileImpl === 'function' ||
+          typeof options.execFileFn === 'function' ||
+          options.allowHostQuitInTest === true;
+        if (!canInvokeHostQuit || !macPubApp) {
+          return {
+            closed: false,
+            shutDown: false,
+            platformId: platformId || sessionChainedHandoff,
+            chainedLauncherHandoff: sessionChainedHandoff,
+            reason: 'skipped_in_test',
+          };
+        }
+
+        try {
+          const osaOk = await runExecFileNoThrow(
+            '/usr/bin/osascript',
+            ['-e', `tell application "${macPubApp.appName}" to quit`],
+            { timeout: 5000 }
+          );
+          if (osaOk) {
+            return {
+              closed: true,
+              shutDown: true,
+              platformId: platformId || sessionChainedHandoff,
+              chainedLauncherHandoff: sessionChainedHandoff,
+              appName: macPubApp.appName,
+              method: 'osascript_quit',
+              ...(settleRes.reason !== 'skipped_in_test' ? { cloudSettleWait: settleRes } : {}),
+            };
+          }
+
+          const busyBeforePkill = checkMacPubBusy();
+          if (busyBeforePkill) {
+            return { closed: false, shutDown: false, reason: busyBeforePkill };
+          }
+          for (const procName of macPubApp.pkillNames) {
+            await runExecFileNoThrow('/usr/bin/pkill', ['-TERM', '-x', procName], {
+              timeout: 2500,
+            });
+          }
+          return {
+            closed: true,
+            shutDown: true,
+            platformId: platformId || sessionChainedHandoff,
+            chainedLauncherHandoff: sessionChainedHandoff,
+            appName: macPubApp.appName,
+            method: 'sigterm_quit',
+            ...(settleRes.reason !== 'skipped_in_test' ? { cloudSettleWait: settleRes } : {}),
+          };
+        } catch {
+          return {
+            closed: false,
+            shutDown: false,
+            platformId: platformId || sessionChainedHandoff,
+            reason: 'shutdown_command_failed',
+          };
+        }
+      }
+
+      // 3. Native Windows (`win32`) graceful-to-force shutdown for ALL 5 publishers
+      if (
+        targetPlatform === 'win32' &&
+        ['ea', 'ubisoft', 'bnet', 'rockstar', 'riot'].includes(sessionChainedHandoff)
+      ) {
+        const checkWinPubBusy = () => {
+          const baseBusy = getBusyOrAbortedReason();
+          if (baseBusy) return baseBusy;
+          if (hasOtherActivePublisherSession('')) return 'other_session_active';
+          if (hasActivePublisherDownload()) return 'active_download_in_progress';
+          return null;
+        };
+        const busyBeforeWinSettle = checkWinPubBusy();
+        if (busyBeforeWinSettle) {
+          return { closed: false, shutDown: false, reason: busyBeforeWinSettle };
+        }
+
+        const settleRes = await waitForPublisherCloudUploadSettle(
+          sessionChainedHandoff,
+          sessionEntry,
+          { ...options, signal: abortCtrl.signal }
+        );
+        const busyAfterWinSettle = checkWinPubBusy();
+        if (busyAfterWinSettle || settleRes.aborted) {
+          return {
+            closed: false,
+            shutDown: false,
+            reason: busyAfterWinSettle || 'other_session_active',
+          };
+        }
+
+        /** @type {Record<string, { gracefulArgs: string[], forceArgs: string[] }>} */
+        const winTaskkillSpecs = {
+          ea: {
+            gracefulArgs: ['/IM', 'EADesktop.exe'],
+            forceArgs: [
+              '/F',
+              '/IM',
+              'EADesktop.exe',
+              '/IM',
+              'EALauncher.exe',
+              '/IM',
+              'Link2EA.exe',
+              '/IM',
+              'EACefSubProcess.exe',
+              '/IM',
+              'EALocalHostSvc.exe',
+              '/IM',
+              'EABackgroundService.exe',
+            ],
+          },
+          ubisoft: {
+            gracefulArgs: ['/IM', 'upc.exe', '/IM', 'UbisoftConnect.exe'],
+            forceArgs: [
+              '/F',
+              '/IM',
+              'upc.exe',
+              '/IM',
+              'UbisoftConnect.exe',
+              '/IM',
+              'UbisoftGameLauncher.exe',
+              '/IM',
+              'UbisoftGameLauncher64.exe',
+              '/IM',
+              'UplayWebCore.exe',
+              '/IM',
+              'UplayService.exe',
+            ],
+          },
+          bnet: {
+            gracefulArgs: ['/IM', 'Battle.net.exe'],
+            forceArgs: [
+              '/F',
+              '/IM',
+              'Battle.net.exe',
+              '/IM',
+              'Battle.net Launcher.exe',
+              '/IM',
+              'Agent.exe',
+              '/IM',
+              'BlizzardBrowser.exe',
+            ],
+          },
+          riot: {
+            gracefulArgs: ['/IM', 'RiotClientUx.exe', '/IM', 'RiotClientServices.exe'],
+            forceArgs: [
+              '/F',
+              '/IM',
+              'RiotClientUx.exe',
+              '/IM',
+              'RiotClientUxRender.exe',
+              '/IM',
+              'RiotClientServices.exe',
+              '/IM',
+              'RiotClientCrashHandler.exe',
+            ],
+          },
+        };
+
+        try {
+          const pubWaitMs = Math.max(
+            0,
+            Number(
+              options.publisherGracefulKillWaitMs ??
+                (sessionChainedHandoff === 'ea' ? options.eaGracefulKillWaitMs : undefined) ??
+                (isTestEnvironment(options) ? 0 : 2500)
+            )
+          );
+
+          if (sessionChainedHandoff === 'rockstar') {
+            // CRITICAL ROCKSTAR SAFETY: NEVER run bare `taskkill.exe /IM Launcher.exe`!
+            // Scope `Launcher.exe` strictly via CIM ExecutablePath filter + explicit Rockstar helper binaries.
+            await runExecFileNoThrow(
+              'powershell.exe',
+              [
+                '-NoProfile',
+                '-NonInteractive',
+                '-WindowStyle',
+                'Hidden',
+                '-Command',
+                "Get-CimInstance Win32_Process -Filter \"Name='Launcher.exe'\" | Where-Object { $_.ExecutablePath -like '*Rockstar Games*Launcher*' } | ForEach-Object { $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; if ($p) { $null = $p.CloseMainWindow() } }",
+              ],
+              { timeout: 5000, windowsHide: true }
+            );
+            await runExecFileNoThrow(
+              'taskkill.exe',
+              ['/IM', 'LauncherPatcher.exe', '/IM', 'SocialClubHelper.exe'],
+              { timeout: 3000, windowsHide: true }
+            );
+            if (pubWaitMs > 0) {
+              await sleepAbortable(pubWaitMs, abortCtrl.signal);
+            }
+            if (!checkWinPubBusy()) {
+              await runExecFileNoThrow(
+                'powershell.exe',
+                [
+                  '-NoProfile',
+                  '-NonInteractive',
+                  '-WindowStyle',
+                  'Hidden',
+                  '-Command',
+                  "Get-CimInstance Win32_Process -Filter \"Name='Launcher.exe'\" | Where-Object { $_.ExecutablePath -like '*Rockstar Games*Launcher*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+                ],
+                { timeout: 5000, windowsHide: true }
+              );
+              await runExecFileNoThrow(
+                'taskkill.exe',
+                [
+                  '/F',
+                  '/IM',
+                  'LauncherPatcher.exe',
+                  '/IM',
+                  'SocialClubHelper.exe',
+                  '/IM',
+                  'RockstarService.exe',
+                ],
+                { timeout: 4000, windowsHide: true }
+              );
+            }
+            return {
+              closed: true,
+              shutDown: true,
+              platformId: platformId || 'rockstar',
+              chainedLauncherHandoff: 'rockstar',
+              method: 'cim_scoped_graceful',
+              ...(settleRes.reason !== 'skipped_in_test' ? { cloudSettleWait: settleRes } : {}),
+            };
+          }
+
+          const spec = winTaskkillSpecs[sessionChainedHandoff];
+          if (spec) {
+            await runExecFileNoThrow('taskkill.exe', spec.gracefulArgs, {
+              timeout: 3000,
+              windowsHide: true,
+            });
+            if (pubWaitMs > 0) {
+              await sleepAbortable(pubWaitMs, abortCtrl.signal);
+            }
+            if (!checkWinPubBusy()) {
+              await runExecFileNoThrow('taskkill.exe', spec.forceArgs, {
+                timeout: 4000,
+                windowsHide: true,
+              });
+            }
+            return {
+              closed: true,
+              shutDown: true,
+              platformId: platformId || sessionChainedHandoff,
+              chainedLauncherHandoff: sessionChainedHandoff,
+              method: 'taskkill_graceful',
+              ...(settleRes.reason !== 'skipped_in_test' ? { cloudSettleWait: settleRes } : {}),
+            };
+          }
+        } catch {
+          return {
+            closed: false,
+            shutDown: false,
+            platformId: platformId || sessionChainedHandoff,
+            reason: 'shutdown_command_failed',
+          };
+        }
+      }
+
+      return { closed: false, shutDown: false, reason: 'not_woken_by_launcher' };
+    };
 
     const shouldReapGogOverlay =
       !isTestEnvironment(options) ||
@@ -491,11 +1463,18 @@ async function shutdownEphemeralStorefrontClient(
         }
       }
 
+      const isGogStorefrontUri =
+        sessionEntry.session?.launchMethod === 'storefront_uri' ||
+        sessionEntry.launchMethod === 'storefront_uri';
       const gogFlushWait = await waitForGogPostExitFlush({
         platform: targetPlatform,
         homedir: options.homedir,
+        isStorefrontUri: isGogStorefrontUri,
         ...(typeof sessionEntry.gogCommLogPreExitOffset === 'number'
           ? { preExitOffset: sessionEntry.gogCommLogPreExitOffset }
+          : {}),
+        ...(typeof sessionEntry.gogClientLogPreExitOffset === 'number'
+          ? { preExitClientOffset: sessionEntry.gogClientLogPreExitOffset }
           : {}),
         signal: abortCtrl.signal,
         options,
@@ -671,6 +1650,11 @@ async function shutdownEphemeralStorefrontClient(
               ...options,
               mode: 'post_exit',
               ignoreStaleLogAge: true,
+              ...(typeof sessionEntry.steamCloudLogSessionStartOffset === 'number'
+                ? { sessionStartOffset: sessionEntry.steamCloudLogSessionStartOffset }
+                : {}),
+              isFastDirectBypass: Boolean(sessionEntry.isFastDirectBypass),
+              wokeSteamByLauncher: Boolean(sessionEntry.wokeSteamByLauncher),
               signal: abortCtrl.signal,
               abortOnSignal: true,
             }
@@ -692,33 +1676,14 @@ async function shutdownEphemeralStorefrontClient(
             windowsHide: true,
           });
           if (child && typeof child.unref === 'function') child.unref();
+          /** @type {any} */
+          let publisherShutdown = null;
           if (
-            sessionEntry.wokePublisherClientByLauncher === true &&
-            resolveAnyChainedHandoffId(sessionEntry.chainedLauncherHandoff) === 'ea' &&
+            wasPublisherWokenByLauncher &&
+            ['ea', 'ubisoft', 'bnet', 'rockstar', 'riot'].includes(sessionChainedHandoff) &&
             !getBusyOrAbortedReason()
           ) {
-            await new Promise((resolve) => {
-              execFileImpl(
-                'taskkill.exe',
-                [
-                  '/F',
-                  '/IM',
-                  'EADesktop.exe',
-                  '/IM',
-                  'EALauncher.exe',
-                  '/IM',
-                  'Link2EA.exe',
-                  '/IM',
-                  'EACefSubProcess.exe',
-                  '/IM',
-                  'EALocalHostSvc.exe',
-                  '/IM',
-                  'EABackgroundService.exe',
-                ],
-                { timeout: 4000, windowsHide: true },
-                () => resolve(undefined)
-              );
-            });
+            publisherShutdown = await shutdownWokenPublisherClient();
           }
           return {
             closed: true,
@@ -727,6 +1692,7 @@ async function shutdownEphemeralStorefrontClient(
             method: 'steam_shutdown_flag',
             binaryPath: steamBin,
             ...(cloudWaitResult ? { cloudSyncWait: cloudWaitResult } : {}),
+            ...(publisherShutdown ? { publisherShutdown } : {}),
           };
         } else if (targetPlatform === 'darwin') {
           if (
@@ -752,12 +1718,16 @@ async function shutdownEphemeralStorefrontClient(
           }
 
           if (sessionEntry.steamClientBinaryPath) {
+            const steamShutdownTimeoutMs = Math.max(
+              1000,
+              Number(options.steamShutdownTimeoutMs ?? 15000)
+            );
             const shutdownOk = await new Promise((resolve) => {
               try {
                 execFileImpl(
                   sessionEntry.steamClientBinaryPath,
                   ['-shutdown'],
-                  { timeout: 3000 },
+                  { timeout: steamShutdownTimeoutMs },
                   (/** @type {any} */ err) => resolve(!err)
                 );
               } catch {
@@ -765,14 +1735,54 @@ async function shutdownEphemeralStorefrontClient(
               }
             });
             if (shutdownOk) {
-              return {
-                closed: true,
-                shutDown: true,
-                platformId: 'steam',
-                method: 'steam_shutdown_flag',
-                binaryPath: sessionEntry.steamClientBinaryPath,
-                ...(cloudWaitResult ? { cloudSyncWait: cloudWaitResult } : {}),
-              };
+              const shouldAwaitHostSteamExit =
+                !isTestEnvironment(options) || options.awaitHostSteamExitInTest === true;
+              const hostSteamExitWaitMs = shouldAwaitHostSteamExit
+                ? Math.max(0, Number(options.hostSteamExitWaitMs ?? 8000))
+                : 0;
+              let exitedCleanly = true;
+              if (hostSteamExitWaitMs > 0) {
+                const pollIntervalMs = Math.max(
+                  15,
+                  Number(options.hostSteamExitPollIntervalMs ?? 250)
+                );
+                const exitDeadline = Date.now() + hostSteamExitWaitMs;
+                exitedCleanly = false;
+                while (true) {
+                  const busyDuringWait = getBusyOrAbortedReason();
+                  if (busyDuringWait) {
+                    return { closed: false, shutDown: false, reason: busyDuringWait };
+                  }
+                  const stillRunning = await isHostMacSteamRunning(execFileImpl, options);
+                  if (!stillRunning) {
+                    exitedCleanly = true;
+                    break;
+                  }
+                  const remaining = exitDeadline - Date.now();
+                  if (remaining <= 0) break;
+                  await sleepAbortable(Math.min(pollIntervalMs, remaining), abortCtrl.signal);
+                }
+              }
+              if (exitedCleanly) {
+                /** @type {any} */
+                let publisherShutdown = null;
+                if (
+                  wasPublisherWokenByLauncher &&
+                  ['ea', 'ubisoft', 'bnet', 'rockstar', 'riot'].includes(sessionChainedHandoff) &&
+                  !getBusyOrAbortedReason()
+                ) {
+                  publisherShutdown = await shutdownWokenPublisherClient();
+                }
+                return {
+                  closed: true,
+                  shutDown: true,
+                  platformId: 'steam',
+                  method: 'steam_shutdown_flag',
+                  binaryPath: sessionEntry.steamClientBinaryPath,
+                  ...(cloudWaitResult ? { cloudSyncWait: cloudWaitResult } : {}),
+                  ...(publisherShutdown ? { publisherShutdown } : {}),
+                };
+              }
             }
           }
 
@@ -789,6 +1799,15 @@ async function shutdownEphemeralStorefrontClient(
               () => resolve(undefined)
             );
           });
+          /** @type {any} */
+          let publisherShutdownAfterPkill = null;
+          if (
+            wasPublisherWokenByLauncher &&
+            ['ea', 'ubisoft', 'bnet', 'rockstar', 'riot'].includes(sessionChainedHandoff) &&
+            !getBusyOrAbortedReason()
+          ) {
+            publisherShutdownAfterPkill = await shutdownWokenPublisherClient();
+          }
           return {
             closed: true,
             shutDown: true,
@@ -796,6 +1815,9 @@ async function shutdownEphemeralStorefrontClient(
             method: 'sigterm_quit',
             binaryPath: sessionEntry.steamClientBinaryPath || null,
             ...(cloudWaitResult ? { cloudSyncWait: cloudWaitResult } : {}),
+            ...(publisherShutdownAfterPkill
+              ? { publisherShutdown: publisherShutdownAfterPkill }
+              : {}),
           };
         }
       } catch {
@@ -812,6 +1834,30 @@ async function shutdownEphemeralStorefrontClient(
       const busyBeforeEpicKill = getBusyOrAbortedReason();
       if (busyBeforeEpicKill) {
         return { closed: false, shutDown: false, reason: busyBeforeEpicKill };
+      }
+
+      const isEpicStorefrontUri =
+        sessionEntry.session?.launchMethod === 'storefront_uri' ||
+        sessionEntry.launchMethod === 'storefront_uri';
+      /** @type {any} */
+      let epicCloudWait = null;
+      if (isEpicStorefrontUri || sessionBottlePath) {
+        try {
+          epicCloudWait = await waitForEpicLauncherCloudSyncCompletion({
+            platform: targetPlatform,
+            homedir: options.homedir,
+            ...(sessionBottlePath ? { bottlePath: sessionBottlePath } : {}),
+            ...(typeof sessionEntry.epicLogPreExitOffset === 'number'
+              ? { preExitOffset: sessionEntry.epicLogPreExitOffset }
+              : {}),
+            signal: abortCtrl.signal,
+            options,
+          });
+        } catch {}
+        const busyAfterEpicCloud = getBusyOrAbortedReason();
+        if (busyAfterEpicCloud) {
+          return { closed: false, shutDown: false, reason: busyAfterEpicCloud };
+        }
       }
 
       try {
@@ -841,19 +1887,7 @@ async function shutdownEphemeralStorefrontClient(
           if (!isTestEnvironment(options) || options.enableEpicForceKillFallback === true) {
             const waitMs = Math.max(0, Number(options.epicGracefulKillWaitMs ?? 3000));
             if (waitMs > 0) {
-              await new Promise((resolve) => {
-                let done = false;
-                const finish = () => {
-                  if (done) return;
-                  done = true;
-                  clearTimeout(t);
-                  abortCtrl.signal.removeEventListener('abort', finish);
-                  resolve(undefined);
-                };
-                const t = setTimeout(finish, waitMs);
-                if (typeof t.unref === 'function') t.unref();
-                abortCtrl.signal.addEventListener('abort', finish, { once: true });
-              });
+              await sleepAbortable(waitMs, abortCtrl.signal);
             }
             if (!getBusyOrAbortedReason()) {
               await new Promise((resolve) => {
@@ -867,12 +1901,25 @@ async function shutdownEphemeralStorefrontClient(
             }
           }
 
+          /** @type {any} */
+          let epicWinPubShutdown = null;
+          if (
+            wasPublisherWokenByLauncher &&
+            ['ea', 'ubisoft', 'bnet', 'rockstar', 'riot'].includes(sessionChainedHandoff) &&
+            !getBusyOrAbortedReason()
+          ) {
+            epicWinPubShutdown = await shutdownWokenPublisherClient();
+          }
           return {
             closed: true,
             shutDown: true,
             platformId: 'epic',
             method: 'taskkill_graceful',
             clientPath: sessionEntry.epicClientPath || null,
+            ...(epicCloudWait && epicCloudWait.reason !== 'skipped_in_test'
+              ? { cloudSyncWait: epicCloudWait }
+              : {}),
+            ...(epicWinPubShutdown ? { publisherShutdown: epicWinPubShutdown } : {}),
           };
         } else if (targetPlatform === 'darwin') {
           if (!isTestEnvironment(options) || options.preferOsascriptQuitOnDarwin === true) {
@@ -889,12 +1936,25 @@ async function shutdownEphemeralStorefrontClient(
               }
             });
             if (osaOk) {
+              /** @type {any} */
+              let epicMacPubShutdown = null;
+              if (
+                wasPublisherWokenByLauncher &&
+                ['ea', 'ubisoft', 'bnet', 'rockstar', 'riot'].includes(sessionChainedHandoff) &&
+                !getBusyOrAbortedReason()
+              ) {
+                epicMacPubShutdown = await shutdownWokenPublisherClient();
+              }
               return {
                 closed: true,
                 shutDown: true,
                 platformId: 'epic',
                 method: 'osascript_quit',
                 clientPath: sessionEntry.epicClientPath || null,
+                ...(epicCloudWait && epicCloudWait.reason !== 'skipped_in_test'
+                  ? { cloudSyncWait: epicCloudWait }
+                  : {}),
+                ...(epicMacPubShutdown ? { publisherShutdown: epicMacPubShutdown } : {}),
               };
             }
           }
@@ -912,12 +1972,25 @@ async function shutdownEphemeralStorefrontClient(
               () => resolve(undefined)
             );
           });
+          /** @type {any} */
+          let epicPkillPubShutdown = null;
+          if (
+            wasPublisherWokenByLauncher &&
+            ['ea', 'ubisoft', 'bnet', 'rockstar', 'riot'].includes(sessionChainedHandoff) &&
+            !getBusyOrAbortedReason()
+          ) {
+            epicPkillPubShutdown = await shutdownWokenPublisherClient();
+          }
           return {
             closed: true,
             shutDown: true,
             platformId: 'epic',
             method: 'sigterm_quit',
             clientPath: sessionEntry.epicClientPath || null,
+            ...(epicCloudWait && epicCloudWait.reason !== 'skipped_in_test'
+              ? { cloudSyncWait: epicCloudWait }
+              : {}),
+            ...(epicPkillPubShutdown ? { publisherShutdown: epicPkillPubShutdown } : {}),
           };
         }
       } catch {
@@ -965,264 +2038,11 @@ async function shutdownEphemeralStorefrontClient(
       }
     }
 
-    const sessionChainedHandoff = resolveAnyChainedHandoffId(
-      sessionEntry.chainedLauncherHandoff ||
-        sessionEntry.chainedRequiresLauncherHandoff ||
-        sessionEntry.chainedHandedOffTo ||
-        sessionEntry.steamChainedPublisherHandoff ||
-        sessionEntry.platformId
-    );
-    const wasPublisherWokenByLauncher = Boolean(
-      sessionEntry.wokePublisherClientByLauncher === true ||
-        sessionEntry.ephemeralClientWoken === true ||
-        sessionEntry.wokeBottleSteamPublisherByLauncher === true ||
-        (sessionEntry.wasRunningAtLaunch === false && Boolean(sessionChainedHandoff))
-    );
-    const sessionBottlePath = String(
-      sessionEntry.winePrefix || sessionEntry.bottlePath || ''
-    ).trim();
-
     if (
-      targetPlatform === 'darwin' &&
       wasPublisherWokenByLauncher &&
-      sessionBottlePath &&
-      ['ea', 'ubisoft', 'bnet', 'rockstar'].includes(sessionChainedHandoff)
+      ['ea', 'ubisoft', 'bnet', 'rockstar', 'riot'].includes(sessionChainedHandoff)
     ) {
-      const resolvedBottlePrefix = path.resolve(sessionBottlePath);
-      const hasOtherActiveSameBottleSession =
-        (pendingBottleLaunches.get(resolvedBottlePrefix) || 0) > 0 ||
-        Array.from(activeSessions.values()).some((other) => {
-          if (!other || other === sessionEntry || other.finalized) return false;
-          const otherPrefix = String(other.winePrefix || other.bottlePath || '').trim();
-          return Boolean(otherPrefix && path.resolve(otherPrefix) === resolvedBottlePrefix);
-        });
-      const hasActivePublisherDownload = Array.from(downloadQueueMap.values()).some(
-        (t) =>
-          t &&
-          (String(t.platformId || '').toLowerCase() === sessionChainedHandoff ||
-            resolveAnyChainedHandoffId(t.chainedLauncherHandoff) === sessionChainedHandoff) &&
-          (['downloading', 'queued', 'extracting', 'verifying'].includes(t.status) ||
-            pausedByInGameTaskIds.has(t.taskId))
-      );
-      const busyBeforeBottlePubKill = getBusyOrAbortedReason();
-      if (
-        busyBeforeBottlePubKill ||
-        hasOtherActiveSameBottleSession ||
-        hasActivePublisherDownload
-      ) {
-        return {
-          closed: false,
-          shutDown: false,
-          reason:
-            busyBeforeBottlePubKill ||
-            (hasOtherActiveSameBottleSession
-              ? 'other_session_active'
-              : 'active_download_in_progress'),
-        };
-      }
-
-      /** @type {Record<string, string[]>} */
-      const bottlePublisherDaemonExesByHandoff = {
-        ea: [
-          'eadesktop.exe',
-          'eabackgroundservice.exe',
-          'ealauncher.exe',
-          'link2ea.exe',
-          'eacefsubprocess.exe',
-          'ealocalhostsvc.exe',
-        ],
-        ubisoft: [
-          'upc.exe',
-          'ubisoftconnect.exe',
-          'ubisoftgamelauncher.exe',
-          'ubisoftgamelauncher64.exe',
-          'uplaywebcore.exe',
-          'uplayservice.exe',
-        ],
-        bnet: ['battle.net.exe', 'battle.net launcher.exe', 'agent.exe', 'blizzardbrowser.exe'],
-        rockstar: [
-          'launcher.exe',
-          'launcherpatcher.exe',
-          'socialclubhelper.exe',
-          'rockstarservice.exe',
-        ],
-      };
-      const targetPubExes = bottlePublisherDaemonExesByHandoff[sessionChainedHandoff] || [];
-      const bottleNormLower = resolvedBottlePrefix.replace(/\\/g, '/').toLowerCase();
-      const killPidImpl =
-        typeof options.killPidFn === 'function'
-          ? options.killPidFn
-          : (/** @type {number} */ pid, /** @type {string} */ sig) => process.kill(pid, sig);
-
-      const readPsOutputAsync = async () => {
-        if (typeof options.mockProcessListOutput === 'string') {
-          return options.mockProcessListOutput;
-        }
-        if (typeof options.getProcessListOutput === 'function') {
-          return String((await options.getProcessListOutput()) || '');
-        }
-        return await new Promise((resolve) => {
-          try {
-            execFileImpl(
-              'ps',
-              ['eww', '-axo', 'pid=,command='],
-              { timeout: 2500 },
-              (/** @type {any} */ err, /** @type {any} */ stdout) =>
-                resolve(err ? '' : String(stdout || ''))
-            );
-          } catch {
-            resolve('');
-          }
-        });
-      };
-
-      const findMatchingBottlePublisherPids = (/** @type {string} */ psText) => {
-        /** @type {number[]} */
-        const matched = [];
-        for (const rawLine of String(psText || '').split(/\r?\n/)) {
-          const m = rawLine.trim().match(/^(\d+)\s+(.+)$/);
-          if (!m) continue;
-          const cPid = Number.parseInt(m[1], 10);
-          if (!(cPid > 1) || cPid === process.pid) continue;
-          const cmdLower = m[2].replace(/\\/g, '/').toLowerCase();
-          if (!cmdLower.includes(bottleNormLower)) continue;
-          if (targetPubExes.some((exeName) => cmdLower.includes(exeName))) {
-            matched.push(cPid);
-          }
-        }
-        return matched;
-      };
-
-      try {
-        const initialPs = await readPsOutputAsync();
-        const pidsToTerminate = findMatchingBottlePublisherPids(initialPs);
-        for (const pid of pidsToTerminate) {
-          try {
-            killPidImpl(pid, 'SIGTERM');
-          } catch {}
-        }
-        const waitMs = Math.max(
-          0,
-          Number(options.bottlePublisherGracefulKillWaitMs ?? (isTestEnvironment(options) ? 0 : 800))
-        );
-        if (waitMs > 0 && pidsToTerminate.length > 0) {
-          await new Promise((resolve) => {
-            const t = setTimeout(resolve, waitMs);
-            if (typeof t.unref === 'function') t.unref();
-          });
-          if (!getBusyOrAbortedReason()) {
-            const followUpPs = await readPsOutputAsync();
-            for (const stillPid of findMatchingBottlePublisherPids(followUpPs)) {
-              try {
-                killPidImpl(stillPid, 'SIGKILL');
-              } catch {}
-            }
-          }
-        }
-        return {
-          closed: true,
-          shutDown: true,
-          platformId: platformId || sessionChainedHandoff,
-          chainedLauncherHandoff: sessionChainedHandoff,
-          winePrefix: resolvedBottlePrefix,
-          terminatedPids: pidsToTerminate,
-          method: 'bottle_publisher_sigterm',
-        };
-      } catch {
-        return {
-          closed: false,
-          shutDown: false,
-          platformId: platformId || sessionChainedHandoff,
-          reason: 'shutdown_command_failed',
-        };
-      }
-    }
-
-    if (
-      sessionChainedHandoff === 'ea' &&
-      wasPublisherWokenByLauncher &&
-      targetPlatform === 'win32'
-    ) {
-      const hasOtherActiveEaSession = Array.from(activeSessions.values()).some(
-        (other) =>
-          other !== sessionEntry &&
-          !other.finalized &&
-          resolveAnyChainedHandoffId(other.chainedLauncherHandoff) === 'ea'
-      );
-      const hasActiveEaDownload = Array.from(downloadQueueMap.values()).some(
-        (t) =>
-          t &&
-          (String(t.platformId || '').toLowerCase() === 'ea' ||
-            resolveAnyChainedHandoffId(t.chainedLauncherHandoff) === 'ea') &&
-          (['downloading', 'queued', 'extracting', 'verifying'].includes(t.status) ||
-            pausedByInGameTaskIds.has(t.taskId))
-      );
-      const busyBeforeEaKill = getBusyOrAbortedReason();
-      if (busyBeforeEaKill || hasOtherActiveEaSession || hasActiveEaDownload) {
-        return {
-          closed: false,
-          shutDown: false,
-          reason: busyBeforeEaKill || (hasOtherActiveEaSession ? 'other_session_active' : 'active_download_in_progress'),
-        };
-      }
-      try {
-        await new Promise((resolve) => {
-          execFileImpl(
-            'taskkill.exe',
-            ['/IM', 'EADesktop.exe'],
-            { timeout: 3000, windowsHide: true },
-            () => resolve(undefined)
-          );
-        });
-        const eaWaitMs = Math.max(
-          0,
-          Number(options.eaGracefulKillWaitMs ?? (isTestEnvironment(options) ? 0 : 1500))
-        );
-        if (eaWaitMs > 0) {
-          await new Promise((resolve) => {
-            const t = setTimeout(resolve, eaWaitMs);
-            if (typeof t.unref === 'function') t.unref();
-          });
-        }
-        if (!getBusyOrAbortedReason()) {
-          await new Promise((resolve) => {
-            execFileImpl(
-              'taskkill.exe',
-              [
-                '/F',
-                '/IM',
-                'EADesktop.exe',
-                '/IM',
-                'EALauncher.exe',
-                '/IM',
-                'Link2EA.exe',
-                '/IM',
-                'EACefSubProcess.exe',
-                '/IM',
-                'EALocalHostSvc.exe',
-                '/IM',
-                'EABackgroundService.exe',
-              ],
-              { timeout: 4000, windowsHide: true },
-              () => resolve(undefined)
-            );
-          });
-        }
-        return {
-          closed: true,
-          shutDown: true,
-          platformId: platformId || 'ea',
-          chainedLauncherHandoff: 'ea',
-          method: 'taskkill_graceful',
-        };
-      } catch {
-        return {
-          closed: false,
-          shutDown: false,
-          platformId: platformId || 'ea',
-          reason: 'shutdown_command_failed',
-        };
-      }
+      return await shutdownWokenPublisherClient();
     }
 
     return { closed: false, shutDown: false, reason: 'not_woken_by_launcher' };
@@ -1698,6 +2518,7 @@ module.exports = {
   resolveSteamClientBinaryPath,
   detectInstalledStorefrontClients,
   resolveSteamClientLaunchCommand,
+  waitForPublisherCloudUploadSettle,
   shutdownEphemeralStorefrontClient,
   syncSessionPlaytimeToStorefront,
   replayPendingCloudUploadsForSupervisor,
