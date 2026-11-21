@@ -831,6 +831,7 @@ function updateDownloadTask(taskId, partial = {}, options = {}) {
   const prevProgress = Number(task.progressPercent || 0);
   const prevBytes = Number(task.bytesDownloaded || 0);
   const prevStatus = task.status;
+  const prevStatusMessage = String(task.statusMessage || '');
 
   Object.assign(task, partial);
 
@@ -905,6 +906,9 @@ function updateDownloadTask(taskId, partial = {}, options = {}) {
   }
 
   const statusChanged = prevStatus !== task.status;
+  const statusMessageChanged =
+    partial.statusMessage !== undefined &&
+    String(task.statusMessage || '') !== prevStatusMessage;
   if (!task.isSimulatedOrManual && !task.manualControl && statusChanged) {
     persistDownloadQueueToDisk(options.userDataDir || task._persistedUserDataDir);
   }
@@ -916,6 +920,7 @@ function updateDownloadTask(taskId, partial = {}, options = {}) {
   const publicTask = toPublicDownloadTask(task);
   const forceImmediate =
     statusChanged ||
+    statusMessageChanged ||
     TERMINAL_DOWNLOAD_STATUSES.has(task.status) ||
     task.status === 'paused' ||
     Boolean(task.manualControl);
