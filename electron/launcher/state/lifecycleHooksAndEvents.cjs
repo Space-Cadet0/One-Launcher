@@ -265,25 +265,6 @@ function createLifecycleHooksAndEvents(deps) {
       } catch {}
     }
 
-    if (typeof sessionLifecycleHook === 'function' && payload) {
-      try {
-        const sess = payload.session || payload;
-        const lifecycleStatus =
-          payload.event === 'stopped'
-            ? 'stopped'
-            : payload.event === 'started'
-              ? 'running'
-              : payload.event === 'stopping'
-                ? 'stopping'
-                : sess.status;
-        sessionLifecycleHook(sess.gameId, {
-          ...sess,
-          ...payload,
-          status: lifecycleStatus,
-        });
-      } catch {}
-    }
-
     let sentToRenderer = false;
     try {
       const win = getMainWindow();
@@ -314,6 +295,25 @@ function createLifecycleHooksAndEvents(deps) {
     ) {
       try {
         queuePendingCompletedSession(payload, options);
+      } catch {}
+    }
+
+    if (typeof sessionLifecycleHook === 'function' && payload) {
+      try {
+        const sess = payload.session || payload;
+        const lifecycleStatus =
+          payload.event === 'stopped'
+            ? 'stopped'
+            : payload.event === 'started'
+              ? 'running'
+              : payload.event === 'stopping'
+                ? 'stopping'
+                : sess.status;
+        sessionLifecycleHook(sess.gameId, {
+          ...sess,
+          ...payload,
+          status: lifecycleStatus,
+        });
       } catch {}
     }
   }

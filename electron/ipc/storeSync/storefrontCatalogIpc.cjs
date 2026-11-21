@@ -36,6 +36,41 @@ const STEAM_SSR_NAV_ALLOWLIST = Object.freeze([
 ]);
 
 /**
+ * Return the first Steam browser partition holding an authenticated `steamLoginSecure` cookie,
+ * or `null` if none is present.
+ *
+ * @param {any} sessionMod
+ * @returns {Promise<string | null>}
+ */
+async function findSteamSessionCookiePartition(sessionMod) {
+  if (!sessionMod || typeof sessionMod.fromPartition !== 'function') return null;
+  const partitions = Array.from(
+    new Set([resolveStorefrontOAuthPartition('steam'), 'persist:storefront_auth'])
+  );
+  for (const partition of partitions) {
+    try {
+      const partSession = sessionMod.fromPartition(partition);
+      if (!partSession?.cookies || typeof partSession.cookies.get !== 'function') continue;
+      const cookies = await partSession.cookies.get({ domain: 'steamcommunity.com' });
+      if (
+        Array.isArray(cookies) &&
+        cookies.some(
+          (/** @type {any} */ c) =>
+            c &&
+            typeof c.name === 'string' &&
+            c.name === 'steamLoginSecure' &&
+            typeof c.value === 'string' &&
+            c.value.trim().length > 0
+        )
+      ) {
+        return partition;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+/**
  * Register storefront token management, library sync, achievement, metadata, and IGDB IPC handlers.
  *
  * @param {{
@@ -114,6 +149,13 @@ function registerStorefrontCatalogIpcHandlers({
           ? fallbackCredentials.gogToken.trim()
           : '';
 
+        const hasSavedSteamId =
+          storefrontId === 'steam' &&
+          typeof tokenData.steamId === 'string' &&
+          tokenData.steamId.trim().length > 0;
+        const steamCookiePartition =
+          storefrontId === 'steam' ? await findSteamSessionCookiePartition(session) : null;
+
         if (
           !isRealSecretToken(tokenData.access_token) &&
           !isRealSecretToken(tokenData.xblAccessToken) &&
@@ -123,7 +165,9 @@ function registerStorefrontCatalogIpcHandlers({
           !isRealSecretToken(tokenData.webapi_token) &&
           !isRealSecretToken(tokenData.apiKey) &&
           !cleanFallbackEpicToken &&
-          !cleanFallbackGogToken
+          !cleanFallbackGogToken &&
+          !hasSavedSteamId &&
+          !steamCookiePartition
         ) {
           return {
             success: false,
@@ -172,12 +216,16 @@ function registerStorefrontCatalogIpcHandlers({
             let refreshedLive = false;
             let networkOfflineDetected = !isNetworkOnlineForStoreSync(handlerOptions);
 
-            if (!networkOfflineDetected && tokenData.webapi_token && tokenData.steamId) {
+            const steamWebApiAuthQuery = isRealSecretToken(tokenData.webapi_token)
+              ? `access_token=${encodeURIComponent(tokenData.webapi_token.trim())}`
+              : isRealSecretToken(tokenData.apiKey)
+                ? `key=${encodeURIComponent(tokenData.apiKey.trim())}`
+                : '';
+
+            if (!networkOfflineDetected && steamWebApiAuthQuery && tokenData.steamId) {
               try {
                 const res = await steamFetchImpl(
-                  `https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?access_token=${encodeURIComponent(
-                    tokenData.webapi_token
-                  )}&steamid=${encodeURIComponent(tokenData.steamId)}&include_appinfo=1&include_played_free_games=1&include_free_sub=0`,
+                  `https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?${steamWebApiAuthQuery}&steamid=${encodeURIComponent(tokenData.steamId)}&include_appinfo=1&include_played_free_games=1&include_free_sub=0`,
                   {
                     signal:
                       typeof AbortSignal !== 'undefined' &&
@@ -225,130 +273,151 @@ function registerStorefrontCatalogIpcHandlers({
               try {
                 const cleanBrowserUA = resolveCleanBrowserUserAgent(session);
 
-                /** @type {{ rgGames: any[], storeItems: Record<string, any>, webApiToken?: string } | null} */
+                /** @type {{ rgGames: any[], storeItems: Record<string, any>, webApiToken?: string, steamId?: string } | null} */
                 let ssrResult = null;
-                const steamOAuthPartition = resolveStorefrontOAuthPartition('steam');
-                try {
-                  const authSession =
-                    session?.fromPartition?.(steamOAuthPartition) ||
-                    session?.fromPartition?.('persist:storefront_auth');
-                  if (authSession && typeof authSession.fetch === 'function') {
-                    const fetchAbort = new AbortController();
-                    const fetchTimer = setTimeout(() => fetchAbort.abort(), 10000);
-                    try {
-                      const ssrRes = await authSession.fetch(
-                        'https://steamcommunity.com/my/games/?tab=all',
-                        {
-                          signal: fetchAbort.signal,
-                          headers: {
-                            'User-Agent': cleanBrowserUA,
-                            Accept: 'text/html,application/xhtml+xml',
-                          },
-                        }
-                      );
-                      const resolvedSsrUrl = String(
-                        ssrRes?.url || 'https://steamcommunity.com/my/games/?tab=all'
-                      );
-                      if (
-                        ssrRes &&
-                        ssrRes.ok &&
-                        isAuthenticatedSteamCommunityUrl(resolvedSsrUrl)
-                      ) {
-                        const html = await ssrRes.text();
-                        const ssrMatch = html.match(
-                          /<script\s+id=["']valve-ssr-data["'][^>]*>([\s\S]*?)<\/script>/i
+                const steamOAuthPartition =
+                  steamCookiePartition || resolveStorefrontOAuthPartition('steam');
+                const steamCandidatePartitions = Array.from(
+                  new Set([
+                    ...(steamCookiePartition ? [steamCookiePartition] : []),
+                    resolveStorefrontOAuthPartition('steam'),
+                    'persist:storefront_auth',
+                  ])
+                );
+                for (const partition of steamCandidatePartitions) {
+                  if (ssrResult || networkOfflineDetected) break;
+                  try {
+                    const authSession = session?.fromPartition?.(partition);
+                    if (authSession && typeof authSession.fetch === 'function') {
+                      const fetchAbort = new AbortController();
+                      const fetchTimer = setTimeout(() => fetchAbort.abort(), 10000);
+                      try {
+                        const ssrRes = await authSession.fetch(
+                          'https://steamcommunity.com/my/games/?tab=all',
+                          {
+                            signal: fetchAbort.signal,
+                            headers: {
+                              'User-Agent': cleanBrowserUA,
+                              Accept: 'text/html,application/xhtml+xml',
+                            },
+                          }
                         );
-                        if (ssrMatch && ssrMatch[1]) {
-                          try {
-                            const ssr = JSON.parse(ssrMatch[1].trim());
-                            let webApiToken;
-                            let rgGames = null;
-                            /** @type {Record<string, any>} */
-                            const storeItems = {};
-                            const loaderData = Array.isArray(ssr?.loaderData) ? ssr.loaderData : [];
-                            for (const item of loaderData) {
-                              if (!item) continue;
-                              try {
-                                const parsed = typeof item === 'string' ? JSON.parse(item) : item;
-                                if (parsed && parsed.strWebAPIToken && !webApiToken) {
-                                  webApiToken = String(parsed.strWebAPIToken);
-                                }
-                              } catch {}
-                            }
-                            const rawQueryData = ssr?.renderContext?.queryData;
-                            if (rawQueryData) {
-                              try {
-                                const qd =
-                                  typeof rawQueryData === 'string'
-                                    ? JSON.parse(rawQueryData)
-                                    : rawQueryData;
-                                const queries = Array.isArray(qd?.queries) ? qd.queries : [];
-                                for (const q of queries) {
-                                  const key = Array.isArray(q?.queryKey) ? q.queryKey : [];
-                                  const data = q?.state?.data;
-                                  if (!data) continue;
-                                  if (key[0] === 'OwnedGames' && Array.isArray(data)) {
-                                    rgGames = data;
-                                  } else if (
-                                    key[0] === 'StoreItem' &&
-                                    typeof key[1] === 'string' &&
-                                    key[1].startsWith('app_')
-                                  ) {
-                                    storeItems[key[1].replace('app_', '')] = data;
-                                  }
-                                }
-                              } catch {}
-                            }
-                            if (Array.isArray(rgGames) && rgGames.length > 0) {
-                              ssrResult = { rgGames, storeItems, webApiToken };
-                            }
-                          } catch {}
-                        }
-                        if (!ssrResult) {
-                          const legacyMatch = html.match(/data-profile-gameslist="([^"]+)"/i);
-                          if (legacyMatch && legacyMatch[1]) {
+                        const resolvedSsrUrl = String(
+                          ssrRes?.url || 'https://steamcommunity.com/my/games/?tab=all'
+                        );
+                        if (
+                          ssrRes &&
+                          ssrRes.ok &&
+                          isAuthenticatedSteamCommunityUrl(resolvedSsrUrl)
+                        ) {
+                          const html = await ssrRes.text();
+                          const htmlSteamIdMatch = html.match(/g_steamID\s*=\s*"(\d{17})"/);
+                          const htmlSteamId = htmlSteamIdMatch ? htmlSteamIdMatch[1] : undefined;
+                          const ssrMatch = html.match(
+                            /<script\s+id=["']valve-ssr-data["'][^>]*>([\s\S]*?)<\/script>/i
+                          );
+                          if (ssrMatch && ssrMatch[1]) {
                             try {
-                              const decoded = legacyMatch[1]
-                                .replace(/&quot;/g, '"')
-                                .replace(/&amp;/g, '&')
-                                .replace(/&lt;/g, '<')
-                                .replace(/&gt;/g, '>')
-                                .replace(/&#039;/g, "'")
-                                .replace(/&#39;/g, "'");
-                              const parsedLegacy = JSON.parse(decoded);
-                              if (
-                                Array.isArray(parsedLegacy?.rgGames) &&
-                                parsedLegacy.rgGames.length > 0
-                              ) {
+                              const ssr = JSON.parse(ssrMatch[1].trim());
+                              let webApiToken;
+                              let rgGames = null;
+                              /** @type {Record<string, any>} */
+                              const storeItems = {};
+                              const loaderData = Array.isArray(ssr?.loaderData)
+                                ? ssr.loaderData
+                                : [];
+                              for (const item of loaderData) {
+                                if (!item) continue;
+                                try {
+                                  const parsed =
+                                    typeof item === 'string' ? JSON.parse(item) : item;
+                                  if (parsed && parsed.strWebAPIToken && !webApiToken) {
+                                    webApiToken = String(parsed.strWebAPIToken);
+                                  }
+                                } catch {}
+                              }
+                              const rawQueryData = ssr?.renderContext?.queryData;
+                              if (rawQueryData) {
+                                try {
+                                  const qd =
+                                    typeof rawQueryData === 'string'
+                                      ? JSON.parse(rawQueryData)
+                                      : rawQueryData;
+                                  const queries = Array.isArray(qd?.queries) ? qd.queries : [];
+                                  for (const q of queries) {
+                                    const key = Array.isArray(q?.queryKey) ? q.queryKey : [];
+                                    const data = q?.state?.data;
+                                    if (!data) continue;
+                                    if (key[0] === 'OwnedGames' && Array.isArray(data)) {
+                                      rgGames = data;
+                                    } else if (
+                                      key[0] === 'StoreItem' &&
+                                      typeof key[1] === 'string' &&
+                                      key[1].startsWith('app_')
+                                    ) {
+                                      storeItems[key[1].replace('app_', '')] = data;
+                                    }
+                                  }
+                                } catch {}
+                              }
+                              if (Array.isArray(rgGames) && rgGames.length > 0) {
                                 ssrResult = {
-                                  rgGames: parsedLegacy.rgGames,
-                                  storeItems: parsedLegacy.storeItems || {},
-                                  webApiToken:
-                                    parsedLegacy.strWebAPIToken || parsedLegacy.webapi_token,
+                                  rgGames,
+                                  storeItems,
+                                  webApiToken,
+                                  ...(htmlSteamId ? { steamId: htmlSteamId } : {}),
                                 };
                               }
                             } catch {}
                           }
+                          if (!ssrResult) {
+                            const legacyMatch = html.match(/data-profile-gameslist="([^"]+)"/i);
+                            if (legacyMatch && legacyMatch[1]) {
+                              try {
+                                const decoded = legacyMatch[1]
+                                  .replace(/&quot;/g, '"')
+                                  .replace(/&amp;/g, '&')
+                                  .replace(/&lt;/g, '<')
+                                  .replace(/&gt;/g, '>')
+                                  .replace(/&#039;/g, "'")
+                                  .replace(/&#39;/g, "'");
+                                const parsedLegacy = JSON.parse(decoded);
+                                if (
+                                  Array.isArray(parsedLegacy?.rgGames) &&
+                                  parsedLegacy.rgGames.length > 0
+                                ) {
+                                  ssrResult = {
+                                    rgGames: parsedLegacy.rgGames,
+                                    storeItems: parsedLegacy.storeItems || {},
+                                    webApiToken:
+                                      parsedLegacy.strWebAPIToken || parsedLegacy.webapi_token,
+                                    ...(htmlSteamId ? { steamId: htmlSteamId } : {}),
+                                  };
+                                }
+                              } catch {}
+                            }
+                          }
                         }
+                      } finally {
+                        clearTimeout(fetchTimer);
                       }
-                    } finally {
-                      clearTimeout(fetchTimer);
                     }
-                  }
-                } catch (ssrErr) {
-                  if (isOfflineOrNetworkError(ssrErr)) {
-                    networkOfflineDetected = true;
+                  } catch (ssrErr) {
+                    if (isOfflineOrNetworkError(ssrErr)) {
+                      networkOfflineDetected = true;
+                    }
                   }
                 }
 
                 if (ssrResult && Array.isArray(ssrResult.rgGames) && ssrResult.rgGames.length > 0) {
+                  const resolvedSteamId = tokenData.steamId || ssrResult.steamId;
                   const refreshed = await parseSteamGamesListJson(
                     {
                       rgGames: ssrResult.rgGames,
                       strProfileName: accountName,
                       storeItems: ssrResult.storeItems || {},
                     },
-                    tokenData.steamId,
+                    resolvedSteamId,
                     accountName,
                     avatarUrl,
                     games,
@@ -357,6 +426,7 @@ function registerStorefrontCatalogIpcHandlers({
                   games = refreshed.games;
                   tokenData = {
                     ...tokenData,
+                    ...(resolvedSteamId ? { steamId: resolvedSteamId } : {}),
                     webapi_token: ssrResult.webApiToken || tokenData.webapi_token,
                   };
                   refreshedLive = true;
@@ -458,13 +528,14 @@ function registerStorefrontCatalogIpcHandlers({
                     Array.isArray(ssrResult.rgGames) &&
                     ssrResult.rgGames.length > 0
                   ) {
+                    const resolvedSteamId = tokenData.steamId || ssrResult.steamId;
                     const refreshed = await parseSteamGamesListJson(
                       {
                         rgGames: ssrResult.rgGames,
                         strProfileName: accountName,
                         storeItems: ssrResult.storeItems || {},
                       },
-                      tokenData.steamId,
+                      resolvedSteamId,
                       accountName,
                       avatarUrl,
                       games,
@@ -473,12 +544,27 @@ function registerStorefrontCatalogIpcHandlers({
                     games = refreshed.games;
                     tokenData = {
                       ...tokenData,
+                      ...(resolvedSteamId ? { steamId: resolvedSteamId } : {}),
                       webapi_token: ssrResult.webApiToken || tokenData.webapi_token,
                     };
                     refreshedLive = true;
                   }
                 }
               } catch {}
+            }
+
+            if (
+              !refreshedLive &&
+              games.length === 0 &&
+              !hasSavedSteamId &&
+              !tokenData.steamId &&
+              !steamWebApiAuthQuery &&
+              !isRealSecretToken(tokenData.access_token)
+            ) {
+              return {
+                success: false,
+                error: 'Steam session expired. Please sign in to Steam again in Settings.',
+              };
             }
 
             /** @type {Record<number, any>} */

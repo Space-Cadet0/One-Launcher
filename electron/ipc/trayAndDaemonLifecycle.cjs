@@ -54,6 +54,12 @@ function getAppIconPath(electronDir) {
  *   setMainWindow: (win: any) => void,
  *   createMainWindow: () => void,
  *   ipcSenderSecurityOptions?: Record<string, any>,
+ *   platform?: string,
+ *   coopActivateHelper?: {
+ *     pollAndActivateBottledGame?: (opts?: { rootPid?: number; targetExeNames?: string[]; bottlePath?: string }) => number,
+ *     restorePresentationOptions?: () => boolean,
+ *   } | null,
+ *   macBottleFocusPollMs?: number,
  * }} deps
  */
 function createTrayAndDaemonLifecycle({
@@ -74,7 +80,11 @@ function createTrayAndDaemonLifecycle({
   setMainWindow,
   createMainWindow,
   ipcSenderSecurityOptions = {},
+  platform,
+  coopActivateHelper,
+  macBottleFocusPollMs,
 }) {
+  const effectivePlatform = platform || process.platform;
   /** @type {any} */
   let appTray = null;
   let isZeroRendererDaemonActive = false;
@@ -100,8 +110,13 @@ function createTrayAndDaemonLifecycle({
 
   /** @type {ReturnType<typeof setInterval> | null} */
   let macBottleFocusTimer = null;
-  /** @type {{ pollAndActivateBottledGame?: (opts?: { rootPid?: number; targetExeNames?: string[] }) => number } | null | false} */
-  let macCoopActivateAddon = null;
+  /**
+   * @type {{
+   *   pollAndActivateBottledGame?: (opts?: { rootPid?: number; targetExeNames?: string[]; bottlePath?: string }) => number,
+   *   restorePresentationOptions?: () => boolean,
+   * } | null | false}
+   */
+  let macCoopActivateAddon = coopActivateHelper !== undefined ? coopActivateHelper || false : null;
 
   /** @type {Array<{ channel: string, payload: any, queuedAt: number }>} */
   const pendingRendererLifecycleEvents = [];
@@ -250,10 +265,24 @@ function createTrayAndDaemonLifecycle({
     } catch {}
   }
 
+  function restoreMacPresentationOptions() {
+    if (effectivePlatform !== 'darwin') return;
+    const helper =
+      macCoopActivateAddon && typeof macCoopActivateAddon === 'object'
+        ? macCoopActivateAddon
+        : null;
+    if (helper && typeof helper.restorePresentationOptions === 'function') {
+      try {
+        helper.restorePresentationOptions();
+      } catch {}
+    }
+  }
+
   function restoreOrCreateMainWindow() {
     isZeroRendererDaemonActive = false;
     zeroRendererTeardownTimer = clearTrackedTimer(zeroRendererTeardownTimer);
-    if (process.platform === 'darwin') {
+    if (effectivePlatform === 'darwin') {
+      restoreMacPresentationOptions();
       if (app.dock && typeof app.dock.show === 'function') {
         try {
           app.dock.show();
@@ -283,7 +312,7 @@ function createTrayAndDaemonLifecycle({
     if (!mainWindow.isVisible()) {
       mainWindow.show();
     }
-    if (process.platform === 'darwin' && typeof app.focus === 'function') {
+    if (effectivePlatform === 'darwin' && typeof app.focus === 'function') {
       try {
         app.focus({ steal: true });
       } catch {}
@@ -375,7 +404,7 @@ function createTrayAndDaemonLifecycle({
     if (macCoopActivateAddon !== null) {
       return macCoopActivateAddon || null;
     }
-    if (process.platform !== 'darwin') {
+    if (effectivePlatform !== 'darwin') {
       macCoopActivateAddon = false;
       return null;
     }
@@ -396,9 +425,12 @@ function createTrayAndDaemonLifecycle({
         process.dlopen(mod, dylibPath);
         if (typeof (/** @type {any} */ (mod.exports).pollAndActivateBottledGame) === 'function') {
           macCoopActivateAddon =
-            /** @type {{ pollAndActivateBottledGame: (opts?: { rootPid?: number; targetExeNames?: string[] }) => number }} */ (
-              mod.exports
-            );
+            /**
+             * @type {{
+             *   pollAndActivateBottledGame: (opts?: { rootPid?: number; targetExeNames?: string[]; bottlePath?: string }) => number,
+             *   restorePresentationOptions?: () => boolean,
+             * }}
+             */ (mod.exports);
           return macCoopActivateAddon;
         }
       } catch {}
@@ -407,10 +439,13 @@ function createTrayAndDaemonLifecycle({
     return null;
   }
 
-  function stopMacBottleFocusHelper() {
+  function stopMacBottleFocusHelper(/** @type {{ restorePresentation?: boolean }} */ opts = {}) {
     if (macBottleFocusTimer) {
       clearInterval(macBottleFocusTimer);
       macBottleFocusTimer = null;
+    }
+    if (opts.restorePresentation === true) {
+      restoreMacPresentationOptions();
     }
     try {
       launcherEngine?.stopMacBottleFocusHelper?.();
@@ -423,10 +458,14 @@ function createTrayAndDaemonLifecycle({
    * game window via native AppKit (`libone_coop_activate.dylib`).
    *
    * @param {any} eventPayload
-   * @param {any} [_effectivePolicy]
+   * @param {any} [effectivePolicy]
    */
-  function activateMacBottleGameWindowOnLaunch(eventPayload, _effectivePolicy) {
-    if (process.platform !== 'darwin' || process.env.VITEST || process.env.NODE_ENV === 'test') {
+  function activateMacBottleGameWindowOnLaunch(eventPayload, effectivePolicy) {
+    const hasInjectedHelper = Boolean(coopActivateHelper);
+    if (
+      effectivePlatform !== 'darwin' ||
+      (!hasInjectedHelper && (process.env.VITEST || process.env.NODE_ENV === 'test'))
+    ) {
       return;
     }
     const sessionInfo = eventPayload && eventPayload.session ? eventPayload.session : eventPayload;
@@ -447,6 +486,9 @@ function createTrayAndDaemonLifecycle({
       return;
     }
 
+    const bottlePath = String(
+      (sessionInfo && (sessionInfo.winePrefix || sessionInfo.bottlePath)) || ''
+    ).trim();
     const coopActivateOpts = {
       rootPid: Number(sessionInfo && sessionInfo.pid) || 0,
       targetExeNames: Array.from(
@@ -461,16 +503,38 @@ function createTrayAndDaemonLifecycle({
             .filter(Boolean)
         )
       ),
+      ...(bottlePath ? { bottlePath } : {}),
+    };
+
+    const shouldHideAppAfterActivation =
+      effectivePolicy?.inGameLauncherBehavior === 'hide_tray_hibernate';
+    let didHideAppForSession = false;
+    const hideLauncherAppOnce = () => {
+      if (!shouldHideAppAfterActivation || didHideAppForSession) return;
+      didHideAppForSession = true;
+      if (typeof app.hide === 'function') {
+        try {
+          app.hide();
+        } catch {}
+      }
     };
 
     let ticks = 0;
+    let visibleWindowTicks = 0;
     let activeLayerTicks = 0;
     let activeTicks = 0;
     let lastPidTag = -1;
+    const pollIntervalMs =
+      typeof macBottleFocusPollMs === 'number' && macBottleFocusPollMs > 0
+        ? macBottleFocusPollMs
+        : 200;
 
     const timer = setInterval(() => {
       ticks += 1;
-      if (ticks > 75) {
+      if (ticks > 200) {
+        if ((launcherEngine.getRunningGames() || []).length > 0) {
+          hideLauncherAppOnce();
+        }
         stopMacBottleFocusHelper();
         return;
       }
@@ -479,6 +543,7 @@ function createTrayAndDaemonLifecycle({
         if ((encoded & 1) === 0) {
           return;
         }
+        visibleWindowTicks += 1;
         const isActive = (encoded & 2) !== 0;
         const layer = (encoded >> 2) & 0x3fff;
         const pidTag = (encoded >> 16) & 0x7fff;
@@ -486,6 +551,12 @@ function createTrayAndDaemonLifecycle({
           lastPidTag = pidTag;
           activeLayerTicks = 0;
           activeTicks = 0;
+        }
+        // Once the game window is active (or mapped for >= 3 ticks), hide One Launcher via
+        // app.hide() so macOS never keeps "One Launcher  Edit  View  Window" in the Menu Bar
+        // above layer=0 borderless D3D12/D3DMetal games.
+        if (isActive || visibleWindowTicks >= 3) {
+          hideLauncherAppOnce();
         }
         if (isActive && layer >= 25) {
           activeLayerTicks += 1;
@@ -505,7 +576,7 @@ function createTrayAndDaemonLifecycle({
       } catch {
         stopMacBottleFocusHelper();
       }
-    }, 200);
+    }, pollIntervalMs);
 
     macBottleFocusTimer = timer;
     if (typeof timer.unref === 'function') {
@@ -578,16 +649,25 @@ function createTrayAndDaemonLifecycle({
                   mainWindow.webContents.setAudioMuted(true);
                   mainWindow.webContents.setBackgroundThrottling?.(true);
                 } catch {}
-                if (tray || process.platform === 'darwin') {
+                if (tray || effectivePlatform === 'darwin') {
                   mainWindow.hide();
                 } else {
                   mainWindow.minimize();
                 }
               }
+              if (
+                effectivePlatform === 'darwin' &&
+                !macBottleFocusTimer &&
+                typeof app.hide === 'function'
+              ) {
+                try {
+                  app.hide();
+                } catch {}
+              }
               launcherEngine.trimLauncherEngineMemory();
             } else if (mode === 'zero_renderer_daemon') {
               const tray = ensureAppTray();
-              if (!tray && process.platform !== 'darwin') {
+              if (!tray && effectivePlatform !== 'darwin') {
                 if (mainWindow && !mainWindow.isDestroyed()) {
                   mainWindow.minimize();
                 }
@@ -604,6 +684,11 @@ function createTrayAndDaemonLifecycle({
                     } catch {}
                     setMainWindow(null);
                   }
+                  if (effectivePlatform === 'darwin' && typeof app.hide === 'function') {
+                    try {
+                      app.hide();
+                    } catch {}
+                  }
                   launcherEngine.trimLauncherEngineMemory();
                 }, 1500);
                 if (typeof zeroRendererTeardownTimer.unref === 'function') {
@@ -612,7 +697,7 @@ function createTrayAndDaemonLifecycle({
               }
             }
           } else if (eventType === 'stopped') {
-            stopMacBottleFocusHelper();
+            stopMacBottleFocusHelper({ restorePresentation: true });
             const remainingGames = launcherEngine.getRunningGames() || [];
             if (remainingGames.length > 0) return;
 
@@ -749,7 +834,7 @@ function createTrayAndDaemonLifecycle({
 
   function runSubsystemShutdownOnce() {
     clearAllLifecycleTimers();
-    stopMacBottleFocusHelper();
+    stopMacBottleFocusHelper({ restorePresentation: true });
     destroyAppTray();
     if (hasCompletedSubsystemShutdown) return;
     hasCompletedSubsystemShutdown = true;

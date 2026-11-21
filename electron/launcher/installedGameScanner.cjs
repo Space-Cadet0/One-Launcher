@@ -76,6 +76,7 @@ const { fromWineWindowsPath } = require('./firstPartyRegistration.cjs');
 const {
   parseByteCountOrFormattedSize,
   inspectMacMachOHeader,
+  inspectWindowsExecutableHeader,
   parseSteamAcf,
   detectKernelAntiCheatMarkersInDir,
   resolveParadoxLauncherSettings,
@@ -1020,11 +1021,11 @@ function getDarwinBottleContainerDirs(/** @type {any} */ ctx) {
 function buildGogScanSources(/** @type {any} */ ctx, /** @type {string[]} */ discoveredBottleRoots) {
   const { homedir, customRoots, userDataDir, isIsolatedTest } = ctx;
   const gogSearchDirs = new Set([
-    path.join(homedir, 'Applications'),
-    path.join(homedir, 'Games'),
     path.join(homedir, 'Games', 'OneLauncher', 'GOG'),
     path.join(homedir, 'Games', 'Heroic'),
     ...customRoots.map((/** @type {string} */ r) => toLocalFsPath(r, customRoots)),
+    path.join(homedir, 'Applications'),
+    path.join(homedir, 'Games'),
   ]);
 
   for (const bottleRoot of discoveredBottleRoots) {
@@ -2094,41 +2095,99 @@ function processCustomLaunchConfigEntry(/** @type {any} */ ctx, /** @type {any} 
   }
 }
 
-function enrichSingleInstalledGameRecord(/** @type {any} */ g) {
-  if (!g || g.driveDisconnected || !g.installPath || typeof g.installPath !== 'string') {
+/**
+ * Populate `executableArchitecture` (`'x64' | 'x86' | 'arm64'`) and `is32BitExecutable`
+ * on a scanned Windows game record via the cached, bounded PE header reader.
+ *
+ * @param {any} g
+ * @param {string[]} [customRoots]
+ * @param {string | null} [localInstallDir]
+ */
+function enrichWindowsExecutableArchitecture(g, customRoots = [], localInstallDir = null) {
+  if (!g || g.driveDisconnected) return;
+  /** @type {string[]} */
+  const candidatePaths = [];
+  if (typeof g.paradoxDirectGameExe === 'string' && g.paradoxDirectGameExe.trim()) {
+    candidatePaths.push(g.paradoxDirectGameExe.trim());
+  }
+  if (typeof g.executablePath === 'string' && g.executablePath.trim()) {
+    candidatePaths.push(g.executablePath.trim());
+  }
+  for (const rawExe of candidatePaths) {
+    if (!/\.exe$/i.test(rawExe)) continue;
+    let localExe = toLocalFsPath(rawExe, customRoots);
+    if (localExe && !path.isAbsolute(localExe) && localInstallDir) {
+      const resolvedRel = path.resolve(localInstallDir, localExe);
+      if (isContainedWithinRoot(localInstallDir, resolvedRel)) {
+        localExe = resolvedRel;
+      }
+    }
+    if (!localExe) continue;
+    const peInfo = inspectWindowsExecutableHeader(localExe, {
+      skipImports: true,
+      skipRdataStringScan: true,
+      inspectDpiManifest: false,
+      inspectElevationManifest: false,
+    });
+    if (!peInfo || !peInfo.isValidPe || peInfo.isSyntheticStub) continue;
+    const arch = peInfo.isX64
+      ? 'x64'
+      : peInfo.isX86
+        ? 'x86'
+        : peInfo.isArm64
+          ? 'arm64'
+          : null;
+    if (arch) {
+      g.executableArchitecture = arch;
+      g.is32BitExecutable = arch === 'x86';
+      return;
+    }
+  }
+}
+
+function enrichSingleInstalledGameRecord(/** @type {any} */ g, /** @type {string[]} */ customRoots = []) {
+  if (!g || g.driveDisconnected) {
     return;
   }
-  try {
-    const localInstallDir = toLocalFsPath(g.installPath);
-    if (!localInstallDir || !fs.existsSync(localInstallDir)) return;
-    const acMarkers = detectKernelAntiCheatMarkersInDir(localInstallDir);
-    if (
-      acMarkers.kernelAntiCheatName ||
-      acMarkers.requiresKernelAntiCheat ||
-      acMarkers.storyModeBypassAvailable
-    ) {
-      if (g.requiresKernelAntiCheat === undefined) {
-        g.requiresKernelAntiCheat = acMarkers.requiresKernelAntiCheat;
-      }
-      if (!g.kernelAntiCheatName && acMarkers.kernelAntiCheatName) {
-        g.kernelAntiCheatName = acMarkers.kernelAntiCheatName;
-      }
-      if (acMarkers.storyModeBypassAvailable) {
-        g.storyModeBypassAvailable = true;
-      }
-    }
-    if (g.executablePath && !g.paradoxDirectGameExe) {
-      const exeBase = path.posix.basename(String(g.executablePath).replace(/\\/g, '/'));
-      if (/^dowser\.exe$/i.test(exeBase)) {
-        const pdx = resolveParadoxLauncherSettings(
-          toLocalFsPath(g.executablePath) || localInstallDir,
-          localInstallDir
-        );
-        if (pdx.paradoxDirectGameExe) {
-          g.paradoxDirectGameExe = pdx.paradoxDirectGameExe;
+  let localInstallDir = null;
+  if (g.installPath && typeof g.installPath === 'string') {
+    try {
+      const candidateInstallDir = toLocalFsPath(g.installPath, customRoots);
+      if (candidateInstallDir && fs.existsSync(candidateInstallDir)) {
+        localInstallDir = candidateInstallDir;
+        const acMarkers = detectKernelAntiCheatMarkersInDir(localInstallDir);
+        if (
+          acMarkers.kernelAntiCheatName ||
+          acMarkers.requiresKernelAntiCheat ||
+          acMarkers.storyModeBypassAvailable
+        ) {
+          if (g.requiresKernelAntiCheat === undefined) {
+            g.requiresKernelAntiCheat = acMarkers.requiresKernelAntiCheat;
+          }
+          if (!g.kernelAntiCheatName && acMarkers.kernelAntiCheatName) {
+            g.kernelAntiCheatName = acMarkers.kernelAntiCheatName;
+          }
+          if (acMarkers.storyModeBypassAvailable) {
+            g.storyModeBypassAvailable = true;
+          }
+        }
+        if (g.executablePath && !g.paradoxDirectGameExe) {
+          const exeBase = path.posix.basename(String(g.executablePath).replace(/\\/g, '/'));
+          if (/^dowser\.exe$/i.test(exeBase)) {
+            const pdx = resolveParadoxLauncherSettings(
+              toLocalFsPath(g.executablePath, customRoots) || localInstallDir,
+              localInstallDir
+            );
+            if (pdx.paradoxDirectGameExe) {
+              g.paradoxDirectGameExe = pdx.paradoxDirectGameExe;
+            }
+          }
         }
       }
-    }
+    } catch {}
+  }
+  try {
+    enrichWindowsExecutableArchitecture(g, customRoots, localInstallDir);
   } catch {}
 }
 
@@ -2305,8 +2364,8 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
         } catch {}
       }
 
-      /** @type {Set<string>} */
-      const visitedGogDirsSync = new Set();
+      /** @type {Map<string, number>} */
+      const visitedGogDirsSync = new Map();
       let gogDirsVisitedCountSync = 0;
       const scanDirForGogInfoSync = (/** @type {string} */ dirPath, depth = 0) => {
         if (
@@ -2322,8 +2381,9 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
         try {
           canonicalDir = fs.realpathSync(dirPath);
         } catch {}
-        if (visitedGogDirsSync.has(canonicalDir)) return;
-        visitedGogDirsSync.add(canonicalDir);
+        const prevMinDepth = visitedGogDirsSync.get(canonicalDir);
+        if (prevMinDepth !== undefined && prevMinDepth <= depth) return;
+        visitedGogDirsSync.set(canonicalDir, depth);
         gogDirsVisitedCountSync += 1;
         /** @type {fs.Dirent[]} */
         let entries = [];
@@ -2547,7 +2607,7 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
     // 6. POST-PASS ENRICHMENT & FINALIZATION
     const installedGames = Array.from(ctx.discoveredMap.values());
     for (const g of installedGames) {
-      enrichSingleInstalledGameRecord(g);
+      enrichSingleInstalledGameRecord(g, customRoots);
     }
     return finalizeScanContext(ctx, installedGames);
   } catch (/** @type {any} */ err) {
@@ -2680,8 +2740,8 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
         } catch {}
       }
 
-      /** @type {Set<string>} */
-      const visitedGogDirsAsync = new Set();
+      /** @type {Map<string, number>} */
+      const visitedGogDirsAsync = new Map();
       let gogVisited = 0;
       const scanDirForGogInfoAsync = async (/** @type {string} */ dirPath, depth = 0) => {
         if (depth > 3 || !dirPath || gogVisited >= MAX_GOG_SCAN_DIRS_VISITED) return;
@@ -2690,8 +2750,9 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
         try {
           canonicalDir = await fs.promises.realpath(dirPath);
         } catch {}
-        if (visitedGogDirsAsync.has(canonicalDir)) return;
-        visitedGogDirsAsync.add(canonicalDir);
+        const prevMinDepth = visitedGogDirsAsync.get(canonicalDir);
+        if (prevMinDepth !== undefined && prevMinDepth <= depth) return;
+        visitedGogDirsAsync.set(canonicalDir, depth);
         /** @type {fs.Dirent[]} */
         let entries = [];
         try {
@@ -2948,7 +3009,7 @@ async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
     // 6. POST-PASS ENRICHMENT (chunked yielding across 30+ installed dirs) & FINALIZATION
     const installedGames = Array.from(ctx.discoveredMap.values());
     for (let i = 0; i < installedGames.length; i++) {
-      enrichSingleInstalledGameRecord(installedGames[i]);
+      enrichSingleInstalledGameRecord(installedGames[i], customRoots);
       if ((i + 1) % ASYNC_SCAN_YIELD_CHUNK === 0) {
         await yieldToEventLoop();
       }

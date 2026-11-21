@@ -20,6 +20,7 @@
 #include <libproc.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -104,6 +105,11 @@ extern napi_status napi_get_value_int32(
     napi_env env,
     napi_value value,
     int32_t *result
+);
+extern napi_status napi_get_value_double(
+    napi_env env,
+    napi_value value,
+    double *result
 );
 extern napi_status napi_is_array(
     napi_env env,
@@ -423,9 +429,87 @@ static bool target_exes_match_owner_or_title(
     return false;
 }
 
-static bool find_top_bottled_game_window(const coop_scope_t *scope, int32_t *out_pid, int32_t *out_layer) {
+/*
+ * Detect full-display borderless game windows (e.g., D3D12/D3DMetal games such as
+ * Hades II presenting Composited at layer == 0 covering >= 95% of display bounds).
+ */
+static bool is_borderless_fullscreen_rect(CGRect rect, CGRect disp_bounds, int32_t layer) {
+    if (layer != 0) return false;
+    if (disp_bounds.size.width <= 0.0 || disp_bounds.size.height <= 0.0) return false;
+    return (rect.size.width >= disp_bounds.size.width * 0.95) &&
+           (rect.size.height >= disp_bounds.size.height * 0.95);
+}
+
+/*
+ * AppKit NSApplicationPresentationOptions ABI bitflags (macOS 10.6+):
+ *   NSApplicationPresentationDefault         = 0
+ *   NSApplicationPresentationAutoHideDock    = 1 << 0
+ *   NSApplicationPresentationAutoHideMenuBar = 1 << 2
+ */
+#define ONE_NS_APP_PRESENTATION_DEFAULT            ((uintptr_t)0)
+#define ONE_NS_APP_PRESENTATION_AUTO_HIDE_DOCK     ((uintptr_t)(1u << 0))
+#define ONE_NS_APP_PRESENTATION_AUTO_HIDE_MENU_BAR ((uintptr_t)(1u << 2))
+#define ONE_NS_APP_PRESENTATION_BORDERLESS_MASK \
+    (ONE_NS_APP_PRESENTATION_AUTO_HIDE_MENU_BAR | ONE_NS_APP_PRESENTATION_AUTO_HIDE_DOCK)
+
+static bool g_borderless_presentation_applied = false;
+static uintptr_t g_saved_presentation_options = ONE_NS_APP_PRESENTATION_DEFAULT;
+
+static bool set_borderless_presentation_options(bool enable) {
+    if (!enable && !g_borderless_presentation_applied) {
+        return true;
+    }
+    if (!pthread_main_np()) {
+        return false;
+    }
+    Class cls_ns_app = objc_getClass("NSApplication");
+    if (!cls_ns_app) {
+        return false;
+    }
+    SEL sel_shared_app = sel_registerName("sharedApplication");
+    id (*msg_id)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+    id ns_app = msg_id((id)cls_ns_app, sel_shared_app);
+    if (!ns_app) {
+        return false;
+    }
+
+    SEL sel_responds = sel_registerName("respondsToSelector:");
+    BOOL (*msg_responds)(id, SEL, SEL) = (BOOL (*)(id, SEL, SEL))objc_msgSend;
+    SEL sel_get_opts = sel_registerName("presentationOptions");
+    SEL sel_set_opts = sel_registerName("setPresentationOptions:");
+    if (!msg_responds(ns_app, sel_responds, sel_get_opts) ||
+        !msg_responds(ns_app, sel_responds, sel_set_opts)) {
+        return false;
+    }
+
+    uintptr_t (*msg_get_opts)(id, SEL) = (uintptr_t (*)(id, SEL))objc_msgSend;
+    void (*msg_set_opts)(id, SEL, uintptr_t) = (void (*)(id, SEL, uintptr_t))objc_msgSend;
+
+    if (enable) {
+        if (!g_borderless_presentation_applied) {
+            g_saved_presentation_options = msg_get_opts(ns_app, sel_get_opts);
+        }
+        uintptr_t target_opts = g_saved_presentation_options | ONE_NS_APP_PRESENTATION_BORDERLESS_MASK;
+        msg_set_opts(ns_app, sel_set_opts, target_opts);
+        g_borderless_presentation_applied = true;
+        return true;
+    }
+
+    msg_set_opts(ns_app, sel_set_opts, g_saved_presentation_options);
+    g_borderless_presentation_applied = false;
+    g_saved_presentation_options = ONE_NS_APP_PRESENTATION_DEFAULT;
+    return true;
+}
+
+static bool find_top_bottled_game_window(
+    const coop_scope_t *scope,
+    int32_t *out_pid,
+    int32_t *out_layer,
+    bool *out_is_borderless_fullscreen
+) {
     *out_pid = 0;
     *out_layer = 0;
+    if (out_is_borderless_fullscreen) *out_is_borderless_fullscreen = false;
 
     CFArrayRef win_list = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
@@ -439,6 +523,7 @@ static bool find_top_bottled_game_window(const coop_scope_t *scope, int32_t *out
     double best_score = -1.0;
     int32_t best_pid = 0;
     int32_t best_layer = 0;
+    bool best_is_borderless_fullscreen = false;
 
     CFIndex count = CFArrayGetCount(win_list);
     for (CFIndex i = 0; i < count; i++) {
@@ -498,7 +583,9 @@ static bool find_top_bottled_game_window(const coop_scope_t *scope, int32_t *out
             : 0.0;
 
         double area = rect.size.width * rect.size.height;
-        bool is_near_fullscreen = (screen_area > 0.0 && area >= screen_area * 0.80);
+        bool is_borderless_fs = is_borderless_fullscreen_rect(rect, disp_bounds, layer);
+        bool is_near_fullscreen =
+            is_borderless_fs || (screen_area > 0.0 && area >= screen_area * 0.80);
         double score = area;
         if (is_near_fullscreen) {
             score += 1.0e12;
@@ -559,6 +646,7 @@ static bool find_top_bottled_game_window(const coop_scope_t *scope, int32_t *out
             best_score = score;
             best_pid = pid;
             best_layer = layer;
+            best_is_borderless_fullscreen = is_borderless_fs;
         }
     }
 
@@ -566,6 +654,9 @@ static bool find_top_bottled_game_window(const coop_scope_t *scope, int32_t *out
     if (found) {
         *out_pid = best_pid;
         *out_layer = best_layer;
+        if (out_is_borderless_fullscreen) {
+            *out_is_borderless_fullscreen = best_is_borderless_fullscreen;
+        }
     }
     return found;
 }
@@ -802,20 +893,78 @@ static napi_value poll_and_activate_bottled_game(napi_env env, napi_callback_inf
 
     int32_t pid = 0;
     int32_t layer = 0;
+    bool is_borderless_fs = false;
     int32_t encoded = 0;
 
     /* MH-04: Drain autoreleased AppKit/ObjC objects on every 200ms poll tick */
     void *pool = objc_autoreleasePoolPush();
-    if (find_top_bottled_game_window(&scope, &pid, &layer)) {
+    if (find_top_bottled_game_window(&scope, &pid, &layer, &is_borderless_fs)) {
         bool active = coop_activate_pid(pid);
+        bool should_auto_hide_chrome = false;
+        if (is_borderless_fs) {
+            /*
+             * Apply NSApplicationPresentationAutoHideMenuBar | NSApplicationPresentationAutoHideDock
+             * when a borderless fullscreen game covers >= 95% of the display at layer == 0,
+             * and restore cleanly when windowed or when the user switches to another app.
+             */
+            Class cls_run_app = objc_getClass("NSRunningApplication");
+            Class cls_ns_app = objc_getClass("NSApplication");
+            id (*msg_id)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+            id ns_app = cls_ns_app ? msg_id((id)cls_ns_app, sel_registerName("sharedApplication")) : NULL;
+            id current_app = cls_run_app ? msg_id((id)cls_run_app, sel_registerName("currentApplication")) : NULL;
+            should_auto_hide_chrome =
+                active || can_cooperatively_transfer_from_frontmost(ns_app, current_app, pid);
+        }
+        if (should_auto_hide_chrome) {
+            (void)set_borderless_presentation_options(true);
+        } else if (g_borderless_presentation_applied) {
+            (void)set_borderless_presentation_options(false);
+        }
         int32_t clamped_layer = layer < 0 ? 0 : (layer > 8191 ? 8191 : layer);
         int32_t pid_tag = (pid & 0x7fff);
         encoded = 1 | (active ? 2 : 0) | (clamped_layer << 2) | (pid_tag << 16);
+    } else if (g_borderless_presentation_applied) {
+        (void)set_borderless_presentation_options(false);
     }
     objc_autoreleasePoolPop(pool);
 
     napi_value out = NULL;
     napi_create_int32(env, encoded, &out);
+    return out;
+}
+
+static napi_value restore_presentation_options(napi_env env, napi_callback_info info) {
+    (void)info;
+    void *pool = objc_autoreleasePoolPush();
+    bool ok = set_borderless_presentation_options(false);
+    objc_autoreleasePoolPop(pool);
+
+    napi_value out = NULL;
+    napi_get_boolean(env, ok, &out);
+    return out;
+}
+
+static napi_value is_borderless_fullscreen_window_js(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value argv[5] = { NULL, NULL, NULL, NULL, NULL };
+    bool result = false;
+    if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) == napi_ok && argc >= 5) {
+        double fw = 0.0, fh = 0.0, sw = 0.0, sh = 0.0;
+        int32_t layer = 0;
+        if (napi_get_value_double(env, argv[0], &fw) == napi_ok &&
+            napi_get_value_double(env, argv[1], &fh) == napi_ok &&
+            napi_get_value_double(env, argv[2], &sw) == napi_ok &&
+            napi_get_value_double(env, argv[3], &sh) == napi_ok &&
+            napi_get_value_int32(env, argv[4], &layer) == napi_ok) {
+            result = is_borderless_fullscreen_rect(
+                CGRectMake(0.0, 0.0, fw, fh),
+                CGRectMake(0.0, 0.0, sw, sh),
+                layer
+            );
+        }
+    }
+    napi_value out = NULL;
+    napi_get_boolean(env, result, &out);
     return out;
 }
 
@@ -826,6 +975,7 @@ static napi_value poll_and_activate_bottled_game(napi_env env, napi_callback_inf
 static napi_value restore_host_display_configuration(napi_env env, napi_callback_info info) {
     (void)info;
     void *pool = objc_autoreleasePoolPush();
+    (void)set_borderless_presentation_options(false);
     CGRestorePermanentDisplayConfiguration();
     CGDisplayRestoreColorSyncSettings();
     objc_autoreleasePoolPop(pool);
@@ -872,6 +1022,8 @@ static void export_napi_fn(napi_env env, napi_value exports, const char *name, n
 __attribute__((visibility("default")))
 napi_value napi_register_module_v1(napi_env env, napi_value exports) {
     export_napi_fn(env, exports, "pollAndActivateBottledGame", poll_and_activate_bottled_game);
+    export_napi_fn(env, exports, "restorePresentationOptions", restore_presentation_options);
+    export_napi_fn(env, exports, "isBorderlessFullscreenWindow", is_borderless_fullscreen_window_js);
     export_napi_fn(env, exports, "restoreHostDisplayConfiguration", restore_host_display_configuration);
     export_napi_fn(env, exports, "isSessionScreenLocked", is_session_screen_locked);
     return exports;

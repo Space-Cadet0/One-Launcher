@@ -1328,51 +1328,151 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
       } catch {}
     }
 
+    const stopExecFileImpl =
+      mergedStopOptions.execFileImpl || mergedStopOptions.execFileFn || execFile;
+    const stopKillImpl =
+      typeof mergedStopOptions.killImpl === 'function'
+        ? mergedStopOptions.killImpl
+        : process.kill.bind(process);
+
     const stopPlatform = mergedStopOptions.platform || process.platform;
     const macAppBundlePath =
       stopPlatform === 'darwin' && !targetEntry.winePrefix
         ? resolveTargetMacAppBundlePath(exePath)
         : null;
-    const signalMacAppBundleProcesses = (/** @type {NodeJS.Signals} */ sig) =>
+    /** @type {string[]} */
+    const macAppBundlePaths = [];
+    if (macAppBundlePath) {
+      macAppBundlePaths.push(path.resolve(macAppBundlePath));
+      try {
+        const realBundle = fs.realpathSync(macAppBundlePath);
+        if (realBundle && !macAppBundlePaths.includes(realBundle)) {
+          macAppBundlePaths.push(realBundle);
+        }
+      } catch {}
+    }
+    const macAppSeedPids = Array.from(
+      new Set(
+        [
+          targetEntry.child && targetEntry.child.pid ? targetEntry.child.pid : null,
+          targetEntry.pid,
+          targetEntry.session?.pid,
+          targetEntry.gamePid,
+          targetEntry.session?.gamePid,
+          targetEntry.reLatchedBottleChildPid,
+        ]
+          .map((v) => Number(v))
+          .filter((n) => Number.isInteger(n) && n > 1 && n !== process.pid)
+      )
+    );
+    /** @type {Map<number, string>} */
+    const trackedMacAppPids = new Map();
+
+    const snapshotMacAppBundleTree = () =>
       new Promise((resolve) => {
-        if (!macAppBundlePath || isTestStopEnv) return resolve(undefined);
-        const macOsDirPrefix = `${path.resolve(macAppBundlePath)}/Contents/MacOS/`;
+        if (!macAppBundlePath || isTestStopEnv) {
+          return resolve({
+            psFailed: false,
+            orderedPids: /** @type {number[]} */ ([]),
+            cmdByPid: /** @type {Map<number, string>} */ (new Map()),
+          });
+        }
         try {
-          execFile('ps', ['-axo', 'pid=,command='], { timeout: 1500 }, (err, stdout) => {
-            if (!err && stdout) {
-              for (const rawLine of String(stdout).split(/\r?\n/)) {
-                const m = rawLine.trim().match(/^(\d+)\s+(.+)$/);
-                if (!m) continue;
-                const cPid = Number.parseInt(m[1], 10);
-                if (cPid > 1 && cPid !== process.pid && m[2].includes(macOsDirPrefix)) {
-                  try {
-                    process.kill(cPid, sig);
-                  } catch {}
+          stopExecFileImpl(
+            'ps',
+            ['-axo', 'pid=,ppid=,command='],
+            { timeout: 1500 },
+            (/** @type {any} */ err, /** @type {any} */ stdout) => {
+              if (err || !stdout) {
+                return resolve({
+                  psFailed: Boolean(err),
+                  orderedPids: /** @type {number[]} */ ([]),
+                  cmdByPid: /** @type {Map<number, string>} */ (new Map()),
+                });
+              }
+              const parsed = collectMacAppBundleProcessTreePids(
+                String(stdout),
+                macAppBundlePaths,
+                macAppSeedPids,
+                process.pid
+              );
+              for (const cPid of parsed.orderedPids) {
+                const cmd = parsed.cmdByPid.get(cPid) || '';
+                if (cmd && !trackedMacAppPids.has(cPid)) {
+                  trackedMacAppPids.set(cPid, cmd);
                 }
               }
+              resolve({
+                psFailed: false,
+                orderedPids: parsed.orderedPids,
+                cmdByPid: parsed.cmdByPid,
+              });
             }
-            resolve(undefined);
-          });
+          );
         } catch {
-          resolve(undefined);
+          resolve({
+            psFailed: true,
+            orderedPids: /** @type {number[]} */ ([]),
+            cmdByPid: /** @type {Map<number, string>} */ (new Map()),
+          });
         }
       });
 
-    if (macAppBundlePath && !isTestHomedir && !isTestEnvironment(mergedStopOptions)) {
-      const bundleId = readMacBundleIdFromInfoPlist(macAppBundlePath);
-      if (bundleId && /^[A-Za-z0-9._-]+$/.test(bundleId)) {
-        await new Promise((resolve) => {
-          try {
-            execFile(
-              'osascript',
-              ['-e', `tell application id "${bundleId}" to quit`],
-              { timeout: 1500 },
-              () => resolve(undefined)
-            );
-          } catch {
-            resolve(undefined);
-          }
-        });
+    const signalMacAppBundleProcesses = async (/** @type {NodeJS.Signals} */ sig) => {
+      if (!macAppBundlePath || isTestStopEnv) return [];
+      const snap = await snapshotMacAppBundleTree();
+      /** @type {number[]} */
+      const pidsToSignal = [];
+      /** @type {Set<number>} */
+      const seen = new Set();
+
+      // Include any previously captured descendants that survived reparenting (e.g. ./dosbox/dosbox -> ppid=1)
+      for (const [prevPid, prevCmd] of trackedMacAppPids.entries()) {
+        if (prevPid <= 1 || prevPid === process.pid || seen.has(prevPid)) continue;
+        if (snap.orderedPids.includes(prevPid)) continue;
+        const liveCmd = snap.cmdByPid.get(prevPid);
+        const stillSameProcess =
+          liveCmd !== undefined
+            ? !prevCmd || liveCmd === prevCmd
+            : snap.psFailed && isProcessAlive(prevPid, stopKillImpl);
+        if (stillSameProcess) {
+          seen.add(prevPid);
+          pidsToSignal.push(prevPid);
+        }
+      }
+      for (const cPid of snap.orderedPids) {
+        if (cPid <= 1 || cPid === process.pid || seen.has(cPid)) continue;
+        seen.add(cPid);
+        pidsToSignal.push(cPid);
+      }
+
+      for (const cPid of pidsToSignal) {
+        try {
+          stopKillImpl(cPid, sig);
+        } catch {}
+      }
+      return pidsToSignal;
+    };
+
+    if (macAppBundlePath && !isTestStopEnv) {
+      // Snapshot full parent->child process tree BEFORE osascript/SIGTERM so reparented children stay tracked
+      await snapshotMacAppBundleTree();
+      if (!isTestHomedir && !isTestEnvironment(mergedStopOptions)) {
+        const bundleId = readMacBundleIdFromInfoPlist(macAppBundlePath);
+        if (bundleId && /^[A-Za-z0-9._-]+$/.test(bundleId)) {
+          await new Promise((resolve) => {
+            try {
+              stopExecFileImpl(
+                'osascript',
+                ['-e', `tell application id "${bundleId}" to quit`],
+                { timeout: 1500 },
+                () => resolve(undefined)
+              );
+            } catch {
+              resolve(undefined);
+            }
+          });
+        }
       }
       await signalMacAppBundleProcesses('SIGTERM');
     }
@@ -1394,9 +1494,9 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
         : (targetEntry.child && targetEntry.child.pid ? targetEntry.child.pid : null) ||
           Number(targetEntry.pid || targetEntry.session?.pid || 0) ||
           null;
-    if (pid) {
+    if (pid && pid > 1 && pid !== process.pid) {
       try {
-        process.kill(pid, 'SIGTERM');
+        stopKillImpl(pid, 'SIGTERM');
       } catch {}
     }
 
@@ -1448,14 +1548,39 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
       }
     }
 
-    // Always allow the 500ms graceful SIGTERM exit window BEFORE falling back to `wineserver -k` or SIGKILL
+    // Always allow the graceful SIGTERM exit window BEFORE falling back to `wineserver -k` or SIGKILL
+    const graceWindowMs = Math.max(10, Number(mergedStopOptions.macStopGraceMs ?? 500));
+    const graceStartMs = Date.now();
     let exitedGracefully = false;
     if (pid) {
       exitedGracefully = await waitForProcessExit(
         usesLatchedPublisherChildPid || elevatedTargetPid > 0 ? null : targetEntry.child,
         pid,
-        500
+        graceWindowMs,
+        stopKillImpl
       );
+    }
+    if (macAppBundlePath && !isTestStopEnv && trackedMacAppPids.size > 0) {
+      const trackedList = Array.from(trackedMacAppPids.keys());
+      const remainingGraceMs = Math.max(0, graceWindowMs - (Date.now() - graceStartMs));
+      if (
+        remainingGraceMs > 0 &&
+        trackedList.some((cPid) => isProcessAlive(cPid, stopKillImpl))
+      ) {
+        const deadline = Date.now() + remainingGraceMs;
+        await new Promise((resolve) => {
+          const timer = setInterval(() => {
+            if (
+              Date.now() >= deadline ||
+              !trackedList.some((cPid) => isProcessAlive(cPid, stopKillImpl))
+            ) {
+              clearInterval(timer);
+              resolve(undefined);
+            }
+          }, 25);
+          if (typeof timer.unref === 'function') timer.unref();
+        });
+      }
     }
 
     if (
@@ -1482,7 +1607,7 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
     }
 
     if (pid) {
-      if (!exitedGracefully && isProcessAlive(pid)) {
+      if (!exitedGracefully && isProcessAlive(pid, stopKillImpl)) {
         if (stopPlatform === 'win32') {
           try {
             await signalSubprocessTree(
@@ -1497,14 +1622,12 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
             Number.isInteger(elevatedTargetPid) &&
             elevatedTargetPid > 0 &&
             targetEntry.child?._requireRunAs &&
-            isProcessAlive(elevatedTargetPid) &&
+            isProcessAlive(elevatedTargetPid, stopKillImpl) &&
             !isTestStopEnv
           ) {
-            const execFileImpl =
-              mergedStopOptions.execFileImpl || mergedStopOptions.execFileFn || execFile;
             await new Promise((resolve) => {
               try {
-                execFileImpl(
+                stopExecFileImpl(
                   'powershell.exe',
                   [
                     '-NoProfile',
@@ -1532,12 +1655,12 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
             targetEntry.child.pid !== elevatedTargetPid
           ) {
             try {
-              process.kill(targetEntry.child.pid, 'SIGTERM');
+              stopKillImpl(targetEntry.child.pid, 'SIGTERM');
             } catch {}
           }
-        } else {
+        } else if (pid > 1 && pid !== process.pid) {
           try {
-            process.kill(pid, 'SIGKILL');
+            stopKillImpl(pid, 'SIGKILL');
           } catch {}
         }
         if (!isTestStopEnv && stopWinExeTargets.length > 0) {
@@ -1547,16 +1670,17 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
             targetEntry.winePrefix || ''
           );
         }
-        if (macAppBundlePath && !isTestStopEnv) {
-          await signalMacAppBundleProcesses('SIGKILL');
-        }
         await waitForProcessExit(
           usesLatchedPublisherChildPid || elevatedTargetPid > 0 ? null : targetEntry.child,
           pid,
-          400
+          400,
+          stopKillImpl
         );
       }
-    } else if (macAppBundlePath && !isTestStopEnv) {
+    }
+    if (macAppBundlePath && !isTestStopEnv) {
+      // Escalate to SIGKILL for any surviving .app bundle process or descendant (e.g. sh / dosbox),
+      // even if the outer `/usr/bin/open -W -a` wrapper already exited on SIGTERM.
       await signalMacAppBundleProcesses('SIGKILL');
     }
 
@@ -1622,9 +1746,117 @@ function shutdownLauncherEngine(/** @type {any} */ options = {}) {
 }
 
 
+/**
+ * Parse `ps -axo pid=,ppid=,command=` output and collect all PIDs belonging to a macOS `.app`
+ * bundle (matching `${bundlePath}/Contents/` across `Contents/MacOS/`, `Contents/Resources/`,
+ * etc.) plus every descendant PID reachable via parent->child links from those matched PIDs
+ * and any provided `seedPids` (such as `/usr/bin/open` session PID or `gamePid`), ordered
+ * deepest descendants first so child engines (`sh`, `./dosbox/dosbox`) are signaled before
+ * parent wrappers. Never includes PID `<= 1` or `selfPid`.
+ *
+ * @param {string} psOutput
+ * @param {string | string[]} macAppBundlePaths
+ * @param {Array<number | null | undefined>} [seedPids]
+ * @param {number} [selfPid]
+ * @returns {{
+ *   matchedRootPids: number[],
+ *   orderedPids: number[],
+ *   cmdByPid: Map<number, string>,
+ * }}
+ */
+function collectMacAppBundleProcessTreePids(
+  psOutput,
+  macAppBundlePaths,
+  seedPids = [],
+  selfPid = process.pid
+) {
+  /** @type {Map<number, number[]>} */
+  const childrenByPpid = new Map();
+  /** @type {Map<number, string>} */
+  const cmdByPid = new Map();
+  /** @type {number[]} */
+  const matchedRootPids = [];
+
+  const rawPaths = Array.isArray(macAppBundlePaths) ? macAppBundlePaths : [macAppBundlePaths];
+  const contentsPrefixesLower = Array.from(
+    new Set(
+      rawPaths
+        .map((p) => String(p || '').trim())
+        .filter(Boolean)
+        .map((p) => `${path.resolve(p).replace(/\/+$/, '')}/contents/`.toLowerCase())
+    )
+  );
+
+  for (const rawLine of String(psOutput || '').split(/\r?\n/)) {
+    const m = rawLine.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+    if (!m) continue;
+    const cPid = Number.parseInt(m[1], 10);
+    const pPid = Number.parseInt(m[2], 10);
+    const cmd = m[3].trim();
+    if (!Number.isInteger(cPid) || cPid <= 1) continue;
+    cmdByPid.set(cPid, cmd);
+    if (Number.isInteger(pPid) && pPid > 0 && pPid !== cPid) {
+      let kids = childrenByPpid.get(pPid);
+      if (!kids) {
+        kids = [];
+        childrenByPpid.set(pPid, kids);
+      }
+      kids.push(cPid);
+    }
+    if (cPid === selfPid || /^(?:\/bin\/|\/usr\/bin\/)?ps(?:\s|$)/i.test(cmd)) {
+      continue;
+    }
+    const lowerCmd = cmd.toLowerCase();
+    if (contentsPrefixesLower.some((prefix) => lowerCmd.includes(prefix))) {
+      matchedRootPids.push(cPid);
+    }
+  }
+
+  /** @type {number[]} */
+  const rootQueue = [];
+  /** @type {Set<number>} */
+  const visited = new Set();
+  const enqueueRoot = (/** @type {unknown} */ rawPid) => {
+    const n = Number(rawPid);
+    if (!Number.isInteger(n) || n <= 1 || n === selfPid || visited.has(n)) return;
+    visited.add(n);
+    rootQueue.push(n);
+  };
+
+  for (const mp of matchedRootPids) enqueueRoot(mp);
+  for (const sp of Array.isArray(seedPids) ? seedPids : []) {
+    const n = Number(sp);
+    if (cmdByPid.has(n) || childrenByPpid.has(n)) {
+      enqueueRoot(n);
+    }
+  }
+
+  /** @type {number[]} */
+  const bfsOrder = [];
+  let idx = 0;
+  while (idx < rootQueue.length) {
+    const curr = rootQueue[idx++];
+    bfsOrder.push(curr);
+    const kids = childrenByPpid.get(curr);
+    if (!kids) continue;
+    for (const kid of kids) {
+      if (kid <= 1 || kid === selfPid || visited.has(kid)) continue;
+      visited.add(kid);
+      rootQueue.push(kid);
+    }
+  }
+
+  return {
+    matchedRootPids,
+    orderedPids: bfsOrder.reverse(),
+    cmdByPid,
+  };
+}
+
 module.exports = {
   finalizeGameSession,
   stopGame,
   getRunningGames,
   shutdownLauncherEngine,
+  collectMacAppBundleProcessTreePids,
 };

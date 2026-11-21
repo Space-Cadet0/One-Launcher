@@ -531,13 +531,74 @@ function readAppBundlePlistVersionStrings(plistPath) {
 }
 
 /**
- * Read all stored runner install receipts (100% read-only; never creates directories or mutates files).
+ * Return all candidate paths for One Launcher's external compatibility-runner install receipts,
+ * ordered from primary to fallback, so Electron (`~/Library/Application Support/one-launcher`)
+ * always reads and merges receipts written to `~/Library/Application Support/OneLauncher`.
  *
  * @param {any} [options]
+ * @returns {string[]}
+ */
+function getRunnerInstallReceiptsCandidatePaths(options = {}) {
+  /** @type {string[]} */
+  const candidates = [];
+  const addUnique = (/** @type {string} */ candidatePath) => {
+    if (!candidatePath || typeof candidatePath !== 'string') return;
+    const resolved = path.resolve(candidatePath);
+    if (!candidates.includes(resolved)) {
+      candidates.push(resolved);
+    }
+  };
+
+  const hasExplicitHomedir = Boolean(
+    options && typeof options.homedir === 'string' && options.homedir.trim()
+  );
+  const hasExplicitUserDataDir = Boolean(
+    options && typeof options.userDataDir === 'string' && options.userDataDir.trim()
+  );
+
+  if (hasExplicitHomedir) {
+    addUnique(
+      path.join(
+        options.homedir.trim(),
+        'Library/Application Support/OneLauncher/runner-install-receipts.json'
+      )
+    );
+  }
+  if (hasExplicitUserDataDir) {
+    const explicitUd = path.resolve(options.userDataDir.trim());
+    addUnique(path.join(explicitUd, 'runner-install-receipts.json'));
+    if (!hasExplicitHomedir) {
+      const parentDir = path.dirname(explicitUd);
+      if (path.basename(parentDir).toLowerCase() === 'application support') {
+        addUnique(path.join(parentDir, 'OneLauncher', 'runner-install-receipts.json'));
+      }
+    }
+  }
+  if (!hasExplicitHomedir && !hasExplicitUserDataDir) {
+    try {
+      const ud = getUserDataDir();
+      if (ud && typeof ud === 'string') {
+        addUnique(path.join(ud, 'runner-install-receipts.json'));
+      }
+    } catch {}
+    addUnique(
+      path.join(
+        os.homedir(),
+        'Library/Application Support/OneLauncher/runner-install-receipts.json'
+      )
+    );
+  }
+
+  return candidates;
+}
+
+/**
+ * Read a single runner install receipts JSON file (100% read-only).
+ *
+ * @param {string} filePath
  * @returns {Record<string, any>}
  */
-function readRunnerInstallReceipts(options = {}) {
-  const filePath = getRunnerInstallReceiptsFilePath(options);
+function readSingleRunnerInstallReceiptsFile(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return {};
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -551,6 +612,45 @@ function readRunnerInstallReceipts(options = {}) {
     }
   } catch {}
   return {};
+}
+
+/**
+ * Read and merge all stored runner install receipts across primary (`getUserDataDir()`) and
+ * fallback (`~/Library/Application Support/OneLauncher/`) locations (100% read-only).
+ *
+ * @param {any} [options]
+ * @returns {Record<string, any>}
+ */
+function readRunnerInstallReceipts(options = {}) {
+  const candidatePaths = getRunnerInstallReceiptsCandidatePaths(options);
+  /** @type {Record<string, any>} */
+  const merged = {};
+  /** @type {Map<string, string>} */
+  const keyByLower = new Map();
+
+  // Read fallback paths first, then higher-priority paths, preferring strictly newer updatedAt timestamps
+  for (let i = candidatePaths.length - 1; i >= 0; i -= 1) {
+    const receiptsObj = readSingleRunnerInstallReceiptsFile(candidatePaths[i]);
+    for (const [rawKey, entry] of Object.entries(receiptsObj)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const lowerKey = rawKey.toLowerCase();
+      const existingKey = keyByLower.get(lowerKey);
+      if (existingKey !== undefined) {
+        const existingEntry = merged[existingKey];
+        const existingTs = Date.parse(String(existingEntry?.updatedAt || ''));
+        const nextTs = Date.parse(String(entry?.updatedAt || ''));
+        if (Number.isFinite(existingTs) && Number.isFinite(nextTs) && existingTs > nextTs) {
+          continue;
+        }
+        if (existingKey !== rawKey) {
+          delete merged[existingKey];
+        }
+      }
+      keyByLower.set(lowerKey, rawKey);
+      merged[rawKey] = entry;
+    }
+  }
+  return merged;
 }
 
 /**
@@ -640,12 +740,24 @@ function extractRunnerVersionInfo(
         }
 
         const bundleSemverMatch = bundleVer.match(/^(\d+\.\d+\.\d+)(?:\.(\d+))?$/);
-        const shortSemverMatch = shortVer.match(/(\d+\.\d+(?:\.\d+)?)/);
+        const bundleRevMatch = !bundleSemverMatch
+          ? bundleVer.match(/^(\d+\.\d+(?:\.\d+)?)[-_](\d{1,4})(?!\d)/)
+          : null;
+        const shortRevMatch = shortVer.match(/(\d+\.\d+(?:\.\d+)?)(?:[-_](\d{1,4})(?!\d))?/);
+        const rawRevTag = bundleRevMatch
+          ? `${bundleRevMatch[1]}${bundleVer.charAt(bundleRevMatch[1].length)}${bundleRevMatch[2]}`
+          : shortRevMatch && shortRevMatch[2]
+            ? shortRevMatch[0]
+            : '';
         const semver = bundleSemverMatch
           ? bundleSemverMatch[1]
-          : shortSemverMatch
-            ? shortSemverMatch[1]
-            : '';
+          : bundleRevMatch
+            ? `${bundleRevMatch[1]}.${bundleRevMatch[2]}`
+            : shortRevMatch
+              ? shortRevMatch[2]
+                ? `${shortRevMatch[1]}.${shortRevMatch[2]}`
+                : shortRevMatch[1]
+              : '';
         const buildNum = bundleSemverMatch && bundleSemverMatch[2] ? bundleSemverMatch[2] : '';
 
         if (previewDate && semver) {
@@ -666,8 +778,18 @@ function extractRunnerVersionInfo(
           displayVersion = `Preview ${previewDate}`;
         } else if (semver) {
           version = semver;
-          buildVersion = bundleVer || (buildNum ? `Build ${buildNum}` : undefined);
-          displayVersion = buildNum ? `${semver} (Build ${buildNum})` : semver;
+          buildVersion =
+            bundleVer ||
+            (rawRevTag && rawRevTag !== semver
+              ? rawRevTag
+              : buildNum
+                ? `Build ${buildNum}`
+                : undefined);
+          displayVersion = buildNum
+            ? `${semver} (Build ${buildNum})`
+            : rawRevTag && rawRevTag !== semver
+              ? rawRevTag
+              : semver;
         } else if (shortVer || bundleVer) {
           version = shortVer || bundleVer;
           buildVersion = bundleVer && bundleVer !== version ? bundleVer : undefined;
@@ -1877,6 +1999,7 @@ module.exports = {
   listAllInitializedBottlePaths,
   resolveTargetBottleForFirstPartySync,
   getRunnerInstallReceiptsFilePath,
+  getRunnerInstallReceiptsCandidatePaths,
   readRunnerInstallReceipts,
   recordRunnerInstallReceipt,
   extractRunnerVersionInfo,
