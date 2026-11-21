@@ -438,12 +438,26 @@ export function useGameDetailMetadata({
             );
           }
           try {
+            const isExplicitNonSteamDetail = Boolean(
+              game.isExplicitNonSteam ||
+                currentOverride?.isExplicitNonSteam ||
+                currentOverride?.steamAppId === null ||
+                (metadataRoute?.mode === 'routed' &&
+                  (metadataRoute.source === 'gog' ||
+                    metadataRoute.source === 'epic' ||
+                    metadataRoute.source === 'igdb' ||
+                    (metadataRoute.source === 'custom' &&
+                      String(metadataRoute.matchedId || '').startsWith('xbox-'))))
+            );
             void window.electronAPI.offlineVault
               .saveGameDetail({
                 gameId: game.id,
                 steamAppId: steamIdToSave ?? game.steamAppId ?? null,
                 canonicalTitle: game.title,
                 enrichedMetadata: enrichedForVault,
+                ...(isExplicitNonSteamDetail
+                  ? { isExplicitNonSteam: true, forceReplaceEnriched: true }
+                  : {}),
                 ...(isUnratedOverride
                   ? { clearCriticScore: true }
                   : resolvedCritic && resolvedCritic.score > 0

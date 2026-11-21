@@ -346,16 +346,25 @@ export function useBackgroundMediaWarmup({
         if (launcherService.isInGameHibernating()) return;
         if (autoMediaWarmupRunningRef.current) return;
 
-        void import('../services/network/syncJobManager')
+        void Promise.all([
+          import('../services/network/syncJobManager'),
+          import('../services/storage/stagedCacheService'),
+        ])
           .then(
-            ({
-              syncJobManager,
-              evaluateGameNeedsStoreMediaSync,
-              computeMediaRepairPriority,
-              buildP2CoverHydrationBatch,
-              hasActiveMediaSyncCooldown,
-              MAX_PASSIVE_REPAIR_PER_BOOT,
-            }) => {
+            async ([
+              {
+                syncJobManager,
+                evaluateGameNeedsStoreMediaSync,
+                computeMediaRepairPriority,
+                buildP2CoverHydrationBatch,
+                hasActiveMediaSyncCooldown,
+                MAX_PASSIVE_REPAIR_PER_BOOT,
+              },
+              { isStagedVaultHydrationComplete, whenStagedCacheHydrated },
+            ]) => {
+              if (!isStagedVaultHydrationComplete()) {
+                await whenStagedCacheHydrated();
+              }
               if (cancelled) return;
               if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
               if (!onlineLifecycleManager.isOnline()) return;

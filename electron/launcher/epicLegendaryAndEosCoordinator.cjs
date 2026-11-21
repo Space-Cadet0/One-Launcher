@@ -683,9 +683,25 @@ function syncEpicFirstPartyLauncher(/** @type {any} */ options = {}) {
         ? cleanLaunchExecutable.match(/^([^/]+\.app)\/Contents\/MacOS\/.+/i)
         : null;
       const finalLaunchExecutable = macBundleMatch ? macBundleMatch[1] : cleanLaunchExecutable;
+      const metaMainGameAppName = (() => {
+        const mainGameRef = meta?.metadata?.mainGameItem || meta?.mainGameItem;
+        const mainReleaseInfo = Array.isArray(mainGameRef?.releaseInfo)
+          ? mainGameRef.releaseInfo
+          : [];
+        for (const rel of mainReleaseInfo) {
+          const candidateAppId = String(rel?.appId || '').trim();
+          if (candidateAppId && candidateAppId.toLowerCase() !== appName.toLowerCase()) {
+            return candidateAppId;
+          }
+        }
+        return '';
+      })();
       const mainGameAppName = entry.is_dlc
         ? String(
-            entry.base_app_name || entry.baseAppName || (isNativeMacEpicTarget ? '' : appName)
+            entry.base_app_name ||
+              entry.baseAppName ||
+              metaMainGameAppName ||
+              (isNativeMacEpicTarget ? '' : appName)
           )
         : isNativeMacEpicTarget
           ? ''
@@ -2151,7 +2167,7 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
         let dirSummaries = null;
         if (
           cachedMeta &&
-          cachedMeta.schemaVersion === 2 &&
+          cachedMeta.schemaVersion === 3 &&
           cachedMeta.mtimeMs === mtimeMs &&
           cachedMeta.fileCount === fileCount &&
           Array.isArray(cachedMeta.summaries)
@@ -2181,6 +2197,58 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
                 ).trim() || undefined;
               const appTitle = String(json.app_title || json.metadata?.title || '').trim();
               const normTitle = norm(appTitle);
+              const metaObj = json.metadata && typeof json.metadata === 'object' ? json.metadata : {};
+              const mainGameRef = metaObj.mainGameItem || json.mainGameItem;
+              const mainGameTargetId = String(mainGameRef?.id || '').trim();
+              const mainGameNamespace = String(mainGameRef?.namespace || '').trim();
+              const hasRealMainGame = Boolean(
+                (mainGameTargetId || mainGameNamespace) &&
+                  (!catalogItemId || !mainGameTargetId || mainGameTargetId !== catalogItemId)
+              );
+              const itemTypeUpper = String(metaObj.itemType || json.itemType || '')
+                .trim()
+                .toUpperCase();
+              const isAddonItemType = [
+                'ADD_ON',
+                'DLC',
+                'CONSUMABLE',
+                'WALLET',
+                'SUBSCRIPTION',
+                'PLUGIN',
+                'EXTRA',
+                'CURRENCY',
+              ].includes(itemTypeUpper);
+              const rawCategories = Array.isArray(metaObj.categories)
+                ? metaObj.categories
+                : Array.isArray(json.categories)
+                  ? json.categories
+                  : [];
+              const hasHardAddonCategory = rawCategories.some((/** @type {any} */ c) => {
+                const rawPath = String(typeof c === 'string' ? c : c?.path || '').toLowerCase();
+                return rawPath
+                  .split('/')
+                  .some((seg) =>
+                    [
+                      'addons',
+                      'add-on',
+                      'addon',
+                      'dlc',
+                      'digitalextras',
+                      'consumable',
+                    ].includes(seg.trim())
+                  );
+              });
+              const isDlc = Boolean(hasRealMainGame || isAddonItemType || hasHardAddonCategory);
+              let mainGameAppName = '';
+              if (mainGameRef && Array.isArray(mainGameRef.releaseInfo)) {
+                for (const rel of mainGameRef.releaseInfo) {
+                  const cand = String(rel?.appId || '').trim();
+                  if (cand && cand.toLowerCase() !== appName.toLowerCase()) {
+                    mainGameAppName = cand;
+                    break;
+                  }
+                }
+              }
               const partnerMeta = extractEpicThirdPartyPartnerMetadata(json);
               const isPartnerManaged = Boolean(partnerMeta.chainedLauncherHandoff);
               const hasMacAsset = Boolean(
@@ -2217,6 +2285,8 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
                 normTitle,
                 hasMac,
                 hasWin,
+                isDlc,
+                ...(mainGameAppName ? { mainGameAppName } : {}),
                 macVersion: isPartnerManaged
                   ? undefined
                   : json.asset_infos?.Mac?.build_version || undefined,
@@ -2247,7 +2317,7 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
             legendaryMetadataDirCache,
             metaDir,
             {
-              schemaVersion: 2,
+              schemaVersion: 3,
               mtimeMs,
               fileCount,
               summaries: dirSummaries,
@@ -2283,6 +2353,12 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
             }
             if (!existing.chainedExternalInstallId && s.chainedExternalInstallId) {
               existing.chainedExternalInstallId = s.chainedExternalInstallId;
+            }
+            if (s.isDlc) {
+              existing.isDlc = true;
+            }
+            if (!existing.mainGameAppName && s.mainGameAppName) {
+              existing.mainGameAppName = s.mainGameAppName;
             }
           }
         }

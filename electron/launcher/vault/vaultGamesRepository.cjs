@@ -31,6 +31,41 @@ const {
 } = require('./vaultMetadataLattice.cjs');
 
 /**
+ * Returns true when persisted `existingEnrichedObj` came from a Steam App ID that is
+ * explicitly incompatible with the incoming game/override route (explicitly unlinked
+ * non-Steam game, re-matched to a different Steam App ID, or explicitly force-replaced).
+ *
+ * @param {any} existingEnrichedObj
+ * @param {{ isExplicitNonSteam?: boolean, steamAppId?: number | null, forceReplaceEnriched?: boolean }} ctx
+ * @returns {boolean}
+ */
+function isExistingVaultEnrichedInvalidated(existingEnrichedObj, ctx) {
+  if (ctx && ctx.forceReplaceEnriched === true) {
+    return true;
+  }
+  if (!existingEnrichedObj || typeof existingEnrichedObj !== 'object') {
+    return false;
+  }
+  const existingAppId = Number(existingEnrichedObj.appId);
+  if (!Number.isFinite(existingAppId) || existingAppId <= 0) {
+    return false;
+  }
+  if (ctx && ctx.isExplicitNonSteam === true) {
+    return true;
+  }
+  if (
+    ctx &&
+    typeof ctx.steamAppId === 'number' &&
+    Number.isFinite(ctx.steamAppId) &&
+    ctx.steamAppId > 0 &&
+    existingAppId !== ctx.steamAppId
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Registers or updates a media candidate row using cached statements and ZERO sync `fs.existsSync`
  * inside SQLite write transactions. When an existing `storage_kind = 'blob'` row has a mismatched
  * URL and `deferredBlobDiskChecks` is provided, disk verification is deferred until after `COMMIT`
@@ -582,6 +617,11 @@ function upsertGames(service, games) {
         incomingQuality = 'skeleton_fallback';
       }
 
+      const existingEnrichedInvalidated = isExistingVaultEnrichedInvalidated(existingEnrichedObj, {
+        isExplicitNonSteam: g.isExplicitNonSteam === true,
+        steamAppId,
+      });
+
       if (
         incomingEnriched &&
         existingEnrichedObj?.xboxDeliveryHints &&
@@ -589,7 +629,7 @@ function upsertGames(service, games) {
       ) {
         incomingEnriched.xboxDeliveryHints = existingEnrichedObj.xboxDeliveryHints;
       }
-      if (incomingEnriched && existingEnrichedObj) {
+      if (incomingEnriched && existingEnrichedObj && !existingEnrichedInvalidated) {
         carryForwardVaultRequirements(incomingEnriched, existingEnrichedObj);
         carryForwardVaultCriticAndReviewFields(incomingEnriched, existingEnrichedObj);
       }
@@ -613,6 +653,13 @@ function upsertGames(service, games) {
             existingEnrichedObj.metadataQuality === 'storefront_native')
         ) {
           existingQuality = 'storefront_native';
+        } else if (
+          existingQuality === 'authoritative' &&
+          existingEnrichedObj &&
+          !(Number(existingEnrichedObj.appId) > 0) &&
+          existingEnrichedObj.metadataQuality !== 'authoritative'
+        ) {
+          existingQuality = inferVaultMetadataQuality({ id: gameId }, existingEnrichedObj);
         }
 
         const existingRank = METADATA_QUALITY_RANK[existingQuality] ?? 0;
@@ -621,6 +668,18 @@ function upsertGames(service, games) {
           keepExistingEnriched = true;
           finalQuality = existingQuality;
           finalEnrichedAt = Number(existing.enriched_at || nowTs);
+        } else if (existingEnrichedInvalidated) {
+          if (rawIncomingEnrichedJson && incomingRank === 0) {
+            keepExistingEnriched = true;
+            finalQuality = existingQuality;
+            finalEnrichedAt = Number(existing.enriched_at || nowTs);
+          } else if (!rawIncomingEnrichedJson) {
+            // Explicitly unlinked / re-routed game whose mismatched Steam enrichedMetadata was wiped:
+            // clear the invalidated Steam blob in SQLite so cold boot never resurrects it.
+            keepExistingEnriched = false;
+            finalQuality = 'skeleton_fallback';
+            finalEnrichedAt = 0;
+          }
         } else if (!rawIncomingEnrichedJson || existingRank > incomingRank) {
           keepExistingEnriched = true;
           finalQuality = existingQuality;
@@ -1268,6 +1327,16 @@ function saveGameDetail(service, payload = {}) {
       existingEnrichedObj?.__quotaSlimmed || existingEnrichedObj?.__digestOnly
     );
 
+    const incomingSteamAppId =
+      typeof payload.steamAppId === 'number' && payload.steamAppId > 0
+        ? payload.steamAppId
+        : null;
+    const existingEnrichedInvalidated = isExistingVaultEnrichedInvalidated(existingEnrichedObj, {
+      isExplicitNonSteam: payload.isExplicitNonSteam === true,
+      steamAppId: incomingSteamAppId,
+      forceReplaceEnriched: payload.forceReplaceEnriched === true,
+    });
+
     if (
       incomingEnrichedObj &&
       existingEnrichedObj?.xboxDeliveryHints &&
@@ -1275,7 +1344,7 @@ function saveGameDetail(service, payload = {}) {
     ) {
       incomingEnrichedObj.xboxDeliveryHints = existingEnrichedObj.xboxDeliveryHints;
     }
-    if (incomingEnrichedObj && existingEnrichedObj) {
+    if (incomingEnrichedObj && existingEnrichedObj && !existingEnrichedInvalidated) {
       carryForwardVaultRequirements(incomingEnrichedObj, existingEnrichedObj);
       carryForwardVaultCriticAndReviewFields(incomingEnrichedObj, existingEnrichedObj);
     }
@@ -1312,6 +1381,13 @@ function saveGameDetail(service, payload = {}) {
           existingEnrichedObj.metadataQuality === 'storefront_native')
       ) {
         existingQuality = 'storefront_native';
+      } else if (
+        existingQuality === 'authoritative' &&
+        existingEnrichedObj &&
+        !(Number(existingEnrichedObj.appId) > 0) &&
+        existingEnrichedObj.metadataQuality !== 'authoritative'
+      ) {
+        existingQuality = inferVaultMetadataQuality({ id: gameId }, existingEnrichedObj);
       }
 
       const existingRank = METADATA_QUALITY_RANK[existingQuality] ?? 0;
@@ -1320,7 +1396,17 @@ function saveGameDetail(service, payload = {}) {
         finalEnrichedJson = compressVaultJson(existing.enriched_json);
         finalQuality = existingQuality;
         finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);
-      } else if (!incomingEnrichedJson || existingRank > incomingRank) {
+      } else if (!incomingEnrichedJson) {
+        finalEnrichedJson = compressVaultJson(existing.enriched_json);
+        finalQuality = existingQuality;
+        finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);
+      } else if (existingEnrichedInvalidated) {
+        if (incomingRank === 0) {
+          finalEnrichedJson = compressVaultJson(existing.enriched_json);
+          finalQuality = existingQuality;
+          finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);
+        }
+      } else if (existingRank > incomingRank) {
         finalEnrichedJson = compressVaultJson(existing.enriched_json);
         finalQuality = existingQuality;
         finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);
