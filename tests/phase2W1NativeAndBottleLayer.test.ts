@@ -403,8 +403,11 @@ int main(void) {
       writeFileEnsureDir(path.join(externalYHost, 'SteamLib', 'steamapps', 'appmanifest_1003.acf'), '"AppState" {}');
       writeFileEnsureDir(path.join(externalZHost, 'steamapps', 'appmanifest_1004.acf'), '"AppState" {}');
 
-      fs.mkdirSync(path.join(bottleDir, 'dosdevices'), { recursive: true });
-      fs.symlinkSync(externalYHost, path.join(bottleDir, 'dosdevices', 'y:'));
+      const isPosixHost = process.platform !== 'win32';
+      if (isPosixHost) {
+        fs.mkdirSync(path.join(bottleDir, 'dosdevices'), { recursive: true });
+        fs.symlinkSync(externalYHost, path.join(bottleDir, 'dosdevices', 'y:'));
+      }
 
       const zWinPath = `Z:${externalZHost.replace(/\//g, '\\\\')}`;
       writeFileEnsureDir(
@@ -421,8 +424,10 @@ int main(void) {
 
       expect(compatRegistry.hasBottleSteamAppManifest(bottleDir, '1001')).toBe(true);
       expect(compatRegistry.hasBottleSteamAppManifest(bottleDir, 'steam-1002')).toBe(true);
-      expect(compatRegistry.hasBottleSteamAppManifest(bottleDir, 1003)).toBe(true);
-      expect(compatRegistry.hasBottleSteamAppManifest(bottleDir, 'steam_1004')).toBe(true);
+      if (isPosixHost) {
+        expect(compatRegistry.hasBottleSteamAppManifest(bottleDir, 1003)).toBe(true);
+        expect(compatRegistry.hasBottleSteamAppManifest(bottleDir, 'steam_1004')).toBe(true);
+      }
       expect(compatRegistry.hasBottleSteamAppManifest(bottleDir, '9999')).toBe(false);
 
       // Bottle without steam.exe always returns false

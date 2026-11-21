@@ -508,8 +508,11 @@ describe('Phase 3: 1-Click Bottle Steam Provisioning & Zero-Duplicate Cross-Bott
         buildAcfContent({ appId: 99902, name: 'MissingDir', installdir: 'GhostGame' }),
         'utf8'
       );
-      // External library folder via source libraryfolders.vdf (dosdevices d:)
-      const extLibRoot = path.join(sb.root, 'ExtSteamLib');
+      // External library folder via source libraryfolders.vdf (dosdevices d: on POSIX, C:\ExtSteamLib on win32 NTFS)
+      const isPosixHost = process.platform !== 'win32';
+      const extLibRoot = isPosixHost
+        ? path.join(sb.root, 'ExtSteamLib')
+        : path.join(srcBottle.bottlePath, 'drive_c', 'ExtSteamLib');
       const extSteamapps = path.join(extLibRoot, 'steamapps');
       const extGame = seedPhysicalSteamGame(extSteamapps, {
         appId: 620,
@@ -518,11 +521,13 @@ describe('Phase 3: 1-Click Bottle Steam Provisioning & Zero-Duplicate Cross-Bott
         exeName: 'portal2.exe',
         sizeOnDisk: '800000000',
       });
-      fs.mkdirSync(path.join(srcBottle.bottlePath, 'dosdevices'), { recursive: true });
-      fs.symlinkSync(extLibRoot, path.join(srcBottle.bottlePath, 'dosdevices', 'd:'), 'dir');
+      if (isPosixHost) {
+        fs.mkdirSync(path.join(srcBottle.bottlePath, 'dosdevices'), { recursive: true });
+        fs.symlinkSync(extLibRoot, path.join(srcBottle.bottlePath, 'dosdevices', 'd:'), 'dir');
+      }
       fs.writeFileSync(
         path.join(srcBottle.steamappsDir, 'libraryfolders.vdf'),
-        buildLibraryFoldersVdf({ '2320': '1234567890' }, 'D:\\'),
+        buildLibraryFoldersVdf({ '2320': '1234567890' }, isPosixHost ? 'D:\\' : 'C:\\\\ExtSteamLib'),
         'utf8'
       );
 
@@ -904,18 +909,23 @@ describe('Phase 3: 1-Click Bottle Steam Provisioning & Zero-Duplicate Cross-Bott
         buildAcfContent({ appId: 9001, name: 'Ghost', installdir: 'NoSuchFolder' }),
         'utf8'
       );
-      // External library folder via dosdevices y:
-      const extLib = path.join(sb.root, 'ExternalSteam');
+      // External library folder via dosdevices y: on POSIX (C:\ExternalSteam on win32 NTFS)
+      const isPosixHost = process.platform !== 'win32';
+      const extLib = isPosixHost
+        ? path.join(sb.root, 'ExternalSteam')
+        : path.join(bottle.bottlePath, 'drive_c', 'ExternalSteam');
       seedPhysicalSteamGame(path.join(extLib, 'steamapps'), {
         appId: 400,
         name: 'Portal',
         installdir: 'Portal',
       });
-      fs.mkdirSync(path.join(bottle.bottlePath, 'dosdevices'), { recursive: true });
-      fs.symlinkSync(extLib, path.join(bottle.bottlePath, 'dosdevices', 'y:'), 'dir');
+      if (isPosixHost) {
+        fs.mkdirSync(path.join(bottle.bottlePath, 'dosdevices'), { recursive: true });
+        fs.symlinkSync(extLib, path.join(bottle.bottlePath, 'dosdevices', 'y:'), 'dir');
+      }
       fs.writeFileSync(
         path.join(bottle.steamappsDir, 'libraryfolders.vdf'),
-        buildLibraryFoldersVdf({ '2320': '512000000' }, 'Y:\\'),
+        buildLibraryFoldersVdf({ '2320': '512000000' }, isPosixHost ? 'Y:\\' : 'C:\\\\ExternalSteam'),
         'utf8'
       );
 
@@ -1364,8 +1374,12 @@ describe('Phase 3: 1-Click Bottle Steam Provisioning & Zero-Duplicate Cross-Bott
         withSteam: true,
       });
 
-      // Malicious source entries pointing to '/', bottlesDir (ancestor), and targetBottle itself
-      fs.symlinkSync('/', path.join(src.steamappsDir, 'common', 'RootEscape'), 'dir');
+      // Malicious source entries pointing to filesystem root, bottlesDir (ancestor), and targetBottle itself
+      fs.symlinkSync(
+        path.parse(sb.root).root,
+        path.join(src.steamappsDir, 'common', 'RootEscape'),
+        'dir'
+      );
       fs.writeFileSync(
         path.join(src.steamappsDir, 'appmanifest_70001.acf'),
         buildAcfContent({ appId: 70001, name: 'RootEscape', installdir: 'RootEscape' }),
