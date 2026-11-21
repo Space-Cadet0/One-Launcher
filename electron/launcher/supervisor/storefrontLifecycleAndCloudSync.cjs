@@ -11,6 +11,7 @@ const { inspectMicrosoftGameConfig } = require('../binaryAndManifestInspectors.c
 const {
   isHostGogGalaxyRunning,
   reapOrphanedGogOverlayProcesses,
+  lineMatchesBottlePrefix,
   waitForGogPostExitFlush,
   waitForEpicLauncherCloudSyncCompletion,
 } = require('../storefrontReadinessBarrier.cjs');
@@ -344,34 +345,43 @@ const MAC_NATIVE_PUBLISHER_APPS = Object.freeze({
 });
 
 /**
- * Check whether a `ps eww` command line belongs to the exact target bottle prefix
- * (supporting unquoted `WINEPREFIX=/.../Bottles/OneLauncher C:\...` and `WINEPREFIX=... KEY=VAL`
- * without cross-matching sibling bottles like `OneLauncher-arm64` or `OneLauncher Copy`).
+ * Strictly match a `ps eww` command line against the exact target bottle prefix by delegating to
+ * `storefrontReadinessBarrier.lineMatchesBottlePrefix(..., { allowUnscopedFallback: false })`.
+ * Also guards unscoped lines and unquoted `WINEPREFIX=... C:\...` lines identically before/after
+ * barrier lookahead consolidation.
  *
  * @param {string} rawCmd
- * @param {string[]} candidateBottleNorms
+ * @param {string} bottleNormLower
+ * @param {string} realBottleNormLower
  * @returns {boolean}
  */
-function lineMatchesExactBottlePrefix(rawCmd, candidateBottleNorms) {
+function lineMatchesStrictBottlePrefix(rawCmd, bottleNormLower, realBottleNormLower) {
   const lowerCmd = String(rawCmd || '')
     .replace(/\\/g, '/')
     .toLowerCase();
-  if (!lowerCmd || candidateBottleNorms.length === 0) return false;
+  if (!lowerCmd || (!bottleNormLower && !realBottleNormLower)) return false;
+  const hasExplicitBottleScope =
+    /\bwineprefix=|\/bottles\//i.test(lowerCmd) ||
+    (Boolean(bottleNormLower) && lowerCmd.includes(bottleNormLower)) ||
+    (Boolean(realBottleNormLower) && lowerCmd.includes(realBottleNormLower));
+  if (!hasExplicitBottleScope) return false;
 
-  const hasWinePrefixEnv = /\bwineprefix=/i.test(lowerCmd);
-  for (const pfx of candidateBottleNorms) {
-    if (!pfx) continue;
-    const escapedPfx = pfx.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (hasWinePrefixEnv) {
-      const exactEnvRe = new RegExp(
-        `\\bwineprefix=(?:["']${escapedPfx}\\/?["']|${escapedPfx}\\/?(?=\\s+[a-z]:\\/|\\s+[a-z_][a-z0-9_]*=|\\s+["'/]|["'](?:\\s|$)|$))`,
-        'i'
-      );
-      if (exactEnvRe.test(lowerCmd)) return true;
-    } else {
-      const boundedPathRe = new RegExp(`(?:^|[\\s"'=])${escapedPfx}(?:\\/|["']|$)`, 'i');
-      if (boundedPathRe.test(lowerCmd)) return true;
-    }
+  const matchBottlePrefix =
+    /** @type {(rawLine: string, normTargetPrefix: string | null | undefined, normRealTargetPrefix?: string | null | undefined, opts?: { allowUnscopedFallback?: boolean }) => boolean} */ (
+      lineMatchesBottlePrefix
+    );
+  if (
+    matchBottlePrefix(rawCmd, bottleNormLower, realBottleNormLower, {
+      allowUnscopedFallback: false,
+    })
+  ) {
+    return true;
+  }
+  if (/\bwineprefix=/i.test(rawCmd) && /\s[A-Za-z]:[\\/]/.test(rawCmd)) {
+    const normalizedDriveCmd = rawCmd.replace(/(\s)([A-Za-z]:[\\/])/g, '$1/$2');
+    return matchBottlePrefix(normalizedDriveCmd, bottleNormLower, realBottleNormLower, {
+      allowUnscopedFallback: false,
+    });
   }
   return false;
 }
@@ -1034,9 +1044,6 @@ async function shutdownEphemeralStorefrontClient(
               .toLowerCase();
           }
         } catch {}
-        const candidateBottleNorms = Array.from(
-          new Set([bottleNormLower, realBottleNormLower].filter(Boolean))
-        );
 
         const killPidImpl =
           typeof options.killPidFn === 'function'
@@ -1075,7 +1082,9 @@ async function shutdownEphemeralStorefrontClient(
             const cPid = Number.parseInt(m[1], 10);
             if (!(cPid > 1) || cPid === process.pid) continue;
             const rawCmd = m[2];
-            if (!lineMatchesExactBottlePrefix(rawCmd, candidateBottleNorms)) continue;
+            if (!lineMatchesStrictBottlePrefix(rawCmd, bottleNormLower, realBottleNormLower)) {
+              continue;
+            }
             if (targetPubRegex.test(rawCmd)) {
               matched.push(cPid);
             }
@@ -1463,9 +1472,11 @@ async function shutdownEphemeralStorefrontClient(
         }
       }
 
-      const isGogStorefrontUri =
-        sessionEntry.session?.launchMethod === 'storefront_uri' ||
-        sessionEntry.launchMethod === 'storefront_uri';
+      const isGogStorefrontUri = Boolean(
+        sessionEntry.isStorefrontUriLaunch ||
+          sessionEntry.session?.launchMethod === 'storefront_uri' ||
+          sessionEntry.launchMethod === 'storefront_uri'
+      );
       const gogFlushWait = await waitForGogPostExitFlush({
         platform: targetPlatform,
         homedir: options.homedir,
@@ -1836,9 +1847,11 @@ async function shutdownEphemeralStorefrontClient(
         return { closed: false, shutDown: false, reason: busyBeforeEpicKill };
       }
 
-      const isEpicStorefrontUri =
-        sessionEntry.session?.launchMethod === 'storefront_uri' ||
-        sessionEntry.launchMethod === 'storefront_uri';
+      const isEpicStorefrontUri = Boolean(
+        sessionEntry.isStorefrontUriLaunch ||
+          sessionEntry.session?.launchMethod === 'storefront_uri' ||
+          sessionEntry.launchMethod === 'storefront_uri'
+      );
       /** @type {any} */
       let epicCloudWait = null;
       if (isEpicStorefrontUri || sessionBottlePath) {

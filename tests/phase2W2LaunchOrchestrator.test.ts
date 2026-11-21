@@ -30,13 +30,59 @@ function buildMinimalPeBuffer(machine: 0x014c | 0x8664 = 0x8664): Buffer {
   return buf;
 }
 
-function createFakeChild(pid = 41234): any {
-  const child: any = new EventEmitter();
-  child.pid = pid;
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
-  child.kill = vi.fn(() => true);
-  child.unref = vi.fn();
+interface FakeChildProcess extends EventEmitter {
+  pid: number;
+  stdout: EventEmitter;
+  stderr: EventEmitter;
+  kill: ReturnType<typeof vi.fn>;
+  unref: ReturnType<typeof vi.fn>;
+}
+
+interface SpawnOptionsLike {
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+  stdio?: unknown;
+  detached?: boolean;
+  windowsHide?: boolean;
+}
+
+type ExecFileCallback = (err: Error | null, stdout?: string, stderr?: string) => void;
+
+interface ExecFileOptionsLike {
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+  timeout?: number;
+  windowsHide?: boolean;
+}
+
+interface ActiveSessionCleanupLike {
+  pollTimer?: ReturnType<typeof setInterval> | null;
+  displayStatusTimer?: ReturnType<typeof setInterval> | null;
+}
+
+interface SessionUpdateEventLike {
+  event?: string;
+  status?: string;
+  session?: {
+    pid?: number;
+    gameId?: string;
+    launchMethod?: string;
+  };
+}
+
+interface XboxLoopbackStartOptionsLike {
+  initialPreLaunchSync?: unknown;
+  [key: string]: unknown;
+}
+
+function createFakeChild(pid = 41234): FakeChildProcess {
+  const child = Object.assign(new EventEmitter(), {
+    pid,
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    kill: vi.fn(() => true),
+    unref: vi.fn(),
+  });
   return child;
 }
 
@@ -138,7 +184,10 @@ describe('Phase 2 W2: Game Launch Orchestrator & Chained Publisher Specs', () =>
   });
 
   afterEach(() => {
-    for (const [, entry] of Array.from(engineStateRegistry.activeSessions.entries()) as any[]) {
+    const entries = Array.from(
+      engineStateRegistry.activeSessions.entries() as Iterable<[string, ActiveSessionCleanupLike]>
+    );
+    for (const [, entry] of entries) {
       if (entry?.pollTimer) clearInterval(entry.pollTimer);
       if (entry?.displayStatusTimer) clearInterval(entry.displayStatusTimer);
     }
@@ -213,8 +262,12 @@ describe('Phase 2 W2: Game Launch Orchestrator & Chained Publisher Specs', () =>
           skipRegistrySpawn: true,
           disableBottleSteamPolling: true,
           mockProcessListOutput: '',
-          gameSpawnFn: (cmd: string, args: string[], opts: any) => {
-            spawns.push({ cmd, args: [...args], env: { ...(opts?.env || {}) } });
+          gameSpawnFn: (cmd: string, args: string[], opts?: SpawnOptionsLike) => {
+            const normalizedEnv: Record<string, string> = {};
+            for (const [k, v] of Object.entries(opts?.env || {})) {
+              if (typeof v === 'string') normalizedEnv[k] = v;
+            }
+            spawns.push({ cmd, args: [...args], env: normalizedEnv });
             return createFakeChild(51001);
           },
         }
@@ -275,8 +328,12 @@ describe('Phase 2 W2: Game Launch Orchestrator & Chained Publisher Specs', () =>
           skipRegistrySpawn: true,
           disableBottleSteamPolling: true,
           mockProcessListOutput: '',
-          gameSpawnFn: (cmd: string, args: string[], opts: any) => {
-            spawns.push({ cmd, args: [...args], env: { ...(opts?.env || {}) } });
+          gameSpawnFn: (cmd: string, args: string[], opts?: SpawnOptionsLike) => {
+            const normalizedEnv: Record<string, string> = {};
+            for (const [k, v] of Object.entries(opts?.env || {})) {
+              if (typeof v === 'string') normalizedEnv[k] = v;
+            }
+            spawns.push({ cmd, args: [...args], env: normalizedEnv });
             return createFakeChild(51002);
           },
         }
@@ -339,8 +396,12 @@ describe('Phase 2 W2: Game Launch Orchestrator & Chained Publisher Specs', () =>
           skipRegistrySpawn: true,
           disableBottleSteamPolling: true,
           mockProcessListOutput: '',
-          gameSpawnFn: (cmd: string, args: string[], opts: any) => {
-            spawns.push({ cmd, args: [...args], env: { ...(opts?.env || {}) } });
+          gameSpawnFn: (cmd: string, args: string[], opts?: SpawnOptionsLike) => {
+            const normalizedEnv: Record<string, string> = {};
+            for (const [k, v] of Object.entries(opts?.env || {})) {
+              if (typeof v === 'string') normalizedEnv[k] = v;
+            }
+            spawns.push({ cmd, args: [...args], env: normalizedEnv });
             return createFakeChild(51003);
           },
         }
@@ -733,8 +794,12 @@ describe('Phase 2 W2: Game Launch Orchestrator & Chained Publisher Specs', () =>
           skipRegistrySpawn: true,
           disableBottleSteamPolling: true,
           mockProcessListOutput: '',
-          gameSpawnFn: (cmd: string, args: string[], opts: any) => {
-            spawns.push({ cmd, args: [...args], env: { ...(opts?.env || {}) } });
+          gameSpawnFn: (cmd: string, args: string[], opts?: SpawnOptionsLike) => {
+            const normalizedEnv: Record<string, string> = {};
+            for (const [k, v] of Object.entries(opts?.env || {})) {
+              if (typeof v === 'string') normalizedEnv[k] = v;
+            }
+            spawns.push({ cmd, args: [...args], env: normalizedEnv });
             // Simulate Stage 1 finishing startup cloud sync right after Stage 1 steam.exe spawns
             if (args.includes(bottle.steamExe) && !args.includes('-applaunch')) {
               fs.appendFileSync(
@@ -814,7 +879,12 @@ describe('Phase 2 W2: Game Launch Orchestrator & Chained Publisher Specs', () =>
       // Part A: Warm -silent -> default_client dispatches separate steam://open/main IPC ping before Stage 2
       bottleDisplayController.setLiveBottleSteamUiMode(bottle.bottlePath, 'silent');
       const eventsA: string[] = [];
-      const execFileA = (cmd: string, args: string[], opts: any, cb: Function) => {
+      const execFileA = (
+        _cmd: string,
+        args: string[],
+        opts: ExecFileOptionsLike | ExecFileCallback,
+        cb?: ExecFileCallback
+      ) => {
         const callback = typeof opts === 'function' ? opts : cb;
         if (args.includes('steam://open/main')) {
           eventsA.push(`open_main:${args.join('|')}`);
@@ -866,7 +936,12 @@ describe('Phase 2 W2: Game Launch Orchestrator & Chained Publisher Specs', () =>
       // Part B: Warm contract mismatch sends -shutdown, polls !isBottleWinExeRunning BEFORE wineserver -k
       const eventsB: string[] = [];
       let steamAlivePolls = 0;
-      const execFileB = (cmd: string, args: string[], opts: any, cb: Function) => {
+      const execFileB = (
+        cmd: string,
+        args: string[],
+        opts: ExecFileOptionsLike | ExecFileCallback,
+        cb?: ExecFileCallback
+      ) => {
         const callback = typeof opts === 'function' ? opts : cb;
         if (args.includes('-shutdown')) {
           eventsB.push('steam_shutdown');
@@ -965,13 +1040,20 @@ describe('Phase 2 W2: Game Launch Orchestrator & Chained Publisher Specs', () =>
       const gpLogPath = path.join(bottleA.steamRoot, 'logs', 'gameprocess_log.txt');
       fs.writeFileSync(gpLogPath, '[old] AppID 77030 adding PID 99999 as a tracked process "C:\\old.exe"\n', 'utf8');
 
-      const killSpy = vi.spyOn(process, 'kill').mockImplementation((() => true) as any);
-      const sessionEvents: any[] = [];
-      const unsub = launcherEngine.onSessionUpdated((ev: any) => sessionEvents.push(ev));
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
+      const sessionEvents: SessionUpdateEventLike[] = [];
+      const unsub = launcherEngine.onSessionUpdated((ev: SessionUpdateEventLike) =>
+        sessionEvents.push(ev)
+      );
 
       let psTick = 0;
       const observedPsArgs: string[][] = [];
-      const execFileImpl = (cmd: string, args: string[], opts: any, cb: Function) => {
+      const execFileImpl = (
+        cmd: string,
+        args: string[],
+        opts: ExecFileOptionsLike | ExecFileCallback,
+        cb?: ExecFileCallback
+      ) => {
         const callback = typeof opts === 'function' ? opts : cb;
         if (cmd === 'ps') {
           observedPsArgs.push([...args]);
@@ -1218,10 +1300,12 @@ describe('Phase 2 W2: Game Launch Orchestrator & Chained Publisher Specs', () =>
       fs.writeFileSync(gameExe, buildMinimalPeBuffer(0x8664));
 
       const xboxMods = engineStateRegistry.getXboxStorefrontModules();
-      const capturedLoopbackOpts: any[] = [];
+      const capturedLoopbackOpts: XboxLoopbackStartOptionsLike[] = [];
       vi.spyOn(xboxMods.xboxRuntimeLoopbackServer, 'startXboxRuntimeLoopbackServer').mockImplementation(
-        async (opts: any) => {
-          capturedLoopbackOpts.push(opts);
+        async (opts: unknown) => {
+          capturedLoopbackOpts.push(
+            (opts && typeof opts === 'object' ? opts : {}) as XboxLoopbackStartOptionsLike
+          );
           return {
             port: 0,
             env: { ONE_XGR_PORT: '0' },
@@ -1448,6 +1532,450 @@ describe('Phase 2 W2: Game Launch Orchestrator & Chained Publisher Specs', () =>
       expect(bnetEntry?.wasHostPublisherRunning).toBe(false);
       expect(bnetEntry?.wokePublisherClientByLauncher).toBe(true);
       expect(bnetEntry?.ephemeralClientWoken).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // 6. Round 2 Hardening: Stable CrossOver Affinity, Bottled GOG URI, Pre-Exit
+  //    Log Offsets (GOG/Epic), Cold-Start Abort/Warning & Rapid-Exit Poller Latch
+  // =========================================================================
+  describe('6. Round 2 Remediation Contracts (P0-1A, P1-3, P1-4, P2-4, P2-9)', () => {
+    it('P0-1A keeps stable CrossOver when both CrossOver.app and CrossOver Preview.app coexist on a compatible win64 bottle', async () => {
+      const root = makeTempDir('w2-r2-stable-crossover-');
+      tempDirs.push(root);
+      const homedir = path.join(root, 'home');
+      const userDataDir = path.join(root, 'userdata');
+      const appsDir = path.join(root, 'Applications');
+      fs.mkdirSync(userDataDir, { recursive: true });
+
+      const stableCx = createFakeCrossOverApp(appsDir, 'CrossOver.app');
+      createFakeCrossOverApp(appsDir, 'CrossOver Preview.app');
+
+      const sharedBottlesDir = path.join(
+        homedir,
+        'Library/Application Support/CrossOver/Bottles'
+      );
+      const win64Bottle = createFakeBottle(sharedBottlesDir, 'OneLauncher', {
+        wineArch: 'win64',
+        withSteam: true,
+        steamAppIds: ['77101'],
+      });
+      const gameDir = path.join(win64Bottle.steamRoot, 'steamapps/common/StableWin64Game');
+      fs.mkdirSync(gameDir, { recursive: true });
+      const gameExe = path.join(gameDir, 'StableWin64.exe');
+      fs.writeFileSync(gameExe, buildMinimalPeBuffer(0x8664));
+
+      const spawns: Array<{ cmd: string; args: string[] }> = [];
+      const res = await launcherEngine.launchGame(
+        {
+          gameId: 'steam-77101',
+          title: 'Stable Win64 Game',
+          platformId: 'steam',
+          platformGameId: '77101',
+          steamAppId: 77101,
+          installPath: gameDir,
+          executablePath: gameExe,
+          isWindowsBinaryOnMac: true,
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir,
+          userDataDir,
+          customApplicationsDir: appsDir,
+          skipRegistrySpawn: true,
+          disableBottleSteamPolling: true,
+          mockProcessListOutput: '',
+          gameSpawnFn: (cmd: string, args: string[]) => {
+            spawns.push({ cmd, args: [...args] });
+            return createFakeChild(51101);
+          },
+        }
+      );
+
+      expect(res.success).toBe(true);
+      expect(res.session?.launchMethod).toBe('compatibility_layer:crossover');
+      expect(spawns).toHaveLength(1);
+      expect(spawns[0].cmd).toBe(stableCx.wineBin);
+    });
+
+    it('P1-3 + P1-4 launches installed bottled Windows GOG storefront_uri via GalaxyClient.exe /command=runGame, preserves game exe hint, sets isStorefrontUriLaunch, and snapshots GOG log offsets', async () => {
+      const root = makeTempDir('w2-r2-gog-bottle-uri-');
+      tempDirs.push(root);
+      const homedir = path.join(root, 'home');
+      const userDataDir = path.join(root, 'userdata');
+      const appsDir = path.join(root, 'Applications');
+      fs.mkdirSync(userDataDir, { recursive: true });
+
+      createFakeCrossOverApp(appsDir, 'CrossOver.app');
+      const bottlesDir = path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
+      const bottle = createFakeBottle(bottlesDir, 'OneLauncher', {
+        wineArch: 'win64',
+        withGogGalaxy: true,
+      });
+
+      const gogLogsDir = path.join(bottle.bottlePath, 'drive_c/ProgramData/GOG.com/Galaxy/logs');
+      fs.mkdirSync(gogLogsDir, { recursive: true });
+      const commLogPath = path.join(gogLogsDir, 'CommunicationService.log');
+      const clientLogPath = path.join(gogLogsDir, 'GalaxyClient.log');
+      fs.writeFileSync(commLogPath, 'prior communication service log line\n', 'utf8');
+      fs.writeFileSync(clientLogPath, 'prior galaxy client cloud log line\n', 'utf8');
+      const expectedCommSize = fs.statSync(commLogPath).size;
+      const expectedClientSize = fs.statSync(clientLogPath).size;
+
+      const gameDir = path.join(bottle.bottlePath, 'drive_c/GOG Games/SynthGogUri');
+      fs.mkdirSync(gameDir, { recursive: true });
+      const gameExe = path.join(gameDir, 'SynthGogUri.exe');
+      fs.writeFileSync(gameExe, buildMinimalPeBuffer(0x8664));
+
+      const spawns: Array<{ cmd: string; args: string[] }> = [];
+      const openedUris: string[] = [];
+      const res = await launcherEngine.launchGame(
+        {
+          gameId: 'gog-1454315831',
+          title: 'Synth GOG URI',
+          platformId: 'gog',
+          platformGameId: '1454315831',
+          installPath: gameDir,
+          executablePath: gameExe,
+          isWindowsBinaryOnMac: true,
+          launchConfig: {
+            launchMethod: 'storefront_uri',
+            storefrontClientLifecycle: 'minimal_and_close_if_started',
+          },
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir,
+          userDataDir,
+          customApplicationsDir: appsDir,
+          skipRegistrySpawn: true,
+          mockProcessListOutput: '',
+          onOpenExternal: (u: string) => openedUris.push(u),
+          gameSpawnFn: (cmd: string, args: string[]) => {
+            spawns.push({ cmd, args: [...args] });
+            return createFakeChild(51102 + spawns.length);
+          },
+        }
+      );
+
+      expect(res.success).toBe(true);
+      expect(openedUris).toEqual([]);
+      const runGameSpawn = spawns.find((s) => s.args.includes('/command=runGame'));
+      expect(runGameSpawn).toBeDefined();
+      expect(runGameSpawn?.args).toContain(bottle.gogExe);
+      expect(runGameSpawn?.args).toContain('/gameId=1454315831');
+      expect(runGameSpawn?.args.some((a) => a.startsWith('/path=C:\\GOG Games\\SynthGogUri'))).toBe(
+        true
+      );
+      expect(runGameSpawn?.args).not.toContain(gameExe);
+
+      const entry = engineStateRegistry.activeSessions.get('gog-1454315831');
+      expect(entry?.isStorefrontUriLaunch).toBe(true);
+      expect(entry?.gogUriOriginalGameExeBasename).toBe('synthgoguri.exe');
+      expect(entry?.targetExeBasenamesLower).toContain('synthgoguri.exe');
+      expect(entry?.session?.targetExeBasenamesLower).toContain('synthgoguri.exe');
+      expect(entry?.gogCommLogPreExitOffset).toBe(expectedCommSize);
+      expect(entry?.gogClientLogPreExitOffset).toBe(expectedClientSize);
+    });
+
+    it('P1-4 snapshots gogClientLogPreExitOffset and epicLogPreExitOffset across bottled Epic and host storefront_uri launches', async () => {
+      const root = makeTempDir('w2-r2-preexit-offsets-');
+      tempDirs.push(root);
+      const homedir = path.join(root, 'home');
+      const userDataDir = path.join(root, 'userdata');
+      const appsDir = path.join(root, 'Applications');
+      fs.mkdirSync(userDataDir, { recursive: true });
+
+      // 1. Bottled Epic launch snapshots bottle EpicGamesLauncher.log byte offset
+      createFakeCrossOverApp(appsDir, 'CrossOver.app');
+      const bottlesDir = path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
+      const bottle = createFakeBottle(bottlesDir, 'OneLauncher', { wineArch: 'win64' });
+      const bottleEpicExe = path.join(
+        bottle.bottlePath,
+        'drive_c/Program Files (x86)/Epic Games/Launcher/Portal/Binaries/Win64/EpicGamesLauncher.exe'
+      );
+      fs.mkdirSync(path.dirname(bottleEpicExe), { recursive: true });
+      fs.writeFileSync(bottleEpicExe, buildMinimalPeBuffer(0x8664));
+
+      const bottleEpicLog = path.join(
+        bottle.bottlePath,
+        'drive_c/users/crossover/AppData/Local/EpicGamesLauncher/Saved/Logs/EpicGamesLauncher.log'
+      );
+      fs.mkdirSync(path.dirname(bottleEpicLog), { recursive: true });
+      fs.writeFileSync(bottleEpicLog, 'LogCloudSync: prior bottle epic log bytes\n', 'utf8');
+      const expectedBottleEpicSize = fs.statSync(bottleEpicLog).size;
+
+      const epicGameDir = path.join(bottle.bottlePath, 'drive_c/EpicGames/SynthEpic');
+      fs.mkdirSync(epicGameDir, { recursive: true });
+      const epicGameExe = path.join(epicGameDir, 'SynthEpic.exe');
+      fs.writeFileSync(epicGameExe, buildMinimalPeBuffer(0x8664));
+
+      const resBottleEpic = await launcherEngine.launchGame(
+        {
+          gameId: 'epic-bottle-offset',
+          title: 'Synth Bottle Epic',
+          platformId: 'epic',
+          platformGameId: 'SynthBottleEpic',
+          installPath: epicGameDir,
+          executablePath: epicGameExe,
+          isWindowsBinaryOnMac: true,
+          launchConfig: {
+            storefrontClientLifecycle: 'minimal_and_close_if_started',
+          },
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir,
+          userDataDir,
+          customApplicationsDir: appsDir,
+          skipRegistrySpawn: true,
+          skipAuthRefresh: true,
+          mockProcessListOutput: '',
+          gameSpawnFn: () => createFakeChild(51105),
+        }
+      );
+      expect(resBottleEpic.success).toBe(true);
+      expect(engineStateRegistry.activeSessions.get('epic-bottle-offset')?.epicLogPreExitOffset).toBe(
+        expectedBottleEpicSize
+      );
+      engineStateRegistry.activeSessions.clear();
+
+      // 2. Host macOS Epic storefront_uri snapshots host EpicGamesLauncher.log byte offset
+      const hostEpicLog = path.join(
+        homedir,
+        'Library/Logs/Unreal Engine/EpicGamesLauncher/EpicGamesLauncher.log'
+      );
+      fs.mkdirSync(path.dirname(hostEpicLog), { recursive: true });
+      fs.writeFileSync(hostEpicLog, 'LogCloudSync: prior host mac epic bytes\n', 'utf8');
+      const expectedHostEpicSize = fs.statSync(hostEpicLog).size;
+
+      const resHostEpic = await launcherEngine.launchGame(
+        {
+          gameId: 'epic-host-uri-offset',
+          title: 'Host Epic URI',
+          platformId: 'epic',
+          platformGameId: 'HostEpicApp',
+          launchConfig: { launchMethod: 'storefront_uri' },
+        },
+        {
+          platform: 'darwin',
+          homedir,
+          userDataDir,
+          disableUriPolling: true,
+          mockProcessListOutput: '',
+          onOpenExternal: () => {},
+        }
+      );
+      expect(resHostEpic.success).toBe(true);
+      expect(engineStateRegistry.activeSessions.get('epic-host-uri-offset')?.epicLogPreExitOffset).toBe(
+        expectedHostEpicSize
+      );
+      engineStateRegistry.activeSessions.clear();
+
+      // 3. Host GOG storefront_uri snapshots both gogCommLogPreExitOffset and gogClientLogPreExitOffset
+      const hostGogLogsDir = path.join(root, 'HostGogLogs');
+      fs.mkdirSync(hostGogLogsDir, { recursive: true });
+      const hostCommLog = path.join(hostGogLogsDir, 'CommunicationService.log');
+      const hostClientLog = path.join(hostGogLogsDir, 'GalaxyClient.log');
+      fs.writeFileSync(hostCommLog, 'host comm prior\n', 'utf8');
+      fs.writeFileSync(hostClientLog, 'host client prior bytes\n', 'utf8');
+
+      const resHostGog = await launcherEngine.launchGame(
+        {
+          gameId: 'gog-host-uri-offset',
+          title: 'Host GOG URI',
+          platformId: 'gog',
+          platformGameId: '1888888888',
+          launchConfig: { launchMethod: 'storefront_uri' },
+        },
+        {
+          platform: 'darwin',
+          homedir,
+          userDataDir,
+          disableUriPolling: true,
+          disableGogGalaxyWake: true,
+          mockProcessListOutput: '',
+          gogCommunicationLogPath: hostCommLog,
+          gogClientLogPath: hostClientLog,
+          onOpenExternal: () => {},
+        }
+      );
+      expect(resHostGog.success).toBe(true);
+      const hostGogEntry = engineStateRegistry.activeSessions.get('gog-host-uri-offset');
+      expect(hostGogEntry?.gogCommLogPreExitOffset).toBe(fs.statSync(hostCommLog).size);
+      expect(hostGogEntry?.gogClientLogPreExitOffset).toBe(fs.statSync(hostClientLog).size);
+    });
+
+    it('P2-4 aborts cleanly when cold-start Steam sync is cancelled and logs diagnostic warning on steam_exited_early', async () => {
+      const root = makeTempDir('w2-r2-coldstart-p24-');
+      tempDirs.push(root);
+      const homedir = path.join(root, 'home');
+      const userDataDir = path.join(root, 'userdata');
+      const appsDir = path.join(root, 'Applications');
+      fs.mkdirSync(userDataDir, { recursive: true });
+
+      createFakeCrossOverApp(appsDir, 'CrossOver.app');
+      const bottlesDir = path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
+      const bottle = createFakeBottle(bottlesDir, 'OneLauncher', {
+        wineArch: 'win64',
+        withSteam: true,
+        steamAppIds: ['77110', '77111'],
+      });
+      const gameDir = path.join(bottle.steamRoot, 'steamapps/common/ColdStartGame');
+      fs.mkdirSync(gameDir, { recursive: true });
+      const gameExe = path.join(gameDir, 'ColdStart.exe');
+      fs.writeFileSync(gameExe, buildMinimalPeBuffer(0x8664));
+
+      // A) Aborted during Stage 1 cold-start wait -> cancels launch and NEVER spawns Stage 2 -applaunch
+      const abortCtrl = new AbortController();
+      const abortSpawns: Array<{ args: string[] }> = [];
+      const resAborted = await launcherEngine.launchGame(
+        {
+          gameId: 'steam-77110',
+          title: 'ColdStart Aborted',
+          platformId: 'steam',
+          platformGameId: '77110',
+          steamAppId: 77110,
+          installPath: gameDir,
+          executablePath: gameExe,
+          isWindowsBinaryOnMac: true,
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir,
+          userDataDir,
+          customApplicationsDir: appsDir,
+          signal: abortCtrl.signal,
+          skipRegistrySpawn: true,
+          disableBottleSteamPolling: true,
+          enableTwoStageSteamColdStart: true,
+          maxStartupCloudWaitMs: 5000,
+          pollIntervalMs: 15,
+          mockProcessListOutput: '',
+          gameSpawnFn: (_cmd: string, args: string[]) => {
+            abortSpawns.push({ args: [...args] });
+            if (!args.includes('-applaunch')) {
+              setTimeout(() => abortCtrl.abort(), 25);
+            }
+            return createFakeChild(51110);
+          },
+        }
+      );
+
+      expect(resAborted.success).toBe(false);
+      expect(resAborted.cancelled).toBe(true);
+      expect(abortSpawns.some((s) => s.args.includes('-applaunch'))).toBe(false);
+
+      // B) steam_exited_early logs diagnostic warning `launcher.steamColdStartExitedEarly`
+      const warnSpy = vi.spyOn(engineStateRegistry.diagLog, 'warn');
+      let aliveChecks = 0;
+      const resEarlyExit = await launcherEngine.launchGame(
+        {
+          gameId: 'steam-77111',
+          title: 'ColdStart Early Exit',
+          platformId: 'steam',
+          platformGameId: '77111',
+          steamAppId: 77111,
+          installPath: gameDir,
+          executablePath: gameExe,
+          isWindowsBinaryOnMac: true,
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir,
+          userDataDir,
+          customApplicationsDir: appsDir,
+          skipRegistrySpawn: true,
+          disableBottleSteamPolling: true,
+          enableTwoStageSteamColdStart: true,
+          maxStartupCloudWaitMs: 1000,
+          livenessGraceMs: 0,
+          pollIntervalMs: 15,
+          mockProcessListOutput: '',
+          isSteamAliveFn: async () => {
+            aliveChecks += 1;
+            return false;
+          },
+          gameSpawnFn: () => createFakeChild(51111),
+        }
+      );
+      expect(resEarlyExit.success).toBe(true);
+      expect(aliveChecks).toBeGreaterThanOrEqual(1);
+      expect(
+        warnSpy.mock.calls.some((call) => call[0] === 'launcher.steamColdStartExitedEarly')
+      ).toBe(true);
+    });
+
+    it('P2-9 finalizes Bottle Steam rapid-exit games when gameprocess_log already logged add+remove PID before the first poller tick', async () => {
+      const root = makeTempDir('w2-r2-rapid-exit-');
+      tempDirs.push(root);
+      const homedir = path.join(root, 'home');
+      const userDataDir = path.join(root, 'userdata');
+      const appsDir = path.join(root, 'Applications');
+      fs.mkdirSync(userDataDir, { recursive: true });
+
+      createFakeCrossOverApp(appsDir, 'CrossOver.app');
+      const bottlesDir = path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
+      const bottle = createFakeBottle(bottlesDir, 'OneLauncher', {
+        wineArch: 'win64',
+        withSteam: true,
+        steamAppIds: ['77120'],
+      });
+      const gameDir = path.join(bottle.steamRoot, 'steamapps/common/RapidExitGame');
+      fs.mkdirSync(gameDir, { recursive: true });
+      const gameExe = path.join(gameDir, 'RapidExit.exe');
+      fs.writeFileSync(gameExe, buildMinimalPeBuffer(0x8664));
+      const gpLogPath = path.join(bottle.steamRoot, 'logs', 'gameprocess_log.txt');
+      fs.writeFileSync(gpLogPath, '', 'utf8');
+
+      const res = await launcherEngine.launchGame(
+        {
+          gameId: 'steam-77120',
+          title: 'Rapid Exit Game',
+          platformId: 'steam',
+          platformGameId: '77120',
+          steamAppId: 77120,
+          installPath: gameDir,
+          executablePath: gameExe,
+          isWindowsBinaryOnMac: true,
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir,
+          userDataDir,
+          customApplicationsDir: appsDir,
+          skipRegistrySpawn: true,
+          bottleSteamPollIntervalMs: 20,
+          bottleSteamExitMissThreshold: 1,
+          // Large startup timeout proves finalization happened via `sawAnyTrackedWin32Pid`, NOT timeout
+          bottleSteamMaxLaunchWaitMs: 60000,
+          bottleSteamProcessListFn: async () => '',
+          gameSpawnFn: () => {
+            // Game starts and exits before the very first poller tick fires
+            fs.appendFileSync(
+              gpLogPath,
+              '[now] AppID 77120 adding PID 912 as a tracked process "C:\\Game\\RapidExit.exe"\n' +
+                '[now] AppID 77120 removing PID 912\n',
+              'utf8'
+            );
+            return createFakeChild(51120);
+          },
+        }
+      );
+
+      expect(res.success).toBe(true);
+      const t0 = Date.now();
+      for (let i = 0; i < 40 && engineStateRegistry.activeSessions.has('steam-77120'); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(engineStateRegistry.activeSessions.has('steam-77120')).toBe(false);
+      expect(Date.now() - t0).toBeLessThan(2000);
     });
   });
 });

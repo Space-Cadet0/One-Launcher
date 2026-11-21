@@ -13,13 +13,28 @@ const bottleDisplayAndEnv = require('../electron/launcher/supervisor/bottleDispl
 const xboxRuntimeLoopbackServer = require('../electron/storefronts/xbox/xboxRuntimeLoopbackServer.cjs');
 const xboxTitleStorageSync = require('../electron/storefronts/xbox/xboxTitleStorageSync.cjs');
 
+type ExecFileCallback = (err: Error | null, stdout?: string, stderr?: string) => void;
+
+interface ExecFileOptionsLike {
+  timeout?: number;
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+  windowsHide?: boolean;
+}
+
+interface LoopbackRpcResponse {
+  ok?: boolean;
+  result?: Record<string, unknown>;
+  error?: { code?: string; message?: string };
+}
+
 async function sendLoopbackRpcCall(
   port: number,
   sessionKey: string,
   method: string,
   params: Record<string, unknown> = {},
   id = 1
-): Promise<any> {
+): Promise<LoopbackRpcResponse> {
   return new Promise((resolve, reject) => {
     const sock = net.createConnection({ host: '127.0.0.1', port }, () => {
       const frame = xboxRuntimeLoopbackServer.encodeRpcFrame({
@@ -153,7 +168,12 @@ describe('Phase 2 W3 — Session Finalizer, Cloud Barrier Handoff & Ordered Clie
               ? '/Applications/Steam.app/Contents/MacOS/steam_osx -silent\n'
               : 'C:\\Program Files (x86)\\Steam\\steam.exe\n';
           },
-          execFileImpl: (cmd: string, args: string[], opts: any, cb: Function) => {
+          execFileImpl: (
+            cmd: string,
+            args: string[],
+            opts: ExecFileOptionsLike,
+            cb: ExecFileCallback
+          ) => {
             execCallsA.push({ cmd, args, timeout: opts?.timeout });
             cb(null, '', '');
           },
@@ -187,7 +207,12 @@ describe('Phase 2 W3 — Session Finalizer, Cloud Barrier Handoff & Ordered Clie
           hostSteamExitPollIntervalMs: 15,
           getProcessListOutput: async () =>
             '/Applications/Steam.app/Contents/MacOS/steam_osx -silent\n',
-          execFileImpl: (cmd: string, args: string[], opts: any, cb: Function) => {
+          execFileImpl: (
+            cmd: string,
+            args: string[],
+            opts: ExecFileOptionsLike,
+            cb: ExecFileCallback
+          ) => {
             execCallsB.push({ cmd, args, timeout: opts?.timeout });
             cb(null, '', '');
           },
@@ -427,7 +452,12 @@ describe('Phase 2 W3 — Session Finalizer, Cloud Barrier Handoff & Ordered Clie
         awaitBottleSteamExitInTest: true,
         bottleSteamExitWaitMs: 1000,
         bottleSteamExitPollIntervalMs: 25,
-        execFileImpl: (cmd: string, args: string[], opts: any, cb: Function) => {
+        execFileImpl: (
+          _cmd: string,
+          args: string[],
+          opts: ExecFileOptionsLike,
+          cb: ExecFileCallback
+        ) => {
           if (args.includes('-shutdown')) {
             timeline.push('steam_shutdown_dispatched');
             steamShutdownTimeout = Number(opts?.timeout || 0);
@@ -822,7 +852,12 @@ describe('Phase 2 W3 — GOG/Epic URI Barriers & Chained Publisher Ordered Shutd
           gogCommunicationLogPath: commLogPath,
           gogClientLogPath: clientLogPath,
           mockProcessListOutput: '/Applications/GOG Galaxy.app/Contents/MacOS/GOG Galaxy\n',
-          execFileImpl: (cmd: string, args: string[], _opts: any, cb: Function) => {
+          execFileImpl: (
+            cmd: string,
+            args: string[],
+            _opts: ExecFileOptionsLike,
+            cb: ExecFileCallback
+          ) => {
             timeline.push(`exec:${cmd}:${args.join(' ')}`);
             cb(null, '', '');
           },
@@ -862,7 +897,12 @@ describe('Phase 2 W3 — GOG/Epic URI Barriers & Chained Publisher Ordered Shutd
           epicCloudSyncWaitMs: 1500,
           pollIntervalMs: 20,
           epicLogPath,
-          execFileImpl: (cmd: string, args: string[], _opts: any, cb: Function) => {
+          execFileImpl: (
+            cmd: string,
+            args: string[],
+            _opts: ExecFileOptionsLike,
+            cb: ExecFileCallback
+          ) => {
             timeline.push(`exec:${cmd}:${args.join(' ')}`);
             cb(null, '', '');
           },
@@ -931,7 +971,12 @@ describe('Phase 2 W3 — GOG/Epic URI Barriers & Chained Publisher Ordered Shutd
         epicCloudSyncWaitMs: 1500,
         pollIntervalMs: 20,
         autoShutdownWinePrefixOnExit: false,
-        execFileImpl: (_cmd: string, args: string[], _opts: any, cb: Function) => {
+        execFileImpl: (
+          _cmd: string,
+          args: string[],
+          _opts: ExecFileOptionsLike,
+          cb: ExecFileCallback
+        ) => {
           bottleTimeline.push(`bottle_exec:${args.join(' ')}`);
           cb(null, '', '');
         },
@@ -1064,7 +1109,12 @@ describe('Phase 2 W3 — GOG/Epic URI Barriers & Chained Publisher Ordered Shutd
           timeline.push(`kill:${pid}:${sig}`);
           if (sig === 'SIGKILL') eaStillAlive = false;
         },
-        execFileImpl: (_cmd: string, args: string[], _opts: any, cb: Function) => {
+        execFileImpl: (
+          _cmd: string,
+          args: string[],
+          _opts: ExecFileOptionsLike,
+          cb: ExecFileCallback
+        ) => {
           timeline.push(`exec:${args.join(' ')}`);
           cb(null, '', '');
         },
@@ -1112,7 +1162,12 @@ describe('Phase 2 W3 — GOG/Epic URI Barriers & Chained Publisher Ordered Shutd
           {
             platform: 'win32',
             userDataDir: tmp,
-            execFileImpl: (cmd: string, args: string[], _opts: any, cb: Function) => {
+            execFileImpl: (
+              cmd: string,
+              args: string[],
+              _opts: ExecFileOptionsLike,
+              cb: ExecFileCallback
+            ) => {
               calls.push({ cmd, args });
               cb(null, '', '');
             },
@@ -1141,7 +1196,12 @@ describe('Phase 2 W3 — GOG/Epic URI Barriers & Chained Publisher Ordered Shutd
         {
           platform: 'win32',
           userDataDir: tmp,
-          execFileImpl: (cmd: string, args: string[], _opts: any, cb: Function) => {
+          execFileImpl: (
+            cmd: string,
+            args: string[],
+            _opts: ExecFileOptionsLike,
+            cb: ExecFileCallback
+          ) => {
             rglCalls.push({ cmd, args });
             cb(null, '', '');
           },
@@ -1182,7 +1242,12 @@ describe('Phase 2 W3 — GOG/Epic URI Barriers & Chained Publisher Ordered Shutd
           spawnFn: (cmd: string, args: string[]) => {
             steamEaSpawns.push({ cmd, args });
           },
-          execFileImpl: (cmd: string, args: string[], _opts: any, cb: Function) => {
+          execFileImpl: (
+            cmd: string,
+            args: string[],
+            _opts: ExecFileOptionsLike,
+            cb: ExecFileCallback
+          ) => {
             steamEaExecs.push({ cmd, args });
             cb(null, '', '');
           },
@@ -1258,7 +1323,12 @@ describe('Phase 2 W3 — GOG/Epic URI Barriers & Chained Publisher Ordered Shutd
           {
             platform: 'darwin',
             userDataDir: tmp,
-            execFileImpl: (cmd: string, args: string[], _opts: any, cb: Function) => {
+            execFileImpl: (
+              cmd: string,
+              args: string[],
+              _opts: ExecFileOptionsLike,
+              cb: ExecFileCallback
+            ) => {
               osaCalls.push({ cmd, args });
               cb(null, '', '');
             },
@@ -1286,7 +1356,12 @@ describe('Phase 2 W3 — GOG/Epic URI Barriers & Chained Publisher Ordered Shutd
           {
             platform: 'darwin',
             userDataDir: tmp,
-            execFileImpl: (cmd: string, args: string[], _opts: any, cb: Function) => {
+            execFileImpl: (
+              cmd: string,
+              args: string[],
+              _opts: ExecFileOptionsLike,
+              cb: ExecFileCallback
+            ) => {
               fallbackCalls.push({ cmd, args });
               if (cmd === '/usr/bin/osascript') {
                 cb(new Error('osascript failed'), '', '');
@@ -1304,6 +1379,329 @@ describe('Phase 2 W3 — GOG/Epic URI Barriers & Chained Publisher Ordered Shutd
           args: ['-TERM', '-x', item.firstPkill],
         });
       }
+    });
+  });
+
+  describe('6. Round 2 Remediation Contracts (P1-3, P1-5, P2-1)', () => {
+    it('6.1 P1-3 bottled Windows GOG isStorefrontUriLaunch waits for GalaxyClient.log cloud upload finish and skips duplicate playtime upload', async () => {
+      const tmp = makeTempDir('r2-gog-bottle-uri-fin');
+      const bottleDir = path.join(tmp, 'GogBottle');
+      const gogLogsDir = path.join(bottleDir, 'drive_c', 'ProgramData', 'GOG.com', 'Galaxy', 'logs');
+      fs.mkdirSync(gogLogsDir, { recursive: true });
+      const commLogPath = path.join(gogLogsDir, 'CommunicationService.log');
+      const clientLogPath = path.join(gogLogsDir, 'GalaxyClient.log');
+      fs.writeFileSync(commLogPath, 'prior comm line\n', 'utf8');
+      fs.writeFileSync(clientLogPath, 'prior client line\n', 'utf8');
+      const commPreOffset = fs.statSync(commLogPath).size;
+      const clientPreOffset = fs.statSync(clientLogPath).size;
+
+      // Append active upload marker after pre-exit offset before finalizer starts
+      fs.appendFileSync(commLogPath, '[GameplayLogicManager] destructor\n', 'utf8');
+      fs.appendFileSync(clientLogPath, 'CloudStorage: Syncing saves for game\n', 'utf8');
+
+      const timeline: string[] = [];
+      setTimeout(() => {
+        timeline.push('bottle_gog_upload_finished');
+        fs.appendFileSync(clientLogPath, 'CloudStorage: Upload finished\n', 'utf8');
+      }, 45);
+
+      const playtimeSyncCalls: string[] = [];
+      const fetchStub = vi.fn(async (url: string | URL) => {
+        playtimeSyncCalls.push(String(url));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+        };
+      });
+
+      engineStateRegistry.activeSessions.set('gog:bottle-uri-p13', {
+        session: {
+          sessionId: 'sess-gog-bottle-uri-p13',
+          gameId: 'gog:bottle-uri-p13',
+          title: 'Synthetic Bottled GOG URI',
+          platformId: 'gog',
+          platformGameId: '1454315831',
+          launchMethod: 'compatibility_layer:crossover',
+          status: 'running',
+          startedAt: new Date(Date.now() - 180_000).toISOString(),
+        },
+        platformId: 'gog',
+        platformGameId: '1454315831',
+        isStorefrontUriLaunch: true,
+        wokeBottleGogByLauncher: true,
+        gogCommLogPreExitOffset: commPreOffset,
+        gogClientLogPreExitOffset: clientPreOffset,
+        winePrefix: bottleDir,
+        wineBinary: '/usr/bin/true',
+        bottleGogExe: 'C:\\Program Files (x86)\\GOG Galaxy\\GalaxyClient.exe',
+        effectiveStorefrontLifecycle: 'minimal_and_close_if_started',
+        startedMs: Date.now() - 180_000,
+        exitCode: 0,
+        stoppedByUser: false,
+        launchOptions: { platform: 'darwin', homedir: tmp, userDataDir: tmp },
+      });
+
+      const fin = supervisor.finalizeGameSession('gog:bottle-uri-p13', {
+        platform: 'darwin',
+        homedir: tmp,
+        userDataDir: tmp,
+        enableUriCloudFlushWaitInTest: true,
+        gogPostExitFlushMs: 1500,
+        gogPostExitSettleMs: 10,
+        pollIntervalMs: 20,
+        autoShutdownWinePrefixOnExit: false,
+        fetchFn: fetchStub,
+        execFileImpl: (
+          _cmd: string,
+          args: string[],
+          _opts: ExecFileOptionsLike,
+          cb: ExecFileCallback
+        ) => {
+          timeline.push(`exec:${args.join(' ')}`);
+          cb(null, '', '');
+        },
+      });
+
+      await fin.postSessionBarrierPromise;
+      const playtimeResult = await fin.storefrontSyncPromise;
+      expect(playtimeResult).toBeNull();
+      expect(playtimeSyncCalls).toEqual([]);
+      expect(timeline[0]).toBe('bottle_gog_upload_finished');
+      expect(timeline[1]).toContain('/command=shutdown');
+    });
+
+    it('6.2 P1-5A aligns syncXboxCloudSaves scid to consumedLock.resolvedScid when fallback SCID holds the lock', async () => {
+      const tmp = makeTempDir('r2-xbox-scid-match');
+      const bottleDir = path.join(tmp, 'XboxScidBottle');
+      fs.mkdirSync(bottleDir, { recursive: true });
+      const primaryScid = '00000000-0000-0000-0000-00000000aaaa';
+      const lockedFallbackScid = '00000000-0000-0000-0000-00000000bbbb';
+      const xuid = '2533274790395904';
+      const pfn = 'Studio.ScidMismatch_8wekyb3d8bbwe';
+
+      const capturedSyncCalls: Array<{
+        payload: Record<string, unknown>;
+        opts: Record<string, unknown>;
+      }> = [];
+      const fakeLoopback = {
+        flushPendingSaves: async () => {},
+        getActiveScids: () => [primaryScid],
+        consumeHeldLock: (scid: string) =>
+          scid.toLowerCase() === primaryScid
+            ? {
+                lockHeld: true,
+                hadWrites: true,
+                xuid,
+                resolvedScid: lockedFallbackScid,
+                pfn,
+              }
+            : null,
+        close: async () => {},
+      };
+
+      engineStateRegistry.activeSessions.set('xbox-scid-match-1', {
+        session: {
+          sessionId: 'sess-xbox-scid-1',
+          gameId: 'xbox-scid-match-1',
+          platformId: 'xbox',
+          platformGameId: '9PSCIDMATCH',
+          title: 'Synthetic SCID Match',
+          status: 'running',
+          launchMethod: 'compatibility_layer',
+          startedAt: new Date(Date.now() - 120_000).toISOString(),
+        },
+        platformId: 'xbox',
+        platformGameId: '9PSCIDMATCH',
+        startedMs: Date.now() - 120_000,
+        exitCode: 0,
+        stoppedByUser: false,
+        winePrefix: bottleDir,
+        packageFamilyName: pfn,
+        scid: primaryScid,
+        fallbackScid: lockedFallbackScid,
+        xboxLoopbackServer: fakeLoopback,
+        launchOptions: {
+          userDataDir: makeTempDir('xbox-ud-scid'),
+        },
+      });
+
+      const fin = supervisor.finalizeGameSession('xbox-scid-match-1', {
+        syncXboxCloudSavesFn: async (
+          payload: Record<string, unknown>,
+          _mode: string,
+          opts: Record<string, unknown>
+        ) => {
+          capturedSyncCalls.push({ payload, opts });
+          return { synced: true, provider: 'xbox_connected_storage', resolvedScid: lockedFallbackScid };
+        },
+      });
+
+      await fin.postSessionBarrierPromise;
+      expect(capturedSyncCalls).toHaveLength(1);
+      expect(capturedSyncCalls[0].payload.scid).toBe(lockedFallbackScid);
+      expect(capturedSyncCalls[0].payload.fallbackScid).toBe(primaryScid);
+      expect(capturedSyncCalls[0].opts.alreadyLocked).toBe(true);
+      expect(capturedSyncCalls[0].opts.priorHadWrites).toBe(true);
+    });
+
+    it('6.3 P1-5B explicitly releases consumed Xbox lock when syncXboxCloudSaves returns early without entering Title Storage or throws', async () => {
+      const tmp = makeTempDir('r2-xbox-early-release');
+      const bottleDir = path.join(tmp, 'XboxEarlyBottle');
+      fs.mkdirSync(bottleDir, { recursive: true });
+      const lockedScid = '00000000-0000-0000-0000-00000000cccc';
+      const xuid = '2533274790395904';
+      const pfn = 'Studio.EarlyRelease_8wekyb3d8bbwe';
+
+      // Case A: syncXboxCloudSaves returns early (`no_cloud_saves_configured`) -> lock explicitly released!
+      const releasedLocksA: Array<Record<string, unknown>> = [];
+      engineStateRegistry.activeSessions.set('xbox-early-ret-1', {
+        session: {
+          sessionId: 'sess-xbox-early-1',
+          gameId: 'xbox-early-ret-1',
+          platformId: 'xbox',
+          platformGameId: '9PEARLYRET',
+          title: 'Synthetic Early Return',
+          status: 'running',
+          launchMethod: 'compatibility_layer',
+          startedAt: new Date(Date.now() - 120_000).toISOString(),
+        },
+        platformId: 'xbox',
+        platformGameId: '9PEARLYRET',
+        startedMs: Date.now() - 120_000,
+        exitCode: 0,
+        stoppedByUser: false,
+        winePrefix: bottleDir,
+        packageFamilyName: pfn,
+        scid: lockedScid,
+        xboxLoopbackServer: {
+          flushPendingSaves: async () => {},
+          getActiveScids: () => [lockedScid],
+          consumeHeldLock: () => ({
+            lockHeld: true,
+            hadWrites: true,
+            xuid,
+            resolvedScid: lockedScid,
+            pfn,
+          }),
+          close: async () => {},
+        },
+        launchOptions: {
+          userDataDir: makeTempDir('xbox-ud-early-a'),
+          xboxSession: { xuid, authorizationHeader: `XBL3.0 x=${xuid};tok` },
+        },
+      });
+
+      const finA = supervisor.finalizeGameSession('xbox-early-ret-1', {
+        syncXboxCloudSavesFn: async () => ({
+          synced: false,
+          provider: 'xbox_connected_storage',
+          reason: 'no_cloud_saves_configured',
+        }),
+        releaseXboxTitleStorageSessionLockFn: async (params: Record<string, unknown>) => {
+          releasedLocksA.push(params);
+          return true;
+        },
+      });
+      await finA.postSessionBarrierPromise;
+
+      expect(releasedLocksA).toHaveLength(1);
+      expect(releasedLocksA[0].xuid).toBe(xuid);
+      expect(releasedLocksA[0].scid).toBe(lockedScid);
+      expect(releasedLocksA[0].hadWrites).toBe(true);
+
+      // Case B: syncXboxCloudSaves throws before Title Storage -> lock explicitly released!
+      const releasedLocksB: Array<Record<string, unknown>> = [];
+      engineStateRegistry.activeSessions.set('xbox-early-throw-2', {
+        session: {
+          sessionId: 'sess-xbox-early-2',
+          gameId: 'xbox-early-throw-2',
+          platformId: 'xbox',
+          platformGameId: '9PEARLYTHROW',
+          title: 'Synthetic Early Throw',
+          status: 'running',
+          launchMethod: 'compatibility_layer',
+          startedAt: new Date(Date.now() - 120_000).toISOString(),
+        },
+        platformId: 'xbox',
+        platformGameId: '9PEARLYTHROW',
+        startedMs: Date.now() - 120_000,
+        exitCode: 0,
+        stoppedByUser: false,
+        winePrefix: bottleDir,
+        packageFamilyName: pfn,
+        scid: lockedScid,
+        xboxLoopbackServer: {
+          flushPendingSaves: async () => {},
+          getActiveScids: () => [lockedScid],
+          consumeHeldLock: () => ({
+            lockHeld: true,
+            hadWrites: false,
+            xuid,
+            resolvedScid: lockedScid,
+            pfn,
+          }),
+          close: async () => {},
+        },
+        launchOptions: {
+          userDataDir: makeTempDir('xbox-ud-early-b'),
+          xboxSession: { xuid, authorizationHeader: `XBL3.0 x=${xuid};tok` },
+        },
+      });
+
+      const finB = supervisor.finalizeGameSession('xbox-early-throw-2', {
+        syncXboxCloudSavesFn: async () => {
+          throw new Error('pre_title_storage_boom');
+        },
+        releaseXboxTitleStorageSessionLockFn: async (params: Record<string, unknown>) => {
+          releasedLocksB.push(params);
+          return true;
+        },
+      });
+      await finB.postSessionBarrierPromise;
+
+      expect(releasedLocksB).toHaveLength(1);
+      expect(releasedLocksB[0].xuid).toBe(xuid);
+      expect(releasedLocksB[0].scid).toBe(lockedScid);
+      expect(releasedLocksB[0].hadWrites).toBe(false);
+    });
+
+    it('6.4 P2-1 strict bottle prefix matching via lineMatchesBottlePrefix never kills unscoped host lines', async () => {
+      const tmp = makeTempDir('r2-p21-strict-prefix');
+      const targetBottle = path.join(tmp, 'Bottles', 'OneLauncher');
+      const siblingBottle = path.join(tmp, 'Bottles', 'OneLauncher-arm64');
+      fs.mkdirSync(targetBottle, { recursive: true });
+      fs.mkdirSync(siblingBottle, { recursive: true });
+
+      const psSnapshot = [
+        `91001 WINEPREFIX=${targetBottle} C:\\Program Files\\Electronic Arts\\EA Desktop\\EADesktop.exe`,
+        `91002 WINEPREFIX=${siblingBottle} C:\\Program Files\\Electronic Arts\\EA Desktop\\EADesktop.exe`,
+        `91003 C:\\Program Files\\Electronic Arts\\EA Desktop\\EADesktop.exe`,
+      ].join('\n');
+
+      const killed: number[] = [];
+      const res = await supervisor.shutdownEphemeralStorefrontClient(
+        {
+          platformId: 'ea',
+          chainedLauncherHandoff: 'ea',
+          wokePublisherClientByLauncher: true,
+          winePrefix: targetBottle,
+          effectiveStorefrontLifecycle: 'minimal_and_close_if_started',
+        },
+        {
+          platform: 'darwin',
+          userDataDir: tmp,
+          mockProcessListOutput: psSnapshot,
+          killPidFn: (pid: number) => {
+            killed.push(pid);
+          },
+        }
+      );
+
+      expect(res.closed).toBe(true);
+      expect(killed).toEqual([91001]);
+      expect(killed).not.toContain(91002);
+      expect(killed).not.toContain(91003);
     });
   });
 });

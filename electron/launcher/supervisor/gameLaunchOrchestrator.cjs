@@ -36,6 +36,7 @@ const {
   inspectRunningBottleSteam,
   probeLocalTcpPort,
   resolveGogCommunicationLogPath,
+  resolveGogClientLogPath,
   waitForGogCommunicationServiceReady,
   waitForBottleEpicPortalReady,
   extractTrackedPidFromSteamGameProcessLog,
@@ -256,6 +257,182 @@ function layerSupportsBottleArch(layer, targetArch, hostArch) {
 }
 
 /**
+ * Check whether an installed, host-supported compatibility layer is ALREADY compatible with
+ * `bottlePath` (matching bottle architecture AND owning `bottlePath` via `availableBottles` or
+ * `bottlesDir`).
+ *
+ * @param {any} layer
+ * @param {string} bottlePath
+ * @param {string} hostArch
+ * @returns {boolean}
+ */
+function isLayerCompatibleWithBottle(layer, bottlePath, hostArch) {
+  if (!layer || !bottlePath) return false;
+  const confMeta = inspectBottleConfMetadata(bottlePath);
+  const targetArch = confMeta.wineArch || 'win64';
+  if (!layerSupportsBottleArch(layer, targetArch, hostArch)) return false;
+  const resolvedBottle = path.resolve(bottlePath);
+  const bottleNameLower = path.basename(resolvedBottle).toLowerCase();
+  const bottleParentDir = path.dirname(resolvedBottle);
+  const hasBottleInAvailable =
+    Array.isArray(layer.availableBottles) &&
+    layer.availableBottles.some(
+      (/** @type {any} */ b) => String(b || '').trim().toLowerCase() === bottleNameLower
+    );
+  const hasMatchingBottlesDir = Boolean(
+    layer.bottlesDir && areSameBottleDirPath(layer.bottlesDir, bottleParentDir)
+  );
+  return hasBottleInAvailable || hasMatchingBottlesDir;
+}
+
+/**
+ * Snapshot the current byte offset of host or bottle `EpicGamesLauncher.log` right before
+ * session launch so post-exit `waitForEpicLauncherCloudSyncCompletion` neither scans stale
+ * prior-session entries nor skips upload markers written during exit-detection latency.
+ *
+ * @param {{ platform?: string, bottlePath?: string | null, homedir?: string, options?: Record<string, any> }} [params]
+ * @returns {number | undefined}
+ */
+function snapshotEpicLogPreExitOffset(params = {}) {
+  const opts = params.options && typeof params.options === 'object' ? params.options : {};
+  /** @type {string[]} */
+  const candidates = [];
+  const explicitRaw = opts.epicLogPath || opts.epicBottleLogPath;
+  if (typeof explicitRaw === 'string' && explicitRaw.trim()) {
+    candidates.push(explicitRaw.trim());
+  } else if (Array.isArray(explicitRaw)) {
+    for (const p of explicitRaw) {
+      if (typeof p === 'string' && p.trim()) candidates.push(p.trim());
+    }
+  }
+
+  if (candidates.length === 0) {
+    const bottlePath = String(params.bottlePath || '').trim();
+    if (bottlePath) {
+      try {
+        const bottleShellFolders = readWinePrefixShellFolders(bottlePath);
+        if (bottleShellFolders?.appDataLocal) {
+          candidates.push(
+            path.join(
+              bottleShellFolders.appDataLocal,
+              'EpicGamesLauncher',
+              'Saved',
+              'Logs',
+              'EpicGamesLauncher.log'
+            )
+          );
+        }
+      } catch {}
+      const driveC = path.join(bottlePath, 'drive_c');
+      /** @type {Set<string>} */
+      const bottleUsers = new Set(['crossover']);
+      try {
+        const currentUser = os.userInfo().username;
+        if (currentUser) bottleUsers.add(currentUser);
+      } catch {}
+      try {
+        const usersDir = path.join(driveC, 'users');
+        if (fs.existsSync(usersDir)) {
+          for (const dirent of fs.readdirSync(usersDir, { withFileTypes: true })) {
+            if (
+              dirent.isDirectory() &&
+              !dirent.name.startsWith('.') &&
+              dirent.name.toLowerCase() !== 'public'
+            ) {
+              bottleUsers.add(dirent.name);
+            }
+          }
+        }
+      } catch {}
+      for (const u of bottleUsers) {
+        candidates.push(
+          path.join(
+            driveC,
+            'users',
+            u,
+            'AppData',
+            'Local',
+            'EpicGamesLauncher',
+            'Saved',
+            'Logs',
+            'EpicGamesLauncher.log'
+          ),
+          path.join(
+            driveC,
+            'users',
+            u,
+            'Local Settings',
+            'Application Data',
+            'EpicGamesLauncher',
+            'Saved',
+            'Logs',
+            'EpicGamesLauncher.log'
+          )
+        );
+      }
+    } else {
+      const targetPlatform = params.platform || opts.platform || process.platform;
+      const homedir = String(params.homedir || opts.homedir || os.homedir());
+      if (targetPlatform === 'win32') {
+        const localAppData = String(
+          opts.localAppDataDir ||
+            process.env.LOCALAPPDATA ||
+            path.join(homedir, 'AppData', 'Local')
+        );
+        candidates.push(
+          localAppData.startsWith('/')
+            ? path.join(
+                localAppData,
+                'EpicGamesLauncher',
+                'Saved',
+                'Logs',
+                'EpicGamesLauncher.log'
+              )
+            : path.win32.join(
+                localAppData,
+                'EpicGamesLauncher',
+                'Saved',
+                'Logs',
+                'EpicGamesLauncher.log'
+              )
+        );
+      } else {
+        candidates.push(
+          path.join(
+            homedir,
+            'Library',
+            'Logs',
+            'Unreal Engine',
+            'EpicGamesLauncher',
+            'EpicGamesLauncher.log'
+          ),
+          path.join(
+            homedir,
+            'Library',
+            'Application Support',
+            'Epic',
+            'EpicGamesLauncher',
+            'Saved',
+            'Logs',
+            'EpicGamesLauncher.log'
+          )
+        );
+      }
+    }
+  }
+
+  for (const candidate of Array.from(new Set(candidates))) {
+    try {
+      if (candidate && fs.existsSync(candidate)) {
+        const st = fs.statSync(candidate);
+        if (st.isFile()) return st.size;
+      }
+    } catch {}
+  }
+  return candidates.length > 0 ? 0 : undefined;
+}
+
+/**
  * Select the best installed, host-supported compatibility layer for `bottlePath` based on its
  * `cxbottle.conf` architecture (`arm64` vs `win64`) and matching `bottlesDir`.
  *
@@ -272,7 +449,7 @@ function selectRecommendedLayerForBottle(layers, bottlePath, hostArch) {
   const preferredOrder =
     targetArch === 'arm64'
       ? ['crossover_preview_arm64']
-      : ['crossover_preview', 'crossover', 'gptk', 'wine'];
+      : ['crossover', 'crossover_preview', 'gptk', 'wine'];
 
   const archCompatible = layers.filter((l) => layerSupportsBottleArch(l, targetArch, hostArch));
   if (archCompatible.length === 0) return null;
@@ -1566,6 +1743,7 @@ async function launchGameInternal(
       let wokeBottleSteamPublisherByLauncher = false;
       /** @type {string | null} */
       let bottleGogExe = null;
+      let gogUriOriginalGameExeBasename = '';
       let shouldWakeBottleGog = false;
       let wasBottleGogRunning = false;
       let wokeBottleGogByLauncher = false;
@@ -1701,23 +1879,47 @@ async function launchGameInternal(
             };
           }
         }
+        const defaultCandidateLayer =
+          layers.find(
+            (l) =>
+              l &&
+              l.available !== false &&
+              !(
+                l.type === 'crossover_preview_arm64' &&
+                platform === 'darwin' &&
+                effectiveHostArch !== 'arm64'
+              ) &&
+              (l.type === 'crossover' ||
+                l.type === 'crossover_preview' ||
+                l.type === 'crossover_preview_arm64')
+          ) ||
+          layers.find(
+            (l) =>
+              l &&
+              l.available !== false &&
+              !(
+                l.type === 'crossover_preview_arm64' &&
+                platform === 'darwin' &&
+                effectiveHostArch !== 'arm64'
+              )
+          ) ||
+          layers[0] ||
+          null;
+        const defaultCompatibleWithAffinity = Boolean(
+          !preferredType &&
+            affinityBottlePath &&
+            defaultCandidateLayer &&
+            isLayerCompatibleWithBottle(defaultCandidateLayer, affinityBottlePath, effectiveHostArch)
+        );
         const affinityMatchedLayer =
-          !preferredType && affinityBottlePath
+          !preferredType && affinityBottlePath && !defaultCompatibleWithAffinity
             ? selectRecommendedLayerForBottle(layers, affinityBottlePath, effectiveHostArch)
             : null;
         let chosenLayer = preferredType
           ? explicitMatchedLayer
-          : affinityMatchedLayer ||
-            layers.find(
-              (l) =>
-                l &&
-                l.available !== false &&
-                (l.type === 'crossover' ||
-                  l.type === 'crossover_preview' ||
-                  l.type === 'crossover_preview_arm64')
-            ) ||
-            layers.find((l) => l && l.available !== false) ||
-            layers[0];
+          : defaultCompatibleWithAffinity
+            ? defaultCandidateLayer
+            : affinityMatchedLayer || defaultCandidateLayer;
 
         if (!chosenLayer) {
           if (
@@ -2295,30 +2497,38 @@ async function launchGameInternal(
                 error: `Cannot launch "${payload.title || gameId}" via GOG Galaxy URI on macOS: bottle "${gogTargetBottleName}" (${chosenLayer.name || chosenLayer.type}) does not have Windows GOG Galaxy installed, and host macOS GOG Galaxy cannot launch Windows bottle games. Install Windows GOG Galaxy in "${gogTargetBottleName}" or switch Launch Method to Direct / Compatibility Layer in Launch Config.`,
               };
             }
-            if (isBottledWindowsGogStorefrontUri && bottleGogExe && !resolvedExePath) {
+            const origGogExePathForSdkCheck = resolvedExePath;
+            if (isBottledWindowsGogStorefrontUri && bottleGogExe) {
+              if (
+                resolvedExePath &&
+                path.basename(resolvedExePath).toLowerCase() !== 'galaxyclient.exe'
+              ) {
+                gogUriOriginalGameExeBasename = path.basename(resolvedExePath).trim().toLowerCase();
+              }
               resolvedExePath = bottleGogExe;
               const cleanBottleGogId = String(payload.platformGameId || gameId || '')
                 .trim()
                 .replace(/^gog[-_]/i, '');
               if (cleanBottleGogId) {
-                args.push('/command=runGame', `/gameId=${cleanBottleGogId}`);
+                const gogRunArgs = ['/command=runGame', `/gameId=${cleanBottleGogId}`];
                 if (localInstallDir) {
                   const winGogInstallDir = toWineWindowsPath(localInstallDir, targetWinePrefix);
                   if (winGogInstallDir) {
-                    args.push(`/path=${winGogInstallDir}`);
+                    gogRunArgs.push(`/path=${winGogInstallDir}`);
                   }
                 }
+                args.unshift(...gogRunArgs);
               }
             }
-            if (!isUnmockedHostBottleInVitest) {
+            if (!isUnmockedHostBottleInVitest || isBottledWindowsGogStorefrontUri) {
               const gogInstallUsesSdk =
-                options.strictGalaxySdkCheck === true
-                  ? doesGogInstallUseGalaxySdk(localInstallDir, resolvedExePath)
-                  : true;
+                isBottledWindowsGogStorefrontUri || options.strictGalaxySdkCheck !== true
+                  ? true
+                  : doesGogInstallUseGalaxySdk(localInstallDir, origGogExePathForSdkCheck);
               shouldWakeBottleGog = Boolean(
                 bottleGogExe &&
                   !isFastMinimalBypass &&
-                  options.usesGalaxySdk !== false &&
+                  (isBottledWindowsGogStorefrontUri || options.usesGalaxySdk !== false) &&
                   gogInstallUsesSdk &&
                   !options.disableBottleGogLaunch &&
                   !options.disableBottleStorefrontLaunch
@@ -2593,22 +2803,24 @@ async function launchGameInternal(
             }
           } catch {}
         } else if (payload.platformId === 'gog') {
-          try {
-            const gogPreSyncRes = await syncGogCloudSaves(payload, 'pre_launch', {
-              ...options,
-              useCompatLayer,
-              winePrefix: targetWinePrefix,
-              installPath: localInstallDir || payload.installPath,
-            });
-            if (gogPreSyncRes && gogPreSyncRes.synced) {
-              lastPreLaunchCloudSyncAt = Date.now();
+          if (!isBottledWindowsGogStorefrontUri) {
+            try {
+              const gogPreSyncRes = await syncGogCloudSaves(payload, 'pre_launch', {
+                ...options,
+                useCompatLayer,
+                winePrefix: targetWinePrefix,
+                installPath: localInstallDir || payload.installPath,
+              });
+              if (gogPreSyncRes && gogPreSyncRes.synced) {
+                lastPreLaunchCloudSyncAt = Date.now();
+              }
+              emitPreLaunchCloudTelemetry(gogPreSyncRes);
+            } catch (/** @type {any} */ gogSyncErr) {
+              emitPreLaunchCloudTelemetry({
+                synced: false,
+                reason: gogSyncErr && gogSyncErr.message ? gogSyncErr.message : 'sync_failed',
+              });
             }
-            emitPreLaunchCloudTelemetry(gogPreSyncRes);
-          } catch (/** @type {any} */ gogSyncErr) {
-            emitPreLaunchCloudTelemetry({
-              synced: false,
-              reason: gogSyncErr && gogSyncErr.message ? gogSyncErr.message : 'sync_failed',
-            });
           }
 
           const shouldWakeHostGog =
@@ -3584,7 +3796,12 @@ async function launchGameInternal(
             const normalizedWineArgs = args.map((a) =>
               normalizeWineArgumentBackslashes(a, effectiveWinePrefix)
             );
-            if (wantDisplayLauncherWrap && bottleDisplayStagedInfo && resolvedExePath) {
+            if (
+              wantDisplayLauncherWrap &&
+              !isBottledWindowsGogStorefrontUri &&
+              bottleDisplayStagedInfo &&
+              resolvedExePath
+            ) {
               const chosenDisplayLauncherPosix = effectiveCaps?.is32Bit
                 ? bottleDisplayStagedInfo.launcherX86Posix
                 : bottleDisplayStagedInfo.launcherX64Posix;
@@ -3608,6 +3825,15 @@ async function launchGameInternal(
                 resolvedExePath,
                 ...args,
               ];
+              if (
+                isBottledWindowsGogStorefrontUri &&
+                wantDisplayLauncherWrap &&
+                localInstallDir &&
+                targetWinePrefix
+              ) {
+                bottleSteamDisplayDllArgs = dllOverrideArgs;
+                bottleShouldWatchSteamGameDir = true;
+              }
             }
             actualLaunchMethod = `compatibility_layer:${chosenCompatLayer.type}`;
           }
@@ -3920,35 +4146,55 @@ async function launchGameInternal(
                 stage1BottleSteam.unref();
               }
 
-              await waitForSteamColdStartupCloudReady(bottleSteamRoot, effectiveSteamAppId, {
-                ...options,
-                preBootLogOffset,
-                steamRootStrict: true,
-                isBottleSteam: true,
-                onStatusUpdate: (/** @type {string} */ statusMessage) => {
-                  emitSessionUpdated(
-                    {
-                      gameId,
-                      platformId: payload.platformId || 'steam',
-                      status: 'starting',
-                      event: 'starting',
-                      statusMessage,
-                    },
-                    options
-                  );
-                },
-                ...(typeof options.isSteamAliveFn === 'function'
-                  ? { isSteamAliveFn: options.isSteamAliveFn }
-                  : !isTestEnvironment(options) && targetWinePrefix
-                    ? {
-                        isSteamAliveFn: () =>
-                          isBottleWinExeRunning('steam.exe', targetWinePrefix, {
-                            ...options,
-                            platform,
-                          }),
-                      }
-                    : {}),
-              });
+              const coldStartRes = await waitForSteamColdStartupCloudReady(
+                bottleSteamRoot,
+                effectiveSteamAppId,
+                {
+                  ...options,
+                  signal: launchSignal,
+                  preBootLogOffset,
+                  steamRootStrict: true,
+                  isBottleSteam: true,
+                  onStatusUpdate: (/** @type {string} */ statusMessage) => {
+                    emitSessionUpdated(
+                      {
+                        gameId,
+                        platformId: payload.platformId || 'steam',
+                        status: 'starting',
+                        event: 'starting',
+                        statusMessage,
+                      },
+                      options
+                    );
+                  },
+                  ...(typeof options.isSteamAliveFn === 'function'
+                    ? { isSteamAliveFn: options.isSteamAliveFn }
+                    : !isTestEnvironment(options) && targetWinePrefix
+                      ? {
+                          isSteamAliveFn: () =>
+                            isBottleWinExeRunning('steam.exe', targetWinePrefix, {
+                              ...options,
+                              platform,
+                            }),
+                        }
+                      : {}),
+                }
+              );
+              if (coldStartRes?.reason === 'aborted' || isLaunchAborted()) {
+                return abortedLaunchResult();
+              }
+              if (coldStartRes?.reason === 'steam_exited_early') {
+                diagLog.warn(
+                  'launcher.steamColdStartExitedEarly',
+                  'Bottle Steam exited before startup cloud sync completed',
+                  {
+                    gameId,
+                    appId: effectiveSteamAppId,
+                    bottlePath: targetWinePrefix || undefined,
+                    waitedMs: coldStartRes.waitedMs,
+                  }
+                );
+              }
             } catch (coldStartErr) {
               diagLog.warn('launchGame.bottleSteamColdStartSync', coldStartErr, {
                 gameId,
@@ -4491,6 +4737,7 @@ async function launchGameInternal(
             const mergedTargetBasenames = Array.from(
               new Set([
                 ...(effectiveCaps?.targetExeBasenamesLower || []),
+                ...(gogUriOriginalGameExeBasename ? [gogUriOriginalGameExeBasename] : []),
                 ...(paradoxExpectedExe
                   ? [path.basename(paradoxExpectedExe).trim().toLowerCase()]
                   : []),
@@ -4529,21 +4776,56 @@ async function launchGameInternal(
                 : {}),
             };
 
-            // CP-04: Snapshot CommunicationService.log byte offset right before session starts so
-            // post-exit `waitForGogPostExitFlush` ignores stale prior-session destructor markers.
+            // CP-04 / P1-4: Snapshot GOG CommunicationService.log & GalaxyClient.log byte offsets
+            // plus EpicGamesLauncher.log byte offset right before session starts so post-exit barriers
+            // ignore stale prior-session entries and never miss lines written during exit detection.
+            /** @type {number | undefined} */
             let gogCommLogPreExitOffset;
-            if (wokeBottleGogByLauncher || (gogWakeResult && gogWakeResult.started)) {
+            /** @type {number | undefined} */
+            let gogClientLogPreExitOffset;
+            if (
+              wokeBottleGogByLauncher ||
+              isBottledWindowsGogStorefrontUri ||
+              (gogWakeResult && gogWakeResult.started)
+            ) {
+              const isBottleGogScope = Boolean(
+                wokeBottleGogByLauncher || isBottledWindowsGogStorefrontUri
+              );
+              const gogLogParams = {
+                platform: isBottleGogScope ? 'win32' : platform,
+                bottlePath: isBottleGogScope ? resolvedWinePrefix || undefined : undefined,
+                homedir: options.homedir,
+                options,
+              };
               try {
-                const gogLogPath = resolveGogCommunicationLogPath({
-                  platform: wokeBottleGogByLauncher ? 'win32' : platform,
-                  bottlePath: wokeBottleGogByLauncher ? resolvedWinePrefix || undefined : undefined,
-                  homedir: options.homedir,
-                  options,
-                });
-                if (gogLogPath && fs.existsSync(gogLogPath)) {
-                  gogCommLogPreExitOffset = fs.statSync(gogLogPath).size;
+                const gogLogPath = resolveGogCommunicationLogPath(gogLogParams);
+                if (gogLogPath) {
+                  gogCommLogPreExitOffset = fs.existsSync(gogLogPath)
+                    ? fs.statSync(gogLogPath).size
+                    : 0;
                 }
               } catch {}
+              try {
+                const gogClientLogPath = resolveGogClientLogPath(gogLogParams);
+                if (gogClientLogPath) {
+                  gogClientLogPreExitOffset = fs.existsSync(gogClientLogPath)
+                    ? fs.statSync(gogClientLogPath).size
+                    : 0;
+                }
+              } catch {}
+            }
+            /** @type {number | undefined} */
+            let epicLogPreExitOffset;
+            if (
+              wokeBottleEpicByLauncher ||
+              (payload.platformId === 'epic' && Boolean(resolvedWinePrefix))
+            ) {
+              epicLogPreExitOffset = snapshotEpicLogPreExitOffset({
+                platform: 'win32',
+                bottlePath: resolvedWinePrefix,
+                homedir: options.homedir,
+                options,
+              });
             }
 
             // Transfer resource ownership cleanly to `entry` so `finally` never disposes active handles
@@ -4562,6 +4844,8 @@ async function launchGameInternal(
               reLatchedBottleChildPid: 0,
               is64Bit: Boolean(effectiveCaps?.is64Bit),
               targetExeBasenamesLower: mergedTargetBasenames,
+              ...(gogUriOriginalGameExeBasename ? { gogUriOriginalGameExeBasename } : {}),
+              ...(isBottledWindowsGogStorefrontUri ? { isStorefrontUriLaunch: true } : {}),
               ...(paradoxExpectedExe ? { expectedGameExe: paradoxExpectedExe } : {}),
               pollTimer: null,
               startedMs: Date.now(),
@@ -4598,6 +4882,10 @@ async function launchGameInternal(
               ...(typeof gogCommLogPreExitOffset === 'number'
                 ? { gogCommLogPreExitOffset }
                 : {}),
+              ...(typeof gogClientLogPreExitOffset === 'number'
+                ? { gogClientLogPreExitOffset }
+                : {}),
+              ...(typeof epicLogPreExitOffset === 'number' ? { epicLogPreExitOffset } : {}),
               wokeSteamByLauncher: false,
               steamClientBinaryPath: null,
               launchedViaBottleSteam: shouldLaunchViaBottleSteam,
@@ -4611,7 +4899,8 @@ async function launchGameInternal(
               wokeBottleSteamByLauncher: shouldLaunchViaBottleSteam
                 ? !wasBottleSteamRunning
                 : false,
-              bottleGogExe: shouldWakeBottleGog ? bottleGogExe : null,
+              bottleGogExe:
+                shouldWakeBottleGog || isBottledWindowsGogStorefrontUri ? bottleGogExe : null,
               wasBottleGogRunning,
               wokeBottleGogByLauncher,
               bottleEpicExe: shouldWakeBottleEpic ? bottleEpicExe : null,
@@ -4701,6 +4990,7 @@ async function launchGameInternal(
                   candidateGameExeNames.add(baseLower);
                   return true;
                 };
+                addBottleHintIfValid(gogUriOriginalGameExeBasename);
                 addBottleHintIfValid(resolvedExePath);
                 addBottleHintIfValid(payload.executablePath);
                 for (const discoveredExe of collectChainedGameCandidateExeNames(
@@ -4770,6 +5060,7 @@ async function launchGameInternal(
                   : null;
                 /** @type {Set<string>} */
                 const trackedWin32Pids = new Set();
+                let sawAnyTrackedWin32Pid = false;
                 let seenGameRunning = false;
                 let consecutiveMisses = 0;
                 let lastEmittedLatchedPid = 0;
@@ -4800,7 +5091,10 @@ async function launchGameInternal(
                         // Track Win32 PID purely as an opaque state count; NEVER pass to POSIX kill()
                         const winPidToken = addMatch[1];
                         const winExePath = addMatch[2];
-                        if (winPidToken) trackedWin32Pids.add(winPidToken);
+                        if (winPidToken) {
+                          trackedWin32Pids.add(winPidToken);
+                          sawAnyTrackedWin32Pid = true;
+                        }
                         if (addBottleHintIfValid(winExePath)) {
                           const newBase = path.win32.basename(winExePath).trim().toLowerCase();
                           bottleExeHints.push(newBase);
@@ -4915,7 +5209,7 @@ async function launchGameInternal(
                             );
                           }
                         }
-                      } else if (seenGameRunning) {
+                      } else if (seenGameRunning || sawAnyTrackedWin32Pid) {
                         consecutiveMisses += 1;
                         const canFinalizeForTrackedWin32 =
                           trackedWin32Pids.size === 0 ||
@@ -5517,13 +5811,9 @@ async function launchGameInternal(
               ? String(steamLaunchSpec.binaryPath).match(/^(.*?\.app)(?:\/|$)/i)
               : null;
           if (macSteamAppMatch && macSteamAppMatch[1] && steamLaunchSpec.useMinimalBinarySpawn) {
-            const macStage1SteamArgs =
-              effectivePerfPolicy.storefrontClientLifecycle === 'fast_direct_bypass'
-                ? ['-silent', '-nofriendsui', '-nochatui', '-nobrowser']
-                : ['-silent'];
             const stage1Child = spawnImpl(
               '/usr/bin/open',
-              ['-g', '-j', '-a', macSteamAppMatch[1], '--args', ...macStage1SteamArgs],
+              ['-g', '-j', '-a', macSteamAppMatch[1], '--args', '-silent'],
               {
                 detached: true,
                 stdio: 'ignore',
@@ -5544,22 +5834,42 @@ async function launchGameInternal(
             }
           }
 
-          await waitForSteamColdStartupCloudReady(hostSteamRoot, steamAppIdVal, {
-            ...options,
-            preBootLogOffset,
-            onStatusUpdate: (/** @type {string} */ statusMessage) => {
-              emitSessionUpdated(
-                {
-                  gameId,
-                  platformId: payload.platformId || 'steam',
-                  status: 'starting',
-                  event: 'starting',
-                  statusMessage,
-                },
-                options
-              );
-            },
-          });
+          const coldStartRes = await waitForSteamColdStartupCloudReady(
+            hostSteamRoot,
+            steamAppIdVal,
+            {
+              ...options,
+              signal: launchSignal,
+              preBootLogOffset,
+              onStatusUpdate: (/** @type {string} */ statusMessage) => {
+                emitSessionUpdated(
+                  {
+                    gameId,
+                    platformId: payload.platformId || 'steam',
+                    status: 'starting',
+                    event: 'starting',
+                    statusMessage,
+                  },
+                  options
+                );
+              },
+            }
+          );
+          if (coldStartRes?.reason === 'aborted' || isLaunchAborted()) {
+            return abortedLaunchResult();
+          }
+          if (coldStartRes?.reason === 'steam_exited_early') {
+            diagLog.warn(
+              'launcher.steamColdStartExitedEarly',
+              'Host Steam exited before startup cloud sync completed',
+              {
+                gameId,
+                appId: steamAppIdVal,
+                steamRoot: hostSteamRoot || undefined,
+                waitedMs: coldStartRes.waitedMs,
+              }
+            );
+          }
 
           snapshotUriSteamCloudLogOffset();
 
@@ -5856,19 +6166,43 @@ async function launchGameInternal(
       isBottledSession: false,
     };
 
-    // CP-04: Snapshot CommunicationService.log byte offset for host GOG URI launches
+    // CP-04 / P1-4: Snapshot GOG CommunicationService.log, GalaxyClient.log, and host
+    // EpicGamesLauncher.log byte offsets for host storefront_uri launches
+    /** @type {number | undefined} */
     let uriGogCommLogPreExitOffset;
-    if (gogWakeResult && gogWakeResult.started) {
+    /** @type {number | undefined} */
+    let uriGogClientLogPreExitOffset;
+    if (payload.platformId === 'gog' || (gogWakeResult && gogWakeResult.started)) {
+      const hostGogLogParams = {
+        platform,
+        homedir: options.homedir,
+        options,
+      };
       try {
-        const hostGogLogPath = resolveGogCommunicationLogPath({
-          platform,
-          homedir: options.homedir,
-          options,
-        });
-        if (hostGogLogPath && fs.existsSync(hostGogLogPath)) {
-          uriGogCommLogPreExitOffset = fs.statSync(hostGogLogPath).size;
+        const hostGogLogPath = resolveGogCommunicationLogPath(hostGogLogParams);
+        if (hostGogLogPath) {
+          uriGogCommLogPreExitOffset = fs.existsSync(hostGogLogPath)
+            ? fs.statSync(hostGogLogPath).size
+            : 0;
         }
       } catch {}
+      try {
+        const hostGogClientLogPath = resolveGogClientLogPath(hostGogLogParams);
+        if (hostGogClientLogPath) {
+          uriGogClientLogPreExitOffset = fs.existsSync(hostGogClientLogPath)
+            ? fs.statSync(hostGogClientLogPath).size
+            : 0;
+        }
+      } catch {}
+    }
+    /** @type {number | undefined} */
+    let uriEpicLogPreExitOffset;
+    if (payload.platformId === 'epic') {
+      uriEpicLogPreExitOffset = snapshotEpicLogPreExitOffset({
+        platform,
+        homedir: options.homedir,
+        options,
+      });
     }
 
     /** @type {any} */
@@ -5895,6 +6229,7 @@ async function launchGameInternal(
       launchConfig,
       effectiveStorefrontLifecycle: effectivePerfPolicy.storefrontClientLifecycle,
       isFastDirectBypass: Boolean(isFastMinimalBypass),
+      isStorefrontUriLaunch: true,
       ...(typeof uriSteamCloudLogSessionStartOffset === 'number'
         ? { steamCloudLogSessionStartOffset: uriSteamCloudLogSessionStartOffset }
         : {}),
@@ -5902,6 +6237,12 @@ async function launchGameInternal(
       gogGalaxyClientPath: gogWakeResult ? gogWakeResult.clientPath || null : null,
       ...(typeof uriGogCommLogPreExitOffset === 'number'
         ? { gogCommLogPreExitOffset: uriGogCommLogPreExitOffset }
+        : {}),
+      ...(typeof uriGogClientLogPreExitOffset === 'number'
+        ? { gogClientLogPreExitOffset: uriGogClientLogPreExitOffset }
+        : {}),
+      ...(typeof uriEpicLogPreExitOffset === 'number'
+        ? { epicLogPreExitOffset: uriEpicLogPreExitOffset }
         : {}),
       wokeSteamByLauncher: Boolean(
         steamMinimalSpawnedResult && steamMinimalSpawnedResult.wokeSteamByLauncher

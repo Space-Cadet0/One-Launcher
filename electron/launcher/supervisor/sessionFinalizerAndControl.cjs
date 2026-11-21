@@ -24,6 +24,7 @@ const {
   enqueuePendingCloudUpload,
 } = require('../cloudSaveEngine.cjs');
 const {
+  getStoreSync,
   getXboxStorefrontModules,
   diagLog,
   getOfflineVaultLifecycleHooks,
@@ -213,12 +214,17 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
     });
   }
 
+  const isStorefrontUri = Boolean(
+    entry.isStorefrontUriLaunch || entry.session?.launchMethod === 'storefront_uri'
+  );
+
   const willRunPostExitCloudSync = Boolean(
     !crashedEarly &&
-      ((stoppedSession.platformId === 'epic' && entry.session?.launchMethod !== 'storefront_uri') ||
-        (stoppedSession.platformId === 'gog' && entry.session?.launchMethod !== 'storefront_uri') ||
+      ((stoppedSession.platformId === 'epic' && !isStorefrontUri) ||
+        (stoppedSession.platformId === 'gog' && !isStorefrontUri) ||
+        (stoppedSession.platformId === 'gog' && isStorefrontUri && entry.wokeBottleGogByLauncher) ||
         (stoppedSession.platformId === 'xbox' &&
-          entry.session?.launchMethod !== 'storefront_uri' &&
+          !isStorefrontUri &&
           !entry.isChainedPublisherLauncher) ||
         Boolean(entry.xboxLoopbackServer) ||
         (entry.bottleSteamRoot && (entry.steamAppId || entry.platformGameId)) ||
@@ -336,7 +342,7 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
   if (
     !crashedEarly &&
     stoppedSession.platformId === 'epic' &&
-    entry.session?.launchMethod !== 'storefront_uri'
+    !isStorefrontUri
   ) {
     const epicUploadJob = {
       record: {
@@ -400,7 +406,7 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
   if (
     !crashedEarly &&
     stoppedSession.platformId === 'gog' &&
-    entry.session?.launchMethod !== 'storefront_uri'
+    !isStorefrontUri
   ) {
     const gogUploadJob = {
       record: {
@@ -527,7 +533,7 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
           if (
             !crashedEarly &&
             stoppedSession.platformId === 'xbox' &&
-            entry.session?.launchMethod !== 'storefront_uri'
+            !isStorefrontUri
           ) {
             const rawRuntimeScids =
               entry.xboxLoopbackServer &&
@@ -551,8 +557,109 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
               entry.scid || entry.xboxScid || entry.payload?.xboxScid || '';
             const scidsToSync =
               dedupedRuntimeScids.length > 0 ? dedupedRuntimeScids : [fallbackEntryScid];
+            const xboxEarlyExitWithoutTitleStorageReasons = new Set([
+              'no_cloud_saves_configured',
+              'not_authenticated',
+              'missing_xbox_auth',
+              'gaming_services_runtime_manages_saves',
+              'windows_gamingservices_managed',
+              'windows_gamingservices_flushed',
+              'offline',
+              'offline_skipped',
+              'skipped',
+              'skipped_in_test',
+              'missing_identifiers',
+              'missing_scid_or_pfn',
+            ]);
+            const releaseConsumedXboxLock = async (
+              /** @type {any} */ lockInfo,
+              /** @type {string | undefined} */ fallbackTargetScid
+            ) => {
+              if (!lockInfo?.lockHeld) return;
+              const targetScid = String(lockInfo.resolvedScid || fallbackTargetScid || '').trim();
+              if (!targetScid) return;
+              try {
+                let authProvider = mergedOptions.xboxAuthProvider || null;
+                if (!authProvider && !mergedOptions.xboxSession) {
+                  try {
+                    const storeSync = getStoreSync();
+                    if (storeSync && typeof storeSync.getXboxAuthProvider === 'function') {
+                      authProvider = storeSync.getXboxAuthProvider({
+                        userDataDir: getUserDataDir(mergedOptions.userDataDir),
+                      });
+                    }
+                  } catch {}
+                }
+                let xuid = String(lockInfo.xuid || mergedOptions.xboxSession?.xuid || '').trim();
+                let authorizationHeader =
+                  mergedOptions.xboxSession?.authorizationHeader || undefined;
+                if (
+                  (!xuid || !authorizationHeader) &&
+                  authProvider &&
+                  typeof authProvider.getValidXboxSession === 'function'
+                ) {
+                  try {
+                    const session = await authProvider.getValidXboxSession();
+                    if (!xuid && session?.xuid) xuid = String(session.xuid).trim();
+                    if (!authorizationHeader && session?.authorizationHeader) {
+                      authorizationHeader = session.authorizationHeader;
+                    }
+                  } catch {}
+                }
+                if (!xuid) return;
+
+                const xboxMods = getXboxStorefrontModules();
+                const releaseParams = {
+                  xuid,
+                  scid: targetScid,
+                  packageFamilyName: lockInfo.pfn || entry.packageFamilyName || '',
+                  msaAppId: entry.msaAppId || '',
+                  titleId: entry.xboxTitleId || '',
+                  authProvider,
+                  authorizationHeader,
+                  titleStorageOrigin: mergedOptions.titleStorageOrigin,
+                  allowLoopbackOrigin: mergedOptions.allowLoopbackOrigin,
+                  fetchImpl: mergedOptions.fetchImpl,
+                  hadWrites: Boolean(lockInfo.hadWrites),
+                };
+                const releaseFn =
+                  typeof mergedOptions.releaseXboxTitleStorageSessionLockFn === 'function'
+                    ? mergedOptions.releaseXboxTitleStorageSessionLockFn
+                    : typeof xboxMods?.releaseXboxTitleStorageSessionLock === 'function'
+                      ? xboxMods.releaseXboxTitleStorageSessionLock
+                      : typeof xboxMods?.xboxTitleStorageSync
+                            ?.releaseXboxTitleStorageSessionLock === 'function'
+                        ? xboxMods.xboxTitleStorageSync.releaseXboxTitleStorageSessionLock
+                        : null;
+                if (releaseFn) {
+                  await releaseFn(releaseParams);
+                  return;
+                }
+                const createClientFn =
+                  typeof xboxMods?.createTitleStorageClient === 'function'
+                    ? xboxMods.createTitleStorageClient
+                    : typeof xboxMods?.xboxTitleStorageSync?.createTitleStorageClient === 'function'
+                      ? xboxMods.xboxTitleStorageSync.createTitleStorageClient
+                      : null;
+                if (createClientFn) {
+                  const client = createClientFn(releaseParams);
+                  if (client && typeof client.releaseLock === 'function') {
+                    await client.releaseLock(Boolean(lockInfo.hadWrites));
+                  }
+                }
+              } catch (releaseErr) {
+                diagLog.warn('finalizeGameSession.releaseOrphanedXboxLock', releaseErr, {
+                  gameId: stoppedSession.gameId,
+                  scid: targetScid,
+                });
+              }
+            };
             /** @type {any} */
             let lastRes = { synced: false, reason: 'skipped' };
+            const syncXboxCloudSavesImpl =
+              typeof mergedOptions.syncXboxCloudSavesFn === 'function'
+                ? mergedOptions.syncXboxCloudSavesFn
+                : syncXboxCloudSaves;
             for (const activeScid of scidsToSync) {
               const effectiveFallbackScid =
                 entry.fallbackScid ||
@@ -595,45 +702,90 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
                 }
                 return null;
               })();
-              const resolvedSyncFallbackScid =
-                effectiveFallbackScid ||
-                (consumedLock?.resolvedScid &&
-                activeScid &&
-                String(consumedLock.resolvedScid).toLowerCase() !== String(activeScid).toLowerCase()
-                  ? consumedLock.resolvedScid
-                  : undefined);
-              const res = await syncXboxCloudSaves(
-                {
-                  platformId: 'xbox',
-                  platformGameId: entry.platformGameId || stoppedSession.platformGameId,
-                  gameId: stoppedSession.gameId,
-                  title: stoppedSession.title,
-                  installPath: entry.installPath,
-                  packageFamilyName: entry.packageFamilyName,
-                  scid: activeScid || consumedLock?.resolvedScid || undefined,
-                  fallbackScid: resolvedSyncFallbackScid,
-                  msaAppId: entry.msaAppId,
-                  xboxTitleId: entry.xboxTitleId,
-                  xboxProductId: entry.xboxProductId,
-                  appUserModelId: entry.appUserModelId,
-                },
-                'post_exit',
-                {
-                  ...mergedOptions,
-                  useCompatLayer: Boolean(entry.winePrefix),
-                  winePrefix: entry.winePrefix,
-                  installPath: entry.installPath,
-                  isAppxRegistered: Boolean(entry.isAppxRegistered),
-                  useGamingServicesRuntime: Boolean(entry.isAppxRegistered),
-                  userDataDir: getUserDataDir(mergedOptions.userDataDir),
-                  alreadyLocked: Boolean(consumedLock?.lockHeld),
-                  keepLockHeld: false,
-                  priorHadWrites: Boolean(consumedLock?.hadWrites),
+              const lockHeldScid =
+                consumedLock?.lockHeld && consumedLock.resolvedScid
+                  ? String(consumedLock.resolvedScid).trim()
+                  : '';
+              const effectiveSyncScid =
+                lockHeldScid || activeScid || consumedLock?.resolvedScid || undefined;
+              const resolvedSyncFallbackScid = (() => {
+                if (
+                  lockHeldScid &&
+                  activeScid &&
+                  String(activeScid).toLowerCase() !== lockHeldScid.toLowerCase()
+                ) {
+                  return activeScid;
                 }
-              );
+                if (
+                  effectiveFallbackScid &&
+                  (!effectiveSyncScid ||
+                    String(effectiveFallbackScid).toLowerCase() !==
+                      String(effectiveSyncScid).toLowerCase())
+                ) {
+                  return effectiveFallbackScid;
+                }
+                if (
+                  consumedLock?.resolvedScid &&
+                  effectiveSyncScid &&
+                  String(consumedLock.resolvedScid).toLowerCase() !==
+                    String(effectiveSyncScid).toLowerCase()
+                ) {
+                  return consumedLock.resolvedScid;
+                }
+                return undefined;
+              })();
+              /** @type {any} */
+              let res;
+              try {
+                res = await syncXboxCloudSavesImpl(
+                  {
+                    platformId: 'xbox',
+                    platformGameId: entry.platformGameId || stoppedSession.platformGameId,
+                    gameId: stoppedSession.gameId,
+                    title: stoppedSession.title,
+                    installPath: entry.installPath,
+                    packageFamilyName: entry.packageFamilyName,
+                    scid: effectiveSyncScid,
+                    fallbackScid: resolvedSyncFallbackScid,
+                    msaAppId: entry.msaAppId,
+                    xboxTitleId: entry.xboxTitleId,
+                    xboxProductId: entry.xboxProductId,
+                    appUserModelId: entry.appUserModelId,
+                  },
+                  'post_exit',
+                  {
+                    ...mergedOptions,
+                    useCompatLayer: Boolean(entry.winePrefix),
+                    winePrefix: entry.winePrefix,
+                    installPath: entry.installPath,
+                    isAppxRegistered: Boolean(entry.isAppxRegistered),
+                    useGamingServicesRuntime: Boolean(entry.isAppxRegistered),
+                    userDataDir: getUserDataDir(mergedOptions.userDataDir),
+                    alreadyLocked: Boolean(consumedLock?.lockHeld),
+                    keepLockHeld: false,
+                    priorHadWrites: Boolean(consumedLock?.hadWrites),
+                  }
+                );
+              } catch (syncErr) {
+                if (consumedLock?.lockHeld) {
+                  await releaseConsumedXboxLock(consumedLock, effectiveSyncScid);
+                }
+                throw syncErr;
+              }
+              if (
+                consumedLock?.lockHeld &&
+                xboxEarlyExitWithoutTitleStorageReasons.has(
+                  String(res?.reason || '').toLowerCase()
+                )
+              ) {
+                await releaseConsumedXboxLock(consumedLock, effectiveSyncScid);
+              }
               if (shouldQueueFailedPostExitUpload(res)) {
                 await enqueuePendingCloudUpload(
-                  { ...xboxUploadJob.record, ...(activeScid ? { scid: activeScid } : {}) },
+                  {
+                    ...xboxUploadJob.record,
+                    ...(effectiveSyncScid ? { scid: effectiveSyncScid } : {}),
+                  },
                   mergedOptions
                 ).catch(() => {});
               }
@@ -799,7 +951,7 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
           await waitForGogPostExitFlush({
             platform: 'win32',
             bottlePath: entry.winePrefix,
-            isStorefrontUri: entry.session?.launchMethod === 'storefront_uri',
+            isStorefrontUri,
             ...(typeof entry.gogCommLogPreExitOffset === 'number'
               ? { preExitOffset: entry.gogCommLogPreExitOffset }
               : {}),
@@ -1109,7 +1261,7 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
   /** @type {Promise<any>} */
   let storefrontSyncPromise = Promise.resolve(null);
   const skipGogStorefrontPlaytimeSync =
-    stoppedSession.platformId === 'gog' && entry.session?.launchMethod === 'storefront_uri';
+    stoppedSession.platformId === 'gog' && isStorefrontUri;
   if (
     !crashedEarly &&
     !skipGogStorefrontPlaytimeSync &&
