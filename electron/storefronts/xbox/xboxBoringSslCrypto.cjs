@@ -234,17 +234,24 @@ function buildOpenSslXtsKey(cik32) {
 
 /**
  * Builds the 16-byte raw XVD AES-XTS tweak (`[u32LE(dataUnit), u32LE(regionId), vduid[0..8]]`).
+ * Zero-fills any missing trailing bytes when `vduidLow8` is shorter than 8 bytes to prevent heap leakage.
  *
  * @param {number} dataUnit
  * @param {number} regionId
- * @param {Buffer} vduidLow8
+ * @param {Buffer|Uint8Array} vduidLow8
  * @returns {Buffer}
  */
 function buildXvdXtsTweak(dataUnit, regionId, vduidLow8) {
-  const tweak = Buffer.allocUnsafe(16);
+  const tweak = Buffer.alloc(16, 0);
   tweak.writeUInt32LE(dataUnit >>> 0, 0);
   tweak.writeUInt32LE(regionId >>> 0, 4);
-  vduidLow8.copy(tweak, 8, 0, 8);
+  if (vduidLow8 !== undefined && vduidLow8 !== null) {
+    const vduidBuf = ensureBufferView(vduidLow8, 'vduidLow8');
+    const copyLen = Math.min(8, vduidBuf.length);
+    if (copyLen > 0) {
+      vduidBuf.copy(tweak, 8, 0, copyLen);
+    }
+  }
   return tweak;
 }
 
@@ -308,30 +315,64 @@ function asAlignedU32Array(buf, byteLen) {
   return new Uint32Array(alignedAb);
 }
 
-// Pre-allocated 4-byte-aligned reusable scratch buffers (eliminates +32 MiB per-chunk GC churn — D4.4)
+// Lazily allocated 4-byte-aligned reusable scratch buffers (avoids eager 2+ MiB startup RSS
+// while still eliminating +32 MiB per-chunk GC churn once XTS crypto is actively used — D4.4)
 const SCRATCH_SLICE_PAGES = 256; // 256 * 4096 = 1 MiB slice window
 const SCRATCH_SLICE_BYTES = SCRATCH_SLICE_PAGES * XVD_PAGE_SIZE;
-const scratchSliceWorkAb = new ArrayBuffer(SCRATCH_SLICE_BYTES);
-const scratchSliceWorkBuf = Buffer.from(scratchSliceWorkAb);
-const scratchSliceWorkU32 = new Uint32Array(scratchSliceWorkAb);
+/** @type {{ buf: Buffer, u32: Uint32Array } | null} */
+let scratchSliceWork = null;
+/** @type {{ buf: Buffer, u32: Uint32Array } | null} */
+let scratchUnalignedSlice = null;
 
-const scratchUnalignedSliceAb = new ArrayBuffer(SCRATCH_SLICE_BYTES);
-const scratchUnalignedSliceBuf = Buffer.from(scratchUnalignedSliceAb);
-const scratchUnalignedSliceU32 = new Uint32Array(scratchUnalignedSliceAb);
+let scratchTweaksCapacityPages = 0;
+/** @type {{ buf: Buffer, u32: Uint32Array } | null} */
+let scratchTweaks = null;
 
-let scratchTweaksCapacityPages = 4096; // 64 KiB initial tweak scratch (covers up to 16 MiB chunks)
-let scratchTweaksAb = new ArrayBuffer(scratchTweaksCapacityPages * 16);
-let scratchTweaksBuf = Buffer.from(scratchTweaksAb);
-let scratchTweaksU32 = new Uint32Array(scratchTweaksAb);
+/**
+ * @returns {{ buf: Buffer, u32: Uint32Array }}
+ */
+function getScratchSliceWork() {
+  if (!scratchSliceWork) {
+    const ab = new ArrayBuffer(SCRATCH_SLICE_BYTES);
+    scratchSliceWork = {
+      buf: Buffer.from(ab),
+      u32: new Uint32Array(ab),
+    };
+  }
+  return scratchSliceWork;
+}
 
+/**
+ * @returns {{ buf: Buffer, u32: Uint32Array }}
+ */
+function getScratchUnalignedSlice() {
+  if (!scratchUnalignedSlice) {
+    const ab = new ArrayBuffer(SCRATCH_SLICE_BYTES);
+    scratchUnalignedSlice = {
+      buf: Buffer.from(ab),
+      u32: new Uint32Array(ab),
+    };
+  }
+  return scratchUnalignedSlice;
+}
+
+/**
+ * @param {number} pages
+ * @returns {{ buf: Buffer, u32: Uint32Array }}
+ */
 function ensureScratchTweaksCapacity(pages) {
-  if (pages <= scratchTweaksCapacityPages) return;
-  let nextCap = scratchTweaksCapacityPages;
+  if (scratchTweaks && pages <= scratchTweaksCapacityPages) {
+    return scratchTweaks;
+  }
+  let nextCap = scratchTweaksCapacityPages > 0 ? scratchTweaksCapacityPages : 4096;
   while (nextCap < pages) nextCap *= 2;
   scratchTweaksCapacityPages = nextCap;
-  scratchTweaksAb = new ArrayBuffer(nextCap * 16);
-  scratchTweaksBuf = Buffer.from(scratchTweaksAb);
-  scratchTweaksU32 = new Uint32Array(scratchTweaksAb);
+  const ab = new ArrayBuffer(nextCap * 16);
+  scratchTweaks = {
+    buf: Buffer.from(ab),
+    u32: new Uint32Array(ab),
+  };
+  return scratchTweaks;
 }
 
 /**
@@ -371,8 +412,9 @@ function transformXtsSectorEcb(inputBuf, osslXtsKey, tweak16, isEncrypt, options
   let workBuf;
   let workU32;
   if (byteLen <= SCRATCH_SLICE_BYTES) {
-    workBuf = scratchSliceWorkBuf.subarray(0, byteLen);
-    workU32 = scratchSliceWorkU32;
+    const workScratch = getScratchSliceWork();
+    workBuf = workScratch.buf.subarray(0, byteLen);
+    workU32 = workScratch.u32;
   } else {
     const workAb = new ArrayBuffer(byteLen);
     workBuf = Buffer.from(workAb);
@@ -383,8 +425,9 @@ function transformXtsSectorEcb(inputBuf, osslXtsKey, tweak16, isEncrypt, options
   if ((sectorBuf.byteOffset & 3) === 0) {
     inU32 = new Uint32Array(sectorBuf.buffer, sectorBuf.byteOffset, byteLen >>> 2);
   } else if (byteLen <= SCRATCH_SLICE_BYTES) {
-    sectorBuf.copy(scratchUnalignedSliceBuf, 0, 0, byteLen);
-    inU32 = scratchUnalignedSliceU32;
+    const unalignedScratch = getScratchUnalignedSlice();
+    sectorBuf.copy(unalignedScratch.buf, 0, 0, byteLen);
+    inU32 = unalignedScratch.u32;
   } else {
     inU32 = asAlignedU32Array(sectorBuf, byteLen);
   }
@@ -533,21 +576,21 @@ function decryptContiguousPageBuffer({
 
   const ctx = getOrCreateXtsEcbContext(osslXtsKey);
 
-  // 1. Build all page tweaks into reusable scratchTweaksBuf and encrypt them in one ECB update
-  ensureScratchTweaksCapacity(pages);
+  // 1. Build all page tweaks into reusable scratchTweaks and encrypt them in one ECB update
+  const tweaksScratch = ensureScratchTweaksCapacity(pages);
   const vduidLo = vduidBuf.readUInt32LE(0);
   const vduidHi = vduidBuf.readUInt32LE(4);
   const regU32 = (Number(regionId) || 0) >>> 0;
 
   for (let p = 0; p < pages; p += 1) {
     const base = p << 2;
-    scratchTweaksU32[base] = dataUnits[p] >>> 0;
-    scratchTweaksU32[base + 1] = regU32;
-    scratchTweaksU32[base + 2] = vduidLo;
-    scratchTweaksU32[base + 3] = vduidHi;
+    tweaksScratch.u32[base] = dataUnits[p] >>> 0;
+    tweaksScratch.u32[base + 1] = regU32;
+    tweaksScratch.u32[base + 2] = vduidLo;
+    tweaksScratch.u32[base + 3] = vduidHi;
   }
 
-  const encTweaks = ctx.tweakCipher.update(scratchTweaksBuf.subarray(0, pages * 16));
+  const encTweaks = ctx.tweakCipher.update(tweaksScratch.buf.subarray(0, pages * 16));
   const encTweaksU32 = asAlignedU32Array(encTweaks, pages * 16);
 
   // Allocate single destination buffer (or reuse rawBuf in-place when aligned & caller opted in)
@@ -560,8 +603,10 @@ function decryptContiguousPageBuffer({
   const fullRawU32 = rawAligned
     ? new Uint32Array(rawBuf.buffer, rawBuf.byteOffset, totalBytes >>> 2)
     : null;
+  const workScratch = getScratchSliceWork();
+  const unalignedScratch = fullRawU32 ? null : getScratchUnalignedSlice();
 
-  // 2–4. Process in bounded 1 MiB (256-page) slices reusing scratchSliceWorkBuf (eliminates +32 MiB churn)
+  // 2–4. Process in bounded 1 MiB (256-page) slices reusing scratchSliceWork (eliminates +32 MiB churn)
   for (let sliceStartPage = 0; sliceStartPage < pages; sliceStartPage += SCRATCH_SLICE_PAGES) {
     const slicePages = Math.min(SCRATCH_SLICE_PAGES, pages - sliceStartPage);
     const sliceBytes = slicePages * XVD_PAGE_SIZE;
@@ -572,13 +617,15 @@ function decryptContiguousPageBuffer({
     if (fullRawU32) {
       srcSliceU32 = fullRawU32;
       srcU32BaseOffset = sliceStartPage * 1024;
-    } else {
-      rawBuf.copy(scratchUnalignedSliceBuf, 0, sliceByteOffset, sliceByteOffset + sliceBytes);
-      srcSliceU32 = scratchUnalignedSliceU32;
+    } else if (unalignedScratch) {
+      rawBuf.copy(unalignedScratch.buf, 0, sliceByteOffset, sliceByteOffset + sliceBytes);
+      srcSliceU32 = unalignedScratch.u32;
       srcU32BaseOffset = 0;
+    } else {
+      throw new Error('Unaligned scratch buffer unavailable');
     }
 
-    // Pre-XOR into reusable scratchSliceWorkU32
+    // Pre-XOR into reusable workScratch.u32
     for (let sp = 0; sp < slicePages; sp += 1) {
       const twBase = (sliceStartPage + sp) << 2;
       let t0 = encTweaksU32[twBase];
@@ -590,10 +637,10 @@ function decryptContiguousPageBuffer({
       let wSrc = srcU32BaseOffset + wDst;
       const wDstEnd = wDst + 1024;
       for (; wDst < wDstEnd; wDst += 4, wSrc += 4) {
-        scratchSliceWorkU32[wDst] = srcSliceU32[wSrc] ^ t0;
-        scratchSliceWorkU32[wDst + 1] = srcSliceU32[wSrc + 1] ^ t1;
-        scratchSliceWorkU32[wDst + 2] = srcSliceU32[wSrc + 2] ^ t2;
-        scratchSliceWorkU32[wDst + 3] = srcSliceU32[wSrc + 3] ^ t3;
+        workScratch.u32[wDst] = srcSliceU32[wSrc] ^ t0;
+        workScratch.u32[wDst + 1] = srcSliceU32[wSrc + 1] ^ t1;
+        workScratch.u32[wDst + 2] = srcSliceU32[wSrc + 2] ^ t2;
+        workScratch.u32[wDst + 3] = srcSliceU32[wSrc + 3] ^ t3;
 
         const mask = (t3 >> 31) & 0x87;
         t3 = ((t3 << 1) | (t2 >>> 31)) >>> 0;
@@ -604,7 +651,7 @@ function decryptContiguousPageBuffer({
     }
 
     // Bulk hardware-AES ECB decrypt for this 1 MiB slice
-    const decSlice = ctx.dataDecipher.update(scratchSliceWorkBuf.subarray(0, sliceBytes));
+    const decSlice = ctx.dataDecipher.update(workScratch.buf.subarray(0, sliceBytes));
     decSlice.copy(outBuf, sliceByteOffset, 0, sliceBytes);
 
     // Post-XOR in-place inside outU32
