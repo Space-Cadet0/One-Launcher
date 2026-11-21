@@ -145,7 +145,7 @@ describe('Wave 1: Critic, HLTB, Override Storage & Match Diagnostics Hardening',
     mockStorage.clear();
     clearStagedMemoryFallback();
     await hydrateAllStagedCacheFromVault();
-    localStorage.setItem('antigravity_critic_schema_v15', '1');
+    localStorage.setItem('antigravity_critic_schema_v16', '1');
     onlineLifecycleManager.ensureInitialized();
     window.dispatchEvent(new Event('online'));
     clearSynopsisTextMemo();
@@ -401,16 +401,26 @@ describe('Wave 1: Critic, HLTB, Override Storage & Match Diagnostics Hardening',
       const revBefore = getUserOverridesRevision();
       vaultSaveSpy.mockClear();
 
+      const ocSsrState = JSON.stringify({
+        'game/4321': {
+          id: 4321,
+          name: 'Routed Refresh Game',
+          topCriticScore: 87,
+          percentRecommended: 92,
+          numReviews: 55,
+          tier: 'Mighty',
+          url: 'https://opencritic.com/game/4321/routed-refresh-game',
+        },
+      })
+        .replace(/&/g, '&a;')
+        .replace(/"/g, '&q;')
+        .replace(/'/g, '&s;')
+        .replace(/</g, '&l;')
+        .replace(/>/g, '&g;');
       vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
         new Response(
-          JSON.stringify({
-            id: 4321,
-            topCriticScore: 87,
-            percentRecommended: 92,
-            numReviews: 55,
-            tier: 'Mighty',
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
+          `<!DOCTYPE html><html><head><title>Routed Refresh Game Reviews - OpenCritic</title><link rel="canonical" href="https://opencritic.com/game/4321/routed-refresh-game" /></head><body><script id="serverApp-state" type="application/json">${ocSsrState}</script></body></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
         )
       );
 
@@ -649,8 +659,8 @@ describe('Wave 1: Critic, HLTB, Override Storage & Match Diagnostics Hardening',
       expect(titleOnly?.reviewScoreOverride?.score).toBe(93);
     });
 
-    it('M2: skips synchronous full localStorage scan and 12 MB catalog parse on startup once schema v15 flag is set', () => {
-      localStorage.setItem('antigravity_critic_schema_v15', '1');
+    it('M2: skips synchronous full localStorage scan and 12 MB catalog parse on startup once schema v16 flag is set', () => {
+      localStorage.setItem('antigravity_critic_schema_v16', '1');
       localStorage.setItem(
         'universal_game_library_catalog',
         JSON.stringify([{ id: 'steam-1234', steamAppId: 1234, title: 'Sentinel Catalog Game' }])

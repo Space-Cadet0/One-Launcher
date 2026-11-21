@@ -124,33 +124,98 @@ describe('Phase 3B & 4.1: Review Scoring Engine Hardening, HLTB Guard, and Reque
       vi.spyOn(steamReviewResolver, 'resolveScore').mockResolvedValue(null);
       vi.spyOn(storefrontStarResolver, 'resolveStorefrontScore').mockResolvedValue(null);
 
-      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
-        if (url.includes('/api/game/search')) {
-          return {
-            ok: true,
-            json: async () => [{ id: 4001, name: 'Shadowbound', dist: 0.0 }],
-          };
+      const stateJson = JSON.stringify({
+        'game/4001': {
+          id: 4001,
+          name: 'Shadowbound',
+          firstReleaseDate: '2017-05-05T00:00:00.000Z',
+          topCriticScore: 82,
+          percentRecommended: 80,
+          numReviews: 95,
+          url: 'https://opencritic.com/game/4001/shadowbound',
+        },
+      })
+        .replace(/&/g, '&a;')
+        .replace(/"/g, '&q;')
+        .replace(/'/g, '&s;')
+        .replace(/</g, '&l;')
+        .replace(/>/g, '&g;');
+      const openCriticSsrHtml = `<!DOCTYPE html><html><head><title>Shadowbound Reviews - OpenCritic</title><link rel="canonical" href="https://opencritic.com/game/4001/shadowbound" /></head><body><script id="serverApp-state" type="application/json">${stateJson}</script></body></html>`;
+
+      const fetchMock = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('query.wikidata.org/sparql')) {
+          return new Response(
+            JSON.stringify({ head: { vars: [] }, results: { bindings: [] } }),
+            { status: 200, headers: { 'content-type': 'application/sparql-results+json' } }
+          );
         }
-        if (url.includes('/api/game/4001')) {
-          return {
-            ok: true,
-            json: async () => ({
-              id: 4001,
-              name: 'Shadowbound',
-              firstReleaseDate: '2017-05-05T00:00:00.000Z',
-              topCriticScore: 82,
-              percentRecommended: 80,
-              numReviews: 95,
+        if (url.includes('www.wikidata.org/w/api.php') && url.includes('action=wbsearchentities')) {
+          return new Response(
+            JSON.stringify({
+              search: [{ id: 'Q994001', label: 'Shadowbound', description: 'video game' }],
+              success: 1,
             }),
-          };
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
         }
-        return { ok: false };
+        if (url.includes('www.wikidata.org/w/api.php') && url.includes('action=wbgetentities')) {
+          return new Response(
+            JSON.stringify({
+              entities: {
+                Q994001: {
+                  id: 'Q994001',
+                  labels: { en: { language: 'en', value: 'Shadowbound' } },
+                  descriptions: { en: { language: 'en', value: 'video game' } },
+                  claims: {
+                    P31: [
+                      {
+                        mainsnak: {
+                          datavalue: {
+                            type: 'wikibase-entityid',
+                            value: { id: 'Q7889' },
+                          },
+                        },
+                        rank: 'normal',
+                      },
+                    ],
+                    P2864: [
+                      {
+                        mainsnak: {
+                          datavalue: {
+                            type: 'string',
+                            value: '4001',
+                          },
+                        },
+                        rank: 'normal',
+                      },
+                    ],
+                  },
+                },
+              },
+              success: 1,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+        if (url.includes('opencritic.com/game/4001/game')) {
+          return new Response(openCriticSsrHtml, {
+            status: 200,
+            headers: { 'content-type': 'text/html; charset=utf-8' },
+          });
+        }
+        return new Response('Not Found', { status: 404 });
       });
-      vi.stubGlobal('fetch', fetchMock);
+      vi.spyOn(globalThis, 'fetch').mockImplementation(fetchMock);
 
       // Querying original 2006 Shadowbound should reject the 2017 reboot from OpenCritic
       const score2006 = await criticScoreService.resolveDynamicScore('Shadowbound', 993970, 2006);
       expect(score2006).toBeNull();
+      expect(
+        fetchMock.mock.calls.some(([calledUrl]) =>
+          String(calledUrl).includes('opencritic.com/game/4001/game')
+        )
+      ).toBe(true);
 
       // Querying 2017 Shadowbound should accept the 2017 OpenCritic candidate
       criticScoreService.clearCache();
