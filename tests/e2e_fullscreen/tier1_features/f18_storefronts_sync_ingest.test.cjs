@@ -18,7 +18,7 @@ suite('Tier 1 — Feature F18: Storefronts Sync, Ingestion & Universal Portabili
     description: 'Steam Two-Stage Cold-Start Sync: supervisor verifies cloud_log.txt offset prior to silent client boot',
   }, () => {
     const supervisorSrc = fs.readFileSync(
-      path.resolve(__dirname, '../../../electron/launcher/sessionAndProcessSupervisor.cjs'),
+      path.resolve(__dirname, '../../../electron/launcher/supervisor/gameLaunchOrchestrator.cjs'),
       'utf8'
     );
 
@@ -34,7 +34,7 @@ suite('Tier 1 — Feature F18: Storefronts Sync, Ingestion & Universal Portabili
     description: 'Steam Two-Stage Cold-Start Sync: Stage 1 silent boot separates client launch from game applaunch',
   }, () => {
     const supervisorSrc = fs.readFileSync(
-      path.resolve(__dirname, '../../../electron/launcher/sessionAndProcessSupervisor.cjs'),
+      path.resolve(__dirname, '../../../electron/launcher/supervisor/gameLaunchOrchestrator.cjs'),
       'utf8'
     );
 
@@ -50,7 +50,7 @@ suite('Tier 1 — Feature F18: Storefronts Sync, Ingestion & Universal Portabili
     description: 'Steam Two-Stage Cold-Start Sync: cloud save post-exit upload barrier precedes wine teardown',
   }, () => {
     const supervisorSrc = fs.readFileSync(
-      path.resolve(__dirname, '../../../electron/launcher/sessionAndProcessSupervisor.cjs'),
+      path.resolve(__dirname, '../../../electron/launcher/supervisor/sessionFinalizerAndControl.cjs'),
       'utf8'
     );
 

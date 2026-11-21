@@ -47,7 +47,7 @@ suite('Tier 1 — Feature F4: Pure Edge-to-Edge Symmetric Panel Span', () => {
     description: 'Supervisor passes ONE_LAUNCHER_SAFE_INSET_TOP="0" for pure panel span',
   }, () => {
     const supervisorSrc = fs.readFileSync(
-      path.resolve(__dirname, '../../../electron/launcher/sessionAndProcessSupervisor.cjs'),
+      path.resolve(__dirname, '../../../electron/launcher/supervisor/bottleDisplayAndEnvController.cjs'),
       'utf8'
     );
 
@@ -69,7 +69,7 @@ suite('Tier 1 — Feature F4: Pure Edge-to-Edge Symmetric Panel Span', () => {
     description: 'Control INI generator writes safe_inset_top = 0 under universal fullscreen',
   }, () => {
     const supervisorSrc = fs.readFileSync(
-      path.resolve(__dirname, '../../../electron/launcher/sessionAndProcessSupervisor.cjs'),
+      path.resolve(__dirname, '../../../electron/launcher/supervisor/bottleDisplayAndEnvController.cjs'),
       'utf8'
     );
 

@@ -1,3 +1,4 @@
+// @ts-check
 'use strict';
 
 const fs = require('node:fs');
@@ -9,6 +10,44 @@ const {
   copyRealDirBoundedSync,
   copyRealDirBoundedAsync,
 } = require('./boundedCopyUtils.cjs');
+const { atomicWriteFileSync } = require('./securityAndPathUtils.cjs');
+
+/**
+ * Atomic async file write with unique temp path, orphan temp cleanup on failure,
+ * and Windows EPERM/EBUSY fallback.
+ *
+ * @param {string} targetPath
+ * @param {string | Buffer} data
+ * @param {BufferEncoding} [encoding]
+ */
+async function atomicWriteFileAsync(targetPath, data, encoding) {
+  await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+  const tmpPath = `${targetPath}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    if (typeof data === 'string') {
+      await fs.promises.writeFile(tmpPath, data, encoding || 'utf8');
+    } else {
+      await fs.promises.writeFile(tmpPath, data);
+    }
+    try {
+      await fs.promises.rename(tmpPath, targetPath);
+    } catch (/** @type {any} */ renameErr) {
+      if (renameErr && (renameErr.code === 'EPERM' || renameErr.code === 'EBUSY' || renameErr.code === 'EACCES')) {
+        if (typeof data === 'string') {
+          await fs.promises.writeFile(targetPath, data, encoding || 'utf8');
+        } else {
+          await fs.promises.writeFile(targetPath, data);
+        }
+        await fs.promises.unlink(tmpPath).catch(() => {});
+      } else {
+        throw renameErr;
+      }
+    }
+  } catch (err) {
+    await fs.promises.unlink(tmpPath).catch(() => {});
+    throw err;
+  }
+}
 
 /**
  * Single-pass Wine `.reg` string unescaper supporting `\\\\`, `\"`, `\xNN` (multi-byte UTF-8
@@ -488,9 +527,100 @@ function parseSteamRemoteCacheText(vdfText, vdfDocSubdirs, vdfSavedGamesSubdirs)
 }
 
 /**
+ * Shared decision helper: classify an inspected symlink target under `<prefix>/drive_c/users/<user>/<folder>`.
+ * @param {string} resolvedPrefix
+ * @param {string} entryPath
+ * @param {string} rawLinkTarget
+ * @returns {{ isExternal: boolean, resolvedTarget: string }}
+ */
+function classifyWineUserFolderSymlink(resolvedPrefix, entryPath, rawLinkTarget) {
+  const linkTarget = String(rawLinkTarget || '').replace(/^\\\\\?\\/, '');
+  const resolvedTarget = path.resolve(path.dirname(entryPath), linkTarget);
+  const isInsidePrefix =
+    resolvedTarget === resolvedPrefix || resolvedTarget.startsWith(resolvedPrefix + path.sep);
+  return { isExternal: !isInsidePrefix, resolvedTarget };
+}
+
+/**
+ * Shared decision helper: build the bounded set of host subdirectories eligible to seed into a
+ * freshly sandboxed Wine user folder (`Documents`, `My Documents`, or `Saved Games`).
+ *
+ * @param {string} folder
+ * @param {boolean} hasMyGamesRealDir
+ * @param {string[]} hostSavedGameDirNames
+ * @param {Set<string>} vdfDocSubdirs
+ * @param {Set<string>} vdfSavedGamesSubdirs
+ * @returns {Set<string>}
+ */
+function buildSandboxSeedCandidateSubdirs(
+  folder,
+  hasMyGamesRealDir,
+  hostSavedGameDirNames,
+  vdfDocSubdirs,
+  vdfSavedGamesSubdirs
+) {
+  /** @type {Set<string>} */
+  const candidateSubdirs = new Set();
+  if (folder === 'Documents' || folder === 'My Documents') {
+    if (hasMyGamesRealDir) {
+      candidateSubdirs.add('My Games');
+    }
+    for (const sub of vdfDocSubdirs) {
+      if (isSafeCandidateSubdirName(sub) || sub === 'My Games') {
+        candidateSubdirs.add(sub);
+      }
+    }
+  } else if (folder === 'Saved Games') {
+    for (const sub of vdfSavedGamesSubdirs) {
+      if (isSafeCandidateSubdirName(sub)) {
+        candidateSubdirs.add(sub);
+      }
+    }
+    for (const dirName of hostSavedGameDirNames) {
+      if (isSafeCandidateSubdirName(dirName)) {
+        candidateSubdirs.add(dirName);
+      }
+    }
+  }
+  return candidateSubdirs;
+}
+
+/**
+ * @param {string} resolvedPrefix
+ * @returns {string[]}
+ */
+function getBottleSteamUserdataRoots(resolvedPrefix) {
+  return [
+    path.join(resolvedPrefix, 'drive_c', 'Program Files (x86)', 'Steam', 'userdata'),
+    path.join(resolvedPrefix, 'drive_c', 'Program Files', 'Steam', 'userdata'),
+  ];
+}
+
+/**
+ * @param {string} folder
+ * @returns {boolean}
+ */
+function isSaveSeededSandboxFolder(folder) {
+  return folder === 'Documents' || folder === 'My Documents' || folder === 'Saved Games';
+}
+
+/**
+ * @param {Record<string, any>} [options]
+ * @returns {number}
+ */
+function resolveMaxSandboxSeedBytes(options = {}) {
+  return typeof options.maxSaveSeedBytes === 'number' && options.maxSaveSeedBytes > 0
+    ? options.maxSaveSeedBytes
+    : 250 * 1024 * 1024;
+}
+
+/**
  * Replace external macOS host symlinks inside `<prefix>/drive_c/users/<user>/*` with real
  * prefix-local directories, seeding existing game saves safely.
  * Fast-paths in <0.2ms when zero external symlinks are present (avoiding `remotecache.vdf` walks).
+ *
+ * @param {string} winePrefix
+ * @param {Record<string, any>} [options]
  */
 function sandboxWinePrefixUserFolders(winePrefix, options = {}) {
   if (!winePrefix || typeof winePrefix !== 'string' || !fs.existsSync(winePrefix)) {
@@ -502,6 +632,7 @@ function sandboxWinePrefixUserFolders(winePrefix, options = {}) {
     return { winePrefix: resolvedPrefix, sandboxedFolders: [] };
   }
 
+  /** @type {fs.Dirent[]} */
   let userEntries = [];
   try {
     userEntries = fs.readdirSync(usersDir, { withFileTypes: true });
@@ -510,7 +641,7 @@ function sandboxWinePrefixUserFolders(winePrefix, options = {}) {
     return { winePrefix: resolvedPrefix, sandboxedFolders: [] };
   }
 
-  // Fast Pre-Check: collect external symlinks BEFORE scanning Steam remotecache.vdf trees!
+  /** @type {Array<{ userName: string, folder: string, entryPath: string, resolvedTarget: string }>} */
   const externalSymlinks = [];
   let needsVdfSaveScan = false;
 
@@ -523,29 +654,16 @@ function sandboxWinePrefixUserFolders(winePrefix, options = {}) {
       try {
         const st = fs.lstatSync(entryPath);
         if (!st.isSymbolicLink()) continue;
-        const linkTarget = String(fs.readlinkSync(entryPath) || '').replace(/^\\\\\?\\/, '');
-        const resolvedTarget = path.resolve(path.dirname(entryPath), linkTarget);
-        const isInsidePrefix =
-          resolvedTarget === resolvedPrefix ||
-          resolvedTarget.startsWith(resolvedPrefix + path.sep);
-        if (!isInsidePrefix) {
-          externalSymlinks.push({
-            userName: userEntry.name,
-            folder,
-            entryPath,
-            resolvedTarget,
-          });
-          if (
-            folder === 'Documents' ||
-            folder === 'My Documents' ||
-            folder === 'Saved Games'
-          ) {
-            needsVdfSaveScan = true;
-          }
+        const { isExternal, resolvedTarget } = classifyWineUserFolderSymlink(
+          resolvedPrefix,
+          entryPath,
+          fs.readlinkSync(entryPath)
+        );
+        if (isExternal) {
+          externalSymlinks.push({ userName: userEntry.name, folder, entryPath, resolvedTarget });
+          if (isSaveSeededSandboxFolder(folder)) needsVdfSaveScan = true;
         }
-      } catch {
-        // Folder doesn't exist or isn't a symlink
-      }
+      } catch {}
     }
   }
 
@@ -553,20 +671,14 @@ function sandboxWinePrefixUserFolders(winePrefix, options = {}) {
     return { winePrefix: resolvedPrefix, sandboxedFolders: [] };
   }
 
-  const maxSeedBytes =
-    typeof options.maxSaveSeedBytes === 'number' && options.maxSaveSeedBytes > 0
-      ? options.maxSaveSeedBytes
-      : 250 * 1024 * 1024;
-
+  const maxSeedBytes = resolveMaxSandboxSeedBytes(options);
+  /** @type {Set<string>} */
   const vdfDocSubdirs = new Set();
+  /** @type {Set<string>} */
   const vdfSavedGamesSubdirs = new Set();
 
   if (needsVdfSaveScan) {
-    const steamUserdataRoots = [
-      path.join(resolvedPrefix, 'drive_c', 'Program Files (x86)', 'Steam', 'userdata'),
-      path.join(resolvedPrefix, 'drive_c', 'Program Files', 'Steam', 'userdata'),
-    ];
-    for (const userdataRoot of steamUserdataRoots) {
+    for (const userdataRoot of getBottleSteamUserdataRoots(resolvedPrefix)) {
       if (!fs.existsSync(userdataRoot)) continue;
       let uidEntries = [];
       try {
@@ -588,8 +700,7 @@ function sandboxWinePrefixUserFolders(winePrefix, options = {}) {
           const vdfPath = path.join(uidDir, appEntry.name, 'remotecache.vdf');
           if (!fs.existsSync(vdfPath)) continue;
           try {
-            const vdfText = fs.readFileSync(vdfPath, 'utf8');
-            parseSteamRemoteCacheText(vdfText, vdfDocSubdirs, vdfSavedGamesSubdirs);
+            parseSteamRemoteCacheText(fs.readFileSync(vdfPath, 'utf8'), vdfDocSubdirs, vdfSavedGamesSubdirs);
           } catch (vdfErr) {
             diagLog.debug('wine.readRemotecacheSync', vdfErr, { vdfPath });
           }
@@ -599,56 +710,43 @@ function sandboxWinePrefixUserFolders(winePrefix, options = {}) {
   }
 
   const sandboxedFolders = [];
-  for (const item of externalSymlinks) {
-    const { userName, folder, entryPath, resolvedTarget } = item;
+  for (const { userName, folder, entryPath, resolvedTarget } of externalSymlinks) {
     try {
-      const candidateSubdirs = new Set();
       let targetExistsDir = false;
       try {
-        targetExistsDir =
-          fs.existsSync(resolvedTarget) && fs.statSync(resolvedTarget).isDirectory();
-      } catch {
-        targetExistsDir = false;
-      }
+        targetExistsDir = fs.existsSync(resolvedTarget) && fs.statSync(resolvedTarget).isDirectory();
+      } catch {}
 
+      let hasMyGamesRealDir = false;
+      /** @type {string[]} */
+      const hostSavedGameDirNames = [];
       if (targetExistsDir) {
         if (folder === 'Documents' || folder === 'My Documents') {
           const myGamesPath = path.join(resolvedTarget, 'My Games');
           try {
-            if (
-              fs.existsSync(myGamesPath) &&
-              !fs.lstatSync(myGamesPath).isSymbolicLink() &&
-              fs.lstatSync(myGamesPath).isDirectory()
-            ) {
-              candidateSubdirs.add('My Games');
-            }
-          } catch {
-            // Ignore unreadable My Games
-          }
-          for (const sub of vdfDocSubdirs) {
-            if (isSafeCandidateSubdirName(sub) || sub === 'My Games') {
-              candidateSubdirs.add(sub);
-            }
-          }
+            const mgStat = fs.lstatSync(myGamesPath);
+            hasMyGamesRealDir = !mgStat.isSymbolicLink() && mgStat.isDirectory();
+          } catch {}
         } else if (folder === 'Saved Games') {
-          for (const sub of vdfSavedGamesSubdirs) {
-            if (isSafeCandidateSubdirName(sub)) {
-              candidateSubdirs.add(sub);
-            }
-          }
           try {
-            const hostSavedEntries = fs.readdirSync(resolvedTarget, { withFileTypes: true });
-            for (const hEnt of hostSavedEntries) {
-              if (hEnt.isSymbolicLink() || !hEnt.isDirectory()) continue;
-              if (isSafeCandidateSubdirName(hEnt.name)) {
-                candidateSubdirs.add(hEnt.name);
+            for (const hEnt of fs.readdirSync(resolvedTarget, { withFileTypes: true })) {
+              if (!hEnt.isSymbolicLink() && hEnt.isDirectory()) {
+                hostSavedGameDirNames.push(hEnt.name);
               }
             }
-          } catch {
-            // Ignore unreadable host Saved Games
-          }
+          } catch {}
         }
       }
+
+      const candidateSubdirs = targetExistsDir
+        ? buildSandboxSeedCandidateSubdirs(
+            folder,
+            hasMyGamesRealDir,
+            hostSavedGameDirNames,
+            vdfDocSubdirs,
+            vdfSavedGamesSubdirs
+          )
+        : new Set();
 
       try {
         fs.unlinkSync(entryPath);
@@ -662,14 +760,13 @@ function sandboxWinePrefixUserFolders(winePrefix, options = {}) {
 
       const seededSubdirs = [];
       for (const subName of candidateSubdirs) {
-        const srcSub = path.join(resolvedTarget, subName);
-        const destSub = path.join(entryPath, subName);
-        const copyRes = copyRealDirBoundedSync(srcSub, destSub, maxSeedBytes, {
-          skipExisting: true,
-        });
-        if (copyRes.copied) {
-          seededSubdirs.push(subName);
-        }
+        const copyRes = copyRealDirBoundedSync(
+          path.join(resolvedTarget, subName),
+          path.join(entryPath, subName),
+          maxSeedBytes,
+          { skipExisting: true }
+        );
+        if (copyRes.copied) seededSubdirs.push(subName);
       }
 
       sandboxedFolders.push({
@@ -689,6 +786,9 @@ function sandboxWinePrefixUserFolders(winePrefix, options = {}) {
 
 /**
  * Asynchronous counterpart to `sandboxWinePrefixUserFolders` for non-blocking main-process launches.
+ *
+ * @param {string} winePrefix
+ * @param {Record<string, any>} [options]
  */
 async function sandboxWinePrefixUserFoldersAsync(winePrefix, options = {}) {
   if (!winePrefix || typeof winePrefix !== 'string') {
@@ -703,6 +803,7 @@ async function sandboxWinePrefixUserFoldersAsync(winePrefix, options = {}) {
   const resolvedPrefix = path.resolve(winePrefix);
   const usersDir = resolveDriveCPathCaseInsensitive(path.join(resolvedPrefix, 'drive_c'), ['users']);
 
+  /** @type {fs.Dirent[]} */
   let userEntries = [];
   try {
     userEntries = await fs.promises.readdir(usersDir, { withFileTypes: true });
@@ -710,6 +811,7 @@ async function sandboxWinePrefixUserFoldersAsync(winePrefix, options = {}) {
     return { winePrefix: resolvedPrefix, sandboxedFolders: [] };
   }
 
+  /** @type {Array<{ userName: string, folder: string, entryPath: string, resolvedTarget: string }>} */
   const externalSymlinks = [];
   let needsVdfSaveScan = false;
 
@@ -722,32 +824,16 @@ async function sandboxWinePrefixUserFoldersAsync(winePrefix, options = {}) {
       try {
         const st = await fs.promises.lstat(entryPath);
         if (!st.isSymbolicLink()) continue;
-        const linkTarget = String((await fs.promises.readlink(entryPath)) || '').replace(
-          /^\\\\\?\\/,
-          ''
+        const { isExternal, resolvedTarget } = classifyWineUserFolderSymlink(
+          resolvedPrefix,
+          entryPath,
+          await fs.promises.readlink(entryPath)
         );
-        const resolvedTarget = path.resolve(path.dirname(entryPath), linkTarget);
-        const isInsidePrefix =
-          resolvedTarget === resolvedPrefix ||
-          resolvedTarget.startsWith(resolvedPrefix + path.sep);
-        if (!isInsidePrefix) {
-          externalSymlinks.push({
-            userName: userEntry.name,
-            folder,
-            entryPath,
-            resolvedTarget,
-          });
-          if (
-            folder === 'Documents' ||
-            folder === 'My Documents' ||
-            folder === 'Saved Games'
-          ) {
-            needsVdfSaveScan = true;
-          }
+        if (isExternal) {
+          externalSymlinks.push({ userName: userEntry.name, folder, entryPath, resolvedTarget });
+          if (isSaveSeededSandboxFolder(folder)) needsVdfSaveScan = true;
         }
-      } catch {
-        // Folder doesn't exist or isn't a symlink
-      }
+      } catch {}
     }
   }
 
@@ -755,20 +841,14 @@ async function sandboxWinePrefixUserFoldersAsync(winePrefix, options = {}) {
     return { winePrefix: resolvedPrefix, sandboxedFolders: [] };
   }
 
-  const maxSeedBytes =
-    typeof options.maxSaveSeedBytes === 'number' && options.maxSaveSeedBytes > 0
-      ? options.maxSaveSeedBytes
-      : 250 * 1024 * 1024;
-
+  const maxSeedBytes = resolveMaxSandboxSeedBytes(options);
+  /** @type {Set<string>} */
   const vdfDocSubdirs = new Set();
+  /** @type {Set<string>} */
   const vdfSavedGamesSubdirs = new Set();
 
   if (needsVdfSaveScan) {
-    const steamUserdataRoots = [
-      path.join(resolvedPrefix, 'drive_c', 'Program Files (x86)', 'Steam', 'userdata'),
-      path.join(resolvedPrefix, 'drive_c', 'Program Files', 'Steam', 'userdata'),
-    ];
-    for (const userdataRoot of steamUserdataRoots) {
+    for (const userdataRoot of getBottleSteamUserdataRoots(resolvedPrefix)) {
       let uidEntries = [];
       try {
         uidEntries = await fs.promises.readdir(userdataRoot, { withFileTypes: true });
@@ -790,64 +870,49 @@ async function sandboxWinePrefixUserFoldersAsync(winePrefix, options = {}) {
           try {
             const vdfText = await fs.promises.readFile(vdfPath, 'utf8');
             parseSteamRemoteCacheText(vdfText, vdfDocSubdirs, vdfSavedGamesSubdirs);
-          } catch {
-            // No remotecache.vdf for this app
-          }
+          } catch {}
         }
       }
     }
   }
 
   const sandboxedFolders = [];
-  for (const item of externalSymlinks) {
-    const { userName, folder, entryPath, resolvedTarget } = item;
+  for (const { userName, folder, entryPath, resolvedTarget } of externalSymlinks) {
     try {
-      const candidateSubdirs = new Set();
       let targetExistsDir = false;
       try {
-        const st = await fs.promises.stat(resolvedTarget);
-        targetExistsDir = st.isDirectory();
-      } catch {
-        targetExistsDir = false;
-      }
+        targetExistsDir = (await fs.promises.stat(resolvedTarget)).isDirectory();
+      } catch {}
 
+      let hasMyGamesRealDir = false;
+      /** @type {string[]} */
+      const hostSavedGameDirNames = [];
       if (targetExistsDir) {
         if (folder === 'Documents' || folder === 'My Documents') {
-          const myGamesPath = path.join(resolvedTarget, 'My Games');
           try {
-            const mgStat = await fs.promises.lstat(myGamesPath);
-            if (!mgStat.isSymbolicLink() && mgStat.isDirectory()) {
-              candidateSubdirs.add('My Games');
-            }
-          } catch {
-            // No My Games folder
-          }
-          for (const sub of vdfDocSubdirs) {
-            if (isSafeCandidateSubdirName(sub) || sub === 'My Games') {
-              candidateSubdirs.add(sub);
-            }
-          }
+            const mgStat = await fs.promises.lstat(path.join(resolvedTarget, 'My Games'));
+            hasMyGamesRealDir = !mgStat.isSymbolicLink() && mgStat.isDirectory();
+          } catch {}
         } else if (folder === 'Saved Games') {
-          for (const sub of vdfSavedGamesSubdirs) {
-            if (isSafeCandidateSubdirName(sub)) {
-              candidateSubdirs.add(sub);
-            }
-          }
           try {
-            const hostSavedEntries = await fs.promises.readdir(resolvedTarget, {
-              withFileTypes: true,
-            });
-            for (const hEnt of hostSavedEntries) {
-              if (hEnt.isSymbolicLink() || !hEnt.isDirectory()) continue;
-              if (isSafeCandidateSubdirName(hEnt.name)) {
-                candidateSubdirs.add(hEnt.name);
+            for (const hEnt of await fs.promises.readdir(resolvedTarget, { withFileTypes: true })) {
+              if (!hEnt.isSymbolicLink() && hEnt.isDirectory()) {
+                hostSavedGameDirNames.push(hEnt.name);
               }
             }
-          } catch {
-            // Unreadable host Saved Games
-          }
+          } catch {}
         }
       }
+
+      const candidateSubdirs = targetExistsDir
+        ? buildSandboxSeedCandidateSubdirs(
+            folder,
+            hasMyGamesRealDir,
+            hostSavedGameDirNames,
+            vdfDocSubdirs,
+            vdfSavedGamesSubdirs
+          )
+        : new Set();
 
       try {
         await fs.promises.unlink(entryPath);
@@ -861,14 +926,13 @@ async function sandboxWinePrefixUserFoldersAsync(winePrefix, options = {}) {
 
       const seededSubdirs = [];
       for (const subName of candidateSubdirs) {
-        const srcSub = path.join(resolvedTarget, subName);
-        const destSub = path.join(entryPath, subName);
-        const copyRes = await copyRealDirBoundedAsync(srcSub, destSub, maxSeedBytes, {
-          skipExisting: true,
-        });
-        if (copyRes.copied) {
-          seededSubdirs.push(subName);
-        }
+        const copyRes = await copyRealDirBoundedAsync(
+          path.join(resolvedTarget, subName),
+          path.join(entryPath, subName),
+          maxSeedBytes,
+          { skipExisting: true }
+        );
+        if (copyRes.copied) seededSubdirs.push(subName);
       }
 
       sandboxedFolders.push({
@@ -1394,9 +1458,7 @@ function sanitizeProvisionedBottleGraphicsBackend(bottlePath) {
       ''
     );
     if (cleaned === raw) return false;
-    const tmpPath = `${confPath}.tmp.${process.pid}.${Date.now()}`;
-    fs.writeFileSync(tmpPath, cleaned, 'utf8');
-    fs.renameSync(tmpPath, confPath);
+    atomicWriteFileSync(confPath, cleaned);
     return true;
   } catch {
     return false;
@@ -1492,13 +1554,19 @@ function sha256Buffer(buf) {
 }
 
 /**
- * Reads a bundled bridge DLL and verifies its SHA-256 against an optional `<dllPath>.sha256` sidecar.
+ * Reads a bundled bridge DLL or launcher EXE and verifies its SHA-256 against its `.sha256`
+ * sidecar (and optional sibling `bridge-build-manifest.json`).
+ *
+ * Security invariant (`XGR-06`): fails closed by default (`strictBridgeSha256 !== false`) on
+ * missing, malformed, or mismatched `.sha256` sidecars or manifest SHA-256 discrepancies.
+ *
  * @param {string} dllPath
  * @param {Record<string, any>} [options]
  * @returns {Promise<{ buf: Buffer | null, sha256: string, sidecarVerified: boolean }>}
  */
 async function readVerifiedBridgeDllBuffer(dllPath, options = {}) {
   if (!dllPath) return { buf: null, sha256: '', sidecarVerified: false };
+  const strictBridgeSha256 = options.strictBridgeSha256 !== false;
   try {
     const buf = await fs.promises.readFile(dllPath);
     const actualHash = sha256Buffer(buf).toLowerCase();
@@ -1509,28 +1577,85 @@ async function readVerifiedBridgeDllBuffer(dllPath, options = {}) {
       : stemSidecar !== dllPath && fs.existsSync(stemSidecar)
         ? stemSidecar
         : '';
+
     let sidecarVerified = false;
-    try {
-      if (sidecarPath) {
-        const rawSidecar = await fs.promises.readFile(sidecarPath, 'utf8');
-        const m = String(rawSidecar || '').trim().match(/^([0-9a-fA-F]{64})\b/);
-        if (m && m[1]) {
-          const expectedSidecarHash = m[1].toLowerCase();
-          if (expectedSidecarHash !== actualHash) {
-            diagLog.warn('wine.bridgeDllSidecarMismatch', 'Bridge DLL SHA-256 mismatch against sidecar', {
-              dllPath,
-              expectedSidecarHash,
-              actualHash,
-            });
-            if (options.strictBridgeSha256 === true) {
-              return { buf: null, sha256: '', sidecarVerified: false };
-            }
-          } else {
-            sidecarVerified = true;
-          }
+    if (!sidecarPath) {
+      diagLog.warn('wine.bridgeDllSidecarMissing', 'Missing SHA-256 sidecar for bridge binary', {
+        dllPath,
+        strictBridgeSha256,
+      });
+      if (strictBridgeSha256) {
+        return { buf: null, sha256: '', sidecarVerified: false };
+      }
+    } else {
+      let rawSidecar = '';
+      try {
+        rawSidecar = await fs.promises.readFile(sidecarPath, 'utf8');
+      } catch (sidecarReadErr) {
+        diagLog.warn('wine.bridgeDllSidecarReadFailed', sidecarReadErr, { dllPath, sidecarPath });
+        if (strictBridgeSha256) {
+          return { buf: null, sha256: '', sidecarVerified: false };
         }
       }
-    } catch {}
+      const m = String(rawSidecar || '')
+        .trim()
+        .match(/^([0-9a-fA-F]{64})\b/);
+      if (!m || !m[1]) {
+        diagLog.warn('wine.bridgeDllSidecarMalformed', 'Malformed SHA-256 sidecar for bridge binary', {
+          dllPath,
+          sidecarPath,
+        });
+        if (strictBridgeSha256) {
+          return { buf: null, sha256: '', sidecarVerified: false };
+        }
+      } else {
+        const expectedSidecarHash = m[1].toLowerCase();
+        if (expectedSidecarHash !== actualHash) {
+          diagLog.warn('wine.bridgeDllSidecarMismatch', 'Bridge DLL SHA-256 mismatch against sidecar', {
+            dllPath,
+            expectedSidecarHash,
+            actualHash,
+          });
+          if (strictBridgeSha256) {
+            return { buf: null, sha256: '', sidecarVerified: false };
+          }
+        } else {
+          sidecarVerified = true;
+        }
+      }
+    }
+
+    // Cross-check sibling `bridge-build-manifest.json` when present in the binary directory
+    const manifestPath = path.join(path.dirname(dllPath), 'bridge-build-manifest.json');
+    if (fs.existsSync(manifestPath)) {
+      try {
+        const parsedManifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8'));
+        const baseName = path.basename(dllPath);
+        const manifestEntry =
+          parsedManifest &&
+          typeof parsedManifest === 'object' &&
+          parsedManifest.outputs &&
+          typeof parsedManifest.outputs === 'object'
+            ? parsedManifest.outputs[baseName]
+            : null;
+        if (manifestEntry && typeof manifestEntry.sha256 === 'string') {
+          const expectedManifestHash = manifestEntry.sha256.trim().toLowerCase();
+          if (/^[0-9a-f]{64}$/.test(expectedManifestHash) && expectedManifestHash !== actualHash) {
+            diagLog.warn(
+              'wine.bridgeDllManifestMismatch',
+              'Bridge binary SHA-256 mismatch against bridge-build-manifest.json',
+              { dllPath, expectedManifestHash, actualHash }
+            );
+            if (strictBridgeSha256) {
+              return { buf: null, sha256: '', sidecarVerified: false };
+            }
+          }
+        }
+      } catch (manifestErr) {
+        diagLog.debug('wine.bridgeManifestReadSkipped', manifestErr, { manifestPath });
+      }
+    }
+
     return { buf, sha256: actualHash, sidecarVerified };
   } catch (err) {
     diagLog.warn('wine.readBridgeDllFailed', err, { dllPath });
@@ -1996,6 +2121,12 @@ function resolveLauncherSettingsChildExecutable(executablePath = '', installDir 
   return '';
 }
 
+/**
+ * @param {string} targetPath
+ * @param {Buffer} srcBuf
+ * @param {string} expectedSha256
+ * @returns {Promise<boolean>}
+ */
 async function copyBufferIfChanged(targetPath, srcBuf, expectedSha256) {
   try {
     const st = await fs.promises.stat(targetPath);
@@ -2006,11 +2137,76 @@ async function copyBufferIfChanged(targetPath, srcBuf, expectedSha256) {
       }
     }
   } catch {}
-  await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
-  const tmpPath = `${targetPath}.tmp.${process.pid}.${Date.now()}`;
-  await fs.promises.writeFile(tmpPath, srcBuf);
-  await fs.promises.rename(tmpPath, targetPath);
+  await atomicWriteFileAsync(targetPath, srcBuf);
   return true;
+}
+
+/**
+ * Shared recursive directory collector (up to `maxDepth`, skipping symlinks & dot-dirs) used by
+ * both `stageWindowsClientlessXboxBridgeDlls` and `prepareXboxBottleEnvironment`.
+ *
+ * @param {string} rootDir
+ * @param {number} maxDepth
+ * @param {Set<string>} outDirs
+ */
+async function collectInstallDirsBoundedAsync(rootDir, maxDepth, outDirs) {
+  /**
+   * @param {string} baseDir
+   * @param {number} depth
+   */
+  const walk = async (baseDir, depth) => {
+    if (!baseDir || depth > maxDepth) return;
+    let st;
+    try {
+      st = await fs.promises.lstat(baseDir);
+    } catch {
+      return;
+    }
+    if (!st.isDirectory() || st.isSymbolicLink()) return;
+    outDirs.add(baseDir);
+    if (depth >= maxDepth) return;
+    const dirents = await fs.promises.readdir(baseDir, { withFileTypes: true }).catch(() => []);
+    for (const d of dirents) {
+      if (!d.isDirectory() || d.isSymbolicLink() || d.name.startsWith('.')) continue;
+      await walk(path.join(baseDir, d.name), depth + 1);
+    }
+  };
+  if (rootDir) {
+    await walk(rootDir, 0);
+  }
+}
+
+/**
+ * Shared local retail Xbox DLL backup (`.msft.bak`) & bridge replacement helper.
+ *
+ * @param {string} localDllPath
+ * @param {Buffer} existingBuf
+ * @param {Buffer} chosenBuf
+ * @param {string} chosenHash
+ * @param {Buffer[]} markerBuffers
+ * @param {Array<{ localDllPath: string, backupPath: string }>} backedUpLocalDlls
+ * @param {string[]} stagedLocalFiles
+ */
+async function backupAndReplaceLocalXboxDllAsync(
+  localDllPath,
+  existingBuf,
+  chosenBuf,
+  chosenHash,
+  markerBuffers,
+  backedUpLocalDlls,
+  stagedLocalFiles
+) {
+  const existingHash = sha256Buffer(existingBuf).toLowerCase();
+  const hasAnyMarker = markerBuffers.some((m) => existingBuf.includes(m));
+  if (existingHash !== chosenHash && !hasAnyMarker) {
+    const backupPath = `${localDllPath}.msft.bak`;
+    if (!fs.existsSync(backupPath)) {
+      await atomicWriteFileAsync(backupPath, existingBuf);
+    }
+    backedUpLocalDlls.push({ localDllPath, backupPath });
+  }
+  await copyBufferIfChanged(localDllPath, chosenBuf, chosenHash);
+  stagedLocalFiles.push(localDllPath);
 }
 
 /**
@@ -2073,9 +2269,7 @@ async function writeStagedLocalBridgeManifest(installDir, stagedLocalFiles, back
       stagedFiles: mergedStaged,
       backedUpLocalDlls: Array.from(backupMap.values()),
     };
-    const tmpPath = `${manifestPath}.tmp.${process.pid}.${Date.now()}`;
-    await fs.promises.writeFile(tmpPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
-    await fs.promises.rename(tmpPath, manifestPath);
+    await atomicWriteFileAsync(manifestPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
   } catch (err) {
     diagLog.debug('wine.writeStagedBridgeManifestFailed', err, { installDir: resolvedInstallDir });
   }
@@ -2204,34 +2398,14 @@ async function stageWindowsClientlessXboxBridgeDlls(options = {}) {
   const maxDepth = Number.isFinite(options.maxDllSearchDepth)
     ? Math.max(0, Math.floor(Number(options.maxDllSearchDepth)))
     : DEFAULT_XBOX_DLL_SEARCH_MAX_DEPTH;
+  /** @type {Set<string>} */
   const candidateDirs = new Set();
-  const walkInstallDirs = async (
-    /** @type {string} */ baseDir,
-    /** @type {number} */ depth = 0
-  ) => {
-    if (!baseDir || depth > maxDepth) return;
-    let st;
-    try {
-      st = await fs.promises.lstat(baseDir);
-    } catch {
-      return;
-    }
-    if (!st.isDirectory() || st.isSymbolicLink()) return;
-    candidateDirs.add(baseDir);
-    if (depth >= maxDepth) return;
-    const dirents = await fs.promises.readdir(baseDir, { withFileTypes: true }).catch(() => []);
-    for (const d of dirents) {
-      if (!d.isDirectory() || d.isSymbolicLink() || d.name.startsWith('.')) continue;
-      await walkInstallDirs(path.join(baseDir, d.name), depth + 1);
-    }
-  };
-
   const resolvedInstallRoot =
     typeof options.installDir === 'string' && options.installDir.trim()
       ? path.resolve(options.installDir.trim())
       : '';
   if (resolvedInstallRoot) {
-    await walkInstallDirs(resolvedInstallRoot, 0);
+    await collectInstallDirsBoundedAsync(resolvedInstallRoot, maxDepth, candidateDirs);
   }
   const resolvedExePath =
     typeof options.executablePath === 'string' && options.executablePath.trim()
@@ -2420,20 +2594,15 @@ async function stageWindowsClientlessXboxBridgeDlls(options = {}) {
           );
           const chosenBridge = selectBridgeForArch(dllArch);
           if (!chosenBridge.buf) continue;
-          const existingHash = sha256Buffer(existingBuf).toLowerCase();
-          if (
-            existingHash !== chosenBridge.sha256 &&
-            !existingBuf.includes(xgrMarkerBuf) &&
-            !existingBuf.includes(genericOneLauncherMarkerBuf)
-          ) {
-            const backupPath = `${localDllPath}.msft.bak`;
-            if (!fs.existsSync(backupPath)) {
-              await fs.promises.writeFile(backupPath, existingBuf);
-            }
-            backedUpLocalDlls.push({ localDllPath, backupPath });
-          }
-          await copyBufferIfChanged(localDllPath, chosenBridge.buf, chosenBridge.sha256);
-          stagedLocalFiles.push(localDllPath);
+          await backupAndReplaceLocalXboxDllAsync(
+            localDllPath,
+            existingBuf,
+            chosenBridge.buf,
+            chosenBridge.sha256,
+            [xgrMarkerBuf, genericOneLauncherMarkerBuf],
+            backedUpLocalDlls,
+            stagedLocalFiles
+          );
           if (primaryExeDir && path.resolve(dirPath) === path.resolve(primaryExeDir)) {
             primaryXgameruntimeDllPath = localDllPath;
           }
@@ -2449,19 +2618,15 @@ async function stageWindowsClientlessXboxBridgeDlls(options = {}) {
           );
           const chosenGi = selectGameInputForArch(dllArch);
           if (!chosenGi.buf) continue;
-          const existingHash = sha256Buffer(existingBuf).toLowerCase();
-          if (
-            existingHash !== chosenGi.sha256 &&
-            !existingBuf.includes(genericOneLauncherMarkerBuf)
-          ) {
-            const backupPath = `${localDllPath}.msft.bak`;
-            if (!fs.existsSync(backupPath)) {
-              await fs.promises.writeFile(backupPath, existingBuf);
-            }
-            backedUpLocalDlls.push({ localDllPath, backupPath });
-          }
-          await copyBufferIfChanged(localDllPath, chosenGi.buf, chosenGi.sha256);
-          stagedLocalFiles.push(localDllPath);
+          await backupAndReplaceLocalXboxDllAsync(
+            localDllPath,
+            existingBuf,
+            chosenGi.buf,
+            chosenGi.sha256,
+            [genericOneLauncherMarkerBuf],
+            backedUpLocalDlls,
+            stagedLocalFiles
+          );
           gameInputStaged = true;
         }
       }
@@ -2533,8 +2698,21 @@ async function stageWindowsClientlessXboxBridgeDlls(options = {}) {
     );
   }
 
-  const winLauncherExePath =
+  const candidateWinLauncherPath =
     resolveBundledXboxWinLauncherExePath({ ...options, arch: targetMachine }) || '';
+  let winLauncherExePath = '';
+  if (candidateWinLauncherPath) {
+    const verifiedWinLauncher = await readVerifiedBridgeDllBuffer(candidateWinLauncherPath, options);
+    if (verifiedWinLauncher.buf) {
+      winLauncherExePath = candidateWinLauncherPath;
+    } else {
+      diagLog.warn(
+        'wine.xboxWinLauncherVerificationFailed',
+        'Refusing to use unverified one_xgr_win_launcher executable',
+        { candidateWinLauncherPath }
+      );
+    }
+  }
 
   return {
     bridgeDllPath: primaryBridgeSelection.dllPath,
@@ -2903,33 +3081,14 @@ async function prepareXboxBottleEnvironment(options = {}) {
     const maxDepth = Number.isFinite(options.maxDllSearchDepth)
       ? Math.max(0, Math.floor(Number(options.maxDllSearchDepth)))
       : DEFAULT_XBOX_DLL_SEARCH_MAX_DEPTH;
+    /** @type {Set<string>} */
     const candidateDirs = new Set();
-    const walkInstallDirs = async (
-      /** @type {string} */ baseDir,
-      /** @type {number} */ depth = 0
-    ) => {
-      if (!baseDir || depth > maxDepth) return;
-      let st;
-      try {
-        st = await fs.promises.lstat(baseDir);
-      } catch {
-        return;
-      }
-      if (!st.isDirectory() || st.isSymbolicLink()) return;
-      candidateDirs.add(baseDir);
-      if (depth >= maxDepth) return;
-      const dirents = await fs.promises.readdir(baseDir, { withFileTypes: true }).catch(() => []);
-      for (const d of dirents) {
-        if (!d.isDirectory() || d.isSymbolicLink() || d.name.startsWith('.')) continue;
-        await walkInstallDirs(path.join(baseDir, d.name), depth + 1);
-      }
-    };
     const resolvedInstallRoot =
       typeof options.installDir === 'string' && options.installDir.trim()
         ? path.resolve(options.installDir.trim())
         : '';
     if (resolvedInstallRoot) {
-      await walkInstallDirs(resolvedInstallRoot, 0);
+      await collectInstallDirsBoundedAsync(resolvedInstallRoot, maxDepth, candidateDirs);
     }
     const resolvedExePath =
       typeof options.executablePath === 'string' && options.executablePath.trim()
@@ -2970,84 +3129,46 @@ async function prepareXboxBottleEnvironment(options = {}) {
         const entries = await fs.promises.readdir(dirPath);
         for (const entryName of entries) {
           const lowerName = entryName.toLowerCase();
-          if (lowerName === 'xgameruntime.dll') {
-            const localDllPath = path.join(dirPath, entryName);
-            const existingBuf = await fs.promises.readFile(localDllPath);
-            const dllArch = determineLocalDllArch(
-              localDllPath,
-              existingBuf,
-              genericOneLauncherMarkerBuf,
-              defaultLocalArch
-            );
-            const chosenBuf = dllArch === 'x86' && bridgeX86Buf ? bridgeX86Buf : bridgeBuf;
-            const chosenHash = dllArch === 'x86' && bridgeX86Buf ? bridgeX86Hash : bridgeHash;
-            const existingHash = sha256Buffer(existingBuf).toLowerCase();
-            if (
-              existingHash !== chosenHash &&
-              !existingBuf.includes(xgrMarkerBuf) &&
-              !existingBuf.includes(genericOneLauncherMarkerBuf)
-            ) {
-              const backupPath = `${localDllPath}.msft.bak`;
-              if (!fs.existsSync(backupPath)) {
-                await fs.promises.writeFile(backupPath, existingBuf);
-              }
-              backedUpLocalDlls.push({ localDllPath, backupPath });
-            }
-            if (chosenBuf) {
-              await copyBufferIfChanged(localDllPath, chosenBuf, chosenHash);
-              stagedLocalFiles.push(localDllPath);
-            }
-          } else if (lowerName === 'gameinput.dll' || lowerName === 'gameinputredist.dll') {
-            const localDllPath = path.join(dirPath, entryName);
-            const existingBuf = await fs.promises.readFile(localDllPath);
-            const dllArch = determineLocalDllArch(
-              localDllPath,
-              existingBuf,
-              genericOneLauncherMarkerBuf,
-              defaultLocalArch
-            );
-            const chosenBuf = dllArch === 'x86' && gameInputX86Buf ? gameInputX86Buf : gameInputBuf;
-            const chosenHash =
-              dllArch === 'x86' && gameInputX86Buf ? gameInputX86Hash : gameInputHash;
-            if (!chosenBuf) continue;
-            if (
-              sha256Buffer(existingBuf).toLowerCase() !== chosenHash &&
-              !existingBuf.includes(genericOneLauncherMarkerBuf)
-            ) {
-              const backupPath = `${localDllPath}.msft.bak`;
-              if (!fs.existsSync(backupPath)) {
-                await fs.promises.writeFile(backupPath, existingBuf);
-              }
-              backedUpLocalDlls.push({ localDllPath, backupPath });
-            }
-            await copyBufferIfChanged(localDllPath, chosenBuf, chosenHash);
-            stagedLocalFiles.push(localDllPath);
-          } else if (lowerName === 'api-ms-win-core-psm-appnotify-l1-1-0.dll') {
-            const localDllPath = path.join(dirPath, entryName);
-            const existingBuf = await fs.promises.readFile(localDllPath);
-            const dllArch = determineLocalDllArch(
-              localDllPath,
-              existingBuf,
-              genericOneLauncherMarkerBuf,
-              defaultLocalArch
-            );
-            const chosenBuf = dllArch === 'x86' && appNotifyX86Buf ? appNotifyX86Buf : appNotifyBuf;
-            const chosenHash =
-              dllArch === 'x86' && appNotifyX86Buf ? appNotifyX86Hash : appNotifyHash;
-            if (!chosenBuf) continue;
-            if (
-              sha256Buffer(existingBuf).toLowerCase() !== chosenHash &&
-              !existingBuf.includes(genericOneLauncherMarkerBuf)
-            ) {
-              const backupPath = `${localDllPath}.msft.bak`;
-              if (!fs.existsSync(backupPath)) {
-                await fs.promises.writeFile(backupPath, existingBuf);
-              }
-              backedUpLocalDlls.push({ localDllPath, backupPath });
-            }
-            await copyBufferIfChanged(localDllPath, chosenBuf, chosenHash);
-            stagedLocalFiles.push(localDllPath);
+          if (
+            lowerName !== 'xgameruntime.dll' &&
+            lowerName !== 'gameinput.dll' &&
+            lowerName !== 'gameinputredist.dll' &&
+            lowerName !== 'api-ms-win-core-psm-appnotify-l1-1-0.dll'
+          ) {
+            continue;
           }
+          const localDllPath = path.join(dirPath, entryName);
+          const existingBuf = await fs.promises.readFile(localDllPath);
+          const dllArch = determineLocalDllArch(
+            localDllPath,
+            existingBuf,
+            genericOneLauncherMarkerBuf,
+            defaultLocalArch
+          );
+          let chosenBuf = null;
+          let chosenHash = '';
+          let markers = [genericOneLauncherMarkerBuf];
+          if (lowerName === 'xgameruntime.dll') {
+            chosenBuf = dllArch === 'x86' && bridgeX86Buf ? bridgeX86Buf : bridgeBuf;
+            chosenHash = dllArch === 'x86' && bridgeX86Buf ? bridgeX86Hash : bridgeHash;
+            markers = [xgrMarkerBuf, genericOneLauncherMarkerBuf];
+          } else if (lowerName === 'gameinput.dll' || lowerName === 'gameinputredist.dll') {
+            chosenBuf = dllArch === 'x86' && gameInputX86Buf ? gameInputX86Buf : gameInputBuf;
+            chosenHash = dllArch === 'x86' && gameInputX86Buf ? gameInputX86Hash : gameInputHash;
+          } else {
+            chosenBuf = dllArch === 'x86' && appNotifyX86Buf ? appNotifyX86Buf : appNotifyBuf;
+            chosenHash = dllArch === 'x86' && appNotifyX86Buf ? appNotifyX86Hash : appNotifyHash;
+          }
+          if (!chosenBuf) continue;
+          await backupAndReplaceLocalXboxDllAsync(
+            localDllPath,
+            existingBuf,
+            chosenBuf,
+            chosenHash,
+            markers,
+            backedUpLocalDlls,
+            stagedLocalFiles
+          );
         }
       } catch (err) {
         diagLog.warn('wine.stageLocalXboxBridgeFailed', err, { dirPath });

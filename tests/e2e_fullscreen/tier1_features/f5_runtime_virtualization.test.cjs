@@ -138,7 +138,7 @@ suite('Tier 1 — Feature F5: Pure Runtime Win32 Display Virtualization', () => 
     description: 'macNativeInstaller source code gates regex mutation on !isUpscalerFullscreenMode',
   }, () => {
     const src = fs.readFileSync(
-      path.resolve(__dirname, '../../../electron/launcher/macNativeInstallerAndCodesign.cjs'),
+      path.resolve(__dirname, '../../../electron/launcher/mac/bottleDisplayConfigAndMetrics.cjs'),
       'utf8'
     );
 

@@ -84,7 +84,7 @@ suite('Tier 1 — Feature F19: Process Supervisor, Security, Offline DB & Wine M
     description: 'Process Supervisor & Job Objects: game hibernation coordinates download pause',
   }, () => {
     const supervisorSrc = fs.readFileSync(
-      path.resolve(__dirname, '../../../electron/launcher/sessionAndProcessSupervisor.cjs'),
+      path.resolve(__dirname, '../../../electron/launcher/supervisor/gameLaunchOrchestrator.cjs'),
       'utf8'
     );
 

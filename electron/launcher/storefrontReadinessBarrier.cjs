@@ -9,27 +9,53 @@ const { execFile } = require('node:child_process');
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
 const { isProcessAlive } = require('./processTreeUtils.cjs');
 const { resolveDriveCPathCaseInsensitive } = require('./wineAndCrossOverManager.cjs');
-const { isNetworkOnlineForLaunch } = require('./engineStateRegistry.cjs');
+const {
+  isNetworkOnlineForLaunch,
+  isTestEnvironment,
+  getUserDataDir,
+} = require('./engineStateRegistry.cjs');
 
 /**
  * Determine whether caller options represent a synthetic test harness rather than a real host launch.
- * Explicitly passing `os.homedir()` in production must NOT be misclassified as a test override.
+ * Explicitly passing `os.homedir()` or the configured production `userDataDir` must NOT be
+ * misclassified as a test override; delegates to `isTestEnvironment`.
  *
  * @param {Record<string, any>} [params]
  * @param {Record<string, any>} [opts]
  * @returns {boolean}
  */
 function isSyntheticTestBarrierEnv(params = {}, opts = {}) {
-  if (process.env.VITEST || process.env.NODE_ENV === 'test') return true;
-  if (opts.userDataDir || params.userDataDir) return true;
-  const realHome = os.homedir();
-  if (opts.homedir && opts.homedir !== realHome) return true;
-  if (params.homedir && params.homedir !== realHome) return true;
-  return false;
+  const realHome = path.resolve(os.homedir());
+  let prodUserDataDir = '';
+  try {
+    const resolvedProd = getUserDataDir();
+    if (resolvedProd && typeof resolvedProd === 'string') {
+      prodUserDataDir = path.resolve(resolvedProd);
+    }
+  } catch {}
+
+  const rawHome = opts.homedir || params.homedir;
+  const effectiveHomedir =
+    typeof rawHome === 'string' && rawHome.trim() && path.resolve(rawHome) !== realHome
+      ? rawHome
+      : undefined;
+
+  const rawUserData = opts.userDataDir || params.userDataDir;
+  const effectiveUserDataDir =
+    typeof rawUserData === 'string' &&
+    rawUserData.trim() &&
+    (!prodUserDataDir || path.resolve(rawUserData) !== prodUserDataDir)
+      ? rawUserData
+      : undefined;
+
+  return isTestEnvironment({
+    homedir: effectiveHomedir,
+    userDataDir: effectiveUserDataDir,
+  });
 }
 
 /**
- * Sleep helper supporting optional AbortSignal.
+ * Sleep helper supporting optional AbortSignal (unref'd so pending barriers never pin shutdown).
  * @param {number} ms
  * @param {AbortSignal | null | undefined} [signal]
  * @returns {Promise<void>}
@@ -48,6 +74,9 @@ function sleepUnref(ms, signal) {
       resolve();
     };
     const timer = setTimeout(finish, ms);
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
     if (signal && typeof signal.addEventListener === 'function') {
       signal.addEventListener('abort', finish, { once: true });
     }
@@ -330,6 +359,19 @@ async function isBottleWinExeRunning(exeName, bottlePath = '', options = {}) {
     ? path.resolve(bottlePath).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
     : '';
 
+  const escapedTargetPrefix = normTargetPrefix
+    ? normTargetPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    : '';
+  const exactWinePrefixEnvRegex = escapedTargetPrefix
+    ? new RegExp(
+        `\\bwineprefix=(?:["']${escapedTargetPrefix}\\/?["']|${escapedTargetPrefix}\\/?(?=\\s+[a-z_][a-z0-9_]*=|\\s+["'/]|$))`,
+        'i'
+      )
+    : null;
+  const boundedTargetPathRegex = escapedTargetPrefix
+    ? new RegExp(`(?:^|[\\s"'=])${escapedTargetPrefix}(?:\\/|["']|$)`, 'i')
+    : null;
+
   /**
    * @param {string} outStr
    * @returns {boolean}
@@ -341,24 +383,21 @@ async function isBottleWinExeRunning(exeName, bottlePath = '', options = {}) {
       if (!line || !exeRegex.test(line)) continue;
       if (/^(?:\/bin\/|\/usr\/bin\/)?ps(?:\s|$)/i.test(line)) continue;
 
-      if (normTargetPrefix) {
+      if (normTargetPrefix && exactWinePrefixEnvRegex && boundedTargetPathRegex) {
         const lowerLine = line.replace(/\\/g, '/').toLowerCase();
-        const envMatch = lowerLine.match(/wineprefix=(?:"([^"]+)"|'([^']+)'|(\S+))/i);
-        if (envMatch) {
-          const linePrefix = (envMatch[1] || envMatch[2] || envMatch[3] || '').replace(/\/+$/, '');
-          if (linePrefix && linePrefix !== normTargetPrefix) {
+        // Match unquoted WINEPREFIX paths containing spaces (e.g., macOS "Application Support/CrossOver/Bottles/<name>")
+        // as well as single/double-quoted WINEPREFIX values.
+        if (/\bwineprefix=/i.test(lowerLine)) {
+          if (!exactWinePrefixEnvRegex.test(lowerLine)) {
             continue;
           }
+          return true;
         }
-        const bottleMatch = lowerLine.match(/((?:[a-z]:)?\/[^\s"']*\/bottles\/[^/\s"']+)/i);
-        if (bottleMatch && bottleMatch[1]) {
-          const lineBottle = bottleMatch[1].replace(/\/+$/, '');
-          if (
-            !normTargetPrefix.startsWith(lineBottle) &&
-            !lineBottle.startsWith(normTargetPrefix)
-          ) {
-            continue;
-          }
+        if (boundedTargetPathRegex.test(lowerLine)) {
+          return true;
+        }
+        if (/\/bottles\/[^/\r\n"']+/i.test(lowerLine)) {
+          continue;
         }
       }
       return true;
@@ -496,23 +535,28 @@ function resolveGogCommunicationLogPath(params = {}) {
 }
 
 /**
- * Inspect `CommunicationService.log` content to confirm an active authenticated GOG session
- * that has not subsequently shut down.
+ * Inspect `CommunicationService.log` content (string or raw Buffer) to confirm an active
+ * authenticated GOG session that has not subsequently shut down.
+ * Byte offsets are sliced on raw UTF-8 `Buffer` bytes BEFORE UTF-8 decoding.
  *
- * @param {string} logContent
+ * @param {string | Buffer} logContent
  * @param {number} [startOffset]
  * @returns {boolean}
  */
 function hasActiveGogAuthSessionInLog(logContent, startOffset = 0) {
-  if (!logContent || typeof logContent !== 'string') return false;
-
-  let slice = logContent;
-  if (startOffset > 0) {
-    if (startOffset >= logContent.length) return false;
-    slice = logContent.slice(startOffset);
-  } else if (logContent.length > 32768) {
-    slice = logContent.slice(-32768);
+  if (!logContent || (typeof logContent !== 'string' && !Buffer.isBuffer(logContent))) {
+    return false;
   }
+
+  const rawBuf = Buffer.isBuffer(logContent) ? logContent : Buffer.from(logContent, 'utf8');
+  let sliceBuf = rawBuf;
+  if (startOffset > 0) {
+    if (startOffset >= rawBuf.length) return false;
+    sliceBuf = rawBuf.subarray(startOffset);
+  } else if (rawBuf.length > 32768) {
+    sliceBuf = rawBuf.subarray(rawBuf.length - 32768);
+  }
+  const slice = sliceBuf.toString('utf8');
 
   let activeBlock = slice;
   const startRegex = /Communication service starting|Application started/gi;
@@ -630,7 +674,7 @@ async function waitForGogCommunicationServiceReady(params = {}) {
       : Math.max(0, Number(params.preBootLogOffset || 0));
 
   const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
+  do {
     if (signal?.aborted) {
       return { ready: false, aborted: true, waitedMs: Date.now() - startedAt, reason: 'aborted' };
     }
@@ -668,7 +712,7 @@ async function waitForGogCommunicationServiceReady(params = {}) {
     const remaining = timeoutMs - (Date.now() - startedAt);
     if (remaining <= 0) break;
     await sleepUnref(Math.min(pollIntervalMs, remaining), signal);
-  }
+  } while (Date.now() - startedAt < timeoutMs);
 
   return {
     ready: false,
@@ -730,8 +774,8 @@ async function waitForGogPostExitFlush(params = {}) {
     baseOffset = params.preExitOffset;
   } else {
     try {
-      const st = fs.statSync(commLogPath);
-      baseOffset = Math.max(0, st.size - 8192);
+      const st = await fs.promises.stat(commLogPath);
+      baseOffset = Math.max(0, st.size);
     } catch {
       baseOffset = 0;
     }
@@ -739,7 +783,7 @@ async function waitForGogPostExitFlush(params = {}) {
 
   const peerClosedRegex = /\[GameplayLogicManager\]\s+destructor|Socket has been closed by peer/i;
 
-  while (Date.now() - startedAt < maxFlushWaitMs) {
+  do {
     if (signal?.aborted) break;
     const logRead = await readLogTailBytesAsync(commLogPath, baseOffset, 65536);
     if (logRead && logRead.text && peerClosedRegex.test(logRead.text)) {
@@ -755,7 +799,7 @@ async function waitForGogPostExitFlush(params = {}) {
     const remaining = maxFlushWaitMs - (Date.now() - startedAt);
     if (remaining <= 0) break;
     await sleepUnref(Math.min(pollIntervalMs, remaining), signal);
-  }
+  } while (Date.now() - startedAt < maxFlushWaitMs);
 
   return {
     flushed: true,
@@ -793,22 +837,42 @@ async function waitForBottleEpicPortalReady(params = {}) {
   const pollIntervalMs = Math.max(20, Number(params.pollIntervalMs ?? opts.pollIntervalMs ?? 250));
   const signal = params.signal || opts.signal;
 
+  /** @type {string[] | null} */
+  let cachedEpicLogCandidates = null;
+  let cachedEpicLogCandidatesAt = 0;
+
   /**
-   * @returns {string[]}
+   * Async cached discovery of bottle Epic Games Launcher log candidates so 250ms poll ticks
+   * never block Electron's main thread with repeated synchronous `readdirSync`/`existsSync`.
+   * @param {boolean} [forceRefresh]
+   * @returns {Promise<string[]>}
    */
-  const discoverBottleEpicLogCandidates = () => {
+  const discoverBottleEpicLogCandidatesAsync = async (forceRefresh = false) => {
     if (opts.epicBottleLogPath && typeof opts.epicBottleLogPath === 'string') {
       return [opts.epicBottleLogPath];
     }
-    if (!bottlePath || !fs.existsSync(bottlePath)) return [];
+    const now = Date.now();
+    if (
+      !forceRefresh &&
+      cachedEpicLogCandidates &&
+      cachedEpicLogCandidates.length > 0 &&
+      now - cachedEpicLogCandidatesAt < 2000
+    ) {
+      return cachedEpicLogCandidates;
+    }
+    if (!bottlePath) return [];
+    try {
+      await fs.promises.access(bottlePath);
+    } catch {
+      return [];
+    }
     const driveC = path.join(bottlePath, 'drive_c');
     const usersDir = resolveDriveCPathCaseInsensitive(driveC, ['users']);
-    if (!fs.existsSync(usersDir)) return [];
     /** @type {string[]} */
     const out = [];
     try {
-      const users = fs
-        .readdirSync(usersDir, { withFileTypes: true })
+      const dirents = await fs.promises.readdir(usersDir, { withFileTypes: true });
+      const users = dirents
         .filter((d) => d.isDirectory() && !d.name.startsWith('.') && d.name.toLowerCase() !== 'public')
         .map((d) => d.name);
       for (const u of users) {
@@ -836,7 +900,9 @@ async function waitForBottleEpicPortalReady(params = {}) {
         );
       }
     } catch {}
-    return Array.from(new Set(out));
+    cachedEpicLogCandidates = Array.from(new Set(out));
+    cachedEpicLogCandidatesAt = now;
+    return cachedEpicLogCandidates;
   };
 
   /** @type {Map<string, number>} */
@@ -847,16 +913,16 @@ async function waitForBottleEpicPortalReady(params = {}) {
       : typeof params.preBootLogOffset === 'number' && params.preBootLogOffset >= 0
         ? params.preBootLogOffset
         : undefined;
+  const initialCandidates = await discoverBottleEpicLogCandidatesAsync(true);
   if (typeof explicitPreBootOffset === 'number') {
-    for (const c of discoverBottleEpicLogCandidates()) {
+    for (const c of initialCandidates) {
       preOffsets.set(c, explicitPreBootOffset);
     }
   } else {
-    for (const c of discoverBottleEpicLogCandidates()) {
+    for (const c of initialCandidates) {
       try {
-        if (fs.existsSync(c)) {
-          preOffsets.set(c, fs.statSync(c).size);
-        }
+        const st = await fs.promises.stat(c);
+        preOffsets.set(c, st.size);
       } catch {}
     }
   }
@@ -865,14 +931,13 @@ async function waitForBottleEpicPortalReady(params = {}) {
   const startedAt = Date.now();
   let firstLogUpdateAt = 0;
 
-  while (Date.now() - startedAt < timeoutMs) {
+  do {
     if (signal?.aborted) {
       return { ready: false, waitedMs: Date.now() - startedAt, reason: 'aborted' };
     }
 
-    const logCandidates = discoverBottleEpicLogCandidates();
+    const logCandidates = await discoverBottleEpicLogCandidatesAsync(false);
     for (const logPath of logCandidates) {
-      if (!fs.existsSync(logPath)) continue;
       const baseOff = preOffsets.has(logPath) ? Number(preOffsets.get(logPath) || 0) : 0;
       const logRead = await readLogTailBytesAsync(logPath, baseOff, 131072);
       if (logRead && logRead.text) {
@@ -900,7 +965,7 @@ async function waitForBottleEpicPortalReady(params = {}) {
     const remaining = timeoutMs - (Date.now() - startedAt);
     if (remaining <= 0) break;
     await sleepUnref(Math.min(pollIntervalMs, remaining), signal);
-  }
+  } while (Date.now() - startedAt < timeoutMs);
 
   return {
     ready: false,
