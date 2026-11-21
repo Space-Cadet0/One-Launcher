@@ -17,6 +17,7 @@ const {
   buildSafeChildEnvironment,
 } = require('../securityAndPathUtils.cjs');
 const { mergeWineDllOverrides } = require('../wineAndCrossOverManager.cjs');
+const { lineMatchesBottlePrefix } = require('../storefrontReadinessBarrier.cjs');
 const { resolveEffectiveGameExecutableCapabilities } = require('../binaryAndManifestInspectors.cjs');
 const {
   diagLog,
@@ -163,7 +164,8 @@ function getPublisherForegroundUiRegex(handoffId) {
   if (norm === 'ea') return /(?:^|[\\/\s"'])(?:eadesktop|ealauncher|origin)\.exe\b/i;
   if (norm === 'ubisoft') return /(?:^|[\\/\s"'])(?:upc|ubisoftconnect|ubisoftgamelauncher)\.exe\b/i;
   if (norm === 'bnet') return /(?:^|[\\/\s"'])battle\.net(?:\s+launcher)?\.exe\b/i;
-  if (norm === 'rockstar') return /(?:^|[\\/\s"'])(?:launcher|rockstarservice)\.exe\b/i;
+  if (norm === 'rockstar')
+    return /(?:rockstar\s*games[\\/]launcher[\\/]launcher(?:patcher)?\.exe|(?:^|[\\/\s"'])(?:rockstarlauncher|launcherpatcher)\.exe(?:\s|["']|$))/i;
   if (norm === 'riot') return /(?:^|[\\/\s"'])(?:riotclientservices|riotclientux)\.exe\b/i;
   return null;
 }
@@ -196,6 +198,7 @@ function checkBottlePublisherUiRunningAsync(bottlePath, handoffId, options = {})
     return Promise.resolve(false);
   }
   const resolvedBottleLower = path.resolve(bottlePath).replace(/\\/g, '/').toLowerCase();
+  const realBottleLower = normalizeBottlePrefixContractKey(bottlePath);
   return new Promise((resolve) => {
     try {
       execFileImpl('ps', ['eww', '-axo', 'command='], { timeout: 1500 }, (err, stdout) => {
@@ -203,15 +206,75 @@ function checkBottlePublisherUiRunningAsync(bottlePath, handoffId, options = {})
         for (const rawLine of String(stdout).split(/\r?\n/)) {
           const normLine = rawLine.replace(/\\/g, '/');
           if (!uiRe.test(normLine)) continue;
-          const lower = normLine.toLowerCase();
-          if (
-            lower.includes(resolvedBottleLower) ||
-            !/\/bottles\//i.test(lower)
-          ) {
+          if (lineMatchesBottlePrefix(rawLine, resolvedBottleLower, realBottleLower)) {
             return resolve(true);
           }
         }
         resolve(false);
+      });
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+/**
+ * Non-blocking check whether a native macOS publisher `.app` (`bnet`, `ea`, `riot`) is already
+ * running on the host (explicitly filtering out bottled `.exe` / `/Bottles/` / `WINEPREFIX=` lines).
+ *
+ * @param {string} handoffId
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<boolean>}
+ */
+function checkHostMacPublisherAppRunningAsync(handoffId, options = {}) {
+  const norm = resolveAnyChainedHandoffId(handoffId);
+  /** @type {RegExp | null} */
+  let macAppRe = null;
+  if (norm === 'bnet') {
+    macAppRe = /(?:Battle\.net\.app\/Contents\/MacOS\/Battle\.net|(?:^|\/)Battle\.net(?:\s|$))/i;
+  } else if (norm === 'ea') {
+    macAppRe =
+      /(?:EA\s*app\.app\/Contents\/MacOS\/(?:EA\s*app|EADesktop|EALauncher)|Origin\.app\/Contents\/MacOS\/Origin|(?:^|\/)(?:EA\s*app|EADesktop|EALauncher)(?:\s|$))/i;
+  } else if (norm === 'riot') {
+    macAppRe =
+      /(?:Riot\s*Client\.app\/Contents\/MacOS\/RiotClient(?:Services|Ux)?|(?:^|\/)RiotClient(?:Services|Ux)(?:\s|$))/i;
+  }
+  if (!macAppRe) return Promise.resolve(false);
+
+  const matchesMacOutput = (/** @type {unknown} */ rawOut) => {
+    for (const rawLine of String(rawOut || '').split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      if (/^(?:\/bin\/|\/usr\/bin\/)?ps(?:\s|$)/i.test(line)) continue;
+      if (/\.exe\b|\/Bottles\/|WINEPREFIX=/i.test(line)) continue;
+      if (macAppRe && macAppRe.test(line)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (typeof options.mockProcessListOutput === 'string') {
+    return Promise.resolve(matchesMacOutput(options.mockProcessListOutput));
+  }
+  if (typeof options.getProcessListOutput === 'function') {
+    return Promise.resolve(options.getProcessListOutput())
+      .then((out) => matchesMacOutput(out))
+      .catch(() => false);
+  }
+  const execFileImpl = options.execFileImpl || options.execFileFn || execFile;
+  if (
+    isTestEnvironment(options) &&
+    execFileImpl === execFile &&
+    options.allowProcessCheckInTest !== true
+  ) {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    try {
+      execFileImpl('ps', ['-ax', '-o', 'command='], { timeout: 1500 }, (err, stdout) => {
+        if (err || !stdout) return resolve(false);
+        resolve(matchesMacOutput(stdout));
       });
     } catch {
       resolve(false);
@@ -1132,7 +1195,13 @@ async function launchChainedPublisherGame(ctx) {
           bottlePath: '',
           platform: 'darwin',
           compatibilityLayerType: 'native',
+          storefrontClientLifecycle: effectivePerfPolicy.storefrontClientLifecycle,
         });
+        const wasHostPublisherRunning = await checkHostMacPublisherAppRunningAsync(
+          chainedHandoffId,
+          options
+        );
+        const wokePublisherClientByLauncher = !wasHostPublisherRunning;
         const spawnImpl = options.gameSpawnFn || options.spawnFn || spawn;
         const child = spawnImpl(nativeSpec.launcherExe, nativeSpec.args || [], {
           cwd:
@@ -1171,6 +1240,9 @@ async function launchChainedPublisherGame(ctx) {
           isChainedPublisherLauncher: true,
           chainedLauncherHandoff: chainedHandoffId,
           launchedViaPublisherClient: true,
+          wasHostPublisherRunning,
+          wokePublisherClientByLauncher,
+          ephemeralClientWoken: wokePublisherClientByLauncher,
           targetExeBasenamesLower: [],
           pollTimer: null,
           startedMs: Date.now(),
@@ -1645,6 +1717,7 @@ async function launchChainedPublisherGame(ctx) {
       storefrontId: normPlatformId || undefined,
       platform: 'darwin',
       compatibilityLayerType: chosenLayer.type,
+      storefrontClientLifecycle: effectivePerfPolicy.storefrontClientLifecycle,
     });
     if (
       !realGameExe &&
@@ -1790,7 +1863,10 @@ async function launchChainedPublisherGame(ctx) {
       : await checkBottlePublisherUiRunningAsync(bottlePath, chainedHandoffId, options);
 
     const prefixContractKey = normalizeBottlePrefixContractKey(bottlePath);
-    const targetGraphicsContract = computeBottleGraphicsEnvContract(bottleEnv);
+    const targetGraphicsContract = computeBottleGraphicsEnvContract(
+      bottleEnv,
+      launchConfig?.environmentVariables
+    );
     const desiredBackendLower = String(bottleEnv.CX_GRAPHICS_BACKEND || 'auto')
       .trim()
       .toLowerCase();
@@ -1831,6 +1907,7 @@ async function launchChainedPublisherGame(ctx) {
         deleteBottleDaemonEnvContract(bottlePath);
         await shutdownWinePrefix(chosenLayer.binaryPath, bottlePath, 3000, {
           bottleName: String(bottleName || ''),
+          layerType: chosenLayer.type,
           execFileFn: options.execFileImpl || options.execFileFn || execFile,
         });
         if (fs.existsSync(bottlePath)) {
@@ -2057,12 +2134,28 @@ async function launchChainedPublisherGame(ctx) {
     if (canWrapChainedDisplayScaler && stagedChainedDisp && bottlePath && chainedWatchTargetDir) {
       try {
         const winWatchDir = toWineWindowsPath(chainedWatchTargetDir, bottlePath);
-        const chainedWatchLauncherPosix =
-          (chainedEffectiveCaps?.is64Bit
-            ? stagedChainedDisp.launcherX64Posix
-            : stagedChainedDisp.launcherX86Posix) ||
-          stagedChainedDisp.launcherX64Posix ||
-          stagedChainedDisp.launcherX86Posix;
+        const rawChainedBottleArch = String(
+          compatResult?.wineArch ||
+            (bottlePath ? inspectBottleConfMetadata(bottlePath).wineArch : '') ||
+            (chosenLayer?.type === 'crossover_preview_arm64' ? 'arm64' : '')
+        )
+          .trim()
+          .toLowerCase();
+        const is64BitChainedBottle =
+          rawChainedBottleArch === 'win64' ||
+          rawChainedBottleArch === 'arm64' ||
+          (rawChainedBottleArch !== 'win32' &&
+            (chosenLayer?.type === 'crossover' ||
+              chosenLayer?.type === 'crossover_preview' ||
+              chosenLayer?.type === 'crossover_preview_arm64' ||
+              Boolean(chainedEffectiveCaps?.is64Bit)));
+        const chainedWatchLauncherPosix = is64BitChainedBottle
+          ? stagedChainedDisp.launcherX64Posix || stagedChainedDisp.launcherX86Posix
+          : (chainedEffectiveCaps?.is64Bit
+              ? stagedChainedDisp.launcherX64Posix
+              : stagedChainedDisp.launcherX86Posix) ||
+            stagedChainedDisp.launcherX64Posix ||
+            stagedChainedDisp.launcherX86Posix;
         if (winWatchDir && chainedWatchLauncherPosix) {
           // SUP-04: Standardize detached POSIX display watcher so signalSubprocessTree reaps full PGID
           chainedDisplayWatcherChild = gameSpawnImpl(
@@ -2105,6 +2198,7 @@ async function launchChainedPublisherGame(ctx) {
       executablePath: realGameExe || spec.launcherExe,
       status: 'running',
       isBottledSession: true,
+      ...(bottlePath ? { winePrefix: bottlePath } : {}),
       fullscreenActive: chainedInitialFullscreen,
       displayScalingMode: chainedDisplayScalingMode,
       displayAspectRatio: chainedDisplayAspectRatio,
@@ -2320,6 +2414,16 @@ async function launchChainedPublisherGame(ctx) {
                 if (entry.session) {
                   entry.session.pid = livePid;
                 }
+                emitSessionUpdated(
+                  {
+                    gameId,
+                    platformId: entry.platformId,
+                    session: { ...entry.session },
+                    status: 'running',
+                    event: 'session_updated',
+                  },
+                  options
+                );
               }
               return;
             }
@@ -2535,6 +2639,7 @@ async function launchChainedPublisherGame(ctx) {
     epicPartnerRegistryPath: rawWinEpicPartnerRegPath || undefined,
     storefrontId: normPlatformId || undefined,
     platform: 'win32',
+    storefrontClientLifecycle: effectivePerfPolicy.storefrontClientLifecycle,
   });
   if (
     !realGameExe &&
@@ -2813,6 +2918,7 @@ module.exports = {
   hasParadoxLauncherInstalledInBottle,
   getPublisherForegroundUiRegex,
   checkBottlePublisherUiRunningAsync,
+  checkHostMacPublisherAppRunningAsync,
   checkHostWinPublisherUiRunningAsync,
   isSafeHostEaGameDirToDelete,
   wineRegistryInstallDirToPosix,

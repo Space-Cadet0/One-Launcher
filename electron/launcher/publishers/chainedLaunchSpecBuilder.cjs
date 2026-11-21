@@ -116,6 +116,7 @@ function isGdkStubOnlyDirectory(dirPath) {
  *   compatibilityLayerType?: string | null,
  *   inBottle?: boolean,
  *   crossoverInjectsNoBattlEye?: boolean,
+ *   storefrontClientLifecycle?: string | null,
  * }} params
  * @returns {ChainedLauncherLaunchSpec}
  */
@@ -137,11 +138,18 @@ function buildChainedLauncherLaunchSpec(params) {
     compatibilityLayerType,
     inBottle,
     crossoverInjectsNoBattlEye,
+    storefrontClientLifecycle,
   } = params || {};
 
   const canonical = normalizeChainedHandoffId(handoffId);
   const normPlatform = String(platform || process.platform).toLowerCase();
   const normLayer = String(compatibilityLayerType || '').toLowerCase();
+  const normLifecycle = String(storefrontClientLifecycle || '')
+    .trim()
+    .toLowerCase();
+  const isMinimalLifecycle =
+    normLifecycle === 'minimal_and_close_if_started' ||
+    normLifecycle === 'minimal_keep_running';
   const isWineBottleExecution =
     inBottle === true ||
     Boolean(bottlePath && String(bottlePath).trim()) ||
@@ -160,6 +168,9 @@ function buildChainedLauncherLaunchSpec(params) {
     const descriptor = CHAINED_PUBLISHER_ECOSYSTEMS.ubisoft;
     /** @type {string[]} */
     const args = isWineBottleExecution ? [...(descriptor.wineClientArgs || [])] : [];
+    if (isMinimalLifecycle && !args.includes('-minimized')) {
+      args.push('-minimized');
+    }
     /** @type {string | undefined} */
     let uri;
     if (safeExternalId) {
@@ -326,10 +337,12 @@ function buildChainedLauncherLaunchSpec(params) {
           isWineBottleExecution
         );
 
+    const rockstarMinimalArgs = isMinimalLifecycle ? ['-minmode'] : [];
+
     if (rockstarLauncherExe && resolvedWinInstallDir) {
       return {
         launcherExe: rockstarLauncherExe,
-        args: ['-launchTitleInFolder', resolvedWinInstallDir],
+        args: [...rockstarMinimalArgs, '-launchTitleInFolder', resolvedWinInstallDir],
         envOverrides,
         expectedGameExe: cleanGameExe || '',
         targetExecutablePath: cleanGameExe || null,
@@ -339,7 +352,7 @@ function buildChainedLauncherLaunchSpec(params) {
     if (rockstarLauncherExe) {
       return {
         launcherExe: rockstarLauncherExe,
-        args: [],
+        args: [...rockstarMinimalArgs],
         envOverrides,
         expectedGameExe: cleanGameExe || '',
         targetExecutablePath: cleanGameExe || null,
@@ -407,7 +420,9 @@ function buildChainedLauncherLaunchSpec(params) {
     // Never spawn raw DRM-gated Rockstar engine executables directly with `args: []`
     return {
       launcherExe: '',
-      args: resolvedWinInstallDir ? ['-launchTitleInFolder', resolvedWinInstallDir] : [],
+      args: resolvedWinInstallDir
+        ? [...rockstarMinimalArgs, '-launchTitleInFolder', resolvedWinInstallDir]
+        : [...rockstarMinimalArgs],
       envOverrides,
       expectedGameExe: cleanGameExe || '',
       targetExecutablePath: cleanGameExe || null,
