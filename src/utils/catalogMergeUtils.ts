@@ -208,14 +208,18 @@ export function reconcileCatalogTrophiesRecords(
         const epicId = String(p.platformGameId || game.id);
         const epicIdLower = epicId.toLowerCase();
         const epicNamespace = p.namespace;
+        const epicCatalogId = p.catalogItemId;
         const epicAch =
+          (epicNamespace ? epicAchs[String(epicNamespace).toLowerCase()] : undefined) ||
           epicAchs[epicId] ||
           epicAchs[epicIdLower] ||
           epicAchs[`epic-${epicIdLower}`] ||
-          (epicNamespace ? epicAchs[String(epicNamespace).toLowerCase()] : undefined) ||
+          (epicCatalogId ? epicAchs[String(epicCatalogId).toLowerCase()] : undefined) ||
           epicAchs[titleLower] ||
           epicAchs[normTitle] ||
-          getKnownEpicAchievements(p.platformGameId || game.id, game.title);
+          (epicNamespace ? getKnownEpicAchievements(epicNamespace, game.title) : undefined) ||
+          getKnownEpicAchievements(p.platformGameId || game.id, game.title) ||
+          (epicCatalogId ? getKnownEpicAchievements(epicCatalogId, game.title) : undefined);
         if (epicAch && epicAch.total > 0) {
           const reconciled = reconcileAchievementSummaries(working.achievements, epicAch, {
             title: game.title,

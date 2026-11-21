@@ -9,6 +9,7 @@ import { DetailedAchievement, StorefrontAchievementsData } from '../../contracts
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 import {
   KNOWN_USER_EPIC_ACHIEVEMENTS,
+  cacheUserEpicAchievements,
   getKnownEpicAchievements,
 } from '../storage/knownGameAchievements';
 import {
@@ -273,6 +274,48 @@ export async function fetchEpicDetailedAchievementsProvider(
     envTotalXp ?? userEpic?.xp?.total ?? (hasSchemaXp ? sumSchemaXp : undefined);
   const resolvedEarnedXp =
     envEarnedXp ?? (hasExactUnlocks && hasSchemaXp ? sumEarnedSchemaXp : userEpic?.xp?.earned);
+  const syncedAt = liveEpicEnvelope?.syncedAt || userEpic?.syncedAt || new Date().toISOString();
+  const isLiveCloudResult = hasExactUnlocks || liveEpicEnvelope?.source === 'live_cloud';
+
+  // Back-propagate verified Epic cloud achievement totals (`0/N` or `M/N` + XP) into the
+  // unified summary store so the Game Detail ActionBar & breakdown drawer self-heal immediately.
+  if (liveEpicEnvelope?.source === 'live_cloud' && totalCount > 0) {
+    const summaryEntry: StoreAchievementSummary = {
+      unlocked: effectiveUnlocked,
+      total: totalCount,
+      percentage,
+      isMastered,
+      ...(resolvedTotalXp !== undefined
+        ? { xp: { earned: resolvedEarnedXp ?? 0, total: resolvedTotalXp } }
+        : {}),
+      source: hasExactUnlocks ? 'live_cloud_graphql' : 'local_client_cache',
+      syncedAt,
+    };
+    const cleanTargetId = String(targetId || '')
+      .replace(/^epic[-_]/i, '')
+      .trim()
+      .toLowerCase();
+    const normTitle = titleLower
+      .replace(/[:\-–—]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const summaryPatch: Record<string, StoreAchievementSummary> = {};
+    if (cleanTargetId) {
+      summaryPatch[cleanTargetId] = summaryEntry;
+      summaryPatch[`epic-${cleanTargetId}`] = summaryEntry;
+    }
+    if (epicNamespace) {
+      summaryPatch[epicNamespace.toLowerCase().trim()] = summaryEntry;
+    }
+    if (epicPlatform?.catalogItemId) {
+      summaryPatch[epicPlatform.catalogItemId.toLowerCase().trim()] = summaryEntry;
+    }
+    if (titleLower) summaryPatch[titleLower] = summaryEntry;
+    if (normTitle) summaryPatch[normTitle] = summaryEntry;
+    if (Object.keys(summaryPatch).length > 0) {
+      cacheUserEpicAchievements(summaryPatch);
+    }
+  }
 
   return deduplicateDetailedAchievements({
     storefrontId: 'epic',
@@ -284,8 +327,8 @@ export async function fetchEpicDetailedAchievementsProvider(
     ...(resolvedTotalXp !== undefined ? { totalXp: resolvedTotalXp } : {}),
     ...(resolvedEarnedXp !== undefined ? { earnedXp: resolvedEarnedXp } : {}),
     achievements,
-    syncedAt: liveEpicEnvelope?.syncedAt || userEpic?.syncedAt || new Date().toISOString(),
-    source: hasExactUnlocks ? 'live_cloud' : 'schema_fallback',
+    syncedAt,
+    source: isLiveCloudResult ? 'live_cloud' : 'schema_fallback',
     unlockPrecision,
     supportsAchievements: true,
     cacheVersion: ACHIEVEMENT_CACHE_VERSION,

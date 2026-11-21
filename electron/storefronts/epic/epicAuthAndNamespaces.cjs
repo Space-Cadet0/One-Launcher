@@ -650,7 +650,7 @@ async function resolveEpicNamespaceAndIds(payload = {}, options = {}) {
     ? options
     : payload;
   const vaultOpts = resolveStoreVaultOptions(effectiveOpts);
-  const rawAppName = String(payload.appName || payload.slug || '')
+  const rawAppName = String(payload.appName || payload.platformGameId || payload.slug || '')
     .replace(/^epic-/i, '')
     .trim();
   const normTitle = String(payload.title || '')
@@ -729,6 +729,24 @@ async function resolveEpicNamespaceAndIds(payload = {}, options = {}) {
               title: item?.app_title || item?.title,
             });
           }
+        }
+      }
+    } catch {}
+
+    const entitlementsFile = path.join(baseDir, 'entitlements.json');
+    try {
+      const entJson = JSON.parse(await fs.promises.readFile(entitlementsFile, 'utf-8'));
+      if (Array.isArray(entJson)) {
+        for (const item of entJson) {
+          if (!item || typeof item !== 'object') continue;
+          const rawTitle = String(item.entitlementName || '').trim();
+          const safeTitle =
+            rawTitle && !/^[0-9a-f]{24,}$/i.test(rawTitle) ? rawTitle : undefined;
+          registerEpicNamespaceMapping({
+            namespace: item.namespace,
+            catalogItemId: item.catalogItemId || item.catalog_item_id,
+            title: safeTitle,
+          });
         }
       }
     } catch {}

@@ -3,7 +3,10 @@ import { StorefrontId, STOREFRONT_REGISTRY } from '../../contracts/platform';
 import { ModalShell } from '../Common/ModalShell';
 import { VirtualListRows } from '../Common/VirtualContainers';
 import { Trophy, X, Loader2, RefreshCw } from 'lucide-react';
-import type { GameAchievementsModalProps } from './achievementsModalTypes';
+import {
+  resolveNoAchievementsSubtitle,
+  type GameAchievementsModalProps,
+} from './achievementsModalTypes';
 import { useAchievementsLoader } from './useAchievementsLoader';
 import { useAchievementsFilterSort } from './useAchievementsFilterSort';
 import {
@@ -277,7 +280,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
                   : searchQuery
                   ? 'Try clearing your search query or switching filter tabs.'
                   : currentStoreData?.supportsAchievements === false || totalCount === 0
-                  ? 'Classic and retro releases, standalone expansions, or developer tools do not feature achievement tracking.'
+                  ? resolveNoAchievementsSubtitle(activeStorefront, multiStoreData)
                   : 'Achievements for this storefront are pending sync or not configured.'}
               </p>
               {!isSchemaUnavailableOffline && (searchQuery || activeFilterTab !== 'all') && (

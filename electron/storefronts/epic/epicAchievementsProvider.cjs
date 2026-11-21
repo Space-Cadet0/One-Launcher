@@ -3,7 +3,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { loadSavedTokensAsync } = require('../tokenVault.cjs');
+const { loadSavedTokensAsync, getTokensFilePath } = require('../tokenVault.cjs');
 const {
   buildStoreFetchSignal,
   buildPlatformStoreUserAgent,
@@ -12,6 +12,7 @@ const {
   resolveStoreVaultOptions,
   resolveSafeLegendaryMetaFilePath,
   classifyAchievementRarityTier,
+  atomicWriteFileAsync,
 } = require('../sync/storeSyncShared.cjs');
 const {
   renewEpicTokens,
@@ -22,11 +23,28 @@ const {
 
 const MAX_EPIC_PRODUCT_ID_CACHE_ENTRIES = 2000;
 const MAX_EPIC_SCHEMA_FILE_CACHE_ENTRIES = 2000;
+const EPIC_PUBLIC_SUMMARY_CACHE_FILENAME = 'one_launcher_epic_public_achievements_cache.json';
+const EPIC_PUBLIC_SUMMARY_POSITIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const EPIC_PUBLIC_SUMMARY_NEGATIVE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_EPIC_PUBLIC_SUMMARY_CACHE_ENTRIES = 2000;
+const MAX_EPIC_PUBLIC_SUMMARY_CACHE_PATHS = 16;
+const DEFAULT_EPIC_PUBLIC_SCHEMA_ENRICH_BUDGET_MS = 15_000;
 
 /** @type {Map<string, string>} */
 const epicSandboxProductIdCache = new Map();
 /** @type {Map<string, { mtimeMs: number, size: number, summary: Record<string, any> }>} */
 const epicSchemaFileCache = new Map();
+/**
+ * @typedef {{
+ *   totalAchievements: number,
+ *   totalProductXP: number,
+ *   productId: string,
+ *   definitiveNotFound: boolean,
+ *   cachedAt: number,
+ * }} EpicPublicSummaryCacheEntry
+ */
+/** @type {Map<string, Record<string, EpicPublicSummaryCacheEntry>>} */
+const epicPublicSummaryCacheByPath = new Map();
 
 /**
  * @param {string} sandboxId
@@ -46,8 +64,114 @@ function setBoundedEpicSandboxProductId(sandboxId, productId) {
 }
 
 /**
+ * Resolve optional disk-cache path for public zero-auth Epic achievement summary totals.
+ * Never touches host `userDataDir` when a test injects `fetchFn` without explicit `userDataDir`.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {string}
+ */
+function getEpicPublicAchievementCachePath(options = {}) {
+  if (typeof options?.userDataDir === 'string' && options.userDataDir.trim()) {
+    return path.join(options.userDataDir.trim(), EPIC_PUBLIC_SUMMARY_CACHE_FILENAME);
+  }
+  if (typeof options?.fetchFn === 'function') {
+    return '';
+  }
+  try {
+    const vaultOpts = resolveStoreVaultOptions(options);
+    const tokensPath = getTokensFilePath(vaultOpts);
+    if (tokensPath) {
+      return path.join(path.dirname(tokensPath), EPIC_PUBLIC_SUMMARY_CACHE_FILENAME);
+    }
+  } catch {}
+  return '';
+}
+
+/**
+ * @param {Record<string, EpicPublicSummaryCacheEntry>} entries
+ * @param {number} nowMs
+ */
+function pruneEpicPublicSummaryCacheEntries(entries, nowMs) {
+  /** @type {Array<[string, EpicPublicSummaryCacheEntry]>} */
+  const validPairs = [];
+  for (const [k, entry] of Object.entries(entries)) {
+    if (!entry || typeof entry !== 'object') {
+      delete entries[k];
+      continue;
+    }
+    const ttl =
+      entry.totalAchievements > 0
+        ? EPIC_PUBLIC_SUMMARY_POSITIVE_TTL_MS
+        : EPIC_PUBLIC_SUMMARY_NEGATIVE_TTL_MS;
+    if (!Number.isFinite(entry.cachedAt) || nowMs - entry.cachedAt >= ttl) {
+      delete entries[k];
+      continue;
+    }
+    validPairs.push([k, entry]);
+  }
+  if (validPairs.length > MAX_EPIC_PUBLIC_SUMMARY_CACHE_ENTRIES) {
+    validPairs.sort((a, b) => (a[1].cachedAt || 0) - (b[1].cachedAt || 0));
+    const excess = validPairs.length - MAX_EPIC_PUBLIC_SUMMARY_CACHE_ENTRIES;
+    for (let i = 0; i < excess; i++) {
+      delete entries[validPairs[i][0]];
+    }
+  }
+}
+
+/**
+ * @param {string} cachePath
+ * @returns {Promise<Record<string, EpicPublicSummaryCacheEntry>>}
+ */
+async function loadEpicPublicSummaryCacheAsync(cachePath) {
+  if (!cachePath) return {};
+  const resolved = path.resolve(cachePath);
+  const existing = epicPublicSummaryCacheByPath.get(resolved);
+  if (existing) {
+    epicPublicSummaryCacheByPath.delete(resolved);
+    epicPublicSummaryCacheByPath.set(resolved, existing);
+    return existing;
+  }
+  /** @type {Record<string, EpicPublicSummaryCacheEntry>} */
+  let entries = {};
+  try {
+    const raw = await fs.promises.readFile(resolved, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && parsed.entries && typeof parsed.entries === 'object') {
+      entries = { ...parsed.entries };
+    }
+  } catch {}
+  while (epicPublicSummaryCacheByPath.size >= MAX_EPIC_PUBLIC_SUMMARY_CACHE_PATHS) {
+    const oldest = epicPublicSummaryCacheByPath.keys().next().value;
+    if (oldest === undefined) break;
+    epicPublicSummaryCacheByPath.delete(oldest);
+  }
+  epicPublicSummaryCacheByPath.set(resolved, entries);
+  return entries;
+}
+
+/**
+ * Detect Epic GraphQL HTTP 200 `ServiceError` with status `404` / Not Found on
+ * `PlayerProfile.playerProfile.productAchievements` — Epic's authoritative response when a
+ * signed-in player has 0 unlocked achievements / has not yet initialized progress in that title.
+ *
+ * @param {any} json
+ * @returns {boolean}
+ */
+function isEpicGraphqlPlayerNotFound(json) {
+  if (!json || typeof json !== 'object') return false;
+  const paNode = json?.data?.PlayerProfile?.playerProfile?.productAchievements;
+  if (!paNode || typeof paNode !== 'object') return false;
+  if (paNode.__typename !== 'ServiceError') return false;
+  const paStatus = Number(paNode.status || 0);
+  const paMsg = String(paNode.message || '');
+  return paStatus === 404 || /\b404\b|not\s*found/i.test(paMsg);
+}
+
+/**
  * Detect Epic GraphQL authentication failure across BOTH HTTP 401/403 AND HTTP 200 GraphQL
- * `errors` (`UNAUTHENTICATED`, `token_verification_failed`, etc.) or `{ __typename: 'ServiceError' }` (`C7`).
+ * `errors` (`UNAUTHENTICATED`, `token_verification_failed`, etc.) or auth-related
+ * `{ __typename: 'ServiceError' }` (`C7`), while NOT misclassifying HTTP 404 "no player record
+ * yet" `ServiceError` responses for 0-trophy games as expired OAuth tokens.
  *
  * @param {number} status
  * @param {any} json
@@ -76,11 +200,14 @@ function isEpicGraphqlAuthFailure(status, json) {
       }
     }
   }
+  if (isEpicGraphqlPlayerNotFound(json)) {
+    return false;
+  }
   const paNode = json?.data?.PlayerProfile?.playerProfile?.productAchievements;
   if (paNode && typeof paNode === 'object') {
-    if (paNode.__typename === 'ServiceError') return true;
     const paStatus = Number(paNode.status || 0);
     if (paStatus === 401 || paStatus === 403) return true;
+    if (paNode.__typename === 'ServiceError' && paStatus === 0) return true;
   }
   return false;
 }
@@ -148,45 +275,10 @@ async function fetchEpicPublicAchievementSchema(sandboxId, options = {}) {
   const fetchImpl = typeof options?.fetchFn === 'function' ? options.fetchFn : fetch;
   const { locale } = resolveDefaultStoreLocaleAndCountry(options);
   const effectiveLocale = String(locale || 'en-US').trim() || 'en-US';
+  const localesToTry =
+    effectiveLocale.toLowerCase() === 'en-us' ? [effectiveLocale] : [effectiveLocale, 'en-US'];
 
-  let saw404 = false;
-
-  try {
-    const restUrl = `https://api.epicgames.dev/epic/achievements/v1/public/achievements/product/${encodeURIComponent(
-      cleanSandbox
-    )}/locale/${encodeURIComponent(effectiveLocale)}`;
-    const res = await fetchImpl(restUrl, {
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
-      },
-      signal: buildStoreFetchSignal(options?.signal),
-    });
-    if (res.ok) {
-      const data = /** @type {any} */ (await res.json());
-      const rawAchievements = Array.isArray(data?.achievements) ? data.achievements : [];
-      const productId = String(data?.productId || '').trim();
-      if (productId) {
-        setBoundedEpicSandboxProductId(cleanSandbox, productId);
-      }
-      if (rawAchievements.length > 0 || productId) {
-        return {
-          productId,
-          sandboxId: String(data?.sandboxId || cleanSandbox),
-          totalAchievements: Number(data?.totalAchievements || rawAchievements.length) || 0,
-          totalProductXP: Number(data?.totalProductXP || 0) || 0,
-          achievementSets: data?.achievementSets || null,
-          rawAchievements,
-          definitiveNotFound: rawAchievements.length === 0,
-        };
-      }
-    } else if (res.status === 404) {
-      saw404 = true;
-    }
-  } catch {}
-
-  try {
-    const gqlQuery = `query Achievement($sandboxId: String!, $locale: String!) {
+  const gqlQuery = `query Achievement($sandboxId: String!, $locale: String!) {
       Achievement {
         productAchievementsRecordBySandbox(sandboxId: $sandboxId, locale: $locale) {
           productId
@@ -229,42 +321,117 @@ async function fetchEpicPublicAchievementSchema(sandboxId, options = {}) {
         }
       }
     }`;
-    const gqlRes = await fetchImpl('https://launcher.store.epicgames.com/graphql', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
-      },
-      body: JSON.stringify({
-        query: gqlQuery,
-        variables: { sandboxId: cleanSandbox, locale: effectiveLocale },
-      }),
-      signal: buildStoreFetchSignal(options?.signal),
-    });
-    if (gqlRes.ok) {
-      const gqlJson = /** @type {any} */ (await gqlRes.json());
-      const rec = gqlJson?.data?.Achievement?.productAchievementsRecordBySandbox;
-      if (rec && typeof rec === 'object') {
-        const rawAchievements = Array.isArray(rec.achievements) ? rec.achievements : [];
-        const productId = String(rec.productId || '').trim();
+
+  let saw404 = false;
+  /** @type {any} */
+  let emptyProductSchema = null;
+
+  for (const currentLocale of localesToTry) {
+    try {
+      const restUrl = `https://api.epicgames.dev/epic/achievements/v1/public/achievements/product/${encodeURIComponent(
+        cleanSandbox
+      )}/locale/${encodeURIComponent(currentLocale)}`;
+      const res = await fetchImpl(restUrl, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
+        },
+        signal: buildStoreFetchSignal(options?.signal),
+      });
+      if (res.ok) {
+        const data = /** @type {any} */ (await res.json());
+        const rawAchievements = Array.isArray(data?.achievements) ? data.achievements : [];
+        const productId = String(data?.productId || '').trim();
         if (productId) {
           setBoundedEpicSandboxProductId(cleanSandbox, productId);
         }
-        if (rawAchievements.length > 0 || productId) {
+        if (rawAchievements.length > 0) {
           return {
             productId,
-            sandboxId: String(rec.sandboxId || cleanSandbox),
-            totalAchievements: Number(rec.totalAchievements || rawAchievements.length) || 0,
-            totalProductXP: Number(rec.totalProductXP || 0) || 0,
-            achievementSets: rec.achievementSets || null,
+            sandboxId: String(data?.sandboxId || cleanSandbox),
+            totalAchievements: Number(data?.totalAchievements || rawAchievements.length) || 0,
+            totalProductXP: Number(data?.totalProductXP || 0) || 0,
+            achievementSets: data?.achievementSets || null,
             rawAchievements,
-            definitiveNotFound: rawAchievements.length === 0,
+            definitiveNotFound: false,
           };
         }
+        if (productId) {
+          emptyProductSchema = {
+            productId,
+            sandboxId: String(data?.sandboxId || cleanSandbox),
+            totalAchievements: Number(data?.totalAchievements || 0) || 0,
+            totalProductXP: Number(data?.totalProductXP || 0) || 0,
+            achievementSets: data?.achievementSets || null,
+            rawAchievements: [],
+            definitiveNotFound: true,
+          };
+          if (currentLocale.toLowerCase() === 'en-us') {
+            return emptyProductSchema;
+          }
+          continue;
+        }
+      } else if (res.status === 404) {
+        saw404 = true;
       }
-    }
-  } catch {}
+    } catch {}
+
+    try {
+      const gqlRes = await fetchImpl('https://launcher.store.epicgames.com/graphql', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
+        },
+        body: JSON.stringify({
+          query: gqlQuery,
+          variables: { sandboxId: cleanSandbox, locale: currentLocale },
+        }),
+        signal: buildStoreFetchSignal(options?.signal),
+      });
+      if (gqlRes.ok) {
+        const gqlJson = /** @type {any} */ (await gqlRes.json());
+        const rec = gqlJson?.data?.Achievement?.productAchievementsRecordBySandbox;
+        if (rec && typeof rec === 'object') {
+          const rawAchievements = Array.isArray(rec.achievements) ? rec.achievements : [];
+          const productId = String(rec.productId || '').trim();
+          if (productId) {
+            setBoundedEpicSandboxProductId(cleanSandbox, productId);
+          }
+          if (rawAchievements.length > 0) {
+            return {
+              productId,
+              sandboxId: String(rec.sandboxId || cleanSandbox),
+              totalAchievements: Number(rec.totalAchievements || rawAchievements.length) || 0,
+              totalProductXP: Number(rec.totalProductXP || 0) || 0,
+              achievementSets: rec.achievementSets || null,
+              rawAchievements,
+              definitiveNotFound: false,
+            };
+          }
+          if (productId) {
+            emptyProductSchema = {
+              productId,
+              sandboxId: String(rec.sandboxId || cleanSandbox),
+              totalAchievements: Number(rec.totalAchievements || 0) || 0,
+              totalProductXP: Number(rec.totalProductXP || 0) || 0,
+              achievementSets: rec.achievementSets || null,
+              rawAchievements: [],
+              definitiveNotFound: true,
+            };
+            if (currentLocale.toLowerCase() === 'en-us') {
+              return emptyProductSchema;
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  if (emptyProductSchema) {
+    return emptyProductSchema;
+  }
 
   if (saw404) {
     return {
@@ -514,8 +681,51 @@ async function fetchEpicDetailedGameAchievements(payload = {}, options = {}) {
     return null;
   }
 
-  const publicSchema = await fetchEpicPublicAchievementSchema(sandboxId, options);
+  let publicSchema = await fetchEpicPublicAchievementSchema(sandboxId, options);
   if (publicSchema?.definitiveNotFound && publicSchema.rawAchievements.length === 0) {
+    // Guard against stale/mismatched payload.namespace when appName/catalogItemId maps to a different sandboxId
+    if (payload.appName || payload.platformGameId || payload.catalogItemId) {
+      try {
+        const altResolved = await resolveEpicNamespaceAndIds(
+          {
+            appName: payload.appName || payload.platformGameId,
+            catalogItemId: payload.catalogItemId,
+            title: payload.title,
+          },
+          { ...options, ...vaultOpts }
+        );
+        const altSandbox = String(altResolved?.namespace || '').trim();
+        if (altSandbox && altSandbox.toLowerCase() !== sandboxId.toLowerCase()) {
+          const altSchema = await fetchEpicPublicAchievementSchema(altSandbox, options);
+          if (altSchema && altSchema.rawAchievements.length > 0) {
+            sandboxId = altSandbox;
+            publicSchema = altSchema;
+          }
+        }
+      } catch {}
+    }
+  }
+
+  if (publicSchema?.definitiveNotFound && publicSchema.rawAchievements.length === 0) {
+    const localFallback = await getEpicGameAchievementSchema(payload, {
+      ...options,
+      localOnly: true,
+    });
+    if (localFallback.length > 0) {
+      return {
+        storefrontId: 'epic',
+        storefrontName: 'Epic Games',
+        total: localFallback.length,
+        unlocked: 0,
+        percentage: 0,
+        isMastered: false,
+        achievements: localFallback,
+        syncedAt,
+        source: 'local_cache',
+        supportsAchievements: true,
+        cacheVersion: 2,
+      };
+    }
     return {
       storefrontId: 'epic',
       storefrontName: 'Epic Games',
@@ -588,6 +798,10 @@ async function fetchEpicDetailedGameAchievements(payload = {}, options = {}) {
         playerProfile(epicAccountId: $epicAccountId) {
           productAchievements(productId: $productId) {
             __typename
+            ... on ServiceError {
+              status
+              message
+            }
             ... on PlayerProductAchievementsResponseSuccess {
               data {
                 sandboxId
@@ -670,7 +884,12 @@ async function fetchEpicDetailedGameAchievements(payload = {}, options = {}) {
 
         const paNode = gqlAttempt.json?.data?.PlayerProfile?.playerProfile?.productAchievements;
         const paData = paNode?.data;
-        if (
+        if (gqlAttempt.ok && isEpicGraphqlPlayerNotFound(gqlAttempt.json)) {
+          // Epic returns ServiceError { status: 404 } when the signed-in account has 0 unlocked
+          // trophies / no initialized player record for this title: authoritative 0/N state!
+          hasAuthoritativePlayerResponse = true;
+          playerTotalXP = 0;
+        } else if (
           gqlAttempt.ok &&
           paNode &&
           paNode.__typename !== 'ServiceError' &&
@@ -1060,7 +1279,24 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
     }
   } catch {}
 
-  if (!accountId || options.skipNetwork) {
+  const bulkTargets = Array.isArray(options?.targets)
+    ? options.targets
+    : Array.isArray(options?.sandboxes)
+      ? options.sandboxes
+      : [];
+
+  if (options.skipNetwork) {
+    return achievementsMap;
+  }
+
+  if (!accountId) {
+    if (bulkTargets.length > 0) {
+      await enrichEpicPublicAchievementSummaries(bulkTargets, achievementsMap, {
+        ...options,
+        sandboxMetaLookup,
+        syncedAt,
+      });
+    }
     return achievementsMap;
   }
 
@@ -1170,6 +1406,10 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
             playerProfile(epicAccountId: $epicAccountId) {
               productAchievements(productId: $productId) {
                 __typename
+                ... on ServiceError {
+                  status
+                  message
+                }
                 ... on PlayerProductAchievementsResponseSuccess {
                   data {
                     sandboxId
@@ -1209,17 +1449,20 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
         const prodJson = /** @type {any} */ (await prodRes.json());
         const paNode = prodJson?.data?.PlayerProfile?.playerProfile?.productAchievements;
         const paData = paNode?.data;
-        if (!paData || paNode?.__typename === 'ServiceError') return false;
+        const isNotFoundZero = isEpicGraphqlPlayerNotFound(prodJson);
+        if (!isNotFoundZero && (!paData || paNode?.__typename === 'ServiceError')) return false;
         const totals =
           fallbackTotals || (await fetchEpicPublicAchievementSchema(targetSandboxId, options));
+        const resolvedTotal = Number(totals?.totalAchievements || 0);
+        if (isNotFoundZero && resolvedTotal <= 0) return false;
         indexEpicAchievementItems([
           {
-            sandboxId: paData.sandboxId || targetSandboxId,
-            totalUnlocked: Number(paData.totalUnlocked || 0),
-            totalXP: Number(paData.totalXP || 0),
+            sandboxId: paData?.sandboxId || targetSandboxId,
+            totalUnlocked: isNotFoundZero ? 0 : Number(paData?.totalUnlocked || 0),
+            totalXP: isNotFoundZero ? 0 : Number(paData?.totalXP || 0),
             product: options.title ? { name: String(options.title) } : undefined,
             productAchievements: {
-              totalAchievements: Number(totals?.totalAchievements || 0),
+              totalAchievements: resolvedTotal,
               totalProductXP: Number(totals?.totalProductXP || 0),
             },
           },
@@ -1279,19 +1522,17 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
         const profileNode = singleJson?.data?.PlayerProfile?.playerProfile;
         const targetedRaw = profileNode?.productAchievements?.data;
         const summaryFallbackRaw = profileNode?.achievementsSummaries?.data;
-        const hasSchemaError = Array.isArray(singleJson?.errors) && singleJson.errors.length > 0;
 
         if (targetedRaw) {
           const list = Array.isArray(targetedRaw) ? targetedRaw : [targetedRaw];
           indexEpicAchievementItems(list);
           return achievementsMap;
         }
-        if (Array.isArray(summaryFallbackRaw)) {
+        if (Array.isArray(summaryFallbackRaw) && summaryFallbackRaw.length > 0) {
           indexEpicAchievementItems(summaryFallbackRaw);
-          return achievementsMap;
-        }
-        if (!hasSchemaError) {
-          return achievementsMap;
+          if ((achievementsMap[targetSandboxId.toLowerCase()]?.total || 0) > 0) {
+            return achievementsMap;
+          }
         }
       } else if (singleRes.status === 401 || singleRes.status === 403) {
         console.warn(`Epic single-game achievements query returned status ${singleRes.status}`);
@@ -1303,6 +1544,36 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
         if (publicSchema?.productId) {
           const hit = await tryQueryByProductId(publicSchema.productId, publicSchema);
           if (hit) return achievementsMap;
+        }
+        if (publicSchema && Number(publicSchema.totalAchievements || 0) > 0) {
+          const sbLower = targetSandboxId.toLowerCase();
+          if ((achievementsMap[sbLower]?.total || 0) <= 0) {
+            const seededSummary = {
+              unlocked: 0,
+              total: Number(publicSchema.totalAchievements),
+              percentage: 0,
+              xp: { earned: 0, total: Number(publicSchema.totalProductXP || 0) },
+              isMastered: false,
+              source: 'local_client_cache',
+              syncedAt,
+            };
+            achievementsMap[sbLower] = seededSummary;
+            if (targetAppName) {
+              const appLower = targetAppName.toLowerCase();
+              achievementsMap[appLower] = seededSummary;
+              achievementsMap[`epic-${appLower}`] = seededSummary;
+            }
+            if (targetCatalogItemId) {
+              achievementsMap[targetCatalogItemId.toLowerCase()] = seededSummary;
+            }
+            if (targetTitle) {
+              const titleLower = targetTitle.toLowerCase().trim();
+              const normTitle = titleLower.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+              if (titleLower) achievementsMap[titleLower] = seededSummary;
+              if (normTitle) achievementsMap[normTitle] = seededSummary;
+            }
+          }
+          return achievementsMap;
         }
       } catch {}
     }
@@ -1348,31 +1619,249 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
 
     if (!res.ok) {
       console.warn(`Epic achievements query returned status ${res.status}`);
-      return achievementsMap;
+    } else {
+      const json = /** @type {any} */ (await res.json());
+      const dataList = json?.data?.PlayerProfile?.playerProfile?.achievementsSummaries?.data || [];
+      indexEpicAchievementItems(dataList);
     }
 
-    const json = /** @type {any} */ (await res.json());
-    const dataList = json?.data?.PlayerProfile?.playerProfile?.achievementsSummaries?.data || [];
-    indexEpicAchievementItems(dataList);
+    if (!isSingleGameScoped && bulkTargets.length > 0) {
+      await enrichEpicPublicAchievementSummaries(bulkTargets, achievementsMap, {
+        ...options,
+        sandboxMetaLookup,
+        syncedAt,
+      });
+    }
 
     return achievementsMap;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn('Epic achievements fetch warning:', msg);
+    if (!isSingleGameScoped && bulkTargets.length > 0) {
+      try {
+        await enrichEpicPublicAchievementSummaries(bulkTargets, achievementsMap, {
+          ...options,
+          sandboxMetaLookup,
+          syncedAt,
+        });
+      } catch {}
+    }
     return achievementsMap;
   }
 }
 
+/**
+ * Enrich `achievementsMap` with zero-auth Epic public product achievement totals (`0/N` + XP)
+ * for owned Epic titles that were omitted by `achievementsSummaries` (unplayed / 0-earned games)
+ * and missing/null in local Legendary `metadata/*.json`.
+ *
+ * Uses a bounded per-`userDataDir` disk+memory cache (`7d` positive TTL, `24h` negative TTL;
+ * `forceRefresh: true` revalidates negative `0/0` entries) and never overwrites existing entries
+ * with `total > 0` (such as live GraphQL player unlocks).
+ *
+ * @param {Array<Record<string, any> | string>} targets
+ * @param {Record<string, any>} achievementsMap
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<Record<string, any>>}
+ */
+async function enrichEpicPublicAchievementSummaries(targets, achievementsMap, options = {}) {
+  if (!Array.isArray(targets) || targets.length === 0 || options?.skipNetwork) {
+    return achievementsMap;
+  }
+
+  const syncedAt = typeof options?.syncedAt === 'string' && options.syncedAt
+    ? options.syncedAt
+    : new Date().toISOString();
+  const nowMs = typeof options?.nowMs === 'number' && Number.isFinite(options.nowMs)
+    ? options.nowMs
+    : Date.now();
+  const forceRefresh = options?.forceRefresh === true;
+  const budgetMs =
+    typeof options?.publicSchemaBudgetMs === 'number' && options.publicSchemaBudgetMs > 0
+      ? options.publicSchemaBudgetMs
+      : DEFAULT_EPIC_PUBLIC_SCHEMA_ENRICH_BUDGET_MS;
+  const deadlineMs = Date.now() + budgetMs;
+  /** @type {Map<string, Array<{ appNameLower: string, catalogIdLower: string, titleLower: string, normTitle: string }>> | null} */
+  const sandboxMetaLookup =
+    options?.sandboxMetaLookup instanceof Map ? options.sandboxMetaLookup : null;
+
+  /** @type {Map<string, { sandboxId: string, aliases: Array<{ appNameLower: string, catalogIdLower: string, titleLower: string, normTitle: string }> }>} */
+  const uniqueBySandbox = new Map();
+
+  for (const rawTarget of targets) {
+    const t =
+      typeof rawTarget === 'string'
+        ? { sandboxId: rawTarget }
+        : rawTarget && typeof rawTarget === 'object'
+          ? rawTarget
+          : null;
+    if (!t) continue;
+    const sandboxId = String(t.sandboxId || t.namespace || '').trim();
+    const sbLower = sandboxId.toLowerCase();
+    if (!sbLower) continue;
+
+    // Skip sandboxes that already have a known non-empty achievement total
+    if ((achievementsMap[sbLower]?.total || 0) > 0) continue;
+
+    const appNameLower = String(t.appName || t.platformGameId || '')
+      .replace(/^epic[-_]/i, '')
+      .trim()
+      .toLowerCase();
+    const catalogIdLower = String(t.catalogItemId || '').trim().toLowerCase();
+    const titleLower = String(t.title || '').trim().toLowerCase();
+    const normTitle = titleLower.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+
+    if (
+      (appNameLower && (achievementsMap[appNameLower]?.total || 0) > 0) ||
+      (catalogIdLower && (achievementsMap[catalogIdLower]?.total || 0) > 0)
+    ) {
+      continue;
+    }
+
+    let bucket = uniqueBySandbox.get(sbLower);
+    if (!bucket) {
+      bucket = { sandboxId, aliases: [] };
+      uniqueBySandbox.set(sbLower, bucket);
+    }
+    bucket.aliases.push({ appNameLower, catalogIdLower, titleLower, normTitle });
+  }
+
+  if (uniqueBySandbox.size === 0) {
+    return achievementsMap;
+  }
+
+  const cachePath = getEpicPublicAchievementCachePath(options);
+  const cacheEntries = cachePath ? await loadEpicPublicSummaryCacheAsync(cachePath) : {};
+  pruneEpicPublicSummaryCacheEntries(cacheEntries, nowMs);
+  let cacheDirty = false;
+
+  /**
+   * @param {string} sbLower
+   * @param {Array<{ appNameLower: string, catalogIdLower: string, titleLower: string, normTitle: string }>} aliases
+   * @param {number} totalAchievements
+   * @param {number} totalProductXP
+   */
+  const seedSummaryForSandbox = (sbLower, aliases, totalAchievements, totalProductXP) => {
+    if (totalAchievements <= 0) return;
+    const seededSummary = {
+      unlocked: 0,
+      total: totalAchievements,
+      percentage: 0,
+      xp: { earned: 0, total: totalProductXP },
+      isMastered: false,
+      source: 'local_client_cache',
+      syncedAt,
+    };
+    /** @param {string} key */
+    const setIfMissing = (key) => {
+      if (!key) return;
+      if ((achievementsMap[key]?.total || 0) > 0) return;
+      achievementsMap[key] = seededSummary;
+    };
+    setIfMissing(sbLower);
+    const mergedAliases = [...aliases, ...(sandboxMetaLookup?.get(sbLower) || [])];
+    for (const a of mergedAliases) {
+      if (a.appNameLower) {
+        setIfMissing(a.appNameLower);
+        setIfMissing(`epic-${a.appNameLower}`);
+      }
+      if (a.catalogIdLower) setIfMissing(a.catalogIdLower);
+      if (a.titleLower) setIfMissing(a.titleLower);
+      if (a.normTitle) setIfMissing(a.normTitle);
+    }
+  };
+
+  /** @type {Array<{ sbLower: string, sandboxId: string, aliases: Array<{ appNameLower: string, catalogIdLower: string, titleLower: string, normTitle: string }> }>} */
+  const toFetch = [];
+
+  for (const [sbLower, bucket] of uniqueBySandbox.entries()) {
+    const cached = cacheEntries[sbLower];
+    if (cached && typeof cached === 'object') {
+      if (cached.totalAchievements > 0) {
+        if (cached.productId) {
+          setBoundedEpicSandboxProductId(bucket.sandboxId, cached.productId);
+        }
+        seedSummaryForSandbox(
+          sbLower,
+          bucket.aliases,
+          cached.totalAchievements,
+          cached.totalProductXP || 0
+        );
+        continue;
+      }
+      if (!forceRefresh && cached.definitiveNotFound) {
+        continue;
+      }
+    }
+    toFetch.push({ sbLower, sandboxId: bucket.sandboxId, aliases: bucket.aliases });
+  }
+
+  const CONCURRENCY = 12;
+  for (let i = 0; i < toFetch.length; i += CONCURRENCY) {
+    if (options?.signal?.aborted) break;
+    if (Date.now() >= deadlineMs) break;
+
+    const batch = toFetch.slice(i, i + CONCURRENCY);
+    await Promise.all(
+      batch.map(async ({ sbLower, sandboxId, aliases }) => {
+        if (options?.signal?.aborted || Date.now() >= deadlineMs) return;
+        try {
+          const schema = await fetchEpicPublicAchievementSchema(sandboxId, options);
+          if (!schema) return;
+          const total = Number(schema.totalAchievements || 0) || 0;
+          const totalXP = Number(schema.totalProductXP || 0) || 0;
+          if (total > 0) {
+            seedSummaryForSandbox(sbLower, aliases, total, totalXP);
+            cacheEntries[sbLower] = {
+              totalAchievements: total,
+              totalProductXP: totalXP,
+              productId: String(schema.productId || ''),
+              definitiveNotFound: false,
+              cachedAt: nowMs,
+            };
+            cacheDirty = true;
+          } else if (schema.definitiveNotFound) {
+            cacheEntries[sbLower] = {
+              totalAchievements: 0,
+              totalProductXP: 0,
+              productId: String(schema.productId || ''),
+              definitiveNotFound: true,
+              cachedAt: nowMs,
+            };
+            cacheDirty = true;
+          }
+        } catch {}
+      })
+    );
+  }
+
+  if (cacheDirty && cachePath) {
+    pruneEpicPublicSummaryCacheEntries(cacheEntries, nowMs);
+    try {
+      await atomicWriteFileAsync(
+        path.resolve(cachePath),
+        JSON.stringify({ schemaVersion: 1, entries: cacheEntries })
+      );
+    } catch {}
+  }
+
+  return achievementsMap;
+}
+
 function trimEpicAchievementsMemory() {
   epicSchemaFileCache.clear();
+  epicPublicSummaryCacheByPath.clear();
 }
 
 module.exports = {
+  isEpicGraphqlPlayerNotFound,
   isEpicGraphqlAuthFailure,
   computeEpicPartialProgress,
   fetchEpicPublicAchievementSchema,
   fetchEpicDetailedGameAchievements,
   fetchEpicAchievements,
+  enrichEpicPublicAchievementSummaries,
+  getEpicPublicAchievementCachePath,
   getEpicGameAchievementSchema,
   trimEpicAchievementsMemory,
 };

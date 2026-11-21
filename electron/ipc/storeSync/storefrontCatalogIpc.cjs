@@ -1045,8 +1045,17 @@ function registerStorefrontCatalogIpcHandlers({
   ipcMain.handle(
     'epic:fetch-achievements',
     async (/** @type {any} */ _event, /** @type {unknown} */ rawPayload = {}) => {
-      const { accountId, accessToken, sandboxId, namespace, appName, catalogItemId, title } =
-        sanitizeRendererIpcOptions(rawPayload);
+      const {
+        accountId,
+        accessToken,
+        sandboxId,
+        namespace,
+        appName,
+        catalogItemId,
+        title,
+        targets,
+        forceRefresh,
+      } = sanitizeRendererIpcOptions(rawPayload);
       try {
         const savedTokens = storeSync.loadSavedTokens();
         const savedEpic = savedTokens?.epic || {};
@@ -1065,6 +1074,27 @@ function registerStorefrontCatalogIpcHandlers({
             resolvedAccountId = resolvedAccountId || legAuth?.accountId;
           } catch {}
         }
+        const safeTargets = Array.isArray(targets)
+          ? targets
+              .slice(0, 2000)
+              .filter((/** @type {any} */ t) => t && typeof t === 'object')
+              .map((/** @type {any} */ t) => ({
+                ...(typeof t.sandboxId === 'string' && t.sandboxId.trim()
+                  ? { sandboxId: t.sandboxId.trim() }
+                  : {}),
+                ...(typeof t.namespace === 'string' && t.namespace.trim()
+                  ? { namespace: t.namespace.trim() }
+                  : {}),
+                ...(typeof t.appName === 'string' && t.appName.trim()
+                  ? { appName: t.appName.trim() }
+                  : {}),
+                ...(typeof t.catalogItemId === 'string' && t.catalogItemId.trim()
+                  ? { catalogItemId: t.catalogItemId.trim() }
+                  : {}),
+                ...(typeof t.title === 'string' && t.title.trim() ? { title: t.title.trim() } : {}),
+              }))
+              .filter((/** @type {any} */ t) => Boolean(t.sandboxId || t.namespace))
+          : [];
         /** @type {Record<string, any>} */
         const targetOpts = {
           ...(sandboxId ? { sandboxId } : {}),
@@ -1072,9 +1102,12 @@ function registerStorefrontCatalogIpcHandlers({
           ...(appName ? { appName } : {}),
           ...(catalogItemId ? { catalogItemId } : {}),
           ...(title ? { title } : {}),
+          ...(safeTargets.length > 0 ? { targets: safeTargets } : {}),
+          ...(forceRefresh === true ? { forceRefresh: true } : {}),
+          ...(handlerOptions.userDataDir ? { userDataDir: handlerOptions.userDataDir } : {}),
         };
-        const hasTargetFilter = Object.keys(targetOpts).length > 0;
-        let result = hasTargetFilter
+        const hasTargetOpts = Object.keys(targetOpts).length > 0;
+        let result = hasTargetOpts
           ? await storeSync.fetchEpicAchievements(resolvedToken, resolvedAccountId, targetOpts)
           : await storeSync.fetchEpicAchievements(resolvedToken, resolvedAccountId);
         if ((!result || Object.keys(result).length === 0) && savedEpic.refresh_token) {
@@ -1082,7 +1115,7 @@ function registerStorefrontCatalogIpcHandlers({
             const renewed = await storeSync.renewEpicTokens(savedEpic.refresh_token);
             resolvedToken = renewed.access_token;
             resolvedAccountId = renewed.account_id || resolvedAccountId;
-            result = hasTargetFilter
+            result = hasTargetOpts
               ? await storeSync.fetchEpicAchievements(resolvedToken, resolvedAccountId, targetOpts)
               : await storeSync.fetchEpicAchievements(resolvedToken, resolvedAccountId);
           } catch {}

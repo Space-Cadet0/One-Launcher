@@ -181,7 +181,25 @@ export async function runStorefrontTrophySync({
       const epicInteg = integrations.find((i) => i.storefrontId === 'epic' && i.isConnected);
       const epicAccountId = epicInteg?.credentials?.epicAccountId || epicInteg?.accountId || '';
       const epicToken = epicInteg?.credentials?.epicToken;
-      const fetchedEpic = await epicIntegration.fetchUserAchievements(epicAccountId, epicToken);
+      const epicTargets = gamesRef.current.flatMap((g) =>
+        g.platforms
+          .filter((p) => p.platformId === 'epic' && Boolean(p.namespace))
+          .map((p) => ({
+            sandboxId: p.namespace!,
+            namespace: p.namespace!,
+            ...(p.storefrontAppId || p.platformGameId
+              ? { appName: p.storefrontAppId || p.platformGameId }
+              : {}),
+            ...(p.catalogItemId ? { catalogItemId: p.catalogItemId } : {}),
+            title: g.title,
+          }))
+      );
+      const fetchedEpic = await epicIntegration.fetchUserAchievements(
+        epicAccountId,
+        epicToken,
+        epicTargets.length > 0 ? epicTargets : undefined,
+        epicTargets.length > 0 ? { forceRefresh: true } : undefined
+      );
       if (fetchedEpic && Object.keys(fetchedEpic).length > 0) {
         Object.assign(epicAchs, fetchedEpic);
         cacheUserEpicAchievements(epicAchs);

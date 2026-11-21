@@ -40,6 +40,16 @@ export type AchievementDetailStorefrontId = 'steam' | 'gog' | 'epic' | 'xbox';
 
 const LEGACY_LS_DETAILED_PREFIX = 'antigravity_detailed_achievements_';
 const IDB_DETAILED_PREFIX = 'detailed_achievements:';
+const ZERO_ACHIEVEMENT_REVALIDATE_AGE_MS = 5 * 60 * 1000;
+
+function isZeroAchievementEntryStale(entry?: StorefrontAchievementsData): boolean {
+  if (!entry) return false;
+  if ((entry.total || 0) > 0 || (entry.achievements?.length || 0) > 0) return false;
+  if (!entry.syncedAt) return true;
+  const syncedMs = Date.parse(entry.syncedAt);
+  if (Number.isNaN(syncedMs)) return true;
+  return Date.now() - syncedMs > ZERO_ACHIEVEMENT_REVALIDATE_AGE_MS;
+}
 
 function filterMapToOwnedStorefronts(
   map: MultiStoreAchievementsMap,
@@ -605,11 +615,19 @@ export class AchievementDetailService {
     const hasElectronIpc =
       typeof window !== 'undefined' && Boolean(window.electronAPI?.getStoreAchievements);
     if (!forceRefresh && hasUsableCached && cached) {
-      const steamStale = (steamPlat?.achievements?.unlocked || 0) > (cached.steam?.unlocked || 0);
-      const epicStale = (epicPlat?.achievements?.unlocked || 0) > (cached.epic?.unlocked || 0);
-      const gogStale = (gogPlat?.achievements?.unlocked || 0) > (cached.gog?.unlocked || 0);
+      const steamStale =
+        (steamPlat?.achievements?.unlocked || 0) > (cached.steam?.unlocked || 0) ||
+        (steamPlat?.achievements?.total || 0) > (cached.steam?.total || 0);
+      const epicStale =
+        (epicPlat?.achievements?.unlocked || 0) > (cached.epic?.unlocked || 0) ||
+        (epicPlat?.achievements?.total || 0) > (cached.epic?.total || 0) ||
+        isZeroAchievementEntryStale(cached.epic);
+      const gogStale =
+        (gogPlat?.achievements?.unlocked || 0) > (cached.gog?.unlocked || 0) ||
+        (gogPlat?.achievements?.total || 0) > (cached.gog?.total || 0);
       const xboxStale =
         (xboxPlat?.achievements?.unlocked || 0) > (cached.xbox?.unlocked || 0) ||
+        (xboxPlat?.achievements?.total || 0) > (cached.xbox?.total || 0) ||
         (xboxPlat?.achievements?.gamerscore?.earned || 0) > (cached.xbox?.earnedGamerscore || 0);
       const ipcUpgradeNeeded =
         hasElectronIpc &&

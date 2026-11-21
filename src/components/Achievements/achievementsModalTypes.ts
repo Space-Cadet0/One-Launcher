@@ -1,6 +1,6 @@
 import type React from 'react';
 import { CanonicalGame } from '../../contracts/game';
-import { StorefrontId } from '../../contracts/platform';
+import { StorefrontId, STOREFRONT_REGISTRY } from '../../contracts/platform';
 import type { MultiStoreAchievementsMap } from '../../contracts/achievement';
 
 export interface GameAchievementsModalProps {
@@ -78,6 +78,7 @@ export function shouldSwrRevalidateMap(map: MultiStoreAchievementsMap): boolean 
     ) {
       return true;
     }
+    if ((entry.total || 0) === 0 && !entry.syncedAt) return true;
     if (entry.syncedAt) {
       const syncedMs = Date.parse(entry.syncedAt);
       if (!Number.isNaN(syncedMs) && now - syncedMs > SWR_STALE_AGE_MS) {
@@ -94,9 +95,27 @@ export function hasHigherPlatformUnlockedSummary(
 ): boolean {
   return game.platforms.some((plat) => {
     const summaryUnlocked = plat.achievements?.unlocked ?? 0;
-    if (summaryUnlocked <= 0) return false;
+    const summaryTotal = plat.achievements?.total ?? 0;
+    if (summaryUnlocked <= 0 && summaryTotal <= 0) return false;
     const cachedEntry = cachedMap[plat.platformId as StorefrontId];
     if (!cachedEntry) return true;
-    return summaryUnlocked > cachedEntry.unlocked;
+    return summaryUnlocked > cachedEntry.unlocked || summaryTotal > cachedEntry.total;
   });
+}
+
+export function resolveNoAchievementsSubtitle(
+  activeStorefront: StorefrontId,
+  multiStoreData: MultiStoreAchievementsMap
+): string {
+  const otherStorefrontHasAchievements = Object.entries(multiStoreData).some(
+    ([storeKey, data]) => storeKey !== activeStorefront && (data?.total ?? 0) > 0
+  );
+  if (otherStorefrontHasAchievements) {
+    const storeName = STOREFRONT_REGISTRY[activeStorefront]?.name || activeStorefront;
+    return `This publisher did not integrate ${storeName} achievements for this release, though achievements are available on another connected storefront.`;
+  }
+  if (activeStorefront === 'epic') {
+    return 'This release does not have Epic Achievements configured by the publisher on the Epic Games Store (many pre-2021 releases and select editions omit Epic Achievements).';
+  }
+  return 'Classic and retro releases, standalone expansions, or developer tools do not feature achievement tracking.';
 }

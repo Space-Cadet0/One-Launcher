@@ -30,7 +30,10 @@ const {
   extractEpicMacSupportFromLegendaryDirsAsync,
   resolveEpicNamespaceAndIds,
 } = require('./epicAuthAndNamespaces.cjs');
-const { fetchEpicAchievements } = require('./epicAchievementsProvider.cjs');
+const {
+  fetchEpicAchievements,
+  enrichEpicPublicAchievementSummaries,
+} = require('./epicAchievementsProvider.cjs');
 
 const EPIC_OFFER_CACHE_FILENAME = 'one_launcher_epic_offer_cache.json';
 const EPIC_OFFER_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -1777,6 +1780,46 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
         gamesMap.set(gameId, newGame);
         knownAppIds.add(appNameLower);
         if (catalogIdLower) knownAppIds.add(catalogIdLower);
+      }
+    }
+
+    // Backfill public zero-auth Epic achievement schemas (`0/N` + XP) for owned games that
+    // had no entry in `achievementsSummaries` (unplayed/0-earned titles) or local Legendary metadata.
+    if (!options?.skipPublicAchievementEnrichment && !options?.skipNetwork && gamesMap.size > 0) {
+      /** @type {Array<{ sandboxId: string, appName: string, catalogItemId: string, title: string }>} */
+      const missingAchTargets = [];
+      for (const game of gamesMap.values()) {
+        const epicPlat = game?.platforms?.[0];
+        if (!epicPlat || epicPlat.achievements?.total > 0 || !epicPlat.namespace) continue;
+        missingAchTargets.push({
+          sandboxId: String(epicPlat.namespace),
+          appName: String(epicPlat.platformGameId || ''),
+          catalogItemId: String(epicPlat.catalogItemId || ''),
+          title: String(game.title || ''),
+        });
+      }
+      if (missingAchTargets.length > 0) {
+        try {
+          await enrichEpicPublicAchievementSummaries(missingAchTargets, achievementsMap, options);
+          for (const game of gamesMap.values()) {
+            const epicPlat = game?.platforms?.[0];
+            if (!epicPlat || epicPlat.achievements?.total > 0) continue;
+            const nsLower = String(epicPlat.namespace || '').toLowerCase().trim();
+            const appLower = String(epicPlat.platformGameId || '').toLowerCase().trim();
+            const catLower = String(epicPlat.catalogItemId || '').toLowerCase().trim();
+            const titleLower = String(game.title || '').toLowerCase().trim();
+            const normTitle = titleLower.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+            const enrichedAch =
+              (nsLower ? achievementsMap[nsLower] : null) ||
+              (appLower ? achievementsMap[appLower] : null) ||
+              (catLower ? achievementsMap[catLower] : null) ||
+              achievementsMap[titleLower] ||
+              achievementsMap[normTitle];
+            if (enrichedAch && enrichedAch.total > 0) {
+              epicPlat.achievements = enrichedAch;
+            }
+          }
+        } catch {}
       }
     }
   } catch (err) {

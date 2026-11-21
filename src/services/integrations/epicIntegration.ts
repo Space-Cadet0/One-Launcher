@@ -294,34 +294,55 @@ export class EpicIntegrationService {
   }
 
   /**
-   * Fetches user achievement progress from official launcher GraphQL service
+   * Fetches user achievement progress from official launcher GraphQL service,
+   * optionally enriching owned Epic sandboxes that have 0 earned trophies via
+   * Epic's public product achievement schema.
    */
   async fetchUserAchievements(
     epicAccountId: string,
-    accessToken?: string
+    accessToken?: string,
+    targets?: Array<{
+      sandboxId?: string;
+      namespace?: string;
+      appName?: string;
+      catalogItemId?: string;
+      title?: string;
+    }>,
+    options?: { forceRefresh?: boolean }
   ): Promise<Record<string, StoreAchievementSummary>> {
     const cleanAccountId = this.extractEpicAccountId(epicAccountId);
-    if (!cleanAccountId) return {};
+    if (!cleanAccountId && (!targets || targets.length === 0)) return {};
 
     try {
       const cleanToken = accessToken ? normalizeEpicBearerToken(accessToken) : '';
 
       // 1. In Electron desktop runtime, delegate to native IPC if available
       if (hasElectronBridge() && window.electronAPI?.fetchEpicAchievements) {
-        const nativeMap = await window.electronAPI.fetchEpicAchievements(
-          cleanAccountId,
-          accessToken
-        );
+        const hasTargets = Array.isArray(targets) && targets.length > 0;
+        const shouldUsePayloadObject = hasTargets || options?.forceRefresh === true;
+        const nativeMap = shouldUsePayloadObject
+          ? await window.electronAPI.fetchEpicAchievements({
+              ...(cleanAccountId ? { accountId: cleanAccountId } : {}),
+              ...(accessToken !== undefined ? { accessToken } : {}),
+              ...(hasTargets ? { targets } : {}),
+              ...(options?.forceRefresh === true ? { forceRefresh: true } : {}),
+            })
+          : await window.electronAPI.fetchEpicAchievements(
+              cleanAccountId || '',
+              accessToken
+            );
         if (nativeMap && Object.keys(nativeMap).length > 0) {
           cacheUserEpicAchievements(nativeMap);
           return nativeMap;
         }
         // In Electron, OAuth tokens stay encrypted in main-process storage (renderer sees '' or
         // 'saved_in_electron'). Do not issue an unauthenticated direct GraphQL POST from renderer.
-        if (!cleanToken || cleanToken === 'saved_in_electron') {
+        if (!cleanToken || cleanToken === 'saved_in_electron' || !cleanAccountId) {
           return nativeMap || {};
         }
       }
+
+      if (!cleanAccountId) return {};
 
       // 2. Fetch directly or via proxy
       const query = `query playerProfile($epicAccountId: String!, $locale: String!) {
