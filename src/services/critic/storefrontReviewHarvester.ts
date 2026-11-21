@@ -6,9 +6,10 @@ import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 import gogEnrichedCache from '../storage/gogEnrichedCache.json';
 import { KNOWN_EPIC_APP_NAMES } from '../integrations/epicCodenames';
 import { KNOWN_CRITIC_SCORES } from './knownCriticScores';
-import { isTitleCompatible } from './metacriticResolver';
+import { isAnchorSlugCompatible, isTitleCompatible } from './metacriticResolver';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
+import { vaultGet } from '../storage/indexedDbVault';
 import {
   loadStagedCache,
   saveStagedCache,
@@ -64,12 +65,12 @@ function getEpicContentBaseUrl(): string {
 export function extractMetacriticSlugFromUrl(url?: string): string | undefined {
   if (!url || typeof url !== 'string') return undefined;
   try {
-    let clean = url.split('?')[0].split('#')[0].trim();
+    let clean = url.split('?')[0].split('#')[0].trim().replace(/%21/gi, '!');
     clean = clean.replace(/\/+$/, '');
     clean = clean.replace(/\/(?:critic-reviews|user-reviews|details|reviews)(?:\/.*)?$/i, '');
     clean = clean.replace(/\/+$/, '');
 
-    const match = clean.match(/\/game\/(?:[a-z0-9-]+\/)?([a-z0-9-]+)$/i);
+    const match = clean.match(/\/game\/(?:[a-z0-9-]+\/)?([a-z0-9][a-z0-9!-]*)$/i);
     if (match && match[1]) {
       return match[1].toLowerCase();
     }
@@ -81,7 +82,118 @@ export function extractMetacriticSlugFromUrl(url?: string): string | undefined {
 
 const MAX_ANCHOR_CACHE_ENTRIES = 2000;
 
+export interface EnrichedMetadataAnchorSource {
+  appId?: number;
+  name?: string;
+  enrichedSource?: string;
+  metadataQuality?: string;
+  metacritic?: {
+    score?: number;
+    url?: string;
+  };
+}
+
+function isValidMetacriticHostUrl(url?: string): boolean {
+  if (!url || typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    const host = parsed.hostname.toLowerCase();
+    return (
+      (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
+      (host === 'metacritic.com' || host.endsWith('.metacritic.com'))
+    );
+  } catch {
+    return /^https?:\/\/(?:www\.)?metacritic\.com\/game\//i.test(trimmed);
+  }
+}
+
+function parseSteamAppIdValue(appId: string | number | null | undefined): number | null {
+  if (typeof appId === 'number') {
+    return Number.isFinite(appId) && appId > 0 ? Math.trunc(appId) : null;
+  }
+  if (typeof appId === 'string') {
+    const cleaned = appId.trim().replace(/^steam[-_]/i, '');
+    if (!/^\d+$/.test(cleaned)) return null;
+    const parsed = parseInt(cleaned, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+  return null;
+}
+
+/**
+ * Validates and constructs a verified Steam Metacritic anchor from enriched metadata while
+ * strictly excluding legacy `local_federated` GOG star ratings masquerading in `enrichedMetadata.metacritic`
+ * (requiring `enrichedSource !== 'local_federated'` / `metadataQuality !== 'local_federated'` and non-GOG/non-Xbox
+ * provenance, OR a valid `metacritic.com` URL).
+ */
+function buildVerifiedSteamAnchorFromMetadata(
+  steamAppId: number,
+  meta: EnrichedMetadataAnchorSource | null | undefined,
+  options?: { requirePositiveScore?: boolean }
+): StorefrontReviewAnchor | null {
+  if (!meta || typeof meta !== 'object' || !meta.metacritic || typeof meta.metacritic !== 'object') {
+    return null;
+  }
+  if (meta.appId !== undefined && Number(meta.appId) > 0 && Number(meta.appId) !== steamAppId) {
+    return null;
+  }
+
+  const score =
+    typeof meta.metacritic.score === 'number' &&
+    Number.isFinite(meta.metacritic.score) &&
+    meta.metacritic.score > 0
+      ? meta.metacritic.score
+      : undefined;
+  const rawUrl =
+    typeof meta.metacritic.url === 'string' && meta.metacritic.url.trim()
+      ? meta.metacritic.url.trim()
+      : undefined;
+  const hasValidMcUrl = isValidMetacriticHostUrl(rawUrl);
+  const slug = hasValidMcUrl ? extractMetacriticSlugFromUrl(rawUrl) : undefined;
+
+  const isLegacyFederated =
+    meta.metadataQuality === 'local_federated' ||
+    meta.enrichedSource === 'local_federated';
+  const isNonSteamSource =
+    typeof meta.enrichedSource === 'string' &&
+    meta.enrichedSource.trim().length > 0 &&
+    meta.enrichedSource !== 'steam';
+
+  // Exclude legacy local_federated / GOG star ratings masquerading in enrichedMetadata.metacritic
+  if ((isLegacyFederated || isNonSteamSource) && !hasValidMcUrl) {
+    return null;
+  }
+
+  if (options?.requirePositiveScore) {
+    if (score === undefined) return null;
+    if (!hasValidMcUrl && meta.enrichedSource !== 'steam') {
+      return null;
+    }
+  } else if (score === undefined && !hasValidMcUrl) {
+    return null;
+  }
+
+  const canonicalMcUrl = slug
+    ? `https://www.metacritic.com/game/${slug}/critic-reviews/`
+    : hasValidMcUrl
+    ? rawUrl
+    : undefined;
+
+  return {
+    storefront: 'steam',
+    metacriticUrl: canonicalMcUrl,
+    metacriticScore: score,
+    metacriticSlug: slug,
+    rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
+    isVerifiedGroundTruth: true,
+  };
+}
+
 interface EnrichedSteamAnchorRecord {
+  enrichedSource?: string;
+  metadataQuality?: string;
   metacritic?: {
     score?: number;
     url?: string;
@@ -278,8 +390,113 @@ export class StorefrontReviewHarvester {
   }
 
   /**
+   * Checks IndexedDB `enriched_metadata:<appId>` and caches any verified Steam Metacritic anchor
+   * (`score > 0`, `url` on `metacritic.com` or `enrichedSource === 'steam'`, strictly excluding
+   * legacy `local_federated` GOG star ratings) into `storefrontReviewHarvester`.
+   */
+  public async recoverSteamAnchorFromVault(
+    appId: string | number
+  ): Promise<StorefrontReviewAnchor | null> {
+    const steamAppId = parseSteamAppIdValue(appId);
+    if (!steamAppId) return null;
+
+    const cacheKey = `steam-${steamAppId}`;
+    const existing = this.anchorCache.get(cacheKey);
+    if (existing) {
+      return existing;
+    }
+
+    try {
+      const vaulted = await vaultGet<EnrichedMetadataAnchorSource>(`enriched_metadata:${steamAppId}`);
+      const anchor = buildVerifiedSteamAnchorFromMetadata(steamAppId, vaulted, {
+        requirePositiveScore: true,
+      });
+      if (anchor) {
+        this.setAnchorCacheBounded(cacheKey, anchor);
+        return anchor;
+      }
+    } catch {
+      // IndexedDB unavailable or read error; fail open to caller
+    }
+    return null;
+  }
+
+  /**
+   * Synchronously harvests a verified Steam Metacritic anchor directly from an in-memory game's
+   * `enrichedMetadata`, strictly excluding legacy `local_federated` GOG star ratings masquerading
+   * inside `enrichedMetadata.metacritic` (requiring `enrichedSource !== 'local_federated'` /
+   * `metadataQuality !== 'local_federated'` or a valid `metacritic.com` URL).
+   */
+  public harvestFromGame(game: {
+    title?: string;
+    steamAppId?: number | null;
+    platforms?: Array<{ platformId: string; platformGameId?: string; xboxProductId?: string }>;
+    id?: string;
+    enrichedMetadata?: EnrichedMetadataAnchorSource | null;
+  }): StorefrontReviewAnchor | null {
+    if (!game?.enrichedMetadata) return null;
+
+    let effectiveSteamAppId: number | null = parseSteamAppIdValue(game.steamAppId);
+    if (!effectiveSteamAppId) {
+      const steamPlat = game.platforms?.find((p) => p.platformId === 'steam' && p.platformGameId);
+      if (steamPlat?.platformGameId) {
+        effectiveSteamAppId = parseSteamAppIdValue(steamPlat.platformGameId);
+      } else if (game.id?.startsWith('steam-')) {
+        effectiveSteamAppId = parseSteamAppIdValue(game.id);
+      }
+    }
+
+    if (effectiveSteamAppId) {
+      const anchor = buildVerifiedSteamAnchorFromMetadata(effectiveSteamAppId, game.enrichedMetadata);
+      if (anchor) {
+        this.setAnchorCacheBounded(`steam-${effectiveSteamAppId}`, anchor);
+        if (game.id && game.id !== `steam-${effectiveSteamAppId}`) {
+          this.setAnchorCacheBounded(game.id, anchor);
+        }
+        return anchor;
+      }
+      return null;
+    }
+
+    // For non-Steam games without a Steam AppID, only trust enrichedMetadata.metacritic when it carries
+    // an explicit valid metacritic.com URL (never bare local_federated GOG star ratings).
+    const mc = game.enrichedMetadata.metacritic;
+    const rawUrl = typeof mc?.url === 'string' ? mc.url.trim() : undefined;
+    if (!isValidMetacriticHostUrl(rawUrl)) {
+      return null;
+    }
+    const slug = extractMetacriticSlugFromUrl(rawUrl);
+    if (!slug) return null;
+    const score =
+      typeof mc?.score === 'number' && Number.isFinite(mc.score) && mc.score > 0
+        ? mc.score
+        : undefined;
+    const gogPlat = game.platforms?.find((p) => p.platformId?.toLowerCase() === 'gog');
+    const epicPlat = game.platforms?.find((p) => p.platformId?.toLowerCase() === 'epic');
+    const xboxPlat = game.platforms?.find((p) => p.platformId?.toLowerCase() === 'xbox');
+    const storefront: StorefrontReviewAnchor['storefront'] = gogPlat
+      ? 'gog'
+      : epicPlat
+      ? 'epic'
+      : xboxPlat
+      ? 'xbox'
+      : 'steam';
+    const anchor: StorefrontReviewAnchor = {
+      storefront,
+      metacriticUrl: `https://www.metacritic.com/game/${slug}/critic-reviews/`,
+      metacriticScore: score,
+      metacriticSlug: slug,
+      isVerifiedGroundTruth: true,
+    };
+    if (game.id) {
+      this.setAnchorCacheBounded(game.id, anchor);
+    }
+    return anchor;
+  }
+
+  /**
    * Harvests an authoritative Metacritic review anchor for a Steam title.
-   * Inspects local cache first before performing rate-limited network lookups.
+   * Inspects local cache and IndexedDB vault first before performing rate-limited network lookups.
    */
   async getSteamAnchor(steamAppId: number): Promise<StorefrontReviewAnchor | null> {
     if (!steamAppId || typeof steamAppId !== 'number' || steamAppId <= 0) {
@@ -295,46 +512,24 @@ export class StorefrontReviewHarvester {
 
     // 1. Check local steamEnrichedCache first
     const preCached = STEAM_ENRICHED_ANCHOR_MAP[String(steamAppId)];
-    if (preCached?.metacritic) {
-      const score = typeof preCached.metacritic.score === 'number' ? preCached.metacritic.score : undefined;
-      const url = typeof preCached.metacritic.url === 'string' ? preCached.metacritic.url : undefined;
-      const slug = extractMetacriticSlugFromUrl(url);
-
-      if (score !== undefined || url) {
-        const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : url;
-        const anchor: StorefrontReviewAnchor = {
-          storefront: 'steam',
-          metacriticUrl: canonicalMcUrl,
-          metacriticScore: score,
-          metacriticSlug: slug,
-          rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
-          isVerifiedGroundTruth: true,
-        };
-        this.setAnchorCacheBounded(cacheKey, anchor);
-        return anchor;
-      }
+    const preCachedAnchor = buildVerifiedSteamAnchorFromMetadata(steamAppId, preCached);
+    if (preCachedAnchor) {
+      this.setAnchorCacheBounded(cacheKey, preCachedAnchor);
+      return preCachedAnchor;
     }
 
-    // 2. Check steamApi in-memory cache
+    // 2. Check steamApi in-memory cache (excluding legacy local_federated GOG star ratings)
     const cachedMeta = steamApi.getCachedMetadata(steamAppId);
-    if (cachedMeta?.metacritic) {
-      const score = typeof cachedMeta.metacritic.score === 'number' ? cachedMeta.metacritic.score : undefined;
-      const url = typeof cachedMeta.metacritic.url === 'string' ? cachedMeta.metacritic.url : undefined;
-      const slug = extractMetacriticSlugFromUrl(url);
+    const cachedMetaAnchor = buildVerifiedSteamAnchorFromMetadata(steamAppId, cachedMeta);
+    if (cachedMetaAnchor) {
+      this.setAnchorCacheBounded(cacheKey, cachedMetaAnchor);
+      return cachedMetaAnchor;
+    }
 
-      if (score !== undefined || url) {
-        const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : url;
-        const anchor: StorefrontReviewAnchor = {
-          storefront: 'steam',
-          metacriticUrl: canonicalMcUrl,
-          metacriticScore: score,
-          metacriticSlug: slug,
-          rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
-          isVerifiedGroundTruth: true,
-        };
-        this.setAnchorCacheBounded(cacheKey, anchor);
-        return anchor;
-      }
+    // 2.5. Recover verified Steam Metacritic anchor from IndexedDB vault (`enriched_metadata:<appId>`)
+    const vaultAnchor = await this.recoverSteamAnchorFromVault(steamAppId);
+    if (vaultAnchor) {
+      return vaultAnchor;
     }
 
     let sawTransientError = !onlineLifecycleManager.isOnline() || steamApi.isStoreRateLimited();
@@ -345,24 +540,10 @@ export class StorefrontReviewHarvester {
     if (!isKnown404 && onlineLifecycleManager.isOnline() && !steamApi.isStoreRateLimited()) {
       try {
         const liveMeta = await steamApi.fetchGameMetadata(steamAppId);
-        if (liveMeta?.metacritic) {
-          const score = typeof liveMeta.metacritic.score === 'number' ? liveMeta.metacritic.score : undefined;
-          const url = typeof liveMeta.metacritic.url === 'string' ? liveMeta.metacritic.url : undefined;
-          const slug = extractMetacriticSlugFromUrl(url);
-
-          if (score !== undefined || url) {
-            const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : url;
-            const anchor: StorefrontReviewAnchor = {
-              storefront: 'steam',
-              metacriticUrl: canonicalMcUrl,
-              metacriticScore: score,
-              metacriticSlug: slug,
-              rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
-              isVerifiedGroundTruth: true,
-            };
-            this.setAnchorCacheBounded(cacheKey, anchor);
-            return anchor;
-          }
+        const liveMetaAnchor = buildVerifiedSteamAnchorFromMetadata(steamAppId, liveMeta);
+        if (liveMetaAnchor) {
+          this.setAnchorCacheBounded(cacheKey, liveMetaAnchor);
+          return liveMetaAnchor;
         }
 
         // Only fire fallback direct fetch if liveMeta was null AND steamApi did not record a 404/delisted AppID
@@ -406,7 +587,7 @@ export class StorefrontReviewHarvester {
                 const url = typeof appData.metacritic.url === 'string' ? appData.metacritic.url : undefined;
                 const slug = extractMetacriticSlugFromUrl(url);
 
-                if ((score !== undefined || url) && (!slug || !appData.name || isTitleCompatible(appData.name, slug.replace(/-/g, ' ')))) {
+                if ((score !== undefined || url) && (!slug || !appData.name || isAnchorSlugCompatible(appData.name, slug))) {
                   const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : url;
                   const anchor: StorefrontReviewAnchor = {
                     storefront: 'steam',
@@ -945,8 +1126,17 @@ export class StorefrontReviewHarvester {
     steamAppId?: number | null;
     platforms?: Array<{ platformId: string; platformGameId?: string; xboxProductId?: string }>;
     id?: string;
+    enrichedMetadata?: EnrichedMetadataAnchorSource | null;
   }): Promise<StorefrontReviewAnchor | null> {
     if (!game) return null;
+
+    // Fast path: harvest directly from verified in-memory game.enrichedMetadata (excluding legacy local_federated GOG scores)
+    if (game.enrichedMetadata) {
+      const harvested = this.harvestFromGame(game);
+      if (harvested) {
+        return harvested;
+      }
+    }
 
     // Determine primary cache key
     let cacheKey = '';
@@ -1180,3 +1370,13 @@ export class StorefrontReviewHarvester {
 }
 
 export const storefrontReviewHarvester = new StorefrontReviewHarvester();
+
+/**
+ * Standalone helper to recover a verified Steam Metacritic anchor from IndexedDB
+ * (`enriched_metadata:<appId>`) and populate `storefrontReviewHarvester`'s cache.
+ */
+export async function recoverSteamAnchorFromVault(
+  appId: string | number
+): Promise<StorefrontReviewAnchor | null> {
+  return storefrontReviewHarvester.recoverSteamAnchorFromVault(appId);
+}
