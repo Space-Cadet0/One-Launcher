@@ -1,10 +1,11 @@
+// @ts-check
 'use strict';
 
 const fs = require('node:fs');
 const path = require('node:path');
-const crypto = require('node:crypto');
 const { Worker, isMainThread, parentPort, workerData } = require('node:worker_threads');
 
+const { isContainedWithinRoot } = require('../../launcher/securityAndPathUtils.cjs');
 const {
   XVD_PAGE_SIZE,
   bytesToPages,
@@ -201,8 +202,7 @@ function resolveSafeDestinationPath(installRoot, rawContainerPath, stripFilesPre
   const rootResolved = path.resolve(installRoot);
   const relPath = normalizeRelativeInstallPath(rawContainerPath, stripFilesPrefix);
   const targetPath = path.resolve(rootResolved, ...relPath.split('/'));
-  const rootWithSep = rootResolved.endsWith(path.sep) ? rootResolved : `${rootResolved}${path.sep}`;
-  if (!targetPath.startsWith(rootWithSep)) {
+  if (!isContainedWithinRoot(rootResolved, targetPath) || targetPath === rootResolved) {
     throw new Error(`Path traversal / containment violation: "${rawContainerPath}" escaped "${rootResolved}"`);
   }
   return targetPath;
@@ -210,11 +210,7 @@ function resolveSafeDestinationPath(installRoot, rawContainerPath, stripFilesPre
 
 async function ensureSafeTargetFilePath(installRootResolved, relPath) {
   const targetPath = path.resolve(installRootResolved, ...relPath.split('/'));
-  const rootWithSep = installRootResolved.endsWith(path.sep)
-    ? installRootResolved
-    : `${installRootResolved}${path.sep}`;
-
-  if (!targetPath.startsWith(rootWithSep)) {
+  if (!isContainedWithinRoot(installRootResolved, targetPath) || targetPath === installRootResolved) {
     throw new Error(`Path containment violation: "${relPath}" escaped "${installRootResolved}"`);
   }
 
@@ -223,6 +219,9 @@ async function ensureSafeTargetFilePath(installRootResolved, relPath) {
   let cursor = installRootResolved;
   for (const part of relDirParts) {
     cursor = path.join(cursor, part);
+    if (!isContainedWithinRoot(installRootResolved, cursor) || cursor === installRootResolved) {
+      throw new Error(`Path containment violation at directory "${cursor}"`);
+    }
     try {
       const st = await fs.promises.lstat(cursor);
       if (st.isSymbolicLink()) {
@@ -241,14 +240,20 @@ async function ensureSafeTargetFilePath(installRootResolved, relPath) {
     }
   }
 
-  // Ensure target itself is not an existing symlink
-  try {
-    const existing = await fs.promises.lstat(targetPath);
-    if (existing.isSymbolicLink()) {
-      throw new Error(`Symlink overwrite blocked at "${targetPath}"`);
+  // Ensure neither the target nor its `.olpart` staging file is an existing symlink
+  const partPath = `${targetPath}.olpart`;
+  if (!isContainedWithinRoot(installRootResolved, partPath) || partPath === installRootResolved) {
+    throw new Error(`Path containment violation at staging path "${partPath}"`);
+  }
+  for (const candidate of [targetPath, partPath]) {
+    try {
+      const existing = await fs.promises.lstat(candidate);
+      if (existing.isSymbolicLink()) {
+        throw new Error(`Symlink overwrite blocked at "${candidate}"`);
+      }
+    } catch (err) {
+      if (!err || err.code !== 'ENOENT') throw err;
     }
-  } catch (err) {
-    if (!err || err.code !== 'ENOENT') throw err;
   }
 
   return targetPath;
@@ -322,8 +327,13 @@ function createJournalCheckpointer(journalPath, journalState) {
     const tmpPath = `${journalPath}.tmp.${process.pid}`;
     writeChain = writeChain
       .then(async () => {
-        await fs.promises.writeFile(tmpPath, payload, 'utf8');
-        await fs.promises.rename(tmpPath, journalPath);
+        try {
+          await fs.promises.writeFile(tmpPath, payload, 'utf8');
+          await fs.promises.rename(tmpPath, journalPath);
+        } catch (err) {
+          await fs.promises.unlink(tmpPath).catch(() => {});
+          throw err;
+        }
       })
       .catch(() => {});
     return writeChain;
@@ -509,6 +519,9 @@ async function extractMsixvcStream(options = {}) {
         headers: options.headers,
         fetchImpl: options.fetchImpl,
         timeoutMs: options.timeoutMs,
+        allowLocalhost: options.allowLocalhost,
+        maxRedirects: options.maxRedirects,
+        allowedHosts: options.allowedHosts,
       });
     }
   }
@@ -617,7 +630,9 @@ async function extractMsixvcStream(options = {}) {
         const [rawPages, spanL0] = await Promise.all([
           rangeReader.readRange(pageAlignedStart, alignedByteLen, activeSig),
           run.isEncrypted || hashTreeEnabled
-            ? readL0EntriesForPages(rangeReader, layout, pageAlignedStart, pageCount, activeSig)
+            ? readL0EntriesForPages(rangeReader, layout, pageAlignedStart, pageCount, activeSig, {
+                topHashBlockHash: hashTreeEnabled ? header.topHashBlockHash : null,
+              })
             : Promise.resolve(null),
         ]);
 
@@ -671,7 +686,7 @@ async function extractMsixvcStream(options = {}) {
     const normalizedSegments = [];
 
     for (const seg of mappedSegments) {
-      const relPath = normalizeRelativeInstallPath(seg.path, stripFilesPrefix);
+      const relPath = normalizeRelativeInstallPath(seg.path || seg.rawPath, stripFilesPrefix);
       const normKey = relPath.toLowerCase();
       const segEntry = { ...seg, relPath };
       normalizedSegments.push(segEntry);
@@ -686,7 +701,7 @@ async function extractMsixvcStream(options = {}) {
     /** @type {Array<{ relPath: string, fileSize: number, encryptedSubRuns?: Array<Record<string, any>>, readRange?: ((offset: number, len: number, sig?: AbortSignal) => Promise<Buffer>) | null, getBytes: (sig?: AbortSignal) => Promise<Buffer> }>} */
     const extraInlineFiles = [];
     for (const entry of userData.entries) {
-      const relPath = normalizeRelativeInstallPath(entry.path, stripFilesPrefix);
+      const relPath = normalizeRelativeInstallPath(entry.path || entry.rawPath, stripFilesPrefix);
       const normKey = relPath.toLowerCase();
       if (normKey === 'segmentmetadata.bin') continue;
       if (seenRelPaths.has(normKey)) continue;
@@ -705,7 +720,7 @@ async function extractMsixvcStream(options = {}) {
     }
 
     for (const nf of ntfsFiles) {
-      const relPath = normalizeRelativeInstallPath(nf.path, stripFilesPrefix);
+      const relPath = normalizeRelativeInstallPath(nf.path || nf.rawPath, stripFilesPrefix);
       const normKey = relPath.toLowerCase();
       if (normKey === 'segmentmetadata.bin') continue;
 
@@ -889,13 +904,27 @@ async function extractMsixvcStream(options = {}) {
     };
 
     // Determine which files are already verified complete on disk from a prior resumed run
+    // Uses lstat across every relative segment so symlinks inside installDir are never followed.
     const isFileAlreadyComplete = async (relPath, expectedSize) => {
       const rec = journal.completedFiles[relPath];
       if (!rec || rec.size !== expectedSize) return false;
       try {
-        const target = path.resolve(installRootResolved, ...relPath.split('/'));
-        const st = await fs.promises.stat(target);
-        return st.isFile() && st.size === expectedSize;
+        const parts = relPath.split('/');
+        let cursor = installRootResolved;
+        for (let i = 0; i < parts.length; i += 1) {
+          cursor = path.join(cursor, parts[i]);
+          if (!isContainedWithinRoot(installRootResolved, cursor) || cursor === installRootResolved) {
+            return false;
+          }
+          const st = await fs.promises.lstat(cursor);
+          if (st.isSymbolicLink()) return false;
+          if (i < parts.length - 1) {
+            if (!st.isDirectory()) return false;
+          } else {
+            return st.isFile() && st.size === expectedSize;
+          }
+        }
+        return false;
       } catch {
         return false;
       }
@@ -904,82 +933,93 @@ async function extractMsixvcStream(options = {}) {
     let resumedUnits = 0;
 
     // Step 1: Stream unencrypted inline metadata / NTFS bootstrap files in bounded 4 MiB chunks (D4.4)
-    for (const inlineFile of extraInlineFiles) {
-      throwIfAborted(signal);
-      if (await isFileAlreadyComplete(inlineFile.relPath, inlineFile.fileSize)) {
-        bytesDownloaded += inlineFile.fileSize;
-        completedFilesCount += 1;
-        resumedUnits += 1;
-        continue;
-      }
-      const targetPath = await ensureSafeTargetFilePath(installRootResolved, inlineFile.relPath);
-      const tmpPath = `${targetPath}.olpart`;
-      let totalWritten = 0;
+    try {
+      for (const inlineFile of extraInlineFiles) {
+        throwIfAborted(signal);
+        if (await isFileAlreadyComplete(inlineFile.relPath, inlineFile.fileSize)) {
+          bytesDownloaded += inlineFile.fileSize;
+          completedFilesCount += 1;
+          resumedUnits += 1;
+          continue;
+        }
+        const targetPath = await ensureSafeTargetFilePath(installRootResolved, inlineFile.relPath);
+        const tmpPath = `${targetPath}.olpart`;
+        let totalWritten = 0;
 
-      if (typeof inlineFile.readRange === 'function') {
-        const fh = await fs.promises.open(tmpPath, 'w');
-        try {
-          let logicalOff = 0;
-          while (logicalOff < inlineFile.fileSize) {
-            throwIfAborted(signal);
-            const want = Math.min(NTFS_STREAM_CHUNK_BYTES, inlineFile.fileSize - logicalOff);
-            const chunk = await inlineFile.readRange(logicalOff, want, signal);
-            if (!chunk || chunk.length === 0) {
-              throw new Error(
-                `Truncated NTFS stream read for "${inlineFile.relPath}" at offset ${logicalOff}/${inlineFile.fileSize}`
-              );
+        if (typeof inlineFile.readRange === 'function') {
+          const fh = await fs.promises.open(tmpPath, 'w');
+          try {
+            let logicalOff = 0;
+            while (logicalOff < inlineFile.fileSize) {
+              throwIfAborted(signal);
+              const want = Math.min(NTFS_STREAM_CHUNK_BYTES, inlineFile.fileSize - logicalOff);
+              const chunk = await inlineFile.readRange(logicalOff, want, signal);
+              if (!chunk || chunk.length === 0) {
+                throw new Error(
+                  `Truncated NTFS stream read for "${inlineFile.relPath}" at offset ${logicalOff}/${inlineFile.fileSize}`
+                );
+              }
+              let chunkOff = 0;
+              while (chunkOff < chunk.length) {
+                const { bytesWritten } = await fh.write(
+                  chunk,
+                  chunkOff,
+                  chunk.length - chunkOff,
+                  logicalOff + chunkOff
+                );
+                if (bytesWritten <= 0) {
+                  throw new Error(`Short disk write on "${tmpPath}"`);
+                }
+                chunkOff += bytesWritten;
+              }
+              logicalOff += chunk.length;
+              totalWritten += chunk.length;
+              bytesDownloaded += chunk.length;
+              emitProgress('downloading', `Streaming ${inlineFile.relPath}`);
             }
-            let chunkOff = 0;
-            while (chunkOff < chunk.length) {
-              const { bytesWritten } = await fh.write(
-                chunk,
-                chunkOff,
-                chunk.length - chunkOff,
-                logicalOff + chunkOff
-              );
+          } catch (streamErr) {
+            await fh.close().catch(() => {});
+            await fs.promises.unlink(tmpPath).catch(() => {});
+            throw streamErr;
+          }
+          await fh.close();
+        } else {
+          const data = await inlineFile.getBytes(signal);
+          const fh = await fs.promises.open(tmpPath, 'w');
+          try {
+            let off = 0;
+            while (off < data.length) {
+              const sliceLen = Math.min(NTFS_STREAM_CHUNK_BYTES, data.length - off);
+              const { bytesWritten } = await fh.write(data, off, sliceLen, off);
               if (bytesWritten <= 0) {
                 throw new Error(`Short disk write on "${tmpPath}"`);
               }
-              chunkOff += bytesWritten;
+              off += bytesWritten;
             }
-            logicalOff += chunk.length;
-            totalWritten += chunk.length;
-            bytesDownloaded += chunk.length;
-            emitProgress('downloading', `Streaming ${inlineFile.relPath}`);
+            totalWritten = data.length;
+          } catch (writeErr) {
+            await fh.close().catch(() => {});
+            await fs.promises.unlink(tmpPath).catch(() => {});
+            throw writeErr;
           }
-        } catch (streamErr) {
-          await fh.close().catch(() => {});
-          await fs.promises.unlink(tmpPath).catch(() => {});
-          throw streamErr;
+          await fh.close();
+          bytesDownloaded += inlineFile.fileSize;
         }
-        await fh.close();
-      } else {
-        const data = await inlineFile.getBytes(signal);
-        const fh = await fs.promises.open(tmpPath, 'w');
-        try {
-          let off = 0;
-          while (off < data.length) {
-            const sliceLen = Math.min(NTFS_STREAM_CHUNK_BYTES, data.length - off);
-            const { bytesWritten } = await fh.write(data, off, sliceLen, off);
-            if (bytesWritten <= 0) {
-              throw new Error(`Short disk write on "${tmpPath}"`);
-            }
-            off += bytesWritten;
-          }
-          totalWritten = data.length;
-        } catch (writeErr) {
-          await fh.close().catch(() => {});
-          await fs.promises.unlink(tmpPath).catch(() => {});
-          throw writeErr;
-        }
-        await fh.close();
-        bytesDownloaded += inlineFile.fileSize;
-      }
 
-      await fs.promises.rename(tmpPath, targetPath);
-      journal.completedFiles[inlineFile.relPath] = { size: totalWritten };
-      checkpointer.scheduleFlush();
-      completedFilesCount += 1;
+        try {
+          throwIfAborted(signal);
+          await fs.promises.rename(tmpPath, targetPath);
+        } catch (renameErr) {
+          await fs.promises.unlink(tmpPath).catch(() => {});
+          throw renameErr;
+        }
+        journal.completedFiles[inlineFile.relPath] = { size: totalWritten };
+        checkpointer.scheduleFlush();
+        completedFilesCount += 1;
+      }
+    } catch (inlineErr) {
+      await checkpointer.flushNow();
+      throw inlineErr;
     }
 
     // Step 2: Filter remaining segments & build coalesced 8–16 MiB Range work queue
@@ -1028,7 +1068,7 @@ async function extractMsixvcStream(options = {}) {
       if (rawSet.size > 0) {
         const targetPath = await ensureSafeTargetFilePath(installRootResolved, relPath);
         const partPath = `${targetPath}.olpart`;
-        const partStat = await fs.promises.stat(partPath).catch(() => null);
+        const partStat = await fs.promises.lstat(partPath).catch(() => null);
 
         let contiguousPrefixCount = 0;
         while (contiguousPrefixCount < sliceCount && rawSet.has(contiguousPrefixCount)) {
@@ -1045,6 +1085,7 @@ async function extractMsixvcStream(options = {}) {
 
         if (
           !partStat ||
+          partStat.isSymbolicLink() ||
           !partStat.isFile() ||
           contiguousPrefixCount === 0 ||
           partStat.size < requiredPartBytes
@@ -1071,6 +1112,8 @@ async function extractMsixvcStream(options = {}) {
         handlePromise: null,
         targetPath: null,
         partPath: null,
+        finalizing: false,
+        finalized: false,
       });
     }
 
@@ -1098,6 +1141,7 @@ async function extractMsixvcStream(options = {}) {
         try {
           await fs.promises.truncate(partPath, st.seg.fileSize);
           await fs.promises.rename(partPath, targetPath);
+          st.finalized = true;
           journal.completedFiles[st.seg.relPath] = { size: st.seg.fileSize };
           delete journal.completedLargeSlices[st.seg.relPath];
           completedFilesCount += 1;
@@ -1116,10 +1160,11 @@ async function extractMsixvcStream(options = {}) {
           const partPath = `${targetPath}.olpart`;
           st.targetPath = targetPath;
           st.partPath = partPath;
-          const exists = await fs.promises
-            .stat(partPath)
-            .then(() => true)
-            .catch(() => false);
+          const partStat = await fs.promises.lstat(partPath).catch(() => null);
+          if (partStat && partStat.isSymbolicLink()) {
+            throw new Error(`Symlink overwrite blocked at "${partPath}"`);
+          }
+          const exists = Boolean(partStat && partStat.isFile());
           return fs.promises.open(partPath, exists ? 'r+' : 'w+');
         })();
       }
@@ -1129,17 +1174,34 @@ async function extractMsixvcStream(options = {}) {
     const workerCount = Math.max(1, Math.min(6, Number(concurrency) || DEFAULT_CONCURRENCY));
     let queueCursor = 0;
 
+    // Internal abort controller propagated to all sibling runners on first error or outer abort
+    // so Promise.allSettled waits for every runner to finish using file handles before cleanup.
+    const runAbortCtrl = new AbortController();
+    const runSignal = runAbortCtrl.signal;
+    /** @type {(() => void) | null} */
+    let onOuterAbort = null;
+    if (signal) {
+      if (signal.aborted) {
+        runAbortCtrl.abort();
+      } else {
+        onOuterAbort = () => runAbortCtrl.abort();
+        signal.addEventListener('abort', onOuterAbort, { once: true });
+      }
+    }
+
     const processWorkUnit = async (unit) => {
-      throwIfAborted(signal);
+      throwIfAborted(runSignal);
 
       if (unit.type === 'coalesced_segments') {
         const spanBytes = unit.endDiskOffset - unit.diskOffset;
         const anyEncrypted = unit.segments.some((s) => s.isEncrypted);
         const totalSpanPages = Math.floor(spanBytes / XVD_PAGE_SIZE);
         const [rawChunk, spanL0] = await Promise.all([
-          rangeReader.readRange(unit.diskOffset, spanBytes, signal),
+          rangeReader.readRange(unit.diskOffset, spanBytes, runSignal),
           anyEncrypted || hashTreeEnabled
-            ? readL0EntriesForPages(rangeReader, layout, unit.diskOffset, totalSpanPages, signal)
+            ? readL0EntriesForPages(rangeReader, layout, unit.diskOffset, totalSpanPages, runSignal, {
+                topHashBlockHash: hashTreeEnabled ? header.topHashBlockHash : null,
+              })
             : Promise.resolve(null),
         ]);
         if (rawChunk.length < spanBytes) {
@@ -1151,7 +1213,7 @@ async function extractMsixvcStream(options = {}) {
         const spanDataUnits = spanL0 ? spanL0.dataUnits : null;
 
         for (const seg of unit.segments) {
-          throwIfAborted(signal);
+          throwIfAborted(runSignal);
           const relByteStart = seg.diskOffset - unit.diskOffset;
           const relPageStart = Math.floor(relByteStart / XVD_PAGE_SIZE);
           const segRawAligned = rawChunk.subarray(relByteStart, relByteStart + seg.alignedByteLength);
@@ -1187,8 +1249,14 @@ async function extractMsixvcStream(options = {}) {
 
           const targetPath = await ensureSafeTargetFilePath(installRootResolved, seg.relPath);
           const tmpPath = `${targetPath}.olpart`;
-          await fs.promises.writeFile(tmpPath, plainBuffer);
-          await fs.promises.rename(tmpPath, targetPath);
+          try {
+            await fs.promises.writeFile(tmpPath, plainBuffer);
+            throwIfAborted(runSignal);
+            await fs.promises.rename(tmpPath, targetPath);
+          } catch (writeErr) {
+            await fs.promises.unlink(tmpPath).catch(() => {});
+            throw writeErr;
+          }
 
           journal.completedFiles[seg.relPath] = { size: seg.fileSize };
           checkpointer.scheduleFlush();
@@ -1203,9 +1271,11 @@ async function extractMsixvcStream(options = {}) {
         const { seg, sliceIndex, diskOffset, alignedByteLength, fileOffset, plainByteLength } = unit;
         const pageCount = bytesToPages(alignedByteLength);
         const [rawSlice, sliceL0] = await Promise.all([
-          rangeReader.readRange(diskOffset, alignedByteLength, signal),
+          rangeReader.readRange(diskOffset, alignedByteLength, runSignal),
           seg.isEncrypted || hashTreeEnabled
-            ? readL0EntriesForPages(rangeReader, layout, diskOffset, pageCount, signal)
+            ? readL0EntriesForPages(rangeReader, layout, diskOffset, pageCount, runSignal, {
+                topHashBlockHash: hashTreeEnabled ? header.topHashBlockHash : null,
+              })
             : Promise.resolve(null),
         ]);
 
@@ -1240,10 +1310,12 @@ async function extractMsixvcStream(options = {}) {
           plainSlice = rawSlice.subarray(0, plainByteLength);
         }
 
+        throwIfAborted(runSignal);
         const st = largeFileStates.get(seg.relPath);
         const fh = await ensureLargeFileHandle(st);
         let written = 0;
         while (written < plainSlice.length) {
+          throwIfAborted(runSignal);
           const { bytesWritten } = await fh.write(
             plainSlice,
             written,
@@ -1258,12 +1330,14 @@ async function extractMsixvcStream(options = {}) {
         journal.completedLargeSlices[seg.relPath] = Array.from(st.completedSet);
         bytesDownloaded += plainByteLength;
 
-        if (st.completedSet.size >= st.sliceCount) {
+        if (st.completedSet.size >= st.sliceCount && !st.finalizing) {
+          st.finalizing = true;
           await fh.truncate(seg.fileSize);
           await fh.sync();
           await fh.close();
           st.handlePromise = null;
           await fs.promises.rename(st.partPath, st.targetPath);
+          st.finalized = true;
           journal.completedFiles[seg.relPath] = { size: seg.fileSize };
           delete journal.completedLargeSlices[seg.relPath];
           completedFilesCount += 1;
@@ -1274,25 +1348,75 @@ async function extractMsixvcStream(options = {}) {
       }
     };
 
+    /** @type {any} */
+    let firstError = null;
     const runners = Array.from({ length: Math.min(workerCount, Math.max(1, runnableUnits.length)) }, async () => {
-      while (true) {
-        throwIfAborted(signal);
-        const idx = queueCursor;
-        queueCursor += 1;
-        if (idx >= runnableUnits.length) break;
-        await processWorkUnit(runnableUnits[idx]);
+      try {
+        while (true) {
+          throwIfAborted(runSignal);
+          const idx = queueCursor;
+          queueCursor += 1;
+          if (idx >= runnableUnits.length) break;
+          await processWorkUnit(runnableUnits[idx]);
+        }
+      } catch (runnerErr) {
+        if (!firstError) {
+          firstError = runnerErr;
+        }
+        if (!runAbortCtrl.signal.aborted) {
+          runAbortCtrl.abort();
+        }
+        throw runnerErr;
       }
     });
 
+    let runFailed = false;
     try {
-      await Promise.all(runners);
+      const settled = await Promise.allSettled(runners);
+      for (const res of settled) {
+        if (res.status === 'rejected' && !firstError) {
+          firstError = res.reason;
+        }
+      }
+      if (firstError) {
+        runFailed = true;
+        throw firstError;
+      }
+      throwIfAborted(signal);
+    } catch (err) {
+      runFailed = true;
+      throw err;
     } finally {
-      // Always close any open large-file handles cleanly on error/pause/completion
-      for (const [, st] of largeFileStates.entries()) {
+      if (signal && onOuterAbort) {
+        signal.removeEventListener('abort', onOuterAbort);
+      }
+      // All concurrent runners have settled — safe to close any open large-file handles now.
+      for (const [relPath, st] of largeFileStates.entries()) {
         if (st.handlePromise) {
           const fh = await st.handlePromise.catch(() => null);
           st.handlePromise = null;
           if (fh) await fh.close().catch(() => {});
+        }
+        if (runFailed && !st.finalized) {
+          const isUserPauseAbort = Boolean(
+            signal?.aborted && options.cleanupPartialOnAbort !== true
+          );
+          let contiguousPrefix = 0;
+          while (contiguousPrefix < st.sliceCount && st.completedSet.has(contiguousPrefix)) {
+            contiguousPrefix += 1;
+          }
+          if (!isUserPauseAbort || contiguousPrefix === 0) {
+            const partToUnlink =
+              st.partPath || `${path.resolve(installRootResolved, ...relPath.split('/'))}.olpart`;
+            if (isContainedWithinRoot(installRootResolved, partToUnlink)) {
+              await fs.promises.unlink(partToUnlink).catch(() => {});
+            }
+            delete journal.completedLargeSlices[relPath];
+          } else {
+            const contiguousArr = [];
+            for (let s = 0; s < contiguousPrefix; s += 1) contiguousArr.push(s);
+            journal.completedLargeSlices[relPath] = contiguousArr;
+          }
         }
       }
       await checkpointer.flushNow();
@@ -1313,6 +1437,21 @@ async function extractMsixvcStream(options = {}) {
     }
 
     const readExtractedManifestCaseInsensitive = async (/** @type {string} */ targetLowerName) => {
+      const readRegularContainedFile = async (/** @type {string} */ cand) => {
+        if (!isContainedWithinRoot(installRootResolved, cand) || cand === installRootResolved) {
+          return '';
+        }
+        const parentDir = path.dirname(cand);
+        if (parentDir !== installRootResolved) {
+          if (!isContainedWithinRoot(installRootResolved, parentDir)) return '';
+          const parentSt = await fs.promises.lstat(parentDir).catch(() => null);
+          if (!parentSt || parentSt.isSymbolicLink() || !parentSt.isDirectory()) return '';
+        }
+        const st = await fs.promises.lstat(cand).catch(() => null);
+        if (!st || st.isSymbolicLink() || !st.isFile()) return '';
+        return fs.promises.readFile(cand, 'utf8');
+      };
+
       const exactCandidates = [
         path.join(installRootResolved, targetLowerName),
         targetLowerName === 'microsoftgame.config'
@@ -1331,17 +1470,18 @@ async function extractMsixvcStream(options = {}) {
       ];
       for (const cand of exactCandidates) {
         try {
-          if (fs.existsSync(cand) && fs.statSync(cand).isFile()) {
-            return await fs.promises.readFile(cand, 'utf8');
-          }
+          const content = await readRegularContainedFile(cand);
+          if (content) return content;
         } catch {}
       }
       const searchDirs = [installRootResolved];
       try {
         const rootEntries = await fs.promises.readdir(installRootResolved, { withFileTypes: true });
         for (const ent of rootEntries) {
+          if (ent.isSymbolicLink()) continue;
           if (ent.isFile() && ent.name.toLowerCase() === targetLowerName) {
-            return await fs.promises.readFile(path.join(installRootResolved, ent.name), 'utf8');
+            const content = await readRegularContainedFile(path.join(installRootResolved, ent.name));
+            if (content) return content;
           }
           if (ent.isDirectory() && ent.name.toLowerCase() === 'content') {
             searchDirs.push(path.join(installRootResolved, ent.name));
@@ -1351,8 +1491,10 @@ async function extractMsixvcStream(options = {}) {
           const subDir = searchDirs[i];
           const subEntries = await fs.promises.readdir(subDir, { withFileTypes: true });
           for (const ent of subEntries) {
+            if (ent.isSymbolicLink()) continue;
             if (ent.isFile() && ent.name.toLowerCase() === targetLowerName) {
-              return await fs.promises.readFile(path.join(subDir, ent.name), 'utf8');
+              const content = await readRegularContainedFile(path.join(subDir, ent.name));
+              if (content) return content;
             }
           }
         }
@@ -1388,6 +1530,27 @@ async function extractMsixvcStream(options = {}) {
       gameConfig?.primaryExecutable ||
       appxManifest?.applications?.[0]?.executable ||
       '';
+    let safePrimaryExecutablePath = '';
+    if (primaryExecutableRel) {
+      try {
+        const normalizedExeRel = normalizeRelativeInstallPath(
+          primaryExecutableRel,
+          stripFilesPrefix
+        );
+        const candidateExePath = path.resolve(installRootResolved, ...normalizedExeRel.split('/'));
+        if (
+          isContainedWithinRoot(installRootResolved, candidateExePath) &&
+          candidateExePath !== installRootResolved
+        ) {
+          const exeStat = await fs.promises.lstat(candidateExePath).catch(() => null);
+          if (!exeStat || !exeStat.isSymbolicLink()) {
+            safePrimaryExecutablePath = candidateExePath;
+          }
+        }
+      } catch {
+        safePrimaryExecutablePath = '';
+      }
+    }
 
     return {
       installDir: installRootResolved,
@@ -1399,9 +1562,7 @@ async function extractMsixvcStream(options = {}) {
       contentId: xvcInfo.contentId,
       gameConfig,
       appxManifest,
-      primaryExecutablePath: primaryExecutableRel
-        ? path.join(installRootResolved, ...primaryExecutableRel.split('/'))
-        : '',
+      primaryExecutablePath: safePrimaryExecutablePath,
     };
   } finally {
     if (ownsReader && typeof rangeReader?.close === 'function') {
@@ -1463,6 +1624,18 @@ function extractMsixvcInWorker(options = {}) {
     concurrency: serializableOpts.concurrency || DEFAULT_CONCURRENCY,
     ...(resolvedChunkBytes !== undefined ? { chunkTargetBytes: resolvedChunkBytes } : {}),
     keepResumeJournal: Boolean(serializableOpts.keepResumeJournal),
+    ...(serializableOpts.allowLocalhost !== undefined
+      ? { allowLocalhost: serializableOpts.allowLocalhost }
+      : {}),
+    ...(serializableOpts.maxRedirects !== undefined
+      ? { maxRedirects: serializableOpts.maxRedirects }
+      : {}),
+    ...(serializableOpts.allowedHosts !== undefined
+      ? { allowedHosts: serializableOpts.allowedHosts }
+      : {}),
+    ...(serializableOpts.cleanupPartialOnAbort !== undefined
+      ? { cleanupPartialOnAbort: Boolean(serializableOpts.cleanupPartialOnAbort) }
+      : {}),
   };
 
   return new Promise((resolve, reject) => {
@@ -1518,10 +1691,16 @@ function extractMsixvcInWorker(options = {}) {
     });
 
     worker.on('exit', (code) => {
-      if (!settled && code !== 0) {
+      if (!settled) {
         settled = true;
         cleanup(false);
-        reject(new Error(`Xbox MSIXVC worker exited with code ${code}`));
+        reject(
+          new Error(
+            code === 0
+              ? 'Xbox MSIXVC worker exited cleanly (code 0) without sending a completion result'
+              : `Xbox MSIXVC worker exited with code ${code}`
+          )
+        );
       }
     });
   });
