@@ -53,7 +53,7 @@ suite('Tier 2 — Feature F17 Boundaries: Process Supervisor, Security, Offline 
     async: true,
   }, async () => {
     const start = Date.now();
-    const exited = await processTree.waitForProcessExit(-99999, 200);
+    const exited = await processTree.waitForProcessExit(null, -99999, 200);
     const elapsed = Date.now() - start;
     assert.strictEqual(exited, true);
     assert.ok(elapsed < 150, `Expected quick resolution, took ${elapsed}ms`);

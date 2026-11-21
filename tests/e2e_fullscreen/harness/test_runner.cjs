@@ -151,6 +151,10 @@ class TestRunner {
             const shortStack = e.stack.split('\n').slice(1, 4).join('\n');
             log(`    ${shortStack}`);
           }
+          if (process.env.GITHUB_ACTIONS === 'true' && !silent) {
+            const singleLineMsg = String(e.message || 'Test failed').replace(/\r?\n/g, ' | ');
+            log(`::error::${label}: ${singleLineMsg}`);
+          }
         } finally {
           for (const afterEachFn of suite.afterEach) {
             try {

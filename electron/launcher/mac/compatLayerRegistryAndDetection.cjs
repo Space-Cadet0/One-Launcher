@@ -633,7 +633,7 @@ function readRunnerInstallReceipts(options = {}) {
     const receiptsObj = readSingleRunnerInstallReceiptsFile(candidatePaths[i]);
     for (const [rawKey, entry] of Object.entries(receiptsObj)) {
       if (!entry || typeof entry !== 'object') continue;
-      const lowerKey = rawKey.toLowerCase();
+      const lowerKey = rawKey.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
       const existingKey = keyByLower.get(lowerKey);
       if (existingKey !== undefined) {
         const existingEntry = merged[existingKey];
@@ -798,9 +798,12 @@ function extractRunnerVersionInfo(
 
         const receipts = readRunnerInstallReceipts(options);
         const normKey = normalizeReceiptAppPath(appPath);
+        const normKeyLower = normKey.toLowerCase();
         const receipt =
           receipts[normKey] ||
-          Object.entries(receipts).find(([k]) => k.toLowerCase() === normKey.toLowerCase())?.[1];
+          Object.entries(receipts).find(
+            ([k]) => k.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() === normKeyLower
+          )?.[1];
         if (
           receipt &&
           typeof receipt.releaseVersion === 'string' &&

@@ -355,8 +355,15 @@ async function isBottleWinExeRunning(exeName, bottlePath = '', options = {}) {
 
   const escapedExe = cleanExe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const exeRegex = new RegExp(`(?:^|[\\\\/\\s"'])${escapedExe}(?:\\s|["']|$)`, 'i');
-  const normTargetPrefix = bottlePath
-    ? path.resolve(bottlePath).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  const trimmedBottlePath = String(bottlePath || '').trim();
+  const normTargetPrefix = trimmedBottlePath
+    ? (trimmedBottlePath.startsWith('/')
+        ? path.posix.resolve(trimmedBottlePath)
+        : path.resolve(trimmedBottlePath)
+      )
+        .replace(/\\/g, '/')
+        .replace(/\/+$/, '')
+        .toLowerCase()
     : '';
 
   const escapedTargetPrefix = normTargetPrefix

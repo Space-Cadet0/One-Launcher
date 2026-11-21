@@ -1783,7 +1783,12 @@ function collectMacAppBundleProcessTreePids(
       rawPaths
         .map((p) => String(p || '').trim())
         .filter(Boolean)
-        .map((p) => `${path.resolve(p).replace(/\/+$/, '')}/contents/`.toLowerCase())
+        .map((p) => {
+          const normalized = p.startsWith('/')
+            ? path.posix.resolve(p).replace(/\/+$/, '')
+            : path.resolve(p).replace(/\\/g, '/').replace(/\/+$/, '');
+          return `${normalized}/contents/`.toLowerCase();
+        })
     )
   );
 
@@ -1806,7 +1811,7 @@ function collectMacAppBundleProcessTreePids(
     if (cPid === selfPid || /^(?:\/bin\/|\/usr\/bin\/)?ps(?:\s|$)/i.test(cmd)) {
       continue;
     }
-    const lowerCmd = cmd.toLowerCase();
+    const lowerCmd = cmd.replace(/\\/g, '/').toLowerCase();
     if (contentsPrefixesLower.some((prefix) => lowerCmd.includes(prefix))) {
       matchedRootPids.push(cPid);
     }
