@@ -112,6 +112,10 @@ export class SessionLifecycleManager {
     return this.inGameHibernating;
   }
 
+  public setInGameHibernatingRaw(val: boolean): void {
+    this.inGameHibernating = val;
+  }
+
   public clearHibernatingFlag(): boolean {
     const wasHibernating = this.inGameHibernating;
     this.inGameHibernating = false;

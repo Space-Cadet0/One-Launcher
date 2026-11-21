@@ -1753,21 +1753,27 @@ export function buildEffectiveLaunchModePreview(
   );
   const coercedFromArm64OnX64 =
     isIntelX64Host && rawSelectedLayerType === 'crossover_preview_arm64';
-  const selectedLayerType: CompatibilityLayerType | undefined = rawSelectedLayerType;
   const fallbackSupportedLayerType: CompatibilityLayerType | undefined =
     isRequestedRunnerUnsupportedOnHost
       ? hostSupportedLayers.find((l) => l.type === 'crossover_preview')?.type ||
         hostSupportedLayers.find((l) => l.type === 'crossover')?.type ||
         hostSupportedLayers.find((l) => l.type !== 'native')?.type ||
         'crossover'
-      : selectedLayerType;
+      : rawSelectedLayerType;
+  const selectedLayerType: CompatibilityLayerType | undefined = coercedFromArm64OnX64
+    ? fallbackSupportedLayerType
+    : rawSelectedLayerType;
   const hasExplicitNonNativeLayer = Boolean(selectedLayerType && selectedLayerType !== 'native');
   const selectedDescriptor = hasExplicitNonNativeLayer
     ? COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === selectedLayerType)
     : undefined;
   const activeLayer = hasExplicitNonNativeLayer
     ? (isRequestedRunnerUnsupportedOnHost ? hostSupportedLayers : layers).find(
-        (l) => l.type === (isRequestedRunnerUnsupportedOnHost ? fallbackSupportedLayerType : selectedLayerType)
+        (l) =>
+          l.type ===
+          (isRequestedRunnerUnsupportedOnHost && !coercedFromArm64OnX64
+            ? fallbackSupportedLayerType
+            : selectedLayerType)
       )
     : hostSupportedLayers.find(
         (l) =>
@@ -1778,7 +1784,7 @@ export function buildEffectiveLaunchModePreview(
       hostSupportedLayers[0] ||
       layers[0];
   const layerName =
-    (isRequestedRunnerUnsupportedOnHost
+    (isRequestedRunnerUnsupportedOnHost && !coercedFromArm64OnX64
       ? selectedDescriptor?.shortLabel || selectedDescriptor?.label || selectedLayerType
       : activeLayer?.name ||
         selectedDescriptor?.shortLabel ||

@@ -201,6 +201,22 @@ export class LauncherService {
     this.downloadManager.setQueue(queue);
   }
 
+  public get activeDownloadPollTimer(): ReturnType<typeof setInterval> | null {
+    return this.downloadManager.getActiveDownloadPollTimer();
+  }
+
+  public set activeDownloadPollTimer(timer: ReturnType<typeof setInterval> | null) {
+    this.downloadManager.setActiveDownloadPollTimer(timer);
+  }
+
+  public get inGameHibernating(): boolean {
+    return this.sessionManager.isInGameHibernating();
+  }
+
+  public set inGameHibernating(val: boolean) {
+    this.sessionManager.setInGameHibernatingRaw(val);
+  }
+
   private get installedStorefrontClients(): Partial<Record<StorefrontId, boolean>> {
     return this.runnerClient.getRawInstalledStorefrontClients();
   }

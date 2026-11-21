@@ -79,6 +79,14 @@ export class DownloadQueueManager {
     this.downloadQueue = queue;
   }
 
+  public getActiveDownloadPollTimer(): ReturnType<typeof setInterval> | null {
+    return this.activeDownloadPollTimer;
+  }
+
+  public setActiveDownloadPollTimer(timer: ReturnType<typeof setInterval> | null): void {
+    this.activeDownloadPollTimer = timer;
+  }
+
   public getActiveDownload(
     gameId: string,
     platformId?: StorefrontId

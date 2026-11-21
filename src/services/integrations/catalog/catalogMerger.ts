@@ -288,14 +288,22 @@ export function mergeStorefrontGames(
       if (incPfn && !incomingLookupIds.includes(incPfn)) incomingLookupIds.push(incPfn);
       if (incTitleId && !incomingLookupIds.includes(incTitleId)) incomingLookupIds.push(incTitleId);
     }
-    // Match multi-storefront merged entries by exact store platformGameId (`g.platforms.some(...)`)
-    // so already-merged Steam+GOG or Steam+Epic games still resolve even if a storefront title changed.
+    // Match single-storefront entries (or multi-storefront merged entries whose canonical title
+    // or explicit user override aligns) by exact store platformGameId, while allowing previously
+    // mis-attached remake/edition entries (e.g. Mafia: Definitive Edition on Mafia 2002) to detach.
     for (const lookupId of incomingLookupIds) {
       const platMatches = byStorePlatformGameId.get(lookupId);
       if (platMatches) {
         for (const idx of platMatches) {
           const g = merged[idx];
-          if (g.platforms.length > 0 && g.platforms.some((p) => p.platformId === storefrontId)) {
+          if (
+            g.platforms.length > 0 &&
+            g.platforms.some((p) => p.platformId === storefrontId) &&
+            (storefrontId === 'xbox' ||
+              g.platforms.every((p) => p.platformId === storefrontId) ||
+              Boolean(entryMeta[idx]?.override) ||
+              entryMeta[idx]?.normTitle === newNorm)
+          ) {
             candidateSet.add(idx);
           }
         }
