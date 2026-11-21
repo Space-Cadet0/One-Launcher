@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { CanonicalGame } from '../src/contracts/game';
+import type { CriticScoreData } from '../src/contracts/critic';
 import { syncJobManager } from '../src/services/network/syncJobManager';
 import { criticScoreService } from '../src/services/critic/criticScoreService';
 import { metacriticResolver } from '../src/services/critic/metacriticResolver';
@@ -26,6 +27,7 @@ const BASE_NOW = new Date('2026-10-16T12:00:00.000Z').getTime();
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
+const NON_CRITIC_FALLBACK_MAX_TTL_MS = 14 * DAY_MS;
 
 function createCatalogGames(baseTimeMs: number): {
   gameA: CanonicalGame;
@@ -48,7 +50,7 @@ function createCatalogGames(baseTimeMs: number): {
     tags: [],
   };
 
-  // Game B: Synthetic Steam score (isSynthetic: true), released 6 months ago (180 days -> mature 30-day TTL)
+  // Game B: Synthetic Steam score (isSynthetic: true), released 6 months ago (mature tier, capped at 14-day non-critic TTL)
   const sixMonthsAgoIso = new Date(baseTimeMs - 180 * DAY_MS).toISOString();
   const gameB: CanonicalGame = {
     id: 'steam-910002',
@@ -203,10 +205,10 @@ describe('Phase 3: End-to-End Sync Lifecycle & Interval Verification', () => {
       expect(stagedA.data?.score).toBe(88);
       expect(stagedA.data?.isVerified).toBe(true);
 
-      const stagedB = loadStagedCache<any>('antigravity_critic_v8_id:910002');
+      const stagedB = loadStagedCache<CriticScoreData>('antigravity_critic_v8_id:910002');
       expect(stagedB.valid).toBe(true);
       expect(stagedB.entry?.tier).toBe('mature');
-      expect(stagedB.entry?.ttlMs).toBe(TIER_TTLS.mature);
+      expect(stagedB.entry?.ttlMs).toBe(NON_CRITIC_FALLBACK_MAX_TTL_MS);
       expect(stagedB.entry?.dynamicResolved).toBe(true);
       expect(stagedB.data?.isSynthetic).toBe(true);
       expect(stagedB.data?.score).toBeGreaterThan(0);
@@ -232,57 +234,101 @@ describe('Phase 3: End-to-End Sync Lifecycle & Interval Verification', () => {
   });
 
   describe('Suite 2: Tiered TTL Expiration Intervals (fresh 48h, early_access 72h, negative 7d, mature 30d, immutable 180d, override Infinity)', () => {
-    it('enforces exact expiration windows for negative (7d), mature (30d), and immutable (180d) games across simulated time jumps', async () => {
+    it('enforces exact expiration windows for negative (7d), non-critic fallback (14d), verified mature (30d), and immutable (180d) games across simulated time jumps', async () => {
       setupDeterministicDynamicMocks();
       const { catalog } = createCatalogGames(BASE_NOW);
+      const clearInMemory = () => {
+        (
+          criticScoreService as unknown as { inMemoryCache: Map<string, CriticScoreData | null> }
+        ).inMemoryCache.clear();
+      };
+
+      // Mature verified Metacritic game (released 6 months ago -> keeps full 30-day mature TTL)
+      const matureVerifiedMcGame: CanonicalGame = {
+        id: 'steam-910004',
+        title: 'Chrono Vanguard Mature',
+        sortTitle: 'Chrono Vanguard Mature',
+        steamAppId: 910004,
+        releaseDate: new Date(BASE_NOW - 180 * DAY_MS).toISOString(),
+        platforms: [{ platformId: 'steam', platformGameId: '910004', installed: false }],
+        headerImage: 'https://cdn.example.com/chrono-vanguard-mature.jpg',
+        developers: ['Studio Alpha'],
+        publishers: ['Studio Alpha'],
+        genres: ['Action', 'RPG'],
+        tags: [],
+      };
+      const extendedCatalog = [...catalog, matureVerifiedMcGame];
 
       // Launch #1 at t = BASE_NOW
-      await syncJobManager.startCriticScoreSync(catalog, { isBackground: true });
+      await syncJobManager.startCriticScoreSync(extendedCatalog, { isBackground: true });
+      expect(loadStagedCache<CriticScoreData>('antigravity_critic_v8_id:910001').entry?.ttlMs).toBe(
+        TIER_TTLS.immutable
+      );
+      expect(loadStagedCache<CriticScoreData>('antigravity_critic_v8_id:910002').entry?.ttlMs).toBe(
+        NON_CRITIC_FALLBACK_MAX_TTL_MS
+      );
+      expect(loadStagedCache<CriticScoreData>('antigravity_critic_v8_id:910004').entry?.ttlMs).toBe(
+        TIER_TTLS.mature
+      );
+
       const resolveSpy = vi.spyOn(criticScoreService, 'resolveDynamicScore');
 
       // 1. Advance time by +3 days (< 7 days negative TTL)
       vi.spyOn(Date, 'now').mockReturnValue(BASE_NOW + 3 * DAY_MS);
-      (criticScoreService as any).inMemoryCache.clear();
+      clearInMemory();
       criticScoreService.clearAttemptedResolutions();
       resolveSpy.mockClear();
 
-      await syncJobManager.startCriticScoreSync(catalog, { isBackground: true });
+      await syncJobManager.startCriticScoreSync(extendedCatalog, { isBackground: true });
       expect(resolveSpy).toHaveBeenCalledTimes(0);
 
-      // 2. Advance time to 7 days + 1 minute: ONLY Game C (negative 7d tier) expires and is re-synced
-      const tSevenDaysPlusOneMin = BASE_NOW + 7 * DAY_MS + MINUTE_MS;
-      vi.spyOn(Date, 'now').mockReturnValue(tSevenDaysPlusOneMin);
-      (criticScoreService as any).inMemoryCache.clear();
+      // 2. Advance time to 7 days + 5 minutes: ONLY Game C (negative 7d tier) expires and is re-synced
+      //    (re-cached at 7d + 5m -> valid until 14d + 5m)
+      const tSevenDaysPlusFiveMin = BASE_NOW + 7 * DAY_MS + 5 * MINUTE_MS;
+      vi.spyOn(Date, 'now').mockReturnValue(tSevenDaysPlusFiveMin);
+      clearInMemory();
       criticScoreService.clearAttemptedResolutions();
       resolveSpy.mockClear();
 
-      await syncJobManager.startCriticScoreSync(catalog, { isBackground: true });
+      await syncJobManager.startCriticScoreSync(extendedCatalog, { isBackground: true });
       expect(resolveSpy).toHaveBeenCalledTimes(1);
       expect(resolveSpy.mock.calls[0][0]).toBe('Mystery Garage Prototype Z9');
       expect(resolveSpy.mock.calls[0][1]).toBe(910003);
 
-      // Game C is now freshly re-cached at t = 7d + 1m.
-      // 3. Advance time to 30 days + 1 minute from BASE_NOW (and keep Game C fresh so we isolate Game B vs Game A):
-      // Wait: from t = 7d + 1m to t = 30d + 1m is 23 days (> 7d), so if we refresh Game C at t = 28d first,
-      // at t = 30d + 1m ONLY Game B (mature 30d tier) expires while Game A (immutable 180d) and Game C remain cached!
-      vi.spyOn(Date, 'now').mockReturnValue(BASE_NOW + 28 * DAY_MS);
-      (criticScoreService as any).inMemoryCache.clear();
-      criticScoreService.clearAttemptedResolutions();
-      await syncJobManager.startCriticScoreSync(catalog, { isBackground: true });
-
-      const tThirtyDaysPlusOneMin = BASE_NOW + 30 * DAY_MS + MINUTE_MS;
-      vi.spyOn(Date, 'now').mockReturnValue(tThirtyDaysPlusOneMin);
-      (criticScoreService as any).inMemoryCache.clear();
+      // 3. Advance time to 14 days + 1 minute: ONLY Game B (synthetic Steam fallback capped at 14d) expires!
+      //    Verified mature MC (30d), verified immutable MC (180d), and freshly re-cached Game C (exp 14d+5m) stay valid.
+      const tFourteenDaysPlusOneMin = BASE_NOW + 14 * DAY_MS + MINUTE_MS;
+      vi.spyOn(Date, 'now').mockReturnValue(tFourteenDaysPlusOneMin);
+      clearInMemory();
       criticScoreService.clearAttemptedResolutions();
       resolveSpy.mockClear();
 
-      await syncJobManager.startCriticScoreSync(catalog, { isBackground: true });
+      await syncJobManager.startCriticScoreSync(extendedCatalog, { isBackground: true });
       expect(resolveSpy).toHaveBeenCalledTimes(1);
       expect(resolveSpy.mock.calls[0][0]).toBe('Stellar Outpost Tactica');
       expect(resolveSpy.mock.calls[0][1]).toBe(910002);
+      expect(loadStagedCache<CriticScoreData>('antigravity_critic_v8_id:910004').valid).toBe(true);
+
+      // 4. Refresh Game B (exp 28d+1m) and Game C (exp 14d+5m) at 28d + 5m so at 30d + 1m
+      //    ONLY verified mature Metacritic (910004, 30d TTL) expires while immutable Game A (180d) stays valid.
+      vi.spyOn(Date, 'now').mockReturnValue(BASE_NOW + 28 * DAY_MS + 5 * MINUTE_MS);
+      clearInMemory();
+      criticScoreService.clearAttemptedResolutions();
+      await syncJobManager.startCriticScoreSync(extendedCatalog, { isBackground: true });
+
+      const tThirtyDaysPlusOneMin = BASE_NOW + 30 * DAY_MS + MINUTE_MS;
+      vi.spyOn(Date, 'now').mockReturnValue(tThirtyDaysPlusOneMin);
+      clearInMemory();
+      criticScoreService.clearAttemptedResolutions();
+      resolveSpy.mockClear();
+
+      await syncJobManager.startCriticScoreSync(extendedCatalog, { isBackground: true });
+      expect(resolveSpy).toHaveBeenCalledTimes(1);
+      expect(resolveSpy.mock.calls[0][0]).toBe('Chrono Vanguard Mature');
+      expect(resolveSpy.mock.calls[0][1]).toBe(910004);
 
       // Verify Game A (immutable 180d) is STILL valid at 30 days + 1 minute
-      expect(loadStagedCache('antigravity_critic_v8_id:910001').valid).toBe(true);
+      expect(loadStagedCache<CriticScoreData>('antigravity_critic_v8_id:910001').valid).toBe(true);
     });
 
     it('enforces fresh (48h), early_access (72h), and override (Infinity — never expires even after 5 years)', async () => {

@@ -576,19 +576,31 @@ describe('Fix & Match Wizard: Priority Scopes, Dynamic Routing & Cross-Storefron
       expect(mcUserRes?.score).toBe(85);
       expect(mcUserRes?.source).toBe('metacritic_user');
 
-      // 2. OpenCritic route via resolveRoutedScore
-      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
-        ok: true,
-        json: async () => ({
+      // 2. OpenCritic route via resolveRoutedScore (SSR TransferState HTML)
+      const ocSsrState = JSON.stringify({
+        'game/4321': {
           id: 4321,
           name: 'The Saboteur',
           topCriticScore: 82.4,
           percentRecommended: 84,
           tier: 'Strong',
           numReviews: 38,
+          firstReleaseDate: '2009-12-08T00:00:00.000Z',
+          url: 'https://opencritic.com/game/4321/the-saboteur',
           reviewSummary: { summary: 'Stylish open-world WWII action.' },
-        }),
-      } as unknown as Response);
+        },
+      })
+        .replace(/&/g, '&a;')
+        .replace(/"/g, '&q;')
+        .replace(/'/g, '&s;')
+        .replace(/</g, '&l;')
+        .replace(/>/g, '&g;');
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(
+          `<!DOCTYPE html><html><head><title>The Saboteur Reviews - OpenCritic</title><link rel="canonical" href="https://opencritic.com/game/4321/the-saboteur" /></head><body><script id="serverApp-state" type="application/json">${ocSsrState}</script></body></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+        )
+      );
 
       const ocRes = await criticScoreService.resolveRoutedScore(
         {

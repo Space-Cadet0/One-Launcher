@@ -793,7 +793,11 @@ describe('Phase 4: Comprehensive QA & End-to-End Regression Audit for Review Sco
         sampleScrapedBundle
       );
 
-      expect(executedDomains).toContain('metacritic.com');
+      expect(
+        executedDomains.some(
+          (domain) => domain === 'backend.metacritic.com' || domain === 'metacritic.com'
+        )
+      ).toBe(true);
       expect(executedDomains).toContain('api.opencritic.com');
     });
   });
