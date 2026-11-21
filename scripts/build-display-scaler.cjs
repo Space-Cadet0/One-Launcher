@@ -53,6 +53,7 @@ const SCALER_DLL_SOURCES = [
 const LAUNCHER_EXE_SOURCES = ['display_launcher.c'];
 
 const TRACKED_MANIFEST_SOURCES = [
+  'electron/helpers/common_process_denylist.h',
   'electron/helpers/display_scaler/display_scaler.h',
   'electron/helpers/display_scaler/display_scaler_internal.h',
   'electron/helpers/display_scaler/display_scaler_math.c',

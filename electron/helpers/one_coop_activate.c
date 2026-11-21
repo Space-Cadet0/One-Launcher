@@ -16,14 +16,22 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <ctype.h>
+#include <errno.h>
 #include <libproc.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/sysctl.h>
+
+#include "common_process_denylist.h"
+
+extern void *objc_autoreleasePoolPush(void);
+extern void objc_autoreleasePoolPop(void *pool);
 
 /* Minimal ABI-stable Node-API v1 declarations */
 typedef struct napi_env__ *napi_env;
@@ -66,6 +74,11 @@ extern napi_status napi_set_named_property(
 extern napi_status napi_create_int32(
     napi_env env,
     int32_t value,
+    napi_value *result
+);
+extern napi_status napi_get_boolean(
+    napi_env env,
+    bool value,
     napi_value *result
 );
 extern napi_status napi_get_cb_info(
@@ -143,57 +156,57 @@ static bool contains_ascii_sub(const char *haystack, const char *needle) {
     return strstr(haystack, needle) != NULL;
 }
 
+/*
+ * Shared Wine/storefront helper denylist (steamwebhelper.exe, epicgameslauncher.exe,
+ * galaxyclient.exe, eadesktop.exe, upc.exe, etc. via common_process_denylist.h)
+ * so cooperative focus transfer never activates background daemons or storefront clients.
+ */
 static bool is_ignored_helper_owner(const char *lower_owner) {
-    static const char *const kIgnored[] = {
-        "explorer.exe",
-        "services.exe",
-        "winedevice.exe",
-        "plugplay.exe",
-        "svchost.exe",
-        "rpcss.exe",
-        "conhost.exe",
-        "tabtip.exe",
-        "cmd.exe",
-        "powershell.exe",
-        "rundll32.exe",
-        "one_display_launcher_x86.exe",
-        "one_display_launcher_x64.exe",
-        "one_xgr_win_launcher.exe",
-        "one_xgr_win_launcher_x86.exe",
-        "galaxyclient.exe",
-        "galaxyclient helper.exe",
-        "galaxyclienthelper.exe",
-        "galaxycommunication.exe",
-        "gog galaxy notifications renderer.exe",
-        "qtwebengineprocess.exe",
-        "python.exe",
-        "steam.exe",
-        "steamwebhelper.exe",
-        "steamservice.exe",
-        "epicgameslauncher.exe",
-        "epicwebhelper.exe",
-        "eadesktop.exe",
-        "eabackgroundservice.exe",
-        "upc.exe",
-        "ubisoftgamelauncher.exe",
-        "rockstarlauncher.exe",
-        "rockstarservice.exe",
-    };
-    for (size_t i = 0; i < sizeof(kIgnored) / sizeof(kIgnored[0]); i++) {
-        if (strcmp(lower_owner, kIgnored[i]) == 0) {
-            return true;
-        }
-    }
-    return false;
+    static const char k_ignored_msz[] =
+        ONE_DENYLIST_WINE_SYSTEM_MSZ
+        ONE_DENYLIST_SHELL_MSZ
+        ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ
+        ONE_DENYLIST_GALAXY_CHAIN_MSZ
+        ONE_DENYLIST_STOREFRONT_CLIENTS_MSZ
+        "python.exe\0";
+    return one_denylist_match_ascii_msz(lower_owner, k_ignored_msz);
 }
 
-#define COOP_MAX_TARGET_EXES 16
-#define COOP_MAX_EXE_NAME    128
+static bool cfstring_copy_utf8_truncated(CFStringRef ref, char *dst, size_t dst_cap) {
+    if (!ref || !dst || dst_cap == 0) return false;
+    dst[0] = '\0';
+    if (CFStringGetCString(ref, dst, (CFIndex)dst_cap, kCFStringEncodingUTF8)) {
+        return dst[0] != '\0';
+    }
+    CFIndex slen = CFStringGetLength(ref);
+    if (slen <= 0) return false;
+    CFIndex used_bytes = 0;
+    CFStringGetBytes(
+        ref,
+        CFRangeMake(0, slen),
+        kCFStringEncodingUTF8,
+        '?',
+        false,
+        (UInt8 *)dst,
+        (CFIndex)(dst_cap - 1),
+        &used_bytes
+    );
+    if (used_bytes < 0) used_bytes = 0;
+    if ((size_t)used_bytes >= dst_cap) used_bytes = (CFIndex)(dst_cap - 1);
+    dst[used_bytes] = '\0';
+    return used_bytes > 0;
+}
+
+#define COOP_MAX_TARGET_EXES  16
+#define COOP_MAX_EXE_NAME     128
+#define COOP_MAX_BOTTLE_PATH  1024
+#define COOP_MAX_PROCARGS_BUF (256u * 1024u)
 
 typedef struct coop_scope_s {
     int32_t root_pid;
     size_t  target_count;
     char    target_exes[COOP_MAX_TARGET_EXES][COOP_MAX_EXE_NAME];
+    char    bottle_path[COOP_MAX_BOTTLE_PATH];
 } coop_scope_t;
 
 static const char *ascii_basename(const char *path) {
@@ -207,11 +220,27 @@ static const char *ascii_basename(const char *path) {
     return base;
 }
 
+static void normalize_bottle_path_lower(const char *src, char *dst, size_t dst_cap) {
+    if (!dst || dst_cap == 0) return;
+    dst[0] = '\0';
+    if (!src || !src[0]) return;
+    size_t j = 0;
+    for (size_t i = 0; src[i] != '\0' && j + 1 < dst_cap; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '\\') c = '/';
+        dst[j++] = (char)tolower(c);
+    }
+    while (j > 1 && dst[j - 1] == '/') {
+        j--;
+    }
+    dst[j] = '\0';
+}
+
 static bool pid_is_descendant_of(int32_t pid, int32_t root_pid) {
     if (pid <= 0 || root_pid <= 0) return false;
     if (pid == root_pid) return true;
     int32_t cur = pid;
-    for (int hop = 0; hop < 8 && cur > 1; hop++) {
+    for (int hop = 0; hop < 12 && cur > 1; hop++) {
         struct proc_bsdinfo bsd;
         memset(&bsd, 0, sizeof(bsd));
         int ret = proc_pidinfo(cur, PROC_PIDTBSDINFO, 0, &bsd, (int)sizeof(bsd));
@@ -226,40 +255,140 @@ static bool pid_is_descendant_of(int32_t pid, int32_t root_pid) {
     return false;
 }
 
-static bool proc_args_match_target_exes(int32_t pid, const coop_scope_t *scope) {
-    if (!scope || scope->target_count == 0 || pid <= 0) return false;
+/*
+ * MH-04: Dynamically size the KERN_PROCARGS2 sysctl buffer by querying the
+ * required byte count first (with KERN_ARGMAX / ENOMEM retry fallback capped at
+ * 256 KiB) so Wine/CrossOver processes with large CX_ENV + PATH environments
+ * never silently fail with ENOMEM.
+ */
+static char *read_procargs2_dynamic(int32_t pid, size_t *out_size) {
+    if (out_size) *out_size = 0;
+    if (pid <= 0) return NULL;
+
     int mib[3] = { CTL_KERN, KERN_PROCARGS2, (int)pid };
-    char buf[4096];
-    size_t sz = sizeof(buf) - 1;
-    if (sysctl(mib, 3, buf, &sz, NULL, 0) != 0 || sz <= sizeof(int)) {
-        return false;
+    size_t sz = 0;
+    if (sysctl(mib, 3, NULL, &sz, NULL, 0) != 0 || sz <= sizeof(int)) {
+        int argmax_mib[2] = { CTL_KERN, KERN_ARGMAX };
+        int argmax = 0;
+        size_t am_sz = sizeof(argmax);
+        if (sysctl(argmax_mib, 2, &argmax, &am_sz, NULL, 0) == 0 && argmax > 0) {
+            sz = (size_t)argmax;
+        } else {
+            sz = 65536u;
+        }
     }
-    buf[sz] = '\0';
+    if (sz < 4096u) sz = 4096u;
+    if (sz > COOP_MAX_PROCARGS_BUF) sz = COOP_MAX_PROCARGS_BUF;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        char *buf = (char *)malloc(sz + 1u);
+        if (!buf) return NULL;
+        size_t req_sz = sz;
+        if (sysctl(mib, 3, buf, &req_sz, NULL, 0) == 0 && req_sz > sizeof(int)) {
+            buf[req_sz] = '\0';
+            if (out_size) *out_size = req_sz;
+            return buf;
+        }
+        int err = errno;
+        free(buf);
+        if (err == ENOMEM && sz < COOP_MAX_PROCARGS_BUF) {
+            sz = (sz * 2u <= COOP_MAX_PROCARGS_BUF) ? (sz * 2u) : COOP_MAX_PROCARGS_BUF;
+            continue;
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
+static void proc_args_inspect_pid(
+    int32_t pid,
+    const coop_scope_t *scope,
+    bool *out_matched_exe,
+    bool *out_matched_bottle
+) {
+    if (out_matched_exe) *out_matched_exe = false;
+    if (out_matched_bottle) *out_matched_bottle = false;
+    if (!scope || pid <= 0) return;
+    bool want_exe = (scope->target_count > 0);
+    bool want_bottle = (scope->bottle_path[0] != '\0');
+    if (!want_exe && !want_bottle) return;
+
+    size_t sz = 0;
+    char *buf = read_procargs2_dynamic(pid, &sz);
+    if (!buf || sz <= sizeof(int)) {
+        free(buf);
+        return;
+    }
+
     int argc_val = 0;
     memcpy(&argc_val, buf, sizeof(int));
-    if (argc_val <= 0) return false;
-    if (argc_val > 12) argc_val = 12;
+    if (argc_val < 0) argc_val = 0;
+    if (argc_val > 64) argc_val = 64;
 
     size_t pos = sizeof(int);
     /* Skip exec_path and trailing NUL padding */
     while (pos < sz && buf[pos] != '\0') pos++;
     while (pos < sz && buf[pos] == '\0') pos++;
 
+    bool matched_exe = false;
+    bool matched_bottle = false;
+
+    /* Walk argv[0..argc_val-1] */
     for (int ai = 0; ai < argc_val && pos < sz; ai++) {
         const char *arg = buf + pos;
         size_t alen = strnlen(arg, sz - pos);
         if (alen > 0) {
-            char lower_base[COOP_MAX_EXE_NAME];
-            str_to_lower_ascii(ascii_basename(arg), lower_base, sizeof(lower_base));
-            for (size_t t = 0; t < scope->target_count; t++) {
-                if (strcmp(lower_base, scope->target_exes[t]) == 0) {
-                    return true;
+            if (want_exe && !matched_exe) {
+                char lower_base[COOP_MAX_EXE_NAME];
+                str_to_lower_ascii(ascii_basename(arg), lower_base, sizeof(lower_base));
+                for (size_t t = 0; t < scope->target_count; t++) {
+                    if (strcmp(lower_base, scope->target_exes[t]) == 0) {
+                        matched_exe = true;
+                        break;
+                    }
+                }
+            }
+            if (want_bottle && !matched_bottle) {
+                char norm_arg[COOP_MAX_BOTTLE_PATH];
+                normalize_bottle_path_lower(arg, norm_arg, sizeof(norm_arg));
+                if (contains_ascii_sub(norm_arg, scope->bottle_path)) {
+                    matched_bottle = true;
                 }
             }
         }
-        pos += alen + 1;
+        pos += alen + 1u;
     }
-    return false;
+
+    /* Walk envp[] entries for WINEPREFIX= / CX_BOTTLE= when bottle scoping is active */
+    if (want_bottle && !matched_bottle) {
+        const char *bottle_base = ascii_basename(scope->bottle_path);
+        while (pos < sz) {
+            while (pos < sz && buf[pos] == '\0') pos++;
+            if (pos >= sz) break;
+            const char *env_ent = buf + pos;
+            size_t elen = strnlen(env_ent, sz - pos);
+            if (elen > 11 && strncasecmp(env_ent, "WINEPREFIX=", 11) == 0) {
+                char norm_wp[COOP_MAX_BOTTLE_PATH];
+                normalize_bottle_path_lower(env_ent + 11, norm_wp, sizeof(norm_wp));
+                if (strcmp(norm_wp, scope->bottle_path) == 0) {
+                    matched_bottle = true;
+                    break;
+                }
+            } else if (elen > 10 && strncasecmp(env_ent, "CX_BOTTLE=", 10) == 0 && bottle_base[0] != '\0') {
+                char lower_cx[COOP_MAX_EXE_NAME];
+                str_to_lower_ascii(env_ent + 10, lower_cx, sizeof(lower_cx));
+                if (strcmp(lower_cx, bottle_base) == 0) {
+                    matched_bottle = true;
+                    break;
+                }
+            }
+            pos += elen + 1u;
+        }
+    }
+
+    free(buf);
+    if (out_matched_exe) *out_matched_exe = matched_exe;
+    if (out_matched_bottle) *out_matched_bottle = matched_bottle;
 }
 
 static bool target_exes_match_owner_or_title(
@@ -320,7 +449,7 @@ static bool find_top_bottled_game_window(const coop_scope_t *scope, int32_t *out
         if (!owner_ref || CFGetTypeID(owner_ref) != CFStringGetTypeID()) continue;
 
         char owner_buf[256];
-        if (!CFStringGetCString(owner_ref, owner_buf, sizeof(owner_buf), kCFStringEncodingUTF8)) {
+        if (!cfstring_copy_utf8_truncated(owner_ref, owner_buf, sizeof(owner_buf))) {
             continue;
         }
 
@@ -378,20 +507,44 @@ static bool find_top_bottled_game_window(const coop_scope_t *scope, int32_t *out
             score += 1.0e10;
         }
 
-        if (scope && (scope->root_pid > 0 || scope->target_count > 0)) {
+        /*
+         * MH-05: When caller specifies a target scope (bottlePath, rootPid, or
+         * targetExeNames), strictly require a match rather than activating an
+         * unrelated Wine window from another bottle.
+         */
+        bool has_bottle_scope = (scope && scope->bottle_path[0] != '\0');
+        bool has_pid_scope = (scope && scope->root_pid > 0);
+        bool has_exe_scope = (scope && scope->target_count > 0);
+        if (has_bottle_scope || has_pid_scope || has_exe_scope) {
             char lower_title[256];
             lower_title[0] = '\0';
             CFStringRef name_ref = (CFStringRef)CFDictionaryGetValue(dict, kCGWindowName);
             if (name_ref && CFGetTypeID(name_ref) == CFStringGetTypeID()) {
                 char title_buf[256];
-                if (CFStringGetCString(name_ref, title_buf, sizeof(title_buf), kCFStringEncodingUTF8)) {
+                if (cfstring_copy_utf8_truncated(name_ref, title_buf, sizeof(title_buf))) {
                     str_to_lower_ascii(title_buf, lower_title, sizeof(lower_title));
                 }
             }
+
+            bool matched_args_exe = false;
+            bool matched_bottle = false;
+            proc_args_inspect_pid(pid, scope, &matched_args_exe, &matched_bottle);
+
             bool matched_exe =
                 target_exes_match_owner_or_title(lower_buf, lower_title, scope) ||
-                proc_args_match_target_exes(pid, scope);
-            bool matched_tree = (scope->root_pid > 0 && pid_is_descendant_of(pid, scope->root_pid));
+                matched_args_exe;
+            bool matched_tree = (has_pid_scope && pid_is_descendant_of(pid, scope->root_pid));
+
+            if (has_bottle_scope && !matched_bottle && !matched_tree) {
+                continue;
+            }
+            if (!matched_exe && !matched_tree && !matched_bottle) {
+                continue;
+            }
+
+            if (matched_bottle) {
+                score += 2.0e14;
+            }
             if (matched_exe) {
                 score += 1.0e14;
             }
@@ -463,6 +616,11 @@ static bool can_cooperatively_transfer_from_frontmost(id ns_app, id current_app,
         return true;
     }
 
+    /*
+     * MH-05: Never substring-match bare "electron" here — our own Electron PID is
+     * already matched above via current_app.processIdentifier, and matching "electron"
+     * would steal focus from unrelated user apps (VS Code, Slack, Discord, etc.).
+     */
     SEL sel_bundle_id = sel_registerName("bundleIdentifier");
     const char *bundle_utf8 = nsstring_to_utf8(msg_id(front_app, sel_bundle_id));
     if (bundle_utf8 && bundle_utf8[0]) {
@@ -470,8 +628,7 @@ static bool can_cooperatively_transfer_from_frontmost(id ns_app, id current_app,
         str_to_lower_ascii(bundle_utf8, lower_bid, sizeof(lower_bid));
         if (contains_ascii_sub(lower_bid, "crossover") ||
             contains_ascii_sub(lower_bid, "wine") ||
-            contains_ascii_sub(lower_bid, "onelauncher") ||
-            contains_ascii_sub(lower_bid, "electron")) {
+            contains_ascii_sub(lower_bid, "onelauncher")) {
             return true;
         }
     }
@@ -485,8 +642,7 @@ static bool can_cooperatively_transfer_from_frontmost(id ns_app, id current_app,
             ends_with_ascii(lower_name, ".exe") ||
             contains_ascii_sub(lower_name, "crossover") ||
             contains_ascii_sub(lower_name, "one launcher") ||
-            contains_ascii_sub(lower_name, "onelauncher") ||
-            contains_ascii_sub(lower_name, "electron")) {
+            contains_ascii_sub(lower_name, "onelauncher")) {
             return true;
         }
     }
@@ -617,6 +773,19 @@ static void parse_optional_scope_arg(napi_env env, napi_callback_info info, coop
             }
         }
     }
+    napi_value bottle_val = NULL;
+    if (napi_get_named_property(env, argv[0], "bottlePath", &bottle_val) == napi_ok && bottle_val) {
+        napi_valuetype bt_type = napi_undefined;
+        if (napi_typeof(env, bottle_val, &bt_type) == napi_ok && bt_type == napi_string) {
+            char raw_bottle[COOP_MAX_BOTTLE_PATH];
+            size_t copied = 0;
+            if (napi_get_value_string_utf8(env, bottle_val, raw_bottle, sizeof(raw_bottle), &copied) == napi_ok &&
+                copied > 0) {
+                raw_bottle[sizeof(raw_bottle) - 1] = '\0';
+                normalize_bottle_path_lower(raw_bottle, out_scope->bottle_path, sizeof(out_scope->bottle_path));
+            }
+        }
+    }
 }
 
 /*
@@ -635,30 +804,75 @@ static napi_value poll_and_activate_bottled_game(napi_env env, napi_callback_inf
     int32_t layer = 0;
     int32_t encoded = 0;
 
+    /* MH-04: Drain autoreleased AppKit/ObjC objects on every 200ms poll tick */
+    void *pool = objc_autoreleasePoolPush();
     if (find_top_bottled_game_window(&scope, &pid, &layer)) {
         bool active = coop_activate_pid(pid);
         int32_t clamped_layer = layer < 0 ? 0 : (layer > 8191 ? 8191 : layer);
         int32_t pid_tag = (pid & 0x7fff);
         encoded = 1 | (active ? 2 : 0) | (clamped_layer << 2) | (pid_tag << 16);
     }
+    objc_autoreleasePoolPop(pool);
 
     napi_value out = NULL;
     napi_create_int32(env, encoded, &out);
     return out;
 }
 
+/*
+ * MH-05 / MH-06 / SUP-05: Restore permanent host CoreGraphics display modes and
+ * ColorSync gamma tables after an abnormal/SIGKILL game exit.
+ */
+static napi_value restore_host_display_configuration(napi_env env, napi_callback_info info) {
+    (void)info;
+    void *pool = objc_autoreleasePoolPush();
+    CGRestorePermanentDisplayConfiguration();
+    CGDisplayRestoreColorSyncSettings();
+    objc_autoreleasePoolPop(pool);
+
+    napi_value out = NULL;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+/*
+ * MH-06: Fast in-process CoreGraphics screen-lock check (replaces slow `swift -e`
+ * shell invocation in scripts/verify-display-output.cjs).
+ */
+static napi_value is_session_screen_locked(napi_env env, napi_callback_info info) {
+    (void)info;
+    bool locked = false;
+    CFDictionaryRef sess = CGSessionCopyCurrentDictionary();
+    if (sess) {
+        CFTypeRef val = CFDictionaryGetValue(sess, CFSTR("CGSSessionScreenIsLocked"));
+        if (val) {
+            if (CFGetTypeID(val) == CFBooleanGetTypeID()) {
+                locked = CFBooleanGetValue((CFBooleanRef)val) != 0;
+            } else if (CFGetTypeID(val) == CFNumberGetTypeID()) {
+                int num = 0;
+                if (CFNumberGetValue((CFNumberRef)val, kCFNumberIntType, &num)) {
+                    locked = (num != 0);
+                }
+            }
+        }
+        CFRelease(sess);
+    }
+    napi_value out = NULL;
+    napi_get_boolean(env, locked, &out);
+    return out;
+}
+
+static void export_napi_fn(napi_env env, napi_value exports, const char *name, napi_callback cb) {
+    napi_value fn = NULL;
+    if (napi_create_function(env, name, strlen(name), cb, NULL, &fn) == napi_ok && fn != NULL) {
+        napi_set_named_property(env, exports, name, fn);
+    }
+}
+
 __attribute__((visibility("default")))
 napi_value napi_register_module_v1(napi_env env, napi_value exports) {
-    napi_value fn = NULL;
-    if (napi_create_function(
-            env,
-            "pollAndActivateBottledGame",
-            26,
-            poll_and_activate_bottled_game,
-            NULL,
-            &fn) == napi_ok &&
-        fn != NULL) {
-        napi_set_named_property(env, exports, "pollAndActivateBottledGame", fn);
-    }
+    export_napi_fn(env, exports, "pollAndActivateBottledGame", poll_and_activate_bottled_game);
+    export_napi_fn(env, exports, "restoreHostDisplayConfiguration", restore_host_display_configuration);
+    export_napi_fn(env, exports, "isSessionScreenLocked", is_session_screen_locked);
     return exports;
 }

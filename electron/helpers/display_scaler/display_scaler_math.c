@@ -866,6 +866,21 @@ static bool ds_parse_bool_span(const char *val, size_t val_len, bool *out_val)
     return true;
 }
 
+static const char k_ini_key_msz[] =
+    "\x01" "seq\0"
+    "\x02" "fullscreen\0"
+    "\x03" "aspect\0"
+    "\x04" "safe_inset_top\0"
+    "\x05" "filter\0"
+    "\x05" "scaling_filter\0"
+    "\x06" "mode\0"
+    "\x06" "scaling_mode\0"
+    "\x07" "hotkey\0"
+    "\x08" "user_override\0"
+    "\x09" "updated_unix_ms\0"
+    "\x0a" "control_file\0"
+    "\x0b" "status_file\0";
+
 bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_state)
 {
     if (out_state) {
@@ -875,6 +890,7 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
         return false;
     }
 
+    bool any = false;
     size_t i = 0;
     while (i < len && text[i] != '\0') {
         size_t line_start = i;
@@ -892,13 +908,7 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
             continue;
         }
 
-        const char *eq = NULL;
-        for (size_t k = 0; k < line_len; k++) {
-            if (line[k] == '=') {
-                eq = line + k;
-                break;
-            }
-        }
+        const char *eq = (const char *)memchr(line, '=', line_len);
         if (!eq) continue;
 
         const char *key = line;
@@ -909,64 +919,84 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
         ds_trim_span(&val, &val_len);
         if (key_len == 0) continue;
 
-        if (ds_ascii_ieq_span(key, key_len, "seq")) {
-            uint64_t parsed_seq = 0;
-            if (ds_parse_u64_span(val, val_len, &parsed_seq)) {
-                out_state->has_seq = true;
-                out_state->seq = parsed_seq;
+        uint8_t kid = 0, ev = 0;
+        if (!ds_match_enum_msz(key, key_len, k_ini_key_msz, &kid)) continue;
+
+        switch (kid) {
+            case 0:
+                if (ds_parse_u64_span(val, val_len, &out_state->seq)) {
+                    out_state->has_seq = true;
+                    any = true;
+                }
+                break;
+            case 1:
+                if (ds_parse_bool_span(val, val_len, &out_state->fullscreen)) {
+                    out_state->has_fullscreen = true;
+                    any = true;
+                }
+                break;
+            case 2:
+                if (ds_match_enum_msz(val, val_len, k_aspect_msz, &ev)) {
+                    out_state->aspect = (ds_aspect_mode_t)ev;
+                    out_state->has_aspect = true;
+                    any = true;
+                }
+                break;
+            case 3: {
+                int32_t inset = 0;
+                if (ds_parse_i32_span(val, val_len, &inset)) {
+                    out_state->safe_inset_top = (inset > 0) ? inset : 0;
+                    out_state->has_safe_inset_top = true;
+                    any = true;
+                }
+                break;
             }
-        } else if (ds_ascii_ieq_span(key, key_len, "fullscreen")) {
-            if (ds_parse_bool_span(val, val_len, &out_state->fullscreen)) {
-                out_state->has_fullscreen = true;
-            }
-        } else if (ds_ascii_ieq_span(key, key_len, "aspect")) {
-            uint8_t v = 0;
-            if (ds_match_enum_msz(val, val_len, k_aspect_msz, &v)) {
-                out_state->has_aspect = true;
-                out_state->aspect = (ds_aspect_mode_t)v;
-            }
-        } else if (ds_ascii_ieq_span(key, key_len, "safe_inset_top")) {
-            int32_t inset = 0;
-            if (ds_parse_i32_span(val, val_len, &inset)) {
-                out_state->has_safe_inset_top = true;
-                out_state->safe_inset_top = (inset > 0) ? inset : 0;
-            }
-        } else if (ds_ascii_ieq_span(key, key_len, "filter") ||
-                   ds_ascii_ieq_span(key, key_len, "scaling_filter")) {
-            uint8_t v = 0;
-            if (ds_match_enum_msz(val, val_len, k_filter_msz, &v)) {
-                out_state->has_filter = true;
-                out_state->filter = (ds_scale_filter_t)v;
-            }
-        } else if (ds_ascii_ieq_span(key, key_len, "mode") ||
-                   ds_ascii_ieq_span(key, key_len, "scaling_mode")) {
-            uint8_t v = 0;
-            if (ds_match_enum_msz(val, val_len, k_mode_msz, &v)) {
-                out_state->has_scaling_mode = true;
-                out_state->scaling_mode = (ds_scaling_mode_t)v;
-            }
-        } else if (ds_ascii_ieq_span(key, key_len, "hotkey")) {
-            if (ds_parse_bool_span(val, val_len, &out_state->hotkey)) {
-                out_state->has_hotkey = true;
-            }
-        } else if (ds_ascii_ieq_span(key, key_len, "user_override")) {
-            if (ds_parse_bool_span(val, val_len, &out_state->user_override)) {
-                out_state->has_user_override = true;
-            }
-        } else if (ds_ascii_ieq_span(key, key_len, "updated_unix_ms")) {
-            uint64_t parsed_ts = 0;
-            if (ds_parse_u64_span(val, val_len, &parsed_ts)) {
-                out_state->has_updated_unix_ms = true;
-                out_state->updated_unix_ms = parsed_ts;
-            }
-        } else if (ds_ascii_ieq_span(key, key_len, "control_file")) {
-            if (ds_copy_unquoted_span(val, val_len, out_state->control_file, sizeof(out_state->control_file))) {
-                out_state->has_control_file = true;
-            }
-        } else if (ds_ascii_ieq_span(key, key_len, "status_file")) {
-            if (ds_copy_unquoted_span(val, val_len, out_state->status_file, sizeof(out_state->status_file))) {
-                out_state->has_status_file = true;
-            }
+            case 4:
+                if (ds_match_enum_msz(val, val_len, k_filter_msz, &ev)) {
+                    out_state->filter = (ds_scale_filter_t)ev;
+                    out_state->has_filter = true;
+                    any = true;
+                }
+                break;
+            case 5:
+                if (ds_match_enum_msz(val, val_len, k_mode_msz, &ev)) {
+                    out_state->scaling_mode = (ds_scaling_mode_t)ev;
+                    out_state->has_scaling_mode = true;
+                    any = true;
+                }
+                break;
+            case 6:
+                if (ds_parse_bool_span(val, val_len, &out_state->hotkey)) {
+                    out_state->has_hotkey = true;
+                    any = true;
+                }
+                break;
+            case 7:
+                if (ds_parse_bool_span(val, val_len, &out_state->user_override)) {
+                    out_state->has_user_override = true;
+                    any = true;
+                }
+                break;
+            case 8:
+                if (ds_parse_u64_span(val, val_len, &out_state->updated_unix_ms)) {
+                    out_state->has_updated_unix_ms = true;
+                    any = true;
+                }
+                break;
+            case 9:
+                if (ds_copy_unquoted_span(val, val_len, out_state->control_file, sizeof(out_state->control_file))) {
+                    out_state->has_control_file = true;
+                    any = true;
+                }
+                break;
+            case 10:
+                if (ds_copy_unquoted_span(val, val_len, out_state->status_file, sizeof(out_state->status_file))) {
+                    out_state->has_status_file = true;
+                    any = true;
+                }
+                break;
+            default:
+                break;
         }
     }
 
@@ -974,17 +1004,7 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
         out_state->user_override = (out_state->has_seq && out_state->seq > 1ULL);
     }
 
-    return out_state->has_seq ||
-           out_state->has_fullscreen ||
-           out_state->has_aspect ||
-           out_state->has_safe_inset_top ||
-           out_state->has_filter ||
-           out_state->has_scaling_mode ||
-           out_state->has_hotkey ||
-           out_state->has_user_override ||
-           out_state->has_updated_unix_ms ||
-           out_state->has_control_file ||
-           out_state->has_status_file;
+    return any;
 }
 
 bool ds_is_vulkan_legacy_d3d(const ds_tier_input_t *in)
@@ -1085,6 +1105,146 @@ int ds_gl_ctx_map_op(ds_gl_ctx_entry_t *slots, size_t cap, uintptr_t key, int op
     slots[dst].key = key;
     slots[dst].is_wined3d = tag;
     return (int)tag;
+}
+
+ds_gl_ctx_fbo_slot_t *ds_gl_ctx_fbo_acquire(
+    ds_gl_ctx_fbo_slot_t *slots,
+    size_t                cap,
+    uintptr_t             ctx_key,
+    bool                  create,
+    uint32_t             *io_gen,
+    ds_gl_ctx_fbo_slot_t *out_evicted
+)
+{
+    if (out_evicted) memset(out_evicted, 0, sizeof(*out_evicted));
+    if (!slots || cap == 0u || ctx_key == 0u) return NULL;
+
+    size_t empty_idx = cap;
+    size_t lru_idx = 0u;
+    uint32_t min_gen = UINT32_MAX;
+
+    for (size_t i = 0; i < cap; i++) {
+        if (slots[i].ctx_key == ctx_key) {
+            if (io_gen) slots[i].last_used_gen = ++(*io_gen);
+            return &slots[i];
+        }
+        if (slots[i].ctx_key == 0u) {
+            if (empty_idx == cap) empty_idx = i;
+        } else if (slots[i].last_used_gen < min_gen) {
+            min_gen = slots[i].last_used_gen;
+            lru_idx = i;
+        }
+    }
+    if (!create) return NULL;
+
+    size_t dst = empty_idx;
+    if (dst == cap) {
+        dst = lru_idx;
+        if (out_evicted) *out_evicted = slots[dst];
+    }
+    memset(&slots[dst], 0, sizeof(slots[dst]));
+    slots[dst].ctx_key = ctx_key;
+    if (io_gen) slots[dst].last_used_gen = ++(*io_gen);
+    return &slots[dst];
+}
+
+bool ds_gl_ctx_fbo_remove(
+    ds_gl_ctx_fbo_slot_t *slots,
+    size_t                cap,
+    uintptr_t             ctx_key,
+    ds_gl_ctx_fbo_slot_t *out_removed
+)
+{
+    if (out_removed) memset(out_removed, 0, sizeof(*out_removed));
+    if (!slots || cap == 0u || ctx_key == 0u) return false;
+    for (size_t i = 0; i < cap; i++) {
+        if (slots[i].ctx_key == ctx_key) {
+            if (out_removed) *out_removed = slots[i];
+            memset(&slots[i], 0, sizeof(slots[i]));
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t ds_gl_dc_map_select_slot(
+    const ds_gl_dc_entry_t *slots,
+    size_t                  cap,
+    uintptr_t               game_hdc,
+    uintptr_t               cur_host_hwnd,
+    uintptr_t               protected_host_hdc
+)
+{
+    if (!slots || cap == 0u) return 0u;
+    size_t empty_idx = cap;
+    size_t stale_idx = cap;
+    size_t lru_unprot = cap;
+    uint32_t min_unprot_gen = UINT32_MAX;
+    size_t lru_any = 0u;
+    uint32_t min_any_gen = UINT32_MAX;
+
+    for (size_t i = 0; i < cap; i++) {
+        if (slots[i].game_hdc == game_hdc &&
+            slots[i].host_hwnd == cur_host_hwnd &&
+            slots[i].host_hdc != 0u) {
+            return i;
+        }
+        if (slots[i].host_hdc == 0u) {
+            if (empty_idx == cap) empty_idx = i;
+            continue;
+        }
+        bool is_prot = (protected_host_hdc != 0u && slots[i].host_hdc == protected_host_hdc);
+        if (!is_prot && cur_host_hwnd != 0u && slots[i].host_hwnd != cur_host_hwnd) {
+            if (stale_idx == cap) stale_idx = i;
+        }
+        if (!is_prot && slots[i].last_used_gen < min_unprot_gen) {
+            min_unprot_gen = slots[i].last_used_gen;
+            lru_unprot = i;
+        }
+        if (slots[i].last_used_gen < min_any_gen) {
+            min_any_gen = slots[i].last_used_gen;
+            lru_any = i;
+        }
+    }
+    if (empty_idx < cap) return empty_idx;
+    if (stale_idx < cap) return stale_idx;
+    if (lru_unprot < cap) return lru_unprot;
+    return lru_any;
+}
+
+bool ds_rawinput_validate_block(
+    uint32_t            dw_size,
+    uint32_t            cb_size_header,
+    size_t              remaining_bytes,
+    bool                is_wow64,
+    bool                is_64bit,
+    ds_rawinput_step_t *out_step
+)
+{
+    if (out_step) {
+        out_step->mouse_offset = 0u;
+        out_step->next_step = 0u;
+    }
+    size_t hdr_sz = (cb_size_header != 0u) ? (size_t)cb_size_header : (is_64bit ? 24u : 16u);
+    if (hdr_sz != 16u && hdr_sz != 24u) {
+        return false;
+    }
+    if ((size_t)dw_size < hdr_sz || (size_t)dw_size > remaining_bytes) {
+        return false;
+    }
+    size_t align = (is_64bit || is_wow64) ? 8u : 4u;
+    if ((size_t)dw_size > SIZE_MAX - (align - 1u)) {
+        return false;
+    }
+    size_t step = ((size_t)dw_size + (align - 1u)) & ~(align - 1u);
+    if (step < (size_t)dw_size) {
+        return false;
+    }
+    if (out_step) {
+        out_step->mouse_offset = hdr_sz;
+        out_step->next_step = step;
+    }
+    return true;
 }
 
 bool ds_is_subnative_exclusive_fullscreen_window(

@@ -27,6 +27,8 @@
 #include <string.h>
 #include <strings.h>
 
+#include "common_process_denylist.h"
+
 typedef OSStatus (*one_audio_get_prop_fn)(
     AudioObjectID inObjectID,
     const AudioObjectPropertyAddress *inAddress,
@@ -44,6 +46,20 @@ typedef OSStatus (*one_audio_set_prop_fn)(
     UInt32 inDataSize,
     const void *inData
 );
+
+/* MH-03: Track original CoreAudio HAL buffer frames so destructor restores them cleanly */
+static pthread_mutex_t g_audio_restore_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_audio_clamped_by_us = 0;
+static AudioObjectID g_audio_device_id = kAudioObjectUnknown;
+static AudioObjectPropertyAddress g_audio_buf_addr = {
+    kAudioDevicePropertyBufferFrameSize,
+    kAudioObjectPropertyScopeOutput,
+    0
+};
+static UInt32 g_audio_prev_frames = 0;
+static UInt32 g_audio_target_frames = 0;
+static one_audio_get_prop_fn g_audio_get_prop = NULL;
+static one_audio_set_prop_fn g_audio_set_prop = NULL;
 
 static int ascii_tolower_char(int c) {
     return (c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c;
@@ -214,8 +230,63 @@ static void clamp_default_output_audio_buffer_to_5ms(void) {
 
     UInt32 target_frames = (UInt32)clamped_frames;
     if (target_frames >= 32 && current_frames > target_frames) {
-        set_prop(output_device, &buf_addr, 0, NULL, (UInt32)sizeof(target_frames), &target_frames);
+        if (set_prop(output_device, &buf_addr, 0, NULL, (UInt32)sizeof(target_frames), &target_frames) == noErr) {
+            pthread_mutex_lock(&g_audio_restore_lock);
+            if (!g_audio_clamped_by_us) {
+                g_audio_clamped_by_us = 1;
+                g_audio_device_id = output_device;
+                g_audio_buf_addr = buf_addr;
+                g_audio_prev_frames = current_frames;
+                g_audio_target_frames = target_frames;
+                g_audio_get_prop = get_prop;
+                g_audio_set_prop = set_prop;
+            }
+            pthread_mutex_unlock(&g_audio_restore_lock);
+        }
     }
+}
+
+/*
+ * MH-03: Restore the system default CoreAudio HAL output buffer frame size when
+ * this process exits, guarded so we only restore if we modified it and no other
+ * application has since changed it away from our clamped value.
+ */
+__attribute__((destructor))
+static void restore_default_output_audio_buffer(void) {
+    pthread_mutex_lock(&g_audio_restore_lock);
+    if (!g_audio_clamped_by_us ||
+        g_audio_device_id == kAudioObjectUnknown ||
+        g_audio_prev_frames < 32 ||
+        !g_audio_set_prop) {
+        pthread_mutex_unlock(&g_audio_restore_lock);
+        return;
+    }
+
+    AudioObjectID dev = g_audio_device_id;
+    AudioObjectPropertyAddress addr = g_audio_buf_addr;
+    UInt32 prev_frames = g_audio_prev_frames;
+    UInt32 expected_target = g_audio_target_frames;
+    one_audio_get_prop_fn get_fn = g_audio_get_prop;
+    one_audio_set_prop_fn set_fn = g_audio_set_prop;
+
+    g_audio_clamped_by_us = 0;
+    g_audio_device_id = kAudioObjectUnknown;
+    g_audio_prev_frames = 0;
+    g_audio_target_frames = 0;
+    g_audio_get_prop = NULL;
+    g_audio_set_prop = NULL;
+    pthread_mutex_unlock(&g_audio_restore_lock);
+
+    if (get_fn) {
+        UInt32 now_frames = 0;
+        UInt32 prop_size = (UInt32)sizeof(now_frames);
+        if (get_fn(dev, &addr, 0, NULL, &prop_size, &now_frames) == noErr &&
+            now_frames != expected_target) {
+            return;
+        }
+    }
+
+    (void)set_fn(dev, &addr, 0, NULL, (UInt32)sizeof(prev_frames), &prev_frames);
 }
 
 /*
@@ -291,9 +362,9 @@ static const one_launcher_dyld_interpose_tuple_t g_one_launcher_interpose_tuples
     },
 };
 
-static int arg_basename_matches_ci(const char *arg, const char *target_lower) {
-    if (!arg || !target_lower) {
-        return 0;
+static const char *arg_basename_ptr(const char *arg) {
+    if (!arg) {
+        return "";
     }
     const char *base = arg;
     for (const char *p = arg; *p != '\0'; ++p) {
@@ -301,13 +372,23 @@ static int arg_basename_matches_ci(const char *arg, const char *target_lower) {
             base = p + 1;
         }
     }
-    return strcasecmp(base, target_lower) == 0;
+    return base;
+}
+
+static int arg_basename_matches_ci(const char *arg, const char *target_lower) {
+    if (!arg || !target_lower) {
+        return 0;
+    }
+    return strcasecmp(arg_basename_ptr(arg), target_lower) == 0;
 }
 
 /*
  * Guard non-GUI Wine daemon/helper processes (reg.exe, wineboot.exe, conhost.exe,
- * services.exe, plugplay.exe, rpcss.exe, svchost.exe, winedevice.exe) so preloading via
- * CX_ENV never initializes Metal HUD / CFRunLoopRun or touches CoreAudio inside background helpers.
+ * services.exe, plugplay.exe, rpcss.exe, svchost.exe, winedevice.exe, tabtip.exe,
+ * steamwebhelper.exe, steamservice.exe, crashhandler.exe, galaxyclient.exe,
+ * one_display_launcher_x86.exe, one_display_launcher_x64.exe, etc. via
+ * common_process_denylist.h) so preloading via CX_ENV never initializes Metal HUD /
+ * CFRunLoopRun or touches CoreAudio inside background helpers.
  */
 static int is_non_gui_wine_helper_process(void) {
     const char *suppress = getenv("ONE_LAUNCHER_SUPPRESS_PRELOAD");
@@ -333,30 +414,12 @@ static int is_non_gui_wine_helper_process(void) {
         "start",
     };
 
-    static const char *const k_helper_exes[] = {
-        "wineserver",
-        "reg.exe",
-        "reg",
-        "regedit.exe",
-        "regsvr32.exe",
-        "wineboot.exe",
-        "wineboot",
-        "conhost.exe",
-        "services.exe",
-        "plugplay.exe",
-        "rpcss.exe",
-        "svchost.exe",
-        "winedevice.exe",
-        "winecfg.exe",
-        "explorer.exe",
-        "rundll32.exe",
-        "cmd.exe",
-        "powershell.exe",
-        "one_display_launcher_x86.exe",
-        "one_display_launcher_x64.exe",
-        "one_xgr_win_launcher.exe",
-        "one_xgr_win_launcher_x86.exe",
-    };
+    static const char k_helper_exes_msz[] =
+        ONE_DENYLIST_UNIX_WINE_MSZ
+        ONE_DENYLIST_WINE_SYSTEM_MSZ
+        ONE_DENYLIST_SHELL_MSZ
+        ONE_DENYLIST_STOREFRONT_DAEMONS_MSZ
+        ONE_DENYLIST_GALAXY_CHAIN_MSZ;
 
     const int argc = *argc_ptr < 32 ? *argc_ptr : 32;
     char **argv = *argv_ptr;
@@ -385,15 +448,23 @@ static int is_non_gui_wine_helper_process(void) {
             continue;
         }
 
-        for (size_t h = 0; h < sizeof(k_helper_exes) / sizeof(k_helper_exes[0]); ++h) {
-            if (arg_basename_matches_ci(arg, k_helper_exes[h])) {
-                return 1;
-            }
+        if (one_denylist_match_ascii_msz(arg_basename_ptr(arg), k_helper_exes_msz)) {
+            return 1;
         }
         /* First real target executable token inspected: if it is not a helper daemon, allow preload */
         break;
     }
     return 0;
+}
+
+static int is_validated_absolute_dylib_path(const char *path) {
+    if (!path || path[0] != '/') {
+        return 0;
+    }
+    if (strstr(path, "..") != NULL) {
+        return 0;
+    }
+    return 1;
 }
 
 __attribute__((constructor))
@@ -417,21 +488,18 @@ static void preload_metal_and_moltenvk(void) {
         return;
     }
 
+    /* MH-03: Only resolve MoltenVK via validated absolute path (never bare relative dlopen) */
     const char *mvk_path = getenv("MVK_ICD_LIBRARY_PATH");
-    if (mvk_path && mvk_path[0]) {
+    if (is_validated_absolute_dylib_path(mvk_path)) {
         if (dlopen(mvk_path, RTLD_LAZY | RTLD_GLOBAL) != NULL || is_moltenvk_already_loaded()) {
             return;
         }
     }
 
     const char *legacy_mvk_path = getenv("ONE_LAUNCHER_MOLTENVK_PATH");
-    if (legacy_mvk_path && legacy_mvk_path[0]) {
+    if (is_validated_absolute_dylib_path(legacy_mvk_path)) {
         if (dlopen(legacy_mvk_path, RTLD_LAZY | RTLD_GLOBAL) != NULL || is_moltenvk_already_loaded()) {
             return;
         }
-    }
-
-    if (!is_moltenvk_already_loaded()) {
-        dlopen("libMoltenVK.dylib", RTLD_LAZY | RTLD_GLOBAL);
     }
 }

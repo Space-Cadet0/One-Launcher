@@ -13,7 +13,8 @@ const path = require('node:path');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const TEST_SRC = path.join(ROOT_DIR, 'tests', 'native', 'display_scaler_asan_test.c');
-const SCALER_DIR = path.join(ROOT_DIR, 'electron', 'helpers', 'display_scaler');
+const HELPERS_DIR = path.join(ROOT_DIR, 'electron', 'helpers');
+const SCALER_DIR = path.join(HELPERS_DIR, 'display_scaler');
 const MATH_SRC = path.join(SCALER_DIR, 'display_scaler_math.c');
 
 function run() {
@@ -38,6 +39,7 @@ function run() {
       '-Wall',
       '-Wextra',
       '-Werror',
+      `-I${HELPERS_DIR}`,
       `-I${SCALER_DIR}`,
       MATH_SRC,
       TEST_SRC,
