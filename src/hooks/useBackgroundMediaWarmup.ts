@@ -115,10 +115,18 @@ export function useBackgroundMediaWarmup({
         .then(({ syncJobManager }) => {
           if (cancelled) return;
           unsub = syncJobManager.subscribe((state) => {
+            if (cancelled) return;
+            const hasStoreMediaCategory = Boolean(
+              state?.activeCategoryKeys?.includes('store_media') ||
+                state?.activeCategories?.some((category) => {
+                  const normalized = category.trim().toLowerCase();
+                  return normalized === 'store_media' || normalized === 'store media';
+                })
+            );
             const active = Boolean(
               state &&
                 (state.type === 'store_media' ||
-                  (state.type === 'multi' && state.activeCategories?.includes('store_media'))) &&
+                  (state.type === 'multi' && hasStoreMediaCategory)) &&
                 (state.status === 'running' ||
                   state.status === 'paused' ||
                   state.status === 'rate_limited')
@@ -153,6 +161,8 @@ export function useBackgroundMediaWarmup({
 
     const isSessionSuspended = isHibernating || runningGamesCount > 0;
 
+    let cancelled = false;
+
     if (isModalSuspended) {
       if (batchFlushTimerRef.current !== null) {
         clearTimeout(batchFlushTimerRef.current);
@@ -161,7 +171,7 @@ export function useBackgroundMediaWarmup({
       if (autoMediaWarmupRunningRef.current) {
         void import('../services/network/syncJobManager')
           .then(({ syncJobManager }) => {
-            if (!isModalSuspendedRef.current) return;
+            if (cancelled || !isModalSuspendedRef.current) return;
             const st = syncJobManager.getState();
             if (st && st.type === 'store_media' && st.status === 'running') {
               modalPausedJobIdRef.current = st.id;
@@ -170,7 +180,9 @@ export function useBackgroundMediaWarmup({
           })
           .catch(() => {});
       }
-      return;
+      return () => {
+        cancelled = true;
+      };
     }
 
     if (modalPausedJobIdRef.current && !isSessionSuspended) {
@@ -178,7 +190,7 @@ export function useBackgroundMediaWarmup({
       modalPausedJobIdRef.current = null;
       void import('../services/network/syncJobManager')
         .then(({ syncJobManager }) => {
-          if (isModalSuspendedRef.current) return;
+          if (cancelled || isModalSuspendedRef.current) return;
           const st = syncJobManager.getState();
           if (st && st.id === pausedId && st.status === 'paused') {
             syncJobManager.resumeJob(pausedId);
@@ -191,11 +203,12 @@ export function useBackgroundMediaWarmup({
       flushWarmupBatch();
     }
 
-    if (isBootHydrating) return;
+    if (isBootHydrating || isSessionSuspended || games.length === 0) {
+      return () => {
+        cancelled = true;
+      };
+    }
 
-    if (isSessionSuspended || games.length === 0) return;
-
-    let cancelled = false;
     let warmupTimer: ReturnType<typeof setTimeout> | null = null;
     let hltbTrickleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -319,12 +332,14 @@ export function useBackgroundMediaWarmup({
         clearTimeout(warmupTimer);
         warmupTimer = null;
       }
+      if (cancelled) return;
       if (isVitestEnv && !allowWarmupInTest) return;
       if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
       if (!onlineLifecycleManager.isOnline()) return;
 
       warmupTimer = setTimeout(() => {
         warmupTimer = null;
+        if (cancelled) return;
         if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
         if (!onlineLifecycleManager.isOnline()) return;
         if (launcherService.getRunningGames().length > 0) return;
@@ -341,6 +356,7 @@ export function useBackgroundMediaWarmup({
               hasActiveMediaSyncCooldown,
               MAX_PASSIVE_REPAIR_PER_BOOT,
             }) => {
+              if (cancelled) return;
               if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
               if (!onlineLifecycleManager.isOnline()) return;
               if (launcherService.getRunningGames().length > 0) return;
@@ -463,7 +479,7 @@ export function useBackgroundMediaWarmup({
                       }
                     }
                   }
-                  if (!isModalSuspendedRef.current) {
+                  if (!cancelled && !isModalSuspendedRef.current) {
                     flushWarmupBatch();
                     queueSessionP2CoversOnce();
                     scheduleHltbTrickle(900);
@@ -483,6 +499,7 @@ export function useBackgroundMediaWarmup({
     let unsubscribeOnline: (() => void) | null = null;
     try {
       unsubscribeOnline = onlineLifecycleManager.onOnline(() => {
+        if (cancelled) return;
         if (offlineSkippedIdsRef.current.size > 0) {
           for (const id of offlineSkippedIdsRef.current) {
             attemptedWarmupIdsRef.current.delete(id);

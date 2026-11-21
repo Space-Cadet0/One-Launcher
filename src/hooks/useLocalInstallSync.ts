@@ -903,16 +903,11 @@ export function useLocalInstallSync({
     let startupSteamSyncPromise: Promise<void> = Promise.resolve();
 
     if (typeof window !== 'undefined' && window.electronAPI?.getSavedTokens) {
-      let resolveStartupSteamSync: (() => void) | null = null;
-      startupSteamSyncPromise = new Promise<void>((resolve) => {
-        resolveStartupSteamSync = resolve;
-      });
+      const { promise: pendingStartupSync, resolve: resolveStartupSteamSync } =
+        Promise.withResolvers<void>();
+      startupSteamSyncPromise = pendingStartupSync;
       const finishStartupSteamSync = () => {
-        if (resolveStartupSteamSync) {
-          const fn = resolveStartupSteamSync;
-          resolveStartupSteamSync = null;
-          fn();
-        }
+        resolveStartupSteamSync();
       };
 
       window.electronAPI

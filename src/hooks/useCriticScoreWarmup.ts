@@ -35,11 +35,13 @@ export function useCriticScoreWarmup(
       return;
     }
 
+    let cancelled = false;
+
     if (isSuspended) {
       if (warmupActiveRef.current) {
         void import('../services/network/syncJobManager')
           .then(({ syncJobManager }) => {
-            if (!isSuspendedRef.current) return;
+            if (cancelled || !isSuspendedRef.current) return;
             const st = syncJobManager.getState();
             if (st && st.type === 'critic_scores' && st.status === 'running') {
               suspendedPausedJobIdRef.current = st.id;
@@ -48,7 +50,9 @@ export function useCriticScoreWarmup(
           })
           .catch(() => {});
       }
-      return;
+      return () => {
+        cancelled = true;
+      };
     }
 
     if (suspendedPausedJobIdRef.current) {
@@ -56,7 +60,7 @@ export function useCriticScoreWarmup(
       suspendedPausedJobIdRef.current = null;
       void import('../services/network/syncJobManager')
         .then(({ syncJobManager }) => {
-          if (isSuspendedRef.current) return;
+          if (cancelled || isSuspendedRef.current) return;
           const st = syncJobManager.getState();
           if (st && st.id === pausedId && st.status === 'paused') {
             syncJobManager.resumeJob(pausedId);
@@ -65,7 +69,11 @@ export function useCriticScoreWarmup(
         .catch(() => {});
     }
 
-    if (!games || games.length === 0) return;
+    if (!games || games.length === 0) {
+      return () => {
+        cancelled = true;
+      };
+    }
 
     const initialDelayMs = isVitestRuntime() ? 350 : 2500;
 
@@ -76,19 +84,25 @@ export function useCriticScoreWarmup(
         clearTimeout(timer);
         timer = null;
       }
+      if (cancelled) return;
       if (isBootHydratingRef.current || isSuspendedRef.current) return;
       if (!onlineLifecycleManager.isOnline()) return;
+      if (launcherService.isInGameHibernating()) return;
 
       timer = setTimeout(() => {
         timer = null;
+        if (cancelled) return;
         if (isBootHydratingRef.current || isSuspendedRef.current) return;
         if (!onlineLifecycleManager.isOnline()) return;
         if (launcherService.getRunningGames().length > 0) return;
+        if (launcherService.isInGameHibernating()) return;
         void import('../services/network/syncJobManager')
           .then(({ syncJobManager }) => {
+            if (cancelled) return;
             if (isBootHydratingRef.current || isSuspendedRef.current) return;
             if (!onlineLifecycleManager.isOnline()) return;
             if (launcherService.getRunningGames().length > 0) return;
+            if (launcherService.isInGameHibernating()) return;
             if (warmupActiveRef.current) return;
             const latestGames = gamesLatestRef.current;
             if (!latestGames || latestGames.length === 0) return;
@@ -110,13 +124,14 @@ export function useCriticScoreWarmup(
     let unsubscribeOnline: (() => void) | null = null;
     try {
       unsubscribeOnline = onlineLifecycleManager.onOnline(() => {
-        if (!isBootHydratingRef.current && !isSuspendedRef.current) {
+        if (!cancelled && !isBootHydratingRef.current && !isSuspendedRef.current) {
           scheduleWarmup();
         }
       });
     } catch {}
 
     return () => {
+      cancelled = true;
       if (timer !== null) {
         clearTimeout(timer);
       }
